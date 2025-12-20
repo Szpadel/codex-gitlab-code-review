@@ -1,0 +1,79 @@
+image:
+  repository: codex-gitlab-review
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+service:
+  port: 8080
+
+resources: {}
+
+serviceAccount:
+  create: true
+  name: ""
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""
+
+config:
+  schedule:
+    cron: "*/10 * * * *"
+    timezone: "UTC"
+  review:
+    maxConcurrent: 2
+    eyesEmoji: "eyes"
+    thumbsEmoji: "thumbsup"
+    commentMarkerPrefix: "<!-- codex-review:sha="
+    staleInProgressMinutes: 120
+    dryRun: false
+  codex:
+    image: "ghcr.io/openai/codex-universal:latest"
+    timeoutSeconds: 1800
+    authHostPath: "/root/.codex"
+    authMountPath: "/root/.codex"
+    execSandbox: "danger-full-access"
+  docker:
+    host: "tcp://localhost:2375"
+  server:
+    bindAddr: "0.0.0.0:8080"
+  proxy:
+    httpProxy: "http://localhost:3128"
+    httpsProxy: "http://localhost:3128"
+    noProxy: "localhost,127.0.0.1,.svc,.cluster.local"
+
+gitlab:
+  baseUrl: "https://gitlab.example.com"
+  repos: []
+  botUserId: ""
+  createdAfter: ""
+  token:
+    existingSecret: ""
+    secretKey: "token"
+    value: ""
+
+codexAuth:
+  existingSecret: ""
+  secretKey: "auth.json"
+
+codexToml: ""
+
+proxy:
+  enabled: true
+  image: "ubuntu/squid:5.2-22.04_beta"
+  port: 3128
+  allowedHosts: []
+  extraConfig: ""
+  command: []
+  args: []
+  resources: {}
+
+dind:
+  image: "docker:dind"
+  resources: {}
+
+networkPolicy:
+  enabled: false
+  allowedNamespaces: []
+  allowedIPs: []

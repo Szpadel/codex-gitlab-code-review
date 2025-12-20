@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "codex-gitlab-review.fullname" . }}-config
+  labels:
+    app.kubernetes.io/name: {{ include "codex-gitlab-review.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+
+data:
+  config.yaml: |
+    gitlab:
+      base_url: {{ .Values.gitlab.baseUrl | quote }}
+      token: ""
+{{- if .Values.gitlab.botUserId }}
+      bot_user_id: {{ .Values.gitlab.botUserId }}
+{{- else }}
+      bot_user_id: null
+{{- end }}
+{{- if .Values.gitlab.createdAfter }}
+      created_after: {{ .Values.gitlab.createdAfter | quote }}
+{{- end }}
+      repos:
+{{- if .Values.gitlab.repos }}
+{{ toYaml .Values.gitlab.repos | indent 6 }}
+{{- else }}
+        []
+{{- end }}
+    schedule:
+      cron: {{ .Values.config.schedule.cron | quote }}
+{{- if .Values.config.schedule.timezone }}
+      timezone: {{ .Values.config.schedule.timezone | quote }}
+{{- else }}
+      timezone: null
+{{- end }}
+    review:
+      max_concurrent: {{ .Values.config.review.maxConcurrent }}
+      eyes_emoji: {{ .Values.config.review.eyesEmoji | quote }}
+      thumbs_emoji: {{ .Values.config.review.thumbsEmoji | quote }}
+      comment_marker_prefix: {{ .Values.config.review.commentMarkerPrefix | quote }}
+      stale_in_progress_minutes: {{ .Values.config.review.staleInProgressMinutes }}
+      dry_run: {{ .Values.config.review.dryRun }}
+    codex:
+      image: {{ .Values.config.codex.image | quote }}
+      timeout_seconds: {{ .Values.config.codex.timeoutSeconds }}
+      auth_host_path: {{ .Values.config.codex.authHostPath | quote }}
+      auth_mount_path: {{ .Values.config.codex.authMountPath | quote }}
+      exec_sandbox: {{ .Values.config.codex.execSandbox | quote }}
+    docker:
+      host: {{ .Values.config.docker.host | quote }}
+    database:
+      path: "/data/state.sqlite"
+    server:
+      bind_addr: {{ .Values.config.server.bindAddr | quote }}
+    proxy:
+      http_proxy: {{ .Values.config.proxy.httpProxy | quote }}
+      https_proxy: {{ .Values.config.proxy.httpsProxy | quote }}
+      no_proxy: {{ .Values.config.proxy.noProxy | quote }}

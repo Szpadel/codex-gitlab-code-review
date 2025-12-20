@@ -1,0 +1,19 @@
+{{- if .Values.proxy.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "codex-gitlab-review.fullname" . }}-proxy
+  labels:
+    app.kubernetes.io/name: {{ include "codex-gitlab-review.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+
+data:
+  squid.conf: |
+    http_port {{ .Values.proxy.port }}
+    acl allowed dstdomain{{- range .Values.proxy.allowedHosts }} {{ . }}{{- end }}
+    http_access allow allowed
+    http_access deny all
+{{- if .Values.proxy.extraConfig }}
+{{ .Values.proxy.extraConfig | nindent 4 }}
+{{- end }}
+{{- end }}

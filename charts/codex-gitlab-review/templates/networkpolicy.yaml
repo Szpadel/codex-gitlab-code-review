@@ -1,0 +1,38 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "codex-gitlab-review.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "codex-gitlab-review.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "codex-gitlab-review.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+{{- if or .Values.networkPolicy.allowedNamespaces .Values.networkPolicy.allowedIPs }}
+      to:
+{{- if .Values.networkPolicy.allowedNamespaces }}
+{{- range .Values.networkPolicy.allowedNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- if .Values.networkPolicy.allowedIPs }}
+{{- range .Values.networkPolicy.allowedIPs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

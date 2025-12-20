@@ -1,0 +1,81 @@
+# Example configuration for codex-gitlab-review.
+# Keys marked "(optional)" can be omitted; defaults are noted in comments.
+# Environment overrides:
+# - CONFIG_PATH selects the config file (default: config.yaml).
+# - CODEX_REVIEW__... overrides nested keys (example: CODEX_REVIEW__GITLAB__TOKEN).
+# - RUN_ONCE and DRY_RUN override runtime behavior.
+
+gitlab:
+  # Required. Base URL of the GitLab instance (no /api/v4).
+  base_url: "https://gitlab.example.com"
+  # Required. Personal access token or OAuth token; can be empty for public read-only access.
+  token: "${GITLAB_TOKEN}"
+  # Optional. Bot user id; if omitted and token is set, resolved via GitLab API.
+  bot_user_id: 1234
+  # Optional. Only review merge requests created after this RFC3339 timestamp.
+  created_after: "2025-01-01T00:00:00Z"
+  # Optional. Target selection (defaults to mode: repos, refresh_seconds: 3600).
+  targets:
+    # Optional. "repos", "groups", or "all".
+    mode: "repos"
+    # Optional. List of "group/project" paths when mode = repos.
+    repos:
+      - "group/project-a"
+      - "group/project-b"
+    # Optional. List of group paths when mode = groups.
+    groups:
+      - "group/subgroup"
+    # Optional. Cache TTL for discovered projects in seconds; 0 disables caching.
+    refresh_seconds: 3600
+
+schedule:
+  # Required. Cron expression with seconds (6 fields) or shorthand like "@hourly".
+  cron: "0 */10 * * * *"
+  # Optional. IANA timezone name; null or omitted means UTC.
+  timezone: "UTC"
+
+review:
+  # Required. Max concurrent reviews.
+  max_concurrent: 2
+  # Required. GitLab award emoji for "review in progress".
+  eyes_emoji: "eyes"
+  # Required. GitLab award emoji for "review passed".
+  thumbs_emoji: "thumbsup"
+  # Required. Prefix used to mark review comments to avoid duplicate processing.
+  comment_marker_prefix: "<!-- codex-review:sha="
+  # Required. Minutes after which in-progress reviews are treated as stale.
+  stale_in_progress_minutes: 120
+  # Optional. If true, skip all GitLab writes (awards/notes).
+  dry_run: false
+
+codex:
+  # Required. Docker image containing the Codex app-server.
+  image: "ghcr.io/openai/codex-universal:latest"
+  # Required. Timeout per review in seconds.
+  timeout_seconds: 1800
+  # Optional. Host path containing Codex auth/config; if empty, uses auth_mount_path.
+  auth_host_path: "/root/.codex"
+  # Required. Container path to mount auth/config from host (read-only).
+  auth_mount_path: "/root/.codex"
+  # Required. Sandbox mode passed to Codex: "read-only", "workspace-write", or "danger-full-access".
+  exec_sandbox: "danger-full-access"
+
+docker:
+  # Optional. Docker host to connect to; default is "unix:///var/run/docker.sock".
+  host: "tcp://localhost:2375"
+
+database:
+  # Required. SQLite database path for persistent state.
+  path: "/data/state.sqlite"
+
+server:
+  # Required. Health server bind address.
+  bind_addr: "0.0.0.0:8080"
+
+proxy:
+  # Optional. HTTP proxy forwarded to the Codex container.
+  http_proxy: "http://localhost:3128"
+  # Optional. HTTPS proxy forwarded to the Codex container.
+  https_proxy: "http://localhost:3128"
+  # Optional. Comma-separated NO_PROXY list forwarded to the Codex container.
+  no_proxy: "localhost,127.0.0.1,.svc,.cluster.local"

@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS service_state (
+    key TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL
+);

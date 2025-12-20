@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codex-gitlab-review.fullname" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "codex-gitlab-review.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "codex-gitlab-review.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "codex-gitlab-review.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ include "codex-gitlab-review.serviceAccountName" . }}
+      containers:
+        - name: codex-review
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: CONFIG_PATH
+              value: "/etc/codex/config.yaml"
+            - name: CODEX_REVIEW__GITLAB__TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default (printf "%s-gitlab-token" (include "codex-gitlab-review.fullname" .)) .Values.gitlab.token.existingSecret }}
+                  key: {{ .Values.gitlab.token.secretKey }}
+            - name: RUST_LOG
+              value: "info"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/codex
+            - name: data
+              mountPath: /data
+{{- if .Values.codexAuth.existingSecret }}
+            - name: codex-auth
+              mountPath: {{ .Values.config.codex.authMountPath }}/auth.json
+              subPath: {{ .Values.codexAuth.secretKey }}
+              readOnly: true
+{{- end }}
+{{- if .Values.codexToml }}
+            - name: codex-config
+              mountPath: {{ .Values.config.codex.authMountPath }}/config.toml
+              subPath: config.toml
+              readOnly: true
+{{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          resources:
+{{ toYaml .Values.resources | indent 12 }}
+        - name: dind
+          image: {{ .Values.dind.image }}
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: ""
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: docker-graph
+              mountPath: /var/lib/docker
+{{- if .Values.codexAuth.existingSecret }}
+            - name: codex-auth
+              mountPath: {{ .Values.config.codex.authMountPath }}/auth.json
+              subPath: {{ .Values.codexAuth.secretKey }}
+              readOnly: true
+{{- end }}
+{{- if .Values.codexToml }}
+            - name: codex-config
+              mountPath: {{ .Values.config.codex.authMountPath }}/config.toml
+              subPath: config.toml
+              readOnly: true
+{{- end }}
+          resources:
+{{ toYaml .Values.dind.resources | indent 12 }}
+{{- if .Values.proxy.enabled }}
+        - name: egress-proxy
+          image: {{ .Values.proxy.image }}
+{{- if .Values.proxy.command }}
+          command:
+{{ toYaml .Values.proxy.command | indent 12 }}
+{{- end }}
+{{- if .Values.proxy.args }}
+          args:
+{{ toYaml .Values.proxy.args | indent 12 }}
+{{- end }}
+          ports:
+            - name: proxy
+              containerPort: {{ .Values.proxy.port }}
+          volumeMounts:
+            - name: proxy-config
+              mountPath: /etc/squid
+          resources:
+{{ toYaml .Values.proxy.resources | indent 12 }}
+{{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "codex-gitlab-review.fullname" . }}-config
+        - name: data
+{{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "codex-gitlab-review.fullname" . }}-data
+{{- else }}
+          emptyDir: {}
+{{- end }}
+        - name: docker-graph
+          emptyDir: {}
+{{- if .Values.codexAuth.existingSecret }}
+        - name: codex-auth
+          secret:
+            secretName: {{ .Values.codexAuth.existingSecret }}
+{{- end }}
+{{- if .Values.codexToml }}
+        - name: codex-config
+          configMap:
+            name: {{ include "codex-gitlab-review.fullname" . }}-codex-config
+{{- end }}
+{{- if .Values.proxy.enabled }}
+        - name: proxy-config
+          configMap:
+            name: {{ include "codex-gitlab-review.fullname" . }}-proxy
+{{- end }}
