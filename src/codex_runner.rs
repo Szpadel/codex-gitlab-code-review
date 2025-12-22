@@ -193,10 +193,11 @@ run_git() {{
     fi
   fi
 }}
-run_git clone git clone --depth 1 "{clone_url}" repo
+run_git clone git clone --depth 1 --recurse-submodules "{clone_url}" repo
 cd repo
 run_git fetch git fetch --depth 1 origin "{head_sha}"
 run_git checkout git checkout "{head_sha}"
+run_git submodule_update git submodule update --init --recursive
 {target_branch_script}# Create a writable CODEX_HOME and copy auth/config from the read-only mount.
 codex_home="/tmp/codex"
 mkdir -p "${{codex_home}}"
@@ -992,5 +993,17 @@ mod tests {
         assert!(script.contains("git fetch --depth 1 origin \"main\""));
         assert!(script.contains("git branch --force \"main\" FETCH_HEAD"));
         assert!(script.contains("git fetch --unshallow"));
+    }
+
+    #[test]
+    fn build_command_script_updates_submodules() {
+        let script = DockerCodexRunner::build_command_script(
+            "https://example.com/repo.git",
+            "abc",
+            "/root/.codex",
+            None,
+        );
+        assert!(script.contains("git clone --depth 1 --recurse-submodules"));
+        assert!(script.contains("git submodule update --init --recursive"));
     }
 }
