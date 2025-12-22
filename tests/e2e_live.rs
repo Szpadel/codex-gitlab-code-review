@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{Duration, Utc};
 use codex_gitlab_code_review::codex_runner::DockerCodexRunner;
 use codex_gitlab_code_review::config::{
     CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets, ProxyConfig,
-    ReviewConfig, ScheduleConfig, ServerConfig,
+    ReviewConfig, ScheduleConfig, ServerConfig, TargetSelector,
 };
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::review::ReviewService;
@@ -27,8 +27,8 @@ async fn e2e_live_dry_run() -> Result<()> {
     let auth_host_path = env::var("E2E_CODEX_AUTH_HOST_PATH")
         .or_else(|_| env::var("HOME").map(|home| format!("{}/.codex", home)))
         .unwrap_or_else(|_| "/root/.codex".to_string());
-    let docker_host = env::var("E2E_DOCKER_HOST")
-        .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
+    let docker_host =
+        env::var("E2E_DOCKER_HOST").unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
     let created_after = Utc::now() - Duration::days(3650);
 
     let config = Config {
@@ -38,7 +38,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             bot_user_id: None,
             created_after: Some(created_after),
             targets: GitLabTargets {
-                repos: vec![repo.clone()],
+                repos: TargetSelector::List(vec![repo.clone()]),
                 ..Default::default()
             },
         },

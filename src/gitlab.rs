@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use reqwest::{header, Client, Response};
+use reqwest::{Client, Response, header};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -190,7 +190,13 @@ impl GitLabClient {
                 .headers()
                 .get("X-Next-Page")
                 .and_then(|val| val.to_str().ok())
-                .and_then(|val| if val.is_empty() { None } else { Some(val.to_string()) });
+                .and_then(|val| {
+                    if val.is_empty() {
+                        None
+                    } else {
+                        Some(val.to_string())
+                    }
+                });
             let mut page_items: Vec<T> = ensure_success(response)
                 .await
                 .with_context(|| format!("gitlab GET {} response", url.as_str()))?;
@@ -284,12 +290,20 @@ impl GitLabApi for GitLabClient {
     }
 
     async fn list_notes(&self, project: &str, iid: u64) -> Result<Vec<Note>> {
-        let url = format!("{}/merge_requests/{}/notes", self.project_path(project), iid);
+        let url = format!(
+            "{}/merge_requests/{}/notes",
+            self.project_path(project),
+            iid
+        );
         self.get_paginated(&url).await
     }
 
     async fn create_note(&self, project: &str, iid: u64, body: &str) -> Result<()> {
-        let url = format!("{}/merge_requests/{}/notes", self.project_path(project), iid);
+        let url = format!(
+            "{}/merge_requests/{}/notes",
+            self.project_path(project),
+            iid
+        );
         self.post_note(&url, body).await
     }
 }
@@ -322,8 +336,8 @@ async fn ensure_success_empty(response: Response) -> Result<()> {
 }
 
 fn normalize_api_base(base_url: &str) -> Result<String> {
-    let mut url = Url::parse(base_url)
-        .with_context(|| format!("parse gitlab base url {}", base_url))?;
+    let mut url =
+        Url::parse(base_url).with_context(|| format!("parse gitlab base url {}", base_url))?;
     let path = url.path().trim_end_matches('/');
     let new_path = if path.ends_with("/api/v4") {
         path.to_string()
@@ -341,8 +355,8 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use wiremock::{
-        matchers::{header_exists, method, path, query_param},
         Mock, MockServer, ResponseTemplate,
+        matchers::{header_exists, method, path, query_param},
     };
 
     #[tokio::test]

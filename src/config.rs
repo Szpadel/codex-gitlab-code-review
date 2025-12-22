@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use serde::de::{self, Deserializer};
 use std::env;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -31,62 +32,93 @@ pub struct GitLabConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub struct GitLabTargets {
     #[serde(default)]
-    pub mode: GitLabTargetMode,
+    pub repos: TargetSelector,
     #[serde(default)]
-    pub repos: Vec<String>,
+    pub groups: TargetSelector,
     #[serde(default)]
-    pub groups: Vec<String>,
+    pub exclude_repos: Vec<String>,
+    #[serde(default)]
+    pub exclude_groups: Vec<String>,
     #[serde(default = "default_refresh_seconds")]
     pub refresh_seconds: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum GitLabTargetMode {
-    Repos,
-    Groups,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TargetSelector {
     All,
+    List(Vec<String>),
 }
 
 impl Default for GitLabTargets {
     fn default() -> Self {
         Self {
-            mode: GitLabTargetMode::Repos,
-            repos: Vec::new(),
-            groups: Vec::new(),
+            repos: TargetSelector::default(),
+            groups: TargetSelector::default(),
+            exclude_repos: Vec::new(),
+            exclude_groups: Vec::new(),
             refresh_seconds: default_refresh_seconds(),
         }
     }
 }
 
-impl Default for GitLabTargetMode {
+impl Default for TargetSelector {
     fn default() -> Self {
-        GitLabTargetMode::Repos
+        TargetSelector::List(Vec::new())
     }
 }
 
-impl GitLabTargetMode {
-    pub fn as_str(self) -> &'static str {
+impl TargetSelector {
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    pub fn list(&self) -> &[String] {
         match self {
-            GitLabTargetMode::Repos => "repos",
-            GitLabTargetMode::Groups => "groups",
-            GitLabTargetMode::All => "all",
+            Self::All => &[],
+            Self::List(items) => items,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TargetSelector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawSelector {
+            String(String),
+            List(Vec<String>),
+            None(()),
+        }
+
+        match RawSelector::deserialize(deserializer)? {
+            RawSelector::String(value) => {
+                if value == "all" {
+                    Ok(TargetSelector::All)
+                } else {
+                    Err(de::Error::custom(format!(
+                        "expected \"all\" or list, got \"{}\"",
+                        value
+                    )))
+                }
+            }
+            RawSelector::List(items) => Ok(TargetSelector::List(items)),
+            RawSelector::None(()) => Ok(TargetSelector::default()),
         }
     }
 }
 
 impl GitLabTargets {
-    pub fn cache_key(&self) -> String {
-        let mut repos = self.repos.clone();
-        repos.sort();
-        let mut groups = self.groups.clone();
+    pub fn cache_key_for_all(&self) -> String {
+        "all".to_string()
+    }
+
+    pub fn cache_key_for_groups(&self) -> String {
+        let mut groups = self.groups.list().to_vec();
         groups.sort();
-        format!(
-            "mode={};repos={};groups={}",
-            self.mode.as_str(),
-            repos.join(","),
-            groups.join(",")
-        )
+        format!("groups={}", groups.join(","))
     }
 }
 
@@ -165,9 +197,7 @@ impl Config {
         let cfg = builder
             .build()
             .with_context(|| format!("load config from {}", path))?;
-        let mut config: Config = cfg
-            .try_deserialize()
-            .context("deserialize config")?;
+        let mut config: Config = cfg.try_deserialize().context("deserialize config")?;
         if config.codex.auth_host_path.is_empty() {
             config.codex.auth_host_path = config.codex.auth_mount_path.clone();
         }
@@ -195,14 +225,14 @@ mod tests {
         path
     }
 
-    fn load_from_yaml(contents: &str) -> Config {
+    fn try_load_from_yaml(contents: &str) -> Result<Config> {
         let _lock = ENV_LOCK.lock().expect("lock env");
         let path = write_temp_config(contents);
         let previous = env::var("CONFIG_PATH").ok();
         unsafe {
             env::set_var("CONFIG_PATH", &path);
         }
-        let loaded = Config::load().expect("load config");
+        let loaded = Config::load();
         match previous {
             Some(value) => unsafe {
                 env::set_var("CONFIG_PATH", value);
@@ -215,6 +245,10 @@ mod tests {
         loaded
     }
 
+    fn load_from_yaml(contents: &str) -> Config {
+        try_load_from_yaml(contents).expect("load config")
+    }
+
     fn base_config_yaml(extra: &str) -> String {
         format!(
             r#"
@@ -223,7 +257,6 @@ gitlab:
   token: "token"
   bot_user_id: 1
   targets:
-    mode: repos
     repos:
       - "group/repo"
 schedule:
@@ -278,5 +311,73 @@ docker:
         assert_eq!(config.proxy.http_proxy, None);
         assert_eq!(config.proxy.https_proxy, None);
         assert_eq!(config.proxy.no_proxy, None);
+    }
+
+    #[test]
+    fn loads_all_target_selector() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos: all
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let config = load_from_yaml(yaml);
+        assert!(config.gitlab.targets.repos.is_all());
+    }
+
+    #[test]
+    fn errors_on_invalid_target_selector() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos: everything
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
     }
 }

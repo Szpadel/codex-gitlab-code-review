@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use clap::Parser;
 use chrono::{DateTime, Utc};
+use clap::Parser;
 use cron::Schedule;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -48,9 +48,12 @@ async fn main() -> Result<()> {
     }
     info!(
         gitlab_base = config.gitlab.base_url.as_str(),
-        target_mode = config.gitlab.targets.mode.as_str(),
-        repos = config.gitlab.targets.repos.len(),
-        groups = config.gitlab.targets.groups.len(),
+        repos_all = config.gitlab.targets.repos.is_all(),
+        repos = config.gitlab.targets.repos.list().len(),
+        groups_all = config.gitlab.targets.groups.is_all(),
+        groups = config.gitlab.targets.groups.list().len(),
+        exclude_repos = config.gitlab.targets.exclude_repos.len(),
+        exclude_groups = config.gitlab.targets.exclude_groups.len(),
         run_once,
         dry_run = config.review.dry_run,
         "starting codex gitlab review"
@@ -116,7 +119,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_health_server(bind_addr: String) {
-    use axum::{routing::get, Router};
+    use axum::{Router, routing::get};
     use tokio::net::TcpListener;
 
     let app = Router::new().route("/healthz", get(|| async { "OK" }));

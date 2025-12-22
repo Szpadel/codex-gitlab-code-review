@@ -1,6 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 
@@ -51,7 +51,11 @@ impl ReviewStateStore {
 
     pub async fn begin_review(&self, repo: &str, iid: u64, sha: &str) -> Result<bool> {
         let now = Utc::now().timestamp();
-        let mut tx = self.pool.begin().await.context("start sqlite transaction")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("start sqlite transaction")?;
         let row = sqlx::query("SELECT status FROM review_state WHERE repo = ? AND iid = ?")
             .bind(repo)
             .bind(iid as i64)
@@ -177,8 +181,8 @@ impl ReviewStateStore {
                 let fetched_at: i64 = row.try_get("fetched_at").context("read fetched_at")?;
                 let projects_json: String =
                     row.try_get("projects").context("read catalog projects")?;
-                let projects: Vec<String> = serde_json::from_str(&projects_json)
-                    .context("deserialize catalog projects")?;
+                let projects: Vec<String> =
+                    serde_json::from_str(&projects_json).context("deserialize catalog projects")?;
                 Ok(Some(ProjectCatalog {
                     fetched_at,
                     projects,
@@ -218,9 +222,7 @@ impl ReviewStateStore {
             .context("load created_after state")?;
         match row {
             Some(row) => {
-                let value: String = row
-                    .try_get("value")
-                    .context("read created_after state")?;
+                let value: String = row.try_get("value").context("read created_after state")?;
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -340,10 +342,7 @@ mod tests {
             .set_project_last_activity(repo, "2025-01-01T00:00:00Z")
             .await?;
         let loaded = store.get_project_last_activity(repo).await?;
-        assert_eq!(
-            loaded,
-            Some("2025-01-01T00:00:00Z".to_string())
-        );
+        assert_eq!(loaded, Some("2025-01-01T00:00:00Z".to_string()));
         Ok(())
     }
 
@@ -370,9 +369,7 @@ mod tests {
         let missing = store.get_created_after().await?;
         assert_eq!(missing, None);
 
-        store
-            .set_created_after("2025-01-02T03:04:05Z")
-            .await?;
+        store.set_created_after("2025-01-02T03:04:05Z").await?;
         let loaded = store.get_created_after().await?;
         assert_eq!(loaded, Some("2025-01-02T03:04:05Z".to_string()));
         Ok(())

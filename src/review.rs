@@ -1,8 +1,8 @@
 use crate::codex_runner::{CodexResult, CodexRunner, ReviewContext};
-use crate::config::{Config, GitLabTargetMode};
+use crate::config::Config;
 use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, Note};
 use crate::state::ReviewStateStore;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
 use std::collections::HashSet;
@@ -89,10 +89,7 @@ impl ReviewService {
                     if let Some(previous) = self.state.get_project_last_activity(repo).await? {
                         if previous == *activity {
                             counters.skipped_inactive += 1;
-                            debug!(
-                                repo = repo.as_str(),
-                                "skip: project has no new activity"
-                            );
+                            debug!(repo = repo.as_str(), "skip: project has no new activity");
                             continue;
                         }
                     }
@@ -142,10 +139,7 @@ impl ReviewService {
         match self.gitlab.get_project(repo).await {
             Ok(project) => {
                 if project.last_activity_at.is_none() {
-                    warn!(
-                        repo = repo,
-                        "project missing last_activity_at; scanning"
-                    );
+                    warn!(repo = repo, "project missing last_activity_at; scanning");
                 }
                 project.last_activity_at
             }
@@ -162,53 +156,109 @@ impl ReviewService {
 
     async fn resolve_repos(&self, mode: ScanMode) -> Result<Vec<String>> {
         let targets = &self.config.gitlab.targets;
-        match targets.mode {
-            GitLabTargetMode::Repos => Ok(targets.repos.clone()),
-            GitLabTargetMode::Groups => self.resolve_group_targets(mode).await,
-            GitLabTargetMode::All => self.resolve_all_targets(mode).await,
+        let include_all = targets.repos.is_all() || targets.groups.is_all();
+        let mut included = HashSet::new();
+        if include_all {
+            for repo in self.resolve_all_targets(mode).await? {
+                included.insert(repo);
+            }
+        } else {
+            for repo in targets.repos.list() {
+                included.insert(repo.clone());
+            }
+            if !targets.groups.list().is_empty() {
+                for repo in self.resolve_group_targets(mode).await? {
+                    included.insert(repo);
+                }
+            }
         }
+
+        if included.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let exclude_repos: HashSet<&str> =
+            targets.exclude_repos.iter().map(String::as_str).collect();
+        let exclude_group_prefixes: Vec<String> = targets
+            .exclude_groups
+            .iter()
+            .map(|group| group.trim_end_matches('/'))
+            .filter(|group| !group.is_empty())
+            .map(|group| format!("{}/", group))
+            .collect();
+
+        let mut repos: Vec<String> = included
+            .into_iter()
+            .filter(|repo| {
+                if exclude_repos.contains(repo.as_str()) {
+                    return false;
+                }
+                if exclude_group_prefixes
+                    .iter()
+                    .any(|prefix| repo.starts_with(prefix))
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
+        repos.sort();
+        Ok(repos)
     }
 
     async fn resolve_all_targets(&self, mode: ScanMode) -> Result<Vec<String>> {
-        self.resolve_discovered_targets(mode, || async {
-            let projects = self.gitlab.list_projects().await?;
-            Ok(projects
-                .into_iter()
-                .map(|project| project.path_with_namespace)
-                .collect())
-        })
+        let cache_key = self.config.gitlab.targets.cache_key_for_all();
+        self.resolve_discovered_targets(
+            mode,
+            || async {
+                let projects = self.gitlab.list_projects().await?;
+                Ok(projects
+                    .into_iter()
+                    .map(|project| project.path_with_namespace)
+                    .collect())
+            },
+            cache_key,
+        )
         .await
     }
 
     async fn resolve_group_targets(&self, mode: ScanMode) -> Result<Vec<String>> {
         let groups = &self.config.gitlab.targets.groups;
-        if groups.is_empty() {
-            return Err(anyhow!("gitlab.targets.groups is empty"));
+        if groups.list().is_empty() {
+            return Ok(Vec::new());
         }
-        self.resolve_discovered_targets(mode, || async {
-            let mut deduped = HashSet::new();
-            for group in groups {
-                let projects = self.gitlab.list_group_projects(group).await?;
-                for project in projects {
-                    deduped.insert(project.path_with_namespace);
+        let cache_key = self.config.gitlab.targets.cache_key_for_groups();
+        self.resolve_discovered_targets(
+            mode,
+            || async {
+                let mut deduped = HashSet::new();
+                for group in groups.list() {
+                    let projects = self.gitlab.list_group_projects(group).await?;
+                    for project in projects {
+                        deduped.insert(project.path_with_namespace);
+                    }
                 }
-            }
-            Ok(deduped.into_iter().collect())
-        })
+                Ok(deduped.into_iter().collect())
+            },
+            cache_key,
+        )
         .await
     }
 
-    async fn resolve_discovered_targets<F, Fut>(&self, mode: ScanMode, fetch: F) -> Result<Vec<String>>
+    async fn resolve_discovered_targets<F, Fut>(
+        &self,
+        mode: ScanMode,
+        fetch: F,
+        cache_key: String,
+    ) -> Result<Vec<String>>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Vec<String>>>,
     {
-        let targets = &self.config.gitlab.targets;
-        let cache_key = targets.cache_key();
         let cached = self.state.load_project_catalog(&cache_key).await?;
         let force_refresh = matches!(mode, ScanMode::Full);
         if let Some(cache) = cached.as_ref() {
-            let refresh_seconds = targets.refresh_seconds;
+            let refresh_seconds = self.config.gitlab.targets.refresh_seconds;
             if !force_refresh
                 && refresh_seconds > 0
                 && Utc::now().timestamp() - cache.fetched_at < refresh_seconds as i64
@@ -289,11 +339,7 @@ impl ReviewService {
             let awards = self.gitlab.list_awards(repo, mr.iid).await?;
             if has_bot_award(&awards, self.bot_user_id, &self.config.review.thumbs_emoji) {
                 counters.skipped_award += 1;
-                debug!(
-                    repo = repo,
-                    iid = mr.iid,
-                    "skip: thumbs up already present"
-                );
+                debug!(repo = repo, iid = mr.iid, "skip: thumbs up already present");
                 continue;
             }
             let notes = self.gitlab.list_notes(repo, mr.iid).await?;
@@ -388,11 +434,7 @@ impl ReviewService {
         ) {
             return Ok(());
         }
-        if !self
-            .state
-            .begin_review(repo, mr.iid, &head_sha)
-            .await?
-        {
+        if !self.state.begin_review(repo, mr.iid, &head_sha).await? {
             return Ok(());
         }
         let _permit = self.semaphore.clone().acquire_owned().await?;
@@ -439,8 +481,14 @@ async fn run_review(
     let result = codex.run_review(review_ctx).await;
     if config.review.dry_run {
         info!(repo = repo, iid = mr.iid, "dry run: skipping eyes removal");
-    } else if let Err(err) =
-        remove_eyes(gitlab.as_ref(), repo, mr.iid, bot_user_id, &config.review.eyes_emoji).await
+    } else if let Err(err) = remove_eyes(
+        gitlab.as_ref(),
+        repo,
+        mr.iid,
+        bot_user_id,
+        &config.review.eyes_emoji,
+    )
+    .await
     {
         warn!(
             repo = repo,
@@ -459,17 +507,18 @@ async fn run_review(
                     .add_award(repo, mr.iid, &config.review.thumbs_emoji)
                     .await?;
             }
-            state
-                .finish_review(repo, mr.iid, head_sha, "pass")
-                .await?;
-            info!(repo = repo, iid = mr.iid, summary = summary.as_str(), "review pass");
+            state.finish_review(repo, mr.iid, head_sha, "pass").await?;
+            info!(
+                repo = repo,
+                iid = mr.iid,
+                summary = summary.as_str(),
+                "review pass"
+            );
         }
         Ok(CodexResult::Comment { summary, body }) => {
             let full_body = format!(
                 "{}\n\n{}{} -->",
-                body,
-                config.review.comment_marker_prefix,
-                head_sha
+                body, config.review.comment_marker_prefix, head_sha
             );
             if config.review.dry_run {
                 info!(repo = repo, iid = mr.iid, "dry run: skipping comment");
@@ -479,7 +528,12 @@ async fn run_review(
             state
                 .finish_review(repo, mr.iid, head_sha, "comment")
                 .await?;
-            info!(repo = repo, iid = mr.iid, summary = summary.as_str(), "review comment");
+            info!(
+                repo = repo,
+                iid = mr.iid,
+                summary = summary.as_str(),
+                "review comment"
+            );
         }
         Err(err) => {
             let body = format!(
@@ -494,9 +548,7 @@ async fn run_review(
             } else {
                 gitlab.create_note(repo, mr.iid, &body).await?;
             }
-            state
-                .finish_review(repo, mr.iid, head_sha, "error")
-                .await?;
+            state.finish_review(repo, mr.iid, head_sha, "error").await?;
         }
     }
 
@@ -517,9 +569,9 @@ fn has_review_marker(notes: &[Note], bot_user_id: u64, prefix: &str, sha: &str) 
         return false;
     }
     let marker = format!("{}{} -->", prefix, sha);
-    notes.iter().any(|note| {
-        note.author.id == bot_user_id && note.body.contains(&marker)
-    })
+    notes
+        .iter()
+        .any(|note| note.author.id == bot_user_id && note.body.contains(&marker))
 }
 
 async fn remove_eyes(
@@ -541,14 +593,14 @@ async fn remove_eyes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use anyhow::anyhow;
     use crate::codex_runner::CodexRunner;
     use crate::config::{
-        CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargetMode, GitLabTargets,
-        ProxyConfig, ReviewConfig, ScheduleConfig, ServerConfig,
+        CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets, ProxyConfig,
+        ReviewConfig, ScheduleConfig, ServerConfig, TargetSelector,
     };
     use crate::gitlab::{AwardEmoji, GitLabUser, Note};
+    use anyhow::anyhow;
+    use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use pretty_assertions::assert_eq;
     use sqlx::Row;
@@ -696,7 +748,7 @@ mod tests {
                 bot_user_id: Some(1),
                 created_after: None,
                 targets: GitLabTargets {
-                    repos: vec!["group/repo".to_string()],
+                    repos: TargetSelector::List(vec!["group/repo".to_string()]),
                     ..Default::default()
                 },
             },
@@ -905,14 +957,7 @@ mod tests {
             calls: Mutex::new(0),
         });
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-        let service = ReviewService::new(
-            config,
-            gitlab.clone(),
-            state,
-            runner.clone(),
-            1,
-            cutoff,
-        );
+        let service = ReviewService::new(config, gitlab.clone(), state, runner.clone(), 1, cutoff);
 
         service.scan_once().await?;
 
@@ -1066,9 +1111,7 @@ mod tests {
 
         assert_eq!(*gitlab.list_open_calls.lock().unwrap(), 1);
         assert_eq!(*runner.calls.lock().unwrap(), 1);
-        let stored = state
-            .get_project_last_activity("group/repo")
-            .await?;
+        let stored = state.get_project_last_activity("group/repo").await?;
         assert_eq!(stored, Some("2025-01-02T00:00:00Z".to_string()));
         Ok(())
     }
@@ -1076,7 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_uses_cached_project_catalog() -> Result<()> {
         let mut config = test_config();
-        config.gitlab.targets.mode = GitLabTargetMode::All;
+        config.gitlab.targets.repos = TargetSelector::All;
         config.gitlab.targets.refresh_seconds = 3600;
 
         let bot_user = GitLabUser {
@@ -1103,7 +1146,7 @@ mod tests {
             calls: Mutex::new(0),
         });
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-        let cache_key = config.gitlab.targets.cache_key();
+        let cache_key = config.gitlab.targets.cache_key_for_all();
         state
             .save_project_catalog(&cache_key, &vec!["group/repo".to_string()])
             .await?;
@@ -1126,7 +1169,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_refreshes_project_catalog_when_expired() -> Result<()> {
         let mut config = test_config();
-        config.gitlab.targets.mode = GitLabTargetMode::All;
+        config.gitlab.targets.repos = TargetSelector::All;
         config.gitlab.targets.refresh_seconds = 0;
 
         let bot_user = GitLabUser {
@@ -1153,7 +1196,7 @@ mod tests {
             calls: Mutex::new(0),
         });
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-        let cache_key = config.gitlab.targets.cache_key();
+        let cache_key = config.gitlab.targets.cache_key_for_all();
         state
             .save_project_catalog(&cache_key, &vec!["group/stale".to_string()])
             .await?;
@@ -1231,6 +1274,56 @@ mod tests {
             .await?;
         let status: String = row.try_get("status")?;
         assert_eq!(status, "done");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolves_targets_with_exclusions() -> Result<()> {
+        let mut config = test_config();
+        config.gitlab.targets.repos =
+            TargetSelector::List(vec!["group/keep".to_string(), "group/drop".to_string()]);
+        config.gitlab.targets.groups = TargetSelector::List(vec!["group".to_string()]);
+        config.gitlab.targets.exclude_repos = vec!["group/drop".to_string()];
+        config.gitlab.targets.exclude_groups = vec!["group/exclude".to_string()];
+
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user,
+            mrs: Mutex::new(Vec::new()),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::from([(
+                "group".to_string(),
+                vec![
+                    "group/include".to_string(),
+                    "group/exclude/project".to_string(),
+                ],
+            )])),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(FakeRunner {
+            result: Mutex::new(None),
+            calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let service = ReviewService::new(config, gitlab, state, runner, 1, default_created_after());
+
+        let repos = service.resolve_repos(ScanMode::Full).await?;
+
+        assert_eq!(
+            repos,
+            vec!["group/include".to_string(), "group/keep".to_string()]
+        );
         Ok(())
     }
 }

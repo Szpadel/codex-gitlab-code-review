@@ -14,16 +14,21 @@ gitlab:
   bot_user_id: 1234
   # Optional. Only review merge requests created after this RFC3339 timestamp.
   created_after: "2025-01-01T00:00:00Z"
-  # Optional. Target selection (defaults to mode: repos, refresh_seconds: 3600).
+  # Optional. Target selection (defaults to empty lists, refresh_seconds: 3600).
   targets:
-    # Optional. "repos", "groups", or "all".
-    mode: "repos"
-    # Optional. List of "group/project" paths when mode = repos.
+    # Optional. List of "group/project" paths or "all". If repos or groups is "all",
+    # all projects are included before applying exclusions.
     repos:
       - "group/project-a"
       - "group/project-b"
-    # Optional. List of group paths when mode = groups.
+    # Optional. List of group paths or "all".
     groups:
+      - "group/subgroup"
+    # Optional. List of "group/project" paths to exclude.
+    exclude_repos:
+      - "group/project-b"
+    # Optional. List of group paths to exclude (covers subgroups).
+    exclude_groups:
       - "group/subgroup"
     # Optional. Cache TTL for discovered projects in seconds; 0 disables caching.
     refresh_seconds: 3600

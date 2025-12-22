@@ -1,16 +1,16 @@
 use crate::config::{CodexConfig, DockerConfig, ProxyConfig};
 use crate::gitlab::MergeRequest;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bollard::container::{
     AttachContainerOptions, Config as ContainerConfig, CreateContainerOptions, LogOutput,
     RemoveContainerOptions, StartContainerOptions,
 };
 use bollard::models::HostConfig;
-use bollard::{Docker, API_DEFAULT_VERSION};
+use bollard::{API_DEFAULT_VERSION, Docker};
 use futures::StreamExt;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::time::Duration;
@@ -105,7 +105,11 @@ impl DockerCodexRunner {
     }
 
     fn review_instructions(&self, ctx: &ReviewContext) -> String {
-        let title = ctx.mr.title.clone().unwrap_or_else(|| "(no title)".to_string());
+        let title = ctx
+            .mr
+            .title
+            .clone()
+            .unwrap_or_else(|| "(no title)".to_string());
         let url = ctx
             .mr
             .web_url
@@ -118,11 +122,7 @@ impl DockerCodexRunner {
             .unwrap_or_else(|| "(unknown)".to_string());
         format!(
             "You are a senior code reviewer. Review only the changes introduced by this merge request (diff against the target branch) and return JSON only.\n\nRepo: {}\nMR: {}\nURL: {}\nHead SHA: {}\nTarget branch: {}\n\nReturn JSON with fields verdict (pass or comment), summary, and comment_markdown. If verdict is pass, comment_markdown can be an empty string.",
-            ctx.repo,
-            title,
-            url,
-            ctx.head_sha,
-            target_branch
+            ctx.repo, title, url, ctx.head_sha, target_branch
         )
     }
 
@@ -388,9 +388,7 @@ exec codex app-server
                 .and_then(|id| id.as_str())
                 .unwrap_or(thread_id.as_str())
                 .to_string();
-            client
-                .stream_review(&review_thread_id, &turn_id)
-                .await
+            client.stream_review(&review_thread_id, &turn_id).await
         })
         .await;
 
@@ -404,7 +402,11 @@ exec codex app-server
 #[async_trait]
 impl CodexRunner for DockerCodexRunner {
     async fn run_review(&self, ctx: ReviewContext) -> Result<CodexResult> {
-        info!(repo = ctx.repo.as_str(), iid = ctx.mr.iid, "starting codex review");
+        info!(
+            repo = ctx.repo.as_str(),
+            iid = ctx.mr.iid,
+            "starting codex review"
+        );
         let output = self.run_app_server_review(&ctx).await?;
         parse_review_output(&output).with_context(|| {
             format!(
@@ -431,10 +433,7 @@ struct ReasoningBuffer {
 }
 
 impl AppServerClient {
-    fn new(
-        attach: bollard::container::AttachContainerResults,
-        log_all_json: bool,
-    ) -> Self {
+    fn new(attach: bollard::container::AttachContainerResults, log_all_json: bool) -> Self {
         Self {
             input: attach.input,
             output: attach.output,
@@ -463,8 +462,7 @@ impl AppServerClient {
     }
 
     async fn initialized(&mut self) -> Result<()> {
-        self.send_json(&json!({ "method": "initialized" }))
-            .await
+        self.send_json(&json!({ "method": "initialized" })).await
     }
 
     async fn stream_review(&mut self, thread_id: &str, turn_id: &str) -> Result<String> {
@@ -580,13 +578,7 @@ impl AppServerClient {
                                         .get("status")
                                         .and_then(|value| value.as_str())
                                         .unwrap_or("<unknown>");
-                                    info!(
-                                        item_id,
-                                        command,
-                                        cwd,
-                                        status,
-                                        "codex command started"
-                                    );
+                                    info!(item_id, command, cwd, status, "codex command started");
                                 }
                                 "reasoning" => {
                                     if self.log_all_json {
@@ -607,16 +599,18 @@ impl AppServerClient {
                                 if let Some(item_id) =
                                     item.get("id").and_then(|value| value.as_str())
                                 {
-                                    if let Some(buffer) =
-                                        self.reasoning_buffers.remove(item_id)
-                                    {
+                                    if let Some(buffer) = self.reasoning_buffers.remove(item_id) {
                                         let reasoning = if !buffer.summary.trim().is_empty() {
                                             buffer.summary
                                         } else {
                                             buffer.text
                                         };
                                         if !reasoning.trim().is_empty() {
-                                            info!(item_id, reasoning = reasoning.as_str(), "codex reasoning completed");
+                                            info!(
+                                                item_id,
+                                                reasoning = reasoning.as_str(),
+                                                "codex reasoning completed"
+                                            );
                                         }
                                     }
                                 }
@@ -637,7 +631,8 @@ impl AppServerClient {
                                     .get("status")
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("<unknown>");
-                                let exit_code = item.get("exitCode").and_then(|value| value.as_i64());
+                                let exit_code =
+                                    item.get("exitCode").and_then(|value| value.as_i64());
                                 let duration_ms =
                                     item.get("durationMs").and_then(|value| value.as_i64());
                                 info!(
@@ -653,13 +648,8 @@ impl AppServerClient {
                                 info!(item_type, "codex item completed");
                             }
                         }
-                        if let Some(review) = item
-                            .get("review")
-                            .and_then(|value| value.as_str())
-                        {
-                            if item
-                                .get("type")
-                                .and_then(|value| value.as_str())
+                        if let Some(review) = item.get("review").and_then(|value| value.as_str()) {
+                            if item.get("type").and_then(|value| value.as_str())
                                 == Some("exitedReviewMode")
                             {
                                 review_text = Some(review.to_string());
