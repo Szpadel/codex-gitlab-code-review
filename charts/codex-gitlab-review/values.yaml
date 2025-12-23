@@ -1,5 +1,5 @@
 image:
-  repository: codex-gitlab-review
+  repository: "ghcr.io/szpadel/codex-gitlab-review"
   tag: "latest"
   pullPolicy: IfNotPresent
 
@@ -19,7 +19,7 @@ persistence:
 
 config:
   schedule:
-    cron: "*/10 * * * *"
+    cron: "0 * * * * *"
     timezone: "UTC"
   review:
     maxConcurrent: 2
@@ -45,7 +45,12 @@ config:
 
 gitlab:
   baseUrl: "https://gitlab.example.com"
-  repos: []
+  targets:
+    repos: []
+    groups: []
+    excludeRepos: []
+    excludeGroups: []
+    refreshSeconds: 3600
   botUserId: ""
   createdAfter: ""
   token:

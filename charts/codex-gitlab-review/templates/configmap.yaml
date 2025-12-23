@@ -19,12 +19,32 @@ data:
 {{- if .Values.gitlab.createdAfter }}
       created_after: {{ .Values.gitlab.createdAfter | quote }}
 {{- end }}
-      repos:
-{{- if .Values.gitlab.repos }}
-{{ toYaml .Values.gitlab.repos | indent 6 }}
+      targets:
+        repos:
+{{- if .Values.gitlab.targets.repos }}
+{{ toYaml .Values.gitlab.targets.repos | indent 8 }}
 {{- else }}
-        []
+          []
 {{- end }}
+        groups:
+{{- if .Values.gitlab.targets.groups }}
+{{ toYaml .Values.gitlab.targets.groups | indent 8 }}
+{{- else }}
+          []
+{{- end }}
+        exclude_repos:
+{{- if .Values.gitlab.targets.excludeRepos }}
+{{ toYaml .Values.gitlab.targets.excludeRepos | indent 8 }}
+{{- else }}
+          []
+{{- end }}
+        exclude_groups:
+{{- if .Values.gitlab.targets.excludeGroups }}
+{{ toYaml .Values.gitlab.targets.excludeGroups | indent 8 }}
+{{- else }}
+          []
+{{- end }}
+        refresh_seconds: {{ .Values.gitlab.targets.refreshSeconds }}
     schedule:
       cron: {{ .Values.config.schedule.cron | quote }}
 {{- if .Values.config.schedule.timezone }}
