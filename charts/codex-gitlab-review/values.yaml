@@ -1,7 +1,7 @@
 image:
   repository: "ghcr.io/szpadel/codex-gitlab-review"
   tag: "latest"
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
 
 service:
   port: 8080

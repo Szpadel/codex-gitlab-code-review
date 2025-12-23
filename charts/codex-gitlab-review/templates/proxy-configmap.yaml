@@ -10,6 +10,7 @@ metadata:
 data:
   squid.conf: |
     http_port {{ .Values.proxy.port }}
+    access_log stdio:/dev/stdout squid
     acl allowed dstdomain{{- range .Values.proxy.allowedHosts }} {{ . }}{{- end }}
     http_access allow allowed
     http_access deny all
