@@ -3,12 +3,89 @@ use crate::config::Config;
 use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, Note};
 use crate::state::ReviewStateStore;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures::future::join_all;
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct RetryKey {
+    repo: String,
+    iid: u64,
+    head_sha: String,
+}
+
+impl RetryKey {
+    fn new(repo: &str, iid: u64, head_sha: &str) -> Self {
+        Self {
+            repo: repo.to_string(),
+            iid,
+            head_sha: head_sha.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RetryState {
+    failures: u32,
+    next_retry_at: DateTime<Utc>,
+}
+
+struct RetryBackoff {
+    base_delay: Duration,
+    entries: Mutex<HashMap<RetryKey, RetryState>>,
+}
+
+impl RetryBackoff {
+    fn new(base_delay: Duration) -> Self {
+        Self {
+            base_delay,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn should_retry(&self, key: &RetryKey, now: DateTime<Utc>) -> bool {
+        let entries = self.entries.lock().unwrap();
+        match entries.get(key) {
+            Some(state) => now >= state.next_retry_at,
+            None => true,
+        }
+    }
+
+    fn record_failure(&self, key: RetryKey, now: DateTime<Utc>) -> DateTime<Utc> {
+        let mut entries = self.entries.lock().unwrap();
+        let failures = entries
+            .get(&key)
+            .map(|state| state.failures + 1)
+            .unwrap_or(1);
+        let base_seconds = self.base_delay.num_seconds().max(0);
+        let exponent = failures.saturating_sub(1).min(30) as u32;
+        let multiplier = 1i64 << exponent;
+        let delay_seconds = base_seconds.saturating_mul(multiplier);
+        let next_retry_at = now + Duration::seconds(delay_seconds);
+        entries.insert(
+            key,
+            RetryState {
+                failures,
+                next_retry_at,
+            },
+        );
+        next_retry_at
+    }
+
+    fn clear(&self, key: &RetryKey) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.remove(key);
+    }
+
+    #[cfg(test)]
+    fn state_for(&self, key: &RetryKey) -> Option<RetryState> {
+        let entries = self.entries.lock().unwrap();
+        entries.get(key).cloned()
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ScanMode {
@@ -23,6 +100,7 @@ struct ScanCounters {
     skipped_award: usize,
     skipped_marker: usize,
     skipped_locked: usize,
+    skipped_backoff: usize,
     missing_sha: usize,
     skipped_inactive: usize,
     skipped_created_before: usize,
@@ -36,6 +114,7 @@ pub struct ReviewService {
     bot_user_id: u64,
     created_after: DateTime<Utc>,
     semaphore: Arc<Semaphore>,
+    retry_backoff: Arc<RetryBackoff>,
 }
 
 impl ReviewService {
@@ -48,6 +127,7 @@ impl ReviewService {
         created_after: DateTime<Utc>,
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.review.max_concurrent));
+        let retry_backoff = Arc::new(RetryBackoff::new(Duration::hours(1)));
         Self {
             config,
             gitlab,
@@ -56,6 +136,7 @@ impl ReviewService {
             bot_user_id,
             created_after,
             semaphore,
+            retry_backoff,
         }
     }
 
@@ -113,6 +194,7 @@ impl ReviewService {
                     skipped_award = counters.skipped_award,
                     skipped_marker = counters.skipped_marker,
                     skipped_locked = counters.skipped_locked,
+                    skipped_backoff = counters.skipped_backoff,
                     missing_sha = counters.missing_sha,
                     skipped_created_before = counters.skipped_created_before,
                     "scan complete"
@@ -125,6 +207,7 @@ impl ReviewService {
                     skipped_award = counters.skipped_award,
                     skipped_marker = counters.skipped_marker,
                     skipped_locked = counters.skipped_locked,
+                    skipped_backoff = counters.skipped_backoff,
                     missing_sha = counters.missing_sha,
                     skipped_inactive = counters.skipped_inactive,
                     skipped_created_before = counters.skipped_created_before,
@@ -336,6 +419,12 @@ impl ReviewService {
                     continue;
                 }
             };
+            let retry_key = RetryKey::new(repo, mr.iid, &head_sha);
+            if !self.retry_backoff.should_retry(&retry_key, Utc::now()) {
+                counters.skipped_backoff += 1;
+                debug!(repo = repo, iid = mr.iid, "skip: review backoff active");
+                continue;
+            }
             let awards = self.gitlab.list_awards(repo, mr.iid).await?;
             if has_bot_award(&awards, self.bot_user_id, &self.config.review.thumbs_emoji) {
                 counters.skipped_award += 1;
@@ -371,6 +460,7 @@ impl ReviewService {
             let gitlab = Arc::clone(&self.gitlab);
             let codex = Arc::clone(&self.codex);
             let state = Arc::clone(&self.state);
+            let retry_backoff = Arc::clone(&self.retry_backoff);
             let config = self.config.clone();
             let bot_user_id = self.bot_user_id;
             counters.scheduled += 1;
@@ -381,6 +471,7 @@ impl ReviewService {
                     gitlab,
                     codex,
                     state,
+                    retry_backoff,
                     bot_user_id,
                     &repo_name,
                     mr,
@@ -421,6 +512,11 @@ impl ReviewService {
                 return Ok(());
             }
         };
+        let retry_key = RetryKey::new(repo, mr.iid, &head_sha);
+        if !self.retry_backoff.should_retry(&retry_key, Utc::now()) {
+            debug!(repo = repo, iid = iid, "skip: review backoff active");
+            return Ok(());
+        }
         let awards = self.gitlab.list_awards(repo, mr.iid).await?;
         if has_bot_award(&awards, self.bot_user_id, &self.config.review.thumbs_emoji) {
             return Ok(());
@@ -443,6 +539,7 @@ impl ReviewService {
             Arc::clone(&self.gitlab),
             Arc::clone(&self.codex),
             Arc::clone(&self.state),
+            Arc::clone(&self.retry_backoff),
             self.bot_user_id,
             repo,
             mr,
@@ -457,6 +554,7 @@ async fn run_review(
     gitlab: Arc<dyn GitLabApi>,
     codex: Arc<dyn CodexRunner>,
     state: Arc<ReviewStateStore>,
+    retry_backoff: Arc<RetryBackoff>,
     bot_user_id: u64,
     repo: &str,
     mr: MergeRequest,
@@ -479,6 +577,7 @@ async fn run_review(
     };
 
     let result = codex.run_review(review_ctx).await;
+    let retry_key = RetryKey::new(repo, mr.iid, head_sha);
     if config.review.dry_run {
         info!(repo = repo, iid = mr.iid, "dry run: skipping eyes removal");
     } else if let Err(err) = remove_eyes(
@@ -507,6 +606,7 @@ async fn run_review(
                     .add_award(repo, mr.iid, &config.review.thumbs_emoji)
                     .await?;
             }
+            retry_backoff.clear(&retry_key);
             state.finish_review(repo, mr.iid, head_sha, "pass").await?;
             info!(
                 repo = repo,
@@ -525,6 +625,7 @@ async fn run_review(
             } else {
                 gitlab.create_note(repo, mr.iid, &full_body).await?;
             }
+            retry_backoff.clear(&retry_key);
             state
                 .finish_review(repo, mr.iid, head_sha, "comment")
                 .await?;
@@ -536,18 +637,14 @@ async fn run_review(
             );
         }
         Err(err) => {
-            let body = format!(
-                "Review failed at {}: {}\n\n{}{} -->",
-                Utc::now().to_rfc3339(),
-                err,
-                config.review.comment_marker_prefix,
-                head_sha
+            let next_retry_at = retry_backoff.record_failure(retry_key, Utc::now());
+            error!(
+                repo = repo,
+                iid = mr.iid,
+                error = %err,
+                next_retry_at = %next_retry_at,
+                "review failed"
             );
-            if config.review.dry_run {
-                info!(repo = repo, iid = mr.iid, "dry run: skipping error comment");
-            } else {
-                gitlab.create_note(repo, mr.iid, &body).await?;
-            }
             state.finish_review(repo, mr.iid, head_sha, "error").await?;
         }
     }
@@ -737,6 +834,18 @@ mod tests {
                 .unwrap_or(CodexResult::Pass {
                     summary: "ok".to_string(),
                 }))
+        }
+    }
+
+    struct FailingRunner {
+        calls: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl CodexRunner for FailingRunner {
+        async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+            *self.calls.lock().unwrap() += 1;
+            Err(anyhow!("runner failed"))
         }
     }
 
@@ -1010,6 +1119,69 @@ mod tests {
         assert_eq!(*runner.calls.lock().unwrap(), 1);
         assert_eq!(gitlab.calls.lock().unwrap().len(), 0);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn error_backoff_skips_repeat_and_no_error_comment() -> Result<()> {
+        let config = test_config();
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(vec![mr(6, "sha1")]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(FailingRunner {
+            calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let service = ReviewService::new(
+            config,
+            gitlab.clone(),
+            state,
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+
+        service.scan_once().await?;
+        service.scan_once().await?;
+
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
+        let calls = gitlab.calls.lock().unwrap();
+        assert!(calls.iter().all(|call| !call.starts_with("create_note:")));
+        Ok(())
+    }
+
+    #[test]
+    fn retry_backoff_doubles_delay() {
+        let backoff = RetryBackoff::new(Duration::hours(1));
+        let key = RetryKey::new("group/repo", 1, "sha1");
+        let start = Utc
+            .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        let next_first = backoff.record_failure(key.clone(), start);
+        assert_eq!(next_first, start + Duration::hours(1));
+
+        let next_second = backoff.record_failure(key.clone(), next_first);
+        assert_eq!(next_second, next_first + Duration::hours(2));
+
+        let state = backoff.state_for(&key).expect("backoff state");
+        assert_eq!(state.failures, 2);
     }
 
     #[tokio::test]
