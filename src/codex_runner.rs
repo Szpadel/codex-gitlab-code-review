@@ -3,10 +3,11 @@ use crate::gitlab::MergeRequest;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bollard::container::LogOutput;
+use bollard::errors::Error as BollardError;
 use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
-    AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder,
-    StartContainerOptionsBuilder,
+    AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
+    RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
 };
 use bollard::{API_DEFAULT_VERSION, Docker};
 use futures::StreamExt;
@@ -241,6 +242,50 @@ exec codex app-server
         vec!["-lc".to_string(), script]
     }
 
+    fn normalize_image_reference(image: &str) -> String {
+        let trimmed = image.trim();
+        if trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        if trimmed.contains('@') {
+            return trimmed.to_string();
+        }
+        let last_slash = trimmed.rfind('/');
+        let last_colon = trimmed.rfind(':');
+        let needs_latest = match (last_colon, last_slash) {
+            (None, _) => true,
+            (Some(colon), Some(slash)) => colon < slash,
+            (Some(_), None) => false,
+        };
+        if needs_latest {
+            format!("{trimmed}:latest")
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    async fn pull_image(&self, image: &str) -> Result<()> {
+        let options = CreateImageOptionsBuilder::new().from_image(image).build();
+        let mut stream = self.docker.create_image(Some(options), None, None);
+        while let Some(next) = stream.next().await {
+            match next {
+                Ok(_) => {}
+                Err(err) => {
+                    return Err(anyhow!(err).context(format!("pull docker image {}", image)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn image_exists(&self, image: &str) -> Result<bool> {
+        match self.docker.inspect_image(image).await {
+            Ok(_) => Ok(true),
+            Err(BollardError::DockerResponseServerError { status_code: 404, .. }) => Ok(false),
+            Err(err) => Err(anyhow!(err).context(format!("inspect docker image {}", image))),
+        }
+    }
+
     fn sandbox_mode_value(&self) -> &'static str {
         match self.codex.exec_sandbox.as_str() {
             "read-only" => "read-only",
@@ -261,9 +306,21 @@ exec codex app-server
 
     async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
         let script = self.command(ctx)?;
+        let image_ref = Self::normalize_image_reference(&self.codex.image);
+        if let Err(err) = self.pull_image(&image_ref).await {
+            if self.image_exists(&image_ref).await? {
+                warn!(
+                    image = image_ref.as_str(),
+                    error = %err,
+                    "failed to pull codex image; using local copy"
+                );
+            } else {
+                return Err(err);
+            }
+        }
         let name = format!("codex-review-{}", Uuid::new_v4());
         let config = ContainerCreateBody {
-            image: Some(self.codex.image.clone()),
+            image: Some(image_ref.clone()),
             cmd: Some(Self::app_server_cmd(script)),
             env: Some(self.env_vars()),
             attach_stdout: Some(true),
@@ -292,7 +349,7 @@ exec codex app-server
             .with_context(|| {
                 format!(
                     "create docker container {} with image {}",
-                    name, self.codex.image
+                    name, image_ref
                 )
             })?;
         let id = create.id;
@@ -1001,5 +1058,50 @@ mod tests {
         );
         assert!(script.contains("git clone --depth 1 --recurse-submodules"));
         assert!(script.contains("git submodule update --init --recursive"));
+    }
+
+    #[test]
+    fn normalize_image_reference_appends_latest_when_missing_tag() {
+        let image = "ghcr.io/openai/codex-universal";
+        assert_eq!(
+            DockerCodexRunner::normalize_image_reference(image),
+            "ghcr.io/openai/codex-universal:latest"
+        );
+    }
+
+    #[test]
+    fn normalize_image_reference_preserves_tag() {
+        let image = "ghcr.io/openai/codex-universal:v1.2.3";
+        assert_eq!(
+            DockerCodexRunner::normalize_image_reference(image),
+            "ghcr.io/openai/codex-universal:v1.2.3"
+        );
+    }
+
+    #[test]
+    fn normalize_image_reference_preserves_digest() {
+        let image = "ghcr.io/openai/codex-universal@sha256:deadbeef";
+        assert_eq!(
+            DockerCodexRunner::normalize_image_reference(image),
+            "ghcr.io/openai/codex-universal@sha256:deadbeef"
+        );
+    }
+
+    #[test]
+    fn normalize_image_reference_handles_registry_port() {
+        let image = "localhost:5000/codex-universal";
+        assert_eq!(
+            DockerCodexRunner::normalize_image_reference(image),
+            "localhost:5000/codex-universal:latest"
+        );
+    }
+
+    #[test]
+    fn normalize_image_reference_keeps_tag_with_registry_port() {
+        let image = "localhost:5000/codex-universal:canary";
+        assert_eq!(
+            DockerCodexRunner::normalize_image_reference(image),
+            "localhost:5000/codex-universal:canary"
+        );
     }
 }
