@@ -2,11 +2,12 @@ use crate::config::{CodexConfig, DockerConfig, ProxyConfig};
 use crate::gitlab::MergeRequest;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use bollard::container::{
-    AttachContainerOptions, Config as ContainerConfig, CreateContainerOptions, LogOutput,
-    RemoveContainerOptions, StartContainerOptions,
+use bollard::container::LogOutput;
+use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::query_parameters::{
+    AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder,
+    StartContainerOptionsBuilder,
 };
-use bollard::models::HostConfig;
 use bollard::{API_DEFAULT_VERSION, Docker};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -253,10 +254,7 @@ exec codex app-server
             .docker
             .remove_container(
                 id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
+                Some(RemoveContainerOptionsBuilder::new().force(true).build()),
             )
             .await;
     }
@@ -264,7 +262,7 @@ exec codex app-server
     async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
         let script = self.command(ctx)?;
         let name = format!("codex-review-{}", Uuid::new_v4());
-        let config = ContainerConfig {
+        let config = ContainerCreateBody {
             image: Some(self.codex.image.clone()),
             cmd: Some(Self::app_server_cmd(script)),
             env: Some(self.env_vars()),
@@ -287,10 +285,7 @@ exec codex app-server
         let create = self
             .docker
             .create_container(
-                Some(CreateContainerOptions {
-                    name: &name,
-                    platform: None,
-                }),
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
                 config,
             )
             .await
@@ -303,7 +298,7 @@ exec codex app-server
         let id = create.id;
         let start_result = self
             .docker
-            .start_container(&id, None::<StartContainerOptions<String>>)
+            .start_container(&id, Some(StartContainerOptionsBuilder::new().build()))
             .await
             .with_context(|| format!("start docker container {}", id));
         if let Err(err) = start_result {
@@ -315,14 +310,15 @@ exec codex app-server
             .docker
             .attach_container(
                 &id,
-                Some(AttachContainerOptions::<String> {
-                    stdout: Some(true),
-                    stderr: Some(true),
-                    stdin: Some(true),
-                    stream: Some(true),
-                    logs: Some(true),
-                    ..Default::default()
-                }),
+                Some(
+                    AttachContainerOptionsBuilder::new()
+                        .stdout(true)
+                        .stderr(true)
+                        .stdin(true)
+                        .stream(true)
+                        .logs(true)
+                        .build(),
+                ),
             )
             .await
             .with_context(|| format!("attach docker container {}", id))
