@@ -45,6 +45,8 @@ spec:
               mountPath: /etc/codex
             - name: data
               mountPath: /data
+            - name: docker-socket
+              mountPath: /var/run
 {{- if .Values.codexAuth.existingSecret }}
             - name: codex-auth
               mountPath: {{ .Values.config.codex.authMountPath }}/auth.json
@@ -72,6 +74,8 @@ spec:
           volumeMounts:
             - name: docker-graph
               mountPath: /var/lib/docker
+            - name: docker-socket
+              mountPath: /var/run
 {{- if .Values.codexAuth.existingSecret }}
             - name: codex-auth
               mountPath: {{ .Values.config.codex.authMountPath }}/auth.json
@@ -118,6 +122,8 @@ spec:
           emptyDir: {}
 {{- end }}
         - name: docker-graph
+          emptyDir: {}
+        - name: docker-socket
           emptyDir: {}
 {{- if .Values.codexAuth.existingSecret }}
         - name: codex-auth

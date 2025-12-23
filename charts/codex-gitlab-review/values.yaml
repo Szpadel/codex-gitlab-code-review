@@ -35,7 +35,7 @@ config:
     authMountPath: "/root/.codex"
     execSandbox: "danger-full-access"
   docker:
-    host: "tcp://localhost:2375"
+    host: "unix:///var/run/docker.sock"
   server:
     bindAddr: "0.0.0.0:8080"
   proxy:
