@@ -641,7 +641,7 @@ async fn run_review(
             error!(
                 repo = repo,
                 iid = mr.iid,
-                error = %err,
+                error = ?err,
                 next_retry_at = %next_retry_at,
                 "review failed"
             );
