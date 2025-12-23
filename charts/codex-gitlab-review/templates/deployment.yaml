@@ -19,6 +19,11 @@ spec:
       labels:
         app.kubernetes.io/name: {{ include "codex-gitlab-review.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/codex-config: {{ include (print $.Template.BasePath "/codex-auth-configmap.yaml") . | sha256sum }}
+        checksum/proxy-config: {{ include (print $.Template.BasePath "/proxy-configmap.yaml") . | sha256sum }}
+        checksum/gitlab-token: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "codex-gitlab-review.serviceAccountName" . }}
       containers:
