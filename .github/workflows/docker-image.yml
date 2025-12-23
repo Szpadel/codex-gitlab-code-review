@@ -55,8 +55,8 @@ jobs:
           push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=linux-amd64
+          cache-to: type=gha,mode=max,scope=linux-amd64
 
       - name: Build and push by digest
         id: build
@@ -68,8 +68,8 @@ jobs:
           platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER_LOWER }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=linux-amd64
+          cache-to: type=gha,mode=max,scope=linux-amd64
 
   build-arm64:
     if: github.event_name != 'pull_request'
@@ -111,8 +111,8 @@ jobs:
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER_LOWER }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=linux-arm64
+          cache-to: type=gha,mode=max,scope=linux-arm64
 
   manifest:
     if: github.event_name != 'pull_request'
