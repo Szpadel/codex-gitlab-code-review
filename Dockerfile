@@ -10,8 +10,8 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/target/release/codex-gitlab-code-review /usr/local/bin/codex-gitlab-review
-ENTRYPOINT ["/usr/local/bin/codex-gitlab-review"]
+ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/codex-gitlab-review"]
