@@ -71,7 +71,9 @@ data:
       path: "/data/state.sqlite"
     server:
       bind_addr: {{ .Values.config.server.bindAddr | quote }}
+{{- if .Values.proxy.enabled }}
     proxy:
       http_proxy: {{ .Values.config.proxy.httpProxy | quote }}
       https_proxy: {{ .Values.config.proxy.httpsProxy | quote }}
       no_proxy: {{ .Values.config.proxy.noProxy | quote }}
+{{- end }}
