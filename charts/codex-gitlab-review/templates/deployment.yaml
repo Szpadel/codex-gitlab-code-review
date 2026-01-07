@@ -1,3 +1,7 @@
+{{- $authSecret := required "codexAuth.existingSecret is required" .Values.codexAuth.existingSecret -}}
+{{- $authSubPath := "codex-auth" -}}
+{{- $authHostPath := default .Values.config.codex.authMountPath .Values.config.codex.authHostPath -}}
+{{- $authMountPath := .Values.config.codex.authMountPath -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,6 +30,38 @@ spec:
         checksum/gitlab-token: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "codex-gitlab-review.serviceAccountName" . }}
+      initContainers:
+        - name: seed-codex-auth
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+                set -eu
+                auth_dir="/mnt/data/{{ $authSubPath }}"
+                auth_file="${auth_dir}/auth.json"
+                mkdir -p "$auth_dir"
+                if [ ! -f "$auth_file" ]; then
+                  cp "/seed/{{ .Values.codexAuth.secretKey }}" "$auth_file"
+                  chmod 0600 "$auth_file"
+                fi
+                if [ -f "/seed-config/config.toml" ]; then
+                  cp "/seed-config/config.toml" "${auth_dir}/config.toml"
+                  chmod 0600 "${auth_dir}/config.toml"
+                fi
+          volumeMounts:
+            - name: data
+              mountPath: /mnt/data
+            - name: codex-auth-seed
+              mountPath: /seed
+              readOnly: true
+{{- if .Values.codexToml }}
+            - name: codex-config
+              mountPath: /seed-config
+              readOnly: true
+{{- end }}
       containers:
         - name: codex-review
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -45,20 +81,16 @@ spec:
               mountPath: /etc/codex
             - name: data
               mountPath: /data
+            - name: data
+              mountPath: {{ $authHostPath }}
+              subPath: {{ $authSubPath }}
+{{- if ne $authHostPath $authMountPath }}
+            - name: data
+              mountPath: {{ $authMountPath }}
+              subPath: {{ $authSubPath }}
+{{- end }}
             - name: docker-socket
               mountPath: /var/run
-{{- if .Values.codexAuth.existingSecret }}
-            - name: codex-auth
-              mountPath: {{ .Values.config.codex.authMountPath }}/auth.json
-              subPath: {{ .Values.codexAuth.secretKey }}
-              readOnly: true
-{{- end }}
-{{- if .Values.codexToml }}
-            - name: codex-config
-              mountPath: {{ .Values.config.codex.authMountPath }}/config.toml
-              subPath: config.toml
-              readOnly: true
-{{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
@@ -76,17 +108,13 @@ spec:
               mountPath: /var/lib/docker
             - name: docker-socket
               mountPath: /var/run
-{{- if .Values.codexAuth.existingSecret }}
-            - name: codex-auth
-              mountPath: {{ .Values.config.codex.authMountPath }}/auth.json
-              subPath: {{ .Values.codexAuth.secretKey }}
-              readOnly: true
-{{- end }}
-{{- if .Values.codexToml }}
-            - name: codex-config
-              mountPath: {{ .Values.config.codex.authMountPath }}/config.toml
-              subPath: config.toml
-              readOnly: true
+            - name: data
+              mountPath: {{ $authHostPath }}
+              subPath: {{ $authSubPath }}
+{{- if ne $authHostPath $authMountPath }}
+            - name: data
+              mountPath: {{ $authMountPath }}
+              subPath: {{ $authSubPath }}
 {{- end }}
           resources:
 {{ toYaml .Values.dind.resources | indent 12 }}
@@ -115,21 +143,15 @@ spec:
           configMap:
             name: {{ include "codex-gitlab-review.fullname" . }}-config
         - name: data
-{{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ include "codex-gitlab-review.fullname" . }}-data
-{{- else }}
-          emptyDir: {}
-{{- end }}
         - name: docker-graph
           emptyDir: {}
         - name: docker-socket
           emptyDir: {}
-{{- if .Values.codexAuth.existingSecret }}
-        - name: codex-auth
+        - name: codex-auth-seed
           secret:
-            secretName: {{ .Values.codexAuth.existingSecret }}
-{{- end }}
+            secretName: {{ $authSecret }}
 {{- if .Values.codexToml }}
         - name: codex-config
           configMap:
