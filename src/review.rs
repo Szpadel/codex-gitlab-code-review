@@ -167,26 +167,26 @@ impl ReviewService {
         let mut counters = ScanCounters::default();
         for repo in &repos {
             let activity_marker = self.load_latest_mr_activity_marker(repo).await;
-            if matches!(mode, ScanMode::Incremental)
-                && let Some(marker) = activity_marker.as_ref()
-            {
-                let previous = self.state.get_project_last_mr_activity(repo).await?;
-                if marker.as_str() == NO_OPEN_MRS_MARKER {
-                    if previous.as_ref() != Some(marker) {
-                        self.state
-                            .set_project_last_mr_activity(repo, marker)
-                            .await?;
+            if matches!(mode, ScanMode::Incremental) {
+                if let Some(marker) = activity_marker.as_ref() {
+                    let previous = self.state.get_project_last_mr_activity(repo).await?;
+                    if marker.as_str() == NO_OPEN_MRS_MARKER {
+                        if previous.as_ref() != Some(marker) {
+                            self.state
+                                .set_project_last_mr_activity(repo, marker)
+                                .await?;
+                        }
+                        counters.skipped_inactive += 1;
+                        debug!(repo = repo.as_str(), "skip: no open MRs");
+                        continue;
                     }
-                    counters.skipped_inactive += 1;
-                    debug!(repo = repo.as_str(), "skip: no open MRs");
-                    continue;
-                }
-                if let Some(previous) = previous
-                    && previous == *marker
-                {
-                    counters.skipped_inactive += 1;
-                    debug!(repo = repo.as_str(), "skip: latest MR activity unchanged");
-                    continue;
+                    if let Some(previous) = previous {
+                        if previous == *marker {
+                            counters.skipped_inactive += 1;
+                            debug!(repo = repo.as_str(), "skip: latest MR activity unchanged");
+                            continue;
+                        }
+                    }
                 }
             }
             let mrs = self.gitlab.list_open_mrs(repo).await?;

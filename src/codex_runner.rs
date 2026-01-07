@@ -610,11 +610,63 @@ impl AppServerClient {
                     }
                 }
                 "item/started" => {
-                    if let Some(item) = params.and_then(|value| value.get("item"))
-                        && let Some(item_type) = item.get("type").and_then(|value| value.as_str())
-                    {
-                        match item_type {
-                            "commandExecution" => {
+                    if let Some(item) = params.and_then(|value| value.get("item")) {
+                        if let Some(item_type) = item.get("type").and_then(|value| value.as_str()) {
+                            match item_type {
+                                "commandExecution" => {
+                                    let item_id = item
+                                        .get("id")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("<unknown>");
+                                    let command = item
+                                        .get("command")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("<unknown>");
+                                    let cwd = item
+                                        .get("cwd")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("<unknown>");
+                                    let status = item
+                                        .get("status")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("<unknown>");
+                                    info!(item_id, command, cwd, status, "codex command started");
+                                }
+                                "reasoning" => {
+                                    if self.log_all_json {
+                                        debug!(item_type, "codex item started");
+                                    }
+                                }
+                                _ => {
+                                    info!(item_type, "codex item started");
+                                }
+                            }
+                        }
+                    }
+                }
+                "item/completed" => {
+                    if let Some(item) = params.and_then(|value| value.get("item")) {
+                        if let Some(item_type) = item.get("type").and_then(|value| value.as_str()) {
+                            if item_type == "reasoning" {
+                                if let Some(item_id) =
+                                    item.get("id").and_then(|value| value.as_str())
+                                {
+                                    if let Some(buffer) = self.reasoning_buffers.remove(item_id) {
+                                        let reasoning = if !buffer.summary.trim().is_empty() {
+                                            buffer.summary
+                                        } else {
+                                            buffer.text
+                                        };
+                                        if !reasoning.trim().is_empty() {
+                                            info!(
+                                                item_id,
+                                                reasoning = reasoning.as_str(),
+                                                "codex reasoning completed"
+                                            );
+                                        }
+                                    }
+                                }
+                            } else if item_type == "commandExecution" {
                                 let item_id = item
                                     .get("id")
                                     .and_then(|value| value.as_str())
@@ -631,77 +683,31 @@ impl AppServerClient {
                                     .get("status")
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("<unknown>");
-                                info!(item_id, command, cwd, status, "codex command started");
+                                let exit_code =
+                                    item.get("exitCode").and_then(|value| value.as_i64());
+                                let duration_ms =
+                                    item.get("durationMs").and_then(|value| value.as_i64());
+                                info!(
+                                    item_id,
+                                    command,
+                                    cwd,
+                                    status,
+                                    exit_code,
+                                    duration_ms,
+                                    "codex command completed"
+                                );
+                            } else {
+                                info!(item_type, "codex item completed");
                             }
-                            "reasoning" => {
-                                if self.log_all_json {
-                                    debug!(item_type, "codex item started");
-                                }
-                            }
-                            _ => {
-                                info!(item_type, "codex item started");
-                            }
-                        }
-                    }
-                }
-                "item/completed" => {
-                    if let Some(item) = params.and_then(|value| value.get("item"))
-                        && let Some(item_type) = item.get("type").and_then(|value| value.as_str())
-                    {
-                        if item_type == "reasoning" {
-                            if let Some(item_id) = item.get("id").and_then(|value| value.as_str())
-                                && let Some(buffer) = self.reasoning_buffers.remove(item_id)
+                            if let Some(review) =
+                                item.get("review").and_then(|value| value.as_str())
                             {
-                                let reasoning = if !buffer.summary.trim().is_empty() {
-                                    buffer.summary
-                                } else {
-                                    buffer.text
-                                };
-                                if !reasoning.trim().is_empty() {
-                                    info!(
-                                        item_id,
-                                        reasoning = reasoning.as_str(),
-                                        "codex reasoning completed"
-                                    );
+                                if item.get("type").and_then(|value| value.as_str())
+                                    == Some("exitedReviewMode")
+                                {
+                                    review_text = Some(review.to_string());
                                 }
                             }
-                        } else if item_type == "commandExecution" {
-                            let item_id = item
-                                .get("id")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("<unknown>");
-                            let command = item
-                                .get("command")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("<unknown>");
-                            let cwd = item
-                                .get("cwd")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("<unknown>");
-                            let status = item
-                                .get("status")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("<unknown>");
-                            let exit_code = item.get("exitCode").and_then(|value| value.as_i64());
-                            let duration_ms =
-                                item.get("durationMs").and_then(|value| value.as_i64());
-                            info!(
-                                item_id,
-                                command,
-                                cwd,
-                                status,
-                                exit_code,
-                                duration_ms,
-                                "codex command completed"
-                            );
-                        } else {
-                            info!(item_type, "codex item completed");
-                        }
-                        if let Some(review) = item.get("review").and_then(|value| value.as_str())
-                            && item.get("type").and_then(|value| value.as_str())
-                                == Some("exitedReviewMode")
-                        {
-                            review_text = Some(review.to_string());
                         }
                     }
                 }
@@ -922,19 +928,19 @@ fn parse_review_output(text: &str) -> Result<CodexResult> {
         });
     }
 
-    if let Some(json_text) = extract_json_block(trimmed)
-        && let Ok(parsed) = serde_json::from_str::<CodexOutput>(&json_text)
-    {
-        return match parsed.verdict.as_str() {
-            "pass" => Ok(CodexResult::Pass {
-                summary: parsed.summary,
-            }),
-            "comment" => Ok(CodexResult::Comment {
-                summary: parsed.summary,
-                body: parsed.comment_markdown,
-            }),
-            other => Err(anyhow!("unknown verdict: {}", other)),
-        };
+    if let Some(json_text) = extract_json_block(trimmed) {
+        if let Ok(parsed) = serde_json::from_str::<CodexOutput>(&json_text) {
+            return match parsed.verdict.as_str() {
+                "pass" => Ok(CodexResult::Pass {
+                    summary: parsed.summary,
+                }),
+                "comment" => Ok(CodexResult::Comment {
+                    summary: parsed.summary,
+                    body: parsed.comment_markdown,
+                }),
+                other => Err(anyhow!("unknown verdict: {}", other)),
+            };
+        }
     }
 
     let summary = trimmed
