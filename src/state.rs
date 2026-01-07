@@ -20,17 +20,17 @@ impl ReviewStateStore {
             if path_obj.is_dir() {
                 bail!("database path is a directory: {}", path_obj.display());
             }
-            if let Some(parent) = path_obj.parent() {
-                if !parent.as_os_str().is_empty() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("create database directory {}", parent.display())
-                    })?;
-                }
+            if let Some(parent) = path_obj.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create database directory {}", parent.display()))?;
             }
             if !path_obj.exists() {
                 OpenOptions::new()
                     .write(true)
                     .create(true)
+                    .truncate(false)
                     .open(path_obj)
                     .with_context(|| format!("create database file {}", path_obj.display()))?;
             }
@@ -131,24 +131,24 @@ impl ReviewStateStore {
         Ok(())
     }
 
-    pub async fn get_project_last_activity(&self, repo: &str) -> Result<Option<String>> {
+    pub async fn get_project_last_mr_activity(&self, repo: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT last_activity_at FROM project_state WHERE repo = ?")
             .bind(repo)
             .fetch_optional(&self.pool)
             .await
-            .context("load project last activity")?;
+            .context("load project last MR activity")?;
         match row {
             Some(row) => {
                 let value: String = row
                     .try_get("last_activity_at")
-                    .context("read project last activity")?;
+                    .context("read project last MR activity")?;
                 Ok(Some(value))
             }
             None => Ok(None),
         }
     }
 
-    pub async fn set_project_last_activity(
+    pub async fn set_project_last_mr_activity(
         &self,
         repo: &str,
         last_activity_at: &str,
@@ -165,7 +165,7 @@ impl ReviewStateStore {
         .bind(last_activity_at)
         .execute(&self.pool)
         .await
-        .context("upsert project last activity")?;
+        .context("upsert project last MR activity")?;
         Ok(())
     }
 
@@ -335,13 +335,13 @@ mod tests {
         let store = ReviewStateStore::new(":memory:").await?;
         let repo = "group/repo";
 
-        let missing = store.get_project_last_activity(repo).await?;
+        let missing = store.get_project_last_mr_activity(repo).await?;
         assert_eq!(missing, None);
 
         store
-            .set_project_last_activity(repo, "2025-01-01T00:00:00Z")
+            .set_project_last_mr_activity(repo, "2025-01-01T00:00:00Z")
             .await?;
-        let loaded = store.get_project_last_activity(repo).await?;
+        let loaded = store.get_project_last_mr_activity(repo).await?;
         assert_eq!(loaded, Some("2025-01-01T00:00:00Z".to_string()));
         Ok(())
     }

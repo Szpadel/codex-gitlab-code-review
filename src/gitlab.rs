@@ -18,6 +18,7 @@ pub struct MergeRequest {
     pub title: Option<String>,
     pub web_url: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
     pub sha: Option<String>,
     pub source_branch: Option<String>,
     pub target_branch: Option<String>,
@@ -68,6 +69,7 @@ pub trait GitLabApi: Send + Sync {
     async fn list_projects(&self) -> Result<Vec<GitLabProjectSummary>>;
     async fn list_group_projects(&self, group: &str) -> Result<Vec<GitLabProjectSummary>>;
     async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>>;
+    async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>>;
     async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest>;
     async fn get_project(&self, project: &str) -> Result<GitLabProject>;
     async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>>;
@@ -246,8 +248,20 @@ impl GitLabApi for GitLabClient {
     }
 
     async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>> {
-        let url = format!("{}/merge_requests?state=opened", self.project_path(project));
+        let url = format!(
+            "{}/merge_requests?state=opened&scope=all",
+            self.project_path(project)
+        );
         self.get_paginated(&url).await
+    }
+
+    async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>> {
+        let url = format!(
+            "{}/merge_requests?state=opened&scope=all&order_by=updated_at&sort=desc&per_page=1",
+            self.project_path(project)
+        );
+        let mut mrs: Vec<MergeRequest> = self.get_json(&url).await?;
+        Ok(mrs.pop())
     }
 
     async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest> {
@@ -378,6 +392,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
             .and(query_param("state", "opened"))
+            .and(query_param("scope", "all"))
             .and(query_param("page", "1"))
             .and(query_param("per_page", "100"))
             .and(header_exists("PRIVATE-TOKEN"))
@@ -388,6 +403,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
             .and(query_param("state", "opened"))
+            .and(query_param("scope", "all"))
             .and(query_param("page", "2"))
             .and(query_param("per_page", "100"))
             .respond_with(page2)
@@ -399,6 +415,39 @@ mod tests {
         assert_eq!(mrs.len(), 2);
         assert_eq!(mrs[0].iid, 1);
         assert_eq!(mrs[1].iid, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_latest_open_mr_activity_fetches_latest_update() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(vec![serde_json::json!({
+            "iid": 7,
+            "updated_at": "2025-01-05T12:34:56Z"
+        })]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+            .and(query_param("state", "opened"))
+            .and(query_param("scope", "all"))
+            .and(query_param("order_by", "updated_at"))
+            .and(query_param("sort", "desc"))
+            .and(query_param("per_page", "1"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let mr = client
+            .get_latest_open_mr_activity("group/repo")
+            .await?
+            .expect("latest MR");
+        assert_eq!(mr.iid, 7);
+        assert_eq!(
+            mr.updated_at,
+            Some(DateTime::parse_from_rfc3339("2025-01-05T12:34:56Z")?.with_timezone(&Utc))
+        );
         Ok(())
     }
 

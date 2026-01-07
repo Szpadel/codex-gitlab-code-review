@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
+const NO_OPEN_MRS_MARKER: &str = "__no_open_mrs__";
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct RetryKey {
     repo: String,
@@ -61,7 +63,7 @@ impl RetryBackoff {
             .map(|state| state.failures + 1)
             .unwrap_or(1);
         let base_seconds = self.base_delay.num_seconds().max(0);
-        let exponent = failures.saturating_sub(1).min(30) as u32;
+        let exponent = failures.saturating_sub(1).min(30);
         let multiplier = 1i64 << exponent;
         let delay_seconds = base_seconds.saturating_mul(multiplier);
         let next_retry_at = now + Duration::seconds(delay_seconds);
@@ -164,24 +166,35 @@ impl ReviewService {
         let mut tasks = Vec::new();
         let mut counters = ScanCounters::default();
         for repo in &repos {
-            let project_activity = self.load_project_activity(repo).await;
-            if matches!(mode, ScanMode::Incremental) {
-                if let Some(activity) = project_activity.as_ref() {
-                    if let Some(previous) = self.state.get_project_last_activity(repo).await? {
-                        if previous == *activity {
-                            counters.skipped_inactive += 1;
-                            debug!(repo = repo.as_str(), "skip: project has no new activity");
-                            continue;
-                        }
+            let activity_marker = self.load_latest_mr_activity_marker(repo).await;
+            if matches!(mode, ScanMode::Incremental)
+                && let Some(marker) = activity_marker.as_ref()
+            {
+                let previous = self.state.get_project_last_mr_activity(repo).await?;
+                if marker.as_str() == NO_OPEN_MRS_MARKER {
+                    if previous.as_ref() != Some(marker) {
+                        self.state
+                            .set_project_last_mr_activity(repo, marker)
+                            .await?;
                     }
+                    counters.skipped_inactive += 1;
+                    debug!(repo = repo.as_str(), "skip: no open MRs");
+                    continue;
+                }
+                if let Some(previous) = previous
+                    && previous == *marker
+                {
+                    counters.skipped_inactive += 1;
+                    debug!(repo = repo.as_str(), "skip: latest MR activity unchanged");
+                    continue;
                 }
             }
             let mrs = self.gitlab.list_open_mrs(repo).await?;
             self.scan_repo_mrs(repo, mrs, &mut counters, &mut tasks)
                 .await?;
-            if let Some(activity) = project_activity {
+            if let Some(marker) = activity_marker {
                 self.state
-                    .set_project_last_activity(repo, &activity)
+                    .set_project_last_mr_activity(repo, &marker)
                     .await?;
             }
         }
@@ -218,19 +231,25 @@ impl ReviewService {
         Ok(())
     }
 
-    async fn load_project_activity(&self, repo: &str) -> Option<String> {
-        match self.gitlab.get_project(repo).await {
-            Ok(project) => {
-                if project.last_activity_at.is_none() {
-                    warn!(repo = repo, "project missing last_activity_at; scanning");
+    async fn load_latest_mr_activity_marker(&self, repo: &str) -> Option<String> {
+        match self.gitlab.get_latest_open_mr_activity(repo).await {
+            Ok(Some(mr)) => match mr.updated_at {
+                Some(updated_at) => Some(format!("{}|{}", updated_at.to_rfc3339(), mr.iid)),
+                None => {
+                    warn!(
+                        repo = repo,
+                        iid = mr.iid,
+                        "latest MR missing updated_at; scanning"
+                    );
+                    None
                 }
-                project.last_activity_at
-            }
+            },
+            Ok(None) => Some(NO_OPEN_MRS_MARKER.to_string()),
             Err(err) => {
                 warn!(
                     repo = repo,
                     error = %err,
-                    "failed to load project metadata; scanning"
+                    "failed to load latest MR activity; scanning"
                 );
                 None
             }
@@ -463,22 +482,18 @@ impl ReviewService {
             let retry_backoff = Arc::clone(&self.retry_backoff);
             let config = self.config.clone();
             let bot_user_id = self.bot_user_id;
+            let review_context = ReviewRunContext {
+                config,
+                gitlab,
+                codex,
+                state,
+                retry_backoff,
+                bot_user_id,
+            };
             counters.scheduled += 1;
             tasks.push(tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(err) = run_review(
-                    &config,
-                    gitlab,
-                    codex,
-                    state,
-                    retry_backoff,
-                    bot_user_id,
-                    &repo_name,
-                    mr,
-                    &head_sha,
-                )
-                .await
-                {
+                if let Err(err) = review_context.run(&repo_name, mr, &head_sha).await {
                     warn!(repo = repo_name.as_str(), error = %err, "review failed");
                 }
             }));
@@ -534,122 +549,124 @@ impl ReviewService {
             return Ok(());
         }
         let _permit = self.semaphore.clone().acquire_owned().await?;
-        run_review(
-            &self.config,
-            Arc::clone(&self.gitlab),
-            Arc::clone(&self.codex),
-            Arc::clone(&self.state),
-            Arc::clone(&self.retry_backoff),
-            self.bot_user_id,
-            repo,
-            mr,
-            &head_sha,
-        )
-        .await
+        let review_context = ReviewRunContext {
+            config: self.config.clone(),
+            gitlab: Arc::clone(&self.gitlab),
+            codex: Arc::clone(&self.codex),
+            state: Arc::clone(&self.state),
+            retry_backoff: Arc::clone(&self.retry_backoff),
+            bot_user_id: self.bot_user_id,
+        };
+        review_context.run(repo, mr, &head_sha).await
     }
 }
 
-async fn run_review(
-    config: &Config,
+struct ReviewRunContext {
+    config: Config,
     gitlab: Arc<dyn GitLabApi>,
     codex: Arc<dyn CodexRunner>,
     state: Arc<ReviewStateStore>,
     retry_backoff: Arc<RetryBackoff>,
     bot_user_id: u64,
-    repo: &str,
-    mr: MergeRequest,
-    head_sha: &str,
-) -> Result<()> {
-    if config.review.dry_run {
-        info!(repo = repo, iid = mr.iid, "dry run: skipping eyes award");
-    } else {
-        gitlab
-            .add_award(repo, mr.iid, &config.review.eyes_emoji)
-            .await
-            .ok();
-    }
+}
 
-    let review_ctx = ReviewContext {
-        repo: repo.to_string(),
-        project_path: repo.to_string(),
-        mr: mr.clone(),
-        head_sha: head_sha.to_string(),
-    };
+impl ReviewRunContext {
+    async fn run(&self, repo: &str, mr: MergeRequest, head_sha: &str) -> Result<()> {
+        if self.config.review.dry_run {
+            info!(repo = repo, iid = mr.iid, "dry run: skipping eyes award");
+        } else {
+            self.gitlab
+                .add_award(repo, mr.iid, &self.config.review.eyes_emoji)
+                .await
+                .ok();
+        }
 
-    let result = codex.run_review(review_ctx).await;
-    let retry_key = RetryKey::new(repo, mr.iid, head_sha);
-    if config.review.dry_run {
-        info!(repo = repo, iid = mr.iid, "dry run: skipping eyes removal");
-    } else if let Err(err) = remove_eyes(
-        gitlab.as_ref(),
-        repo,
-        mr.iid,
-        bot_user_id,
-        &config.review.eyes_emoji,
-    )
-    .await
-    {
-        warn!(
-            repo = repo,
-            iid = mr.iid,
-            error = %err,
-            "failed to remove eyes award"
-        );
-    }
+        let review_ctx = ReviewContext {
+            repo: repo.to_string(),
+            project_path: repo.to_string(),
+            mr: mr.clone(),
+            head_sha: head_sha.to_string(),
+        };
 
-    match result {
-        Ok(CodexResult::Pass { summary }) => {
-            if config.review.dry_run {
-                info!(repo = repo, iid = mr.iid, "dry run: skipping thumbs up");
-            } else {
-                gitlab
-                    .add_award(repo, mr.iid, &config.review.thumbs_emoji)
+        let result = self.codex.run_review(review_ctx).await;
+        let retry_key = RetryKey::new(repo, mr.iid, head_sha);
+        if self.config.review.dry_run {
+            info!(repo = repo, iid = mr.iid, "dry run: skipping eyes removal");
+        } else if let Err(err) = remove_eyes(
+            self.gitlab.as_ref(),
+            repo,
+            mr.iid,
+            self.bot_user_id,
+            &self.config.review.eyes_emoji,
+        )
+        .await
+        {
+            warn!(
+                repo = repo,
+                iid = mr.iid,
+                error = %err,
+                "failed to remove eyes award"
+            );
+        }
+
+        match result {
+            Ok(CodexResult::Pass { summary }) => {
+                if self.config.review.dry_run {
+                    info!(repo = repo, iid = mr.iid, "dry run: skipping thumbs up");
+                } else {
+                    self.gitlab
+                        .add_award(repo, mr.iid, &self.config.review.thumbs_emoji)
+                        .await?;
+                }
+                self.retry_backoff.clear(&retry_key);
+                self.state
+                    .finish_review(repo, mr.iid, head_sha, "pass")
+                    .await?;
+                info!(
+                    repo = repo,
+                    iid = mr.iid,
+                    summary = summary.as_str(),
+                    "review pass"
+                );
+            }
+            Ok(CodexResult::Comment { summary, body }) => {
+                let full_body = format!(
+                    "{}\n\n{}{} -->",
+                    body, self.config.review.comment_marker_prefix, head_sha
+                );
+                if self.config.review.dry_run {
+                    info!(repo = repo, iid = mr.iid, "dry run: skipping comment");
+                } else {
+                    self.gitlab.create_note(repo, mr.iid, &full_body).await?;
+                }
+                self.retry_backoff.clear(&retry_key);
+                self.state
+                    .finish_review(repo, mr.iid, head_sha, "comment")
+                    .await?;
+                info!(
+                    repo = repo,
+                    iid = mr.iid,
+                    summary = summary.as_str(),
+                    "review comment"
+                );
+            }
+            Err(err) => {
+                let next_retry_at = self.retry_backoff.record_failure(retry_key, Utc::now());
+                error!(
+                    repo = repo,
+                    iid = mr.iid,
+                    error = ?err,
+                    next_retry_at = %next_retry_at,
+                    "review failed"
+                );
+                self.state
+                    .finish_review(repo, mr.iid, head_sha, "error")
                     .await?;
             }
-            retry_backoff.clear(&retry_key);
-            state.finish_review(repo, mr.iid, head_sha, "pass").await?;
-            info!(
-                repo = repo,
-                iid = mr.iid,
-                summary = summary.as_str(),
-                "review pass"
-            );
         }
-        Ok(CodexResult::Comment { summary, body }) => {
-            let full_body = format!(
-                "{}\n\n{}{} -->",
-                body, config.review.comment_marker_prefix, head_sha
-            );
-            if config.review.dry_run {
-                info!(repo = repo, iid = mr.iid, "dry run: skipping comment");
-            } else {
-                gitlab.create_note(repo, mr.iid, &full_body).await?;
-            }
-            retry_backoff.clear(&retry_key);
-            state
-                .finish_review(repo, mr.iid, head_sha, "comment")
-                .await?;
-            info!(
-                repo = repo,
-                iid = mr.iid,
-                summary = summary.as_str(),
-                "review comment"
-            );
-        }
-        Err(err) => {
-            let next_retry_at = retry_backoff.record_failure(retry_key, Utc::now());
-            error!(
-                repo = repo,
-                iid = mr.iid,
-                error = ?err,
-                next_retry_at = %next_retry_at,
-                "review failed"
-            );
-            state.finish_review(repo, mr.iid, head_sha, "error").await?;
-        }
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
 fn has_bot_award(awards: &[AwardEmoji], bot_user_id: u64, name: &str) -> bool {
@@ -754,6 +771,37 @@ mod tests {
         async fn list_open_mrs(&self, _project: &str) -> Result<Vec<MergeRequest>> {
             *self.list_open_calls.lock().unwrap() += 1;
             Ok(self.mrs.lock().unwrap().clone())
+        }
+
+        async fn get_latest_open_mr_activity(
+            &self,
+            _project: &str,
+        ) -> Result<Option<MergeRequest>> {
+            let mrs = self.mrs.lock().unwrap();
+            let mut latest: Option<MergeRequest> = None;
+            for mr in mrs.iter() {
+                let candidate_time = mr.updated_at.or(mr.created_at);
+                let Some(candidate_time) = candidate_time else {
+                    continue;
+                };
+                match latest.as_ref() {
+                    Some(existing) => {
+                        let existing_time = existing.updated_at.or(existing.created_at);
+                        let replace = match existing_time {
+                            Some(existing_time) => {
+                                candidate_time > existing_time
+                                    || (candidate_time == existing_time && mr.iid > existing.iid)
+                            }
+                            None => true,
+                        };
+                        if replace {
+                            latest = Some(mr.clone());
+                        }
+                    }
+                    None => latest = Some(mr.clone()),
+                }
+            }
+            Ok(latest)
         }
 
         async fn get_mr(&self, _project: &str, _iid: u64) -> Result<MergeRequest> {
@@ -919,6 +967,7 @@ mod tests {
             title: None,
             web_url: None,
             created_at: Some(created_at),
+            updated_at: Some(created_at),
             sha: Some(sha.to_string()),
             source_branch: None,
             target_branch: None,
@@ -1216,8 +1265,9 @@ mod tests {
             calls: Mutex::new(0),
         });
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let activity_marker = format!("{}|{}", default_created_at().to_rfc3339(), 10);
         state
-            .set_project_last_activity("group/repo", "2025-01-01T00:00:00Z")
+            .set_project_last_mr_activity("group/repo", &activity_marker)
             .await?;
         let service = ReviewService::new(
             config,
@@ -1267,8 +1317,13 @@ mod tests {
             calls: Mutex::new(0),
         });
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let previous_marker = format!(
+            "{}|{}",
+            (default_created_at() - Duration::days(1)).to_rfc3339(),
+            11
+        );
         state
-            .set_project_last_activity("group/repo", "2024-12-31T00:00:00Z")
+            .set_project_last_mr_activity("group/repo", &previous_marker)
             .await?;
         let service = ReviewService::new(
             config,
@@ -1283,8 +1338,9 @@ mod tests {
 
         assert_eq!(*gitlab.list_open_calls.lock().unwrap(), 1);
         assert_eq!(*runner.calls.lock().unwrap(), 1);
-        let stored = state.get_project_last_activity("group/repo").await?;
-        assert_eq!(stored, Some("2025-01-02T00:00:00Z".to_string()));
+        let stored = state.get_project_last_mr_activity("group/repo").await?;
+        let current_marker = format!("{}|{}", default_created_at().to_rfc3339(), 11);
+        assert_eq!(stored, Some(current_marker));
         Ok(())
     }
 
@@ -1320,7 +1376,7 @@ mod tests {
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         let cache_key = config.gitlab.targets.cache_key_for_all();
         state
-            .save_project_catalog(&cache_key, &vec!["group/repo".to_string()])
+            .save_project_catalog(&cache_key, &["group/repo".to_string()])
             .await?;
         let service = ReviewService::new(
             config,
@@ -1334,7 +1390,7 @@ mod tests {
         service.scan_once_incremental().await?;
 
         assert_eq!(*gitlab.list_projects_calls.lock().unwrap(), 0);
-        assert_eq!(*gitlab.list_open_calls.lock().unwrap(), 1);
+        assert_eq!(*gitlab.list_open_calls.lock().unwrap(), 0);
         Ok(())
     }
 
@@ -1370,7 +1426,7 @@ mod tests {
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         let cache_key = config.gitlab.targets.cache_key_for_all();
         state
-            .save_project_catalog(&cache_key, &vec!["group/stale".to_string()])
+            .save_project_catalog(&cache_key, &["group/stale".to_string()])
             .await?;
         let service = ReviewService::new(
             config,
