@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use cron::Schedule;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 
 use codex_gitlab_code_review::codex_runner::DockerCodexRunner;
 use codex_gitlab_code_review::config::Config;
+use codex_gitlab_code_review::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::review::ReviewService;
 use codex_gitlab_code_review::state::ReviewStateStore;
@@ -16,6 +17,8 @@ use codex_gitlab_code_review::state::ReviewStateStore;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Codex GitLab review service")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Run a single scan and exit.
     #[arg(long)]
     once: bool,
@@ -25,6 +28,26 @@ struct Cli {
     /// Enable verbose logging and full Codex app-server event logs.
     #[arg(long)]
     debug: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Manage Codex authentication.
+    Auth(AuthCommand),
+}
+
+#[derive(Parser, Debug)]
+struct AuthCommand {
+    #[command(subcommand)]
+    action: AuthSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthSubcommand {
+    /// Run device-code login flow and persist auth.json.
+    Login,
+    /// Show current authentication status.
+    Status,
 }
 
 #[tokio::main]
@@ -40,6 +63,19 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let mut config = Config::load()?;
+    if let Some(Command::Auth(auth_cmd)) = cli.command {
+        let runner = AuthRunner::new(
+            config.docker.clone(),
+            config.codex.clone(),
+            config.proxy.clone(),
+        )?;
+        let action = match auth_cmd.action {
+            AuthSubcommand::Login => RunnerAuthAction::Login,
+            AuthSubcommand::Status => RunnerAuthAction::Status,
+        };
+        runner.run(action, cli.debug).await?;
+        return Ok(());
+    }
     let run_once = cli.once || env_flag("RUN_ONCE");
     let dry_run_override = cli.dry_run || env_flag("DRY_RUN");
     if dry_run_override {

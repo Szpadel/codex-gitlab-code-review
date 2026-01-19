@@ -14,6 +14,8 @@ serviceAccount:
 
 persistence:
   # Persistent storage is required for auth.json and state.
+  # After installing, run `codex-gitlab-review auth login` in the pod to
+  # create or refresh auth.json on the PVC.
   size: 1Gi
   storageClass: ""
 
@@ -32,6 +34,7 @@ config:
     image: "ghcr.io/openai/codex-universal:latest"
     timeoutSeconds: 1800
     # Leave empty to default to authMountPath.
+    # Must be writable to persist refreshed auth.json credentials.
     authHostPath: ""
     authMountPath: "/root/.codex"
     execSandbox: "danger-full-access"
@@ -58,12 +61,6 @@ gitlab:
     existingSecret: ""
     secretKey: "token"
     value: ""
-
-codexAuth:
-  # Required. Secret must contain auth.json (or alternate key via secretKey).
-  # To rotate credentials, delete auth.json from the PVC (or recreate the PVC) so it can be re-seeded.
-  existingSecret: ""
-  secretKey: "auth.json"
 
 codexToml: ""
 

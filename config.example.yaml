@@ -59,6 +59,7 @@ codex:
   # Required. Timeout per review in seconds.
   timeout_seconds: 1800
   # Optional. Host path containing Codex auth/config; if empty, uses auth_mount_path.
+  # Must be writable to persist refreshed auth.json credentials.
   auth_host_path: "/root/.codex"
   # Required. Container path to mount auth/config from host (read-only).
   auth_mount_path: "/root/.codex"

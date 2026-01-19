@@ -1,15 +1,15 @@
 use crate::config::{CodexConfig, DockerConfig, ProxyConfig};
+use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
 use crate::gitlab::MergeRequest;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bollard::container::LogOutput;
-use bollard::errors::Error as BollardError;
 use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
-    AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
-    RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
+    AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder,
+    StartContainerOptionsBuilder,
 };
-use bollard::{API_DEFAULT_VERSION, Docker};
+use bollard::Docker;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -59,16 +59,7 @@ impl DockerCodexRunner {
         gitlab_token: String,
         log_all_json: bool,
     ) -> Result<Self> {
-        let docker = if docker_cfg.host.starts_with("unix://") {
-            Docker::connect_with_unix(&docker_cfg.host, 120, API_DEFAULT_VERSION)
-                .with_context(|| format!("connect to docker unix socket {}", docker_cfg.host))?
-        } else if docker_cfg.host.ends_with(".sock") {
-            Docker::connect_with_unix(&docker_cfg.host, 120, API_DEFAULT_VERSION)
-                .with_context(|| format!("connect to docker unix socket {}", docker_cfg.host))?
-        } else {
-            Docker::connect_with_http(&docker_cfg.host, 120, API_DEFAULT_VERSION)
-                .with_context(|| format!("connect to docker host {}", docker_cfg.host))?
-        };
+        let docker = connect_docker(&docker_cfg)?;
         Ok(Self {
             docker,
             codex,
@@ -200,16 +191,9 @@ cd repo
 run_git fetch git fetch --depth 1 origin "{head_sha}"
 run_git checkout git checkout "{head_sha}"
 run_git submodule_update git submodule update --init --recursive
-{target_branch_script}# Create a writable CODEX_HOME and copy auth/config from the read-only mount.
-codex_home="/tmp/codex"
-mkdir -p "${{codex_home}}"
-if [ -f "{auth_mount_path}/auth.json" ]; then
-  cp "{auth_mount_path}/auth.json" "${{codex_home}}/auth.json"
-fi
-if [ -f "{auth_mount_path}/config.toml" ]; then
-  cp "{auth_mount_path}/config.toml" "${{codex_home}}/config.toml"
-fi
-export CODEX_HOME="${{codex_home}}"
+{target_branch_script}# Use the mounted auth directory directly so token refresh persists.
+mkdir -p "{auth_mount_path}"
+export CODEX_HOME="{auth_mount_path}"
 # Ensure Codex CLI is available for app-server mode
 if ! command -v codex >/dev/null 2>&1; then
   echo "codex-runner: codex not found, installing"
@@ -243,49 +227,7 @@ exec codex app-server
     }
 
     fn normalize_image_reference(image: &str) -> String {
-        let trimmed = image.trim();
-        if trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-        if trimmed.contains('@') {
-            return trimmed.to_string();
-        }
-        let last_slash = trimmed.rfind('/');
-        let last_colon = trimmed.rfind(':');
-        let needs_latest = match (last_colon, last_slash) {
-            (None, _) => true,
-            (Some(colon), Some(slash)) => colon < slash,
-            (Some(_), None) => false,
-        };
-        if needs_latest {
-            format!("{trimmed}:latest")
-        } else {
-            trimmed.to_string()
-        }
-    }
-
-    async fn pull_image(&self, image: &str) -> Result<()> {
-        let options = CreateImageOptionsBuilder::new().from_image(image).build();
-        let mut stream = self.docker.create_image(Some(options), None, None);
-        while let Some(next) = stream.next().await {
-            match next {
-                Ok(_) => {}
-                Err(err) => {
-                    return Err(anyhow!(err).context(format!("pull docker image {}", image)));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn image_exists(&self, image: &str) -> Result<bool> {
-        match self.docker.inspect_image(image).await {
-            Ok(_) => Ok(true),
-            Err(BollardError::DockerResponseServerError {
-                status_code: 404, ..
-            }) => Ok(false),
-            Err(err) => Err(anyhow!(err).context(format!("inspect docker image {}", image))),
-        }
+        normalize_image_reference(image)
     }
 
     fn sandbox_mode_value(&self) -> &'static str {
@@ -309,17 +251,7 @@ exec codex app-server
     async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
         let script = self.command(ctx)?;
         let image_ref = Self::normalize_image_reference(&self.codex.image);
-        if let Err(err) = self.pull_image(&image_ref).await {
-            if self.image_exists(&image_ref).await? {
-                warn!(
-                    image = image_ref.as_str(),
-                    error = %err,
-                    "failed to pull codex image; using local copy"
-                );
-            } else {
-                return Err(err);
-            }
-        }
+        ensure_image(&self.docker, &image_ref).await?;
         let name = format!("codex-review-{}", Uuid::new_v4());
         let config = ContainerCreateBody {
             image: Some(image_ref.clone()),
@@ -332,7 +264,7 @@ exec codex app-server
             tty: Some(false),
             host_config: Some(HostConfig {
                 binds: Some(vec![format!(
-                    "{}:{}:ro",
+                    "{}:{}:rw",
                     self.codex.auth_host_path, self.codex.auth_mount_path
                 )]),
                 auto_remove: Some(false),
@@ -1030,9 +962,8 @@ mod tests {
             "/root/.codex",
             None,
         );
-        assert!(script.contains("codex_home=\"/tmp/codex\""));
-        assert!(script.contains("export CODEX_HOME=\"${codex_home}\""));
-        assert!(script.contains("cp \"/root/.codex/auth.json\""));
+        assert!(script.contains("export CODEX_HOME=\"/root/.codex\""));
+        assert!(script.contains("mkdir -p \"/root/.codex\""));
     }
 
     #[test]
