@@ -149,6 +149,7 @@ impl DockerCodexRunner {
                 .target_branch
                 .as_deref()
                 .filter(|value| !value.is_empty()),
+            self.codex.deps.enabled,
         ))
     }
 
@@ -157,6 +158,7 @@ impl DockerCodexRunner {
         head_sha: &str,
         auth_mount_path: &str,
         target_branch: Option<&str>,
+        deps_enabled: bool,
     ) -> String {
         let target_branch_script = target_branch
             .map(|branch| {
@@ -168,6 +170,106 @@ run_git fetch git fetch --unshallow\n"
                 )
             })
             .unwrap_or_default();
+        let deps_prefetch_script = if deps_enabled {
+            r#"
+prefetch_deps() (
+  set +e
+  deps_dir="/work/repo/.codex_deps"
+  log_file="/tmp/codex-deps.log"
+  mkdir -p "$deps_dir"
+  failures=0
+  run_prefetch() {
+    action="$1"
+    shift
+    if [ "${CODEX_RUNNER_DEBUG:-}" = "1" ]; then
+      "$@" || { echo "codex-runner-warn: $action failed"; failures=$((failures+1)); }
+    else
+      if ! "$@" >"$log_file" 2>&1; then
+        echo "codex-runner-warn: $action failed"
+        tail -n 50 "$log_file" | sed 's/^/codex-runner-warn: /'
+        failures=$((failures+1))
+      fi
+    fi
+  }
+
+  if [ -f "package.json" ]; then
+    if [ -f "pnpm-lock.yaml" ] && command -v pnpm >/dev/null 2>&1; then
+      run_prefetch "pnpm install" pnpm install --ignore-scripts
+    elif [ -f "yarn.lock" ] && command -v yarn >/dev/null 2>&1; then
+      run_prefetch "yarn install" yarn install --ignore-scripts
+    elif [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+      run_prefetch "npm ci" npm ci --ignore-scripts --no-audit --no-fund
+    else
+      run_prefetch "npm install" npm install --ignore-scripts --no-audit --no-fund
+    fi
+  fi
+
+  if [ -f "Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+    mkdir -p "$deps_dir/cargo"
+    if [ -f "Cargo.lock" ]; then
+      CARGO_HOME="$deps_dir/cargo" run_prefetch "cargo fetch" cargo fetch --locked
+    else
+      echo "codex-runner-warn: Cargo.lock missing; skipping cargo fetch"
+    fi
+  fi
+
+  if [ -f "go.mod" ] && command -v go >/dev/null 2>&1; then
+    mkdir -p "$deps_dir/go/mod" "$deps_dir/go/cache"
+    GOMODCACHE="$deps_dir/go/mod" GOCACHE="$deps_dir/go/cache" GOFLAGS="-mod=readonly" run_prefetch "go mod download" go mod download
+  fi
+
+  if [ -f "requirements.txt" ] && command -v pip >/dev/null 2>&1; then
+    mkdir -p "$deps_dir/pip"
+    run_prefetch "pip download requirements.txt" pip download -r requirements.txt -d "$deps_dir/pip"
+  fi
+
+  if [ -f "pyproject.toml" ] && [ -f "poetry.lock" ] && command -v poetry >/dev/null 2>&1 && command -v pip >/dev/null 2>&1; then
+    if [ "${CODEX_RUNNER_DEBUG:-}" = "1" ]; then
+      poetry export -f requirements.txt --without-hashes -o /tmp/poetry-reqs.txt || failures=$((failures+1))
+    else
+      if ! poetry export -f requirements.txt --without-hashes -o /tmp/poetry-reqs.txt >"$log_file" 2>&1; then
+        echo "codex-runner-warn: poetry export failed"
+        tail -n 50 "$log_file" | sed 's/^/codex-runner-warn: /'
+        failures=$((failures+1))
+      fi
+    fi
+    if [ -f /tmp/poetry-reqs.txt ]; then
+      mkdir -p "$deps_dir/pip"
+      run_prefetch "pip download poetry export" pip download -r /tmp/poetry-reqs.txt -d "$deps_dir/pip"
+    fi
+  fi
+
+  if [ -f "pom.xml" ] && command -v mvn >/dev/null 2>&1; then
+    mkdir -p "$deps_dir/m2"
+    MAVEN_USER_HOME="$deps_dir/m2" run_prefetch "maven go-offline" mvn -q -DskipTests dependency:go-offline
+  fi
+
+  if [ -f "composer.json" ] && command -v composer >/dev/null 2>&1; then
+    mkdir -p "$deps_dir/composer-cache"
+    COMPOSER_CACHE_DIR="$deps_dir/composer-cache" COMPOSER_ALLOW_SUPERUSER=1 run_prefetch "composer install" \
+      composer install --no-dev --no-scripts --no-plugins --prefer-dist --no-interaction --no-progress
+  fi
+
+  if [ "$failures" -ne 0 ]; then
+    return 1
+  fi
+  return 0
+)
+prefetch_home="/tmp/codex-prefetch"
+mkdir -p "$prefetch_home/.config" "$prefetch_home/.cache" "$prefetch_home/.state"
+if ! HOME="$prefetch_home" XDG_CONFIG_HOME="$prefetch_home/.config" XDG_CACHE_HOME="$prefetch_home/.cache" \
+  XDG_STATE_HOME="$prefetch_home/.state" GITLAB_TOKEN="" CODEX_HOME="" prefetch_deps; then
+  echo "codex-runner-warn: dependency prefetch had failures; continuing"
+fi
+export CARGO_HOME="/work/repo/.codex_deps/cargo"
+export GOMODCACHE="/work/repo/.codex_deps/go/mod"
+export GOCACHE="/work/repo/.codex_deps/go/cache"
+export MAVEN_USER_HOME="/work/repo/.codex_deps/m2"
+export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
+"#
+        } else {
+            ""
+        };
         format!(
             r#"set -eu
 mkdir -p /work
@@ -191,7 +293,7 @@ cd repo
 run_git fetch git fetch --depth 1 origin "{head_sha}"
 run_git checkout git checkout "{head_sha}"
 run_git submodule_update git submodule update --init --recursive
-{target_branch_script}# Use the mounted auth directory directly so token refresh persists.
+{target_branch_script}{deps_prefetch_script}# Use the mounted auth directory directly so token refresh persists.
 mkdir -p "{auth_mount_path}"
 export CODEX_HOME="{auth_mount_path}"
 # Ensure Codex CLI is available for app-server mode
@@ -217,7 +319,8 @@ exec codex app-server
             clone_url = clone_url,
             head_sha = head_sha,
             auth_mount_path = auth_mount_path,
-            target_branch_script = target_branch_script
+            target_branch_script = target_branch_script,
+            deps_prefetch_script = deps_prefetch_script
         )
     }
 
@@ -791,6 +894,10 @@ impl AppServerClient {
                     info!("{}", trimmed);
                     continue;
                 }
+                if trimmed.starts_with("codex-runner-warn:") {
+                    warn!("{}", trimmed);
+                    continue;
+                }
                 if trimmed.starts_with("codex-runner-error:") {
                     warn!("{}", trimmed);
                     continue;
@@ -961,6 +1068,7 @@ mod tests {
             "abc",
             "/root/.codex",
             None,
+            false,
         );
         assert!(script.contains("export CODEX_HOME=\"/root/.codex\""));
         assert!(script.contains("mkdir -p \"/root/.codex\""));
@@ -973,6 +1081,7 @@ mod tests {
             "abc",
             "/root/.codex",
             Some("main"),
+            false,
         );
         assert!(script.contains("git fetch --depth 1 origin \"main\""));
         assert!(script.contains("git branch --force \"main\" FETCH_HEAD"));
@@ -986,9 +1095,23 @@ mod tests {
             "abc",
             "/root/.codex",
             None,
+            false,
         );
         assert!(script.contains("git clone --depth 1 --recurse-submodules"));
         assert!(script.contains("git submodule update --init --recursive"));
+    }
+
+    #[test]
+    fn build_command_script_includes_prefetch_when_enabled() {
+        let script = DockerCodexRunner::build_command_script(
+            "https://example.com/repo.git",
+            "abc",
+            "/root/.codex",
+            None,
+            true,
+        );
+        assert!(script.contains("prefetch_deps()"));
+        assert!(script.contains("composer install"));
     }
 
     #[test]

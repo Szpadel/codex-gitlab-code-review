@@ -147,6 +147,8 @@ pub struct CodexConfig {
     pub auth_host_path: String,
     pub auth_mount_path: String,
     pub exec_sandbox: String,
+    #[serde(default)]
+    pub deps: DepsConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -186,6 +188,12 @@ pub struct ProxyConfig {
     pub http_proxy: Option<String>,
     pub https_proxy: Option<String>,
     pub no_proxy: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DepsConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 impl Config {

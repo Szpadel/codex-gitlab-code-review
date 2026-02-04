@@ -60,6 +60,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             auth_host_path,
             auth_mount_path: "/root/.codex".to_string(),
             exec_sandbox: "danger-full-access".to_string(),
+            deps: codex_gitlab_code_review::config::DepsConfig { enabled: false },
         },
         docker: DockerConfig { host: docker_host },
         database: DatabaseConfig {

@@ -927,6 +927,7 @@ mod tests {
                 auth_host_path: "/root/.codex".to_string(),
                 auth_mount_path: "/root/.codex".to_string(),
                 exec_sandbox: "danger-full-access".to_string(),
+                deps: crate::config::DepsConfig { enabled: false },
             },
             docker: DockerConfig {
                 host: "tcp://localhost:2375".to_string(),

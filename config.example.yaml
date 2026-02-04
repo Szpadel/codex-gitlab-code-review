@@ -65,6 +65,10 @@ codex:
   auth_mount_path: "/root/.codex"
   # Required. Sandbox mode passed to Codex: "read-only", "workspace-write", or "danger-full-access".
   exec_sandbox: "danger-full-access"
+  # Optional. Prefetch dependency sources before running Codex (root-only detection).
+  # Note: prefetch runs before Codex and counts toward timeout_seconds.
+  deps:
+    enabled: false
 
 docker:
   # Optional. Docker host to connect to; default is "unix:///var/run/docker.sock".
