@@ -3,6 +3,7 @@ use chrono::Utc;
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use std::fs::{self, OpenOptions};
 use std::path::Path;
+use uuid::Uuid;
 
 pub struct ReviewStateStore {
     pool: SqlitePool,
@@ -11,6 +12,13 @@ pub struct ReviewStateStore {
 pub struct ProjectCatalog {
     pub fetched_at: i64,
     pub projects: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InProgressReview {
+    pub repo: String,
+    pub iid: u64,
+    pub head_sha: String,
 }
 
 impl ReviewStateStore {
@@ -100,7 +108,7 @@ impl ReviewStateStore {
             r#"
             UPDATE review_state
             SET status = 'done', head_sha = ?, result = ?, updated_at = ?
-            WHERE repo = ? AND iid = ?
+            WHERE repo = ? AND iid = ? AND head_sha = ? AND status = 'in_progress'
             "#,
         )
         .bind(sha)
@@ -108,10 +116,39 @@ impl ReviewStateStore {
         .bind(now)
         .bind(repo)
         .bind(iid as i64)
+        .bind(sha)
         .execute(&self.pool)
         .await
         .context("update review state")?;
         Ok(())
+    }
+
+    pub async fn list_in_progress_reviews(&self) -> Result<Vec<InProgressReview>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT repo, iid, head_sha
+            FROM review_state
+            WHERE status = 'in_progress'
+            ORDER BY repo, iid
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list in-progress reviews")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let repo: String = row.try_get("repo").context("read review repo")?;
+                let iid_raw: i64 = row.try_get("iid").context("read review iid")?;
+                let iid = u64::try_from(iid_raw).context("convert review iid to u64")?;
+                let head_sha: String = row.try_get("head_sha").context("read review head sha")?;
+                Ok(InProgressReview {
+                    repo,
+                    iid,
+                    head_sha,
+                })
+            })
+            .collect()
     }
 
     pub async fn clear_stale_in_progress(&self, max_age_minutes: u64) -> Result<()> {
@@ -246,6 +283,28 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    pub async fn get_or_create_review_owner_id(&self) -> Result<String> {
+        let candidate = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO service_state (key, value)
+            VALUES ('review_owner_id', ?)
+            "#,
+        )
+        .bind(candidate)
+        .execute(&self.pool)
+        .await
+        .context("insert review_owner_id state")?;
+
+        let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
+            .bind("review_owner_id")
+            .fetch_one(&self.pool)
+            .await
+            .context("load review_owner_id state")?;
+        let owner_id: String = row.try_get("value").context("read review_owner_id state")?;
+        Ok(owner_id)
+    }
+
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
@@ -298,6 +357,102 @@ mod tests {
         store.clear_stale_in_progress(1).await?;
         let again = store.begin_review("group/repo", 2, "sha2").await?;
         assert_eq!(again, true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_in_progress_reviews_returns_only_active_rows() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        store.begin_review("group/repo-a", 1, "sha1").await?;
+        store.begin_review("group/repo-b", 2, "sha2").await?;
+        store
+            .finish_review("group/repo-b", 2, "sha2", "pass")
+            .await?;
+
+        let in_progress = store.list_in_progress_reviews().await?;
+        assert_eq!(
+            in_progress,
+            vec![InProgressReview {
+                repo: "group/repo-a".to_string(),
+                iid: 1,
+                head_sha: "sha1".to_string(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_review_is_noop_once_row_is_not_in_progress() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        store.begin_review("group/repo", 3, "sha1").await?;
+
+        store.finish_review("group/repo", 3, "sha1", "pass").await?;
+        store
+            .finish_review("group/repo", 3, "sha2", "error")
+            .await?;
+
+        let row = sqlx::query(
+            "SELECT status, head_sha, result FROM review_state WHERE repo = ? AND iid = ?",
+        )
+        .bind("group/repo")
+        .bind(3i64)
+        .fetch_one(store.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let head_sha: String = row.try_get("head_sha")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done".to_string());
+        assert_eq!(head_sha, "sha1".to_string());
+        assert_eq!(result, Some("pass".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_review_ignores_outdated_sha_for_new_in_progress_review() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let repo = "group/repo";
+        let iid = 4u64;
+        store.begin_review(repo, iid, "sha1").await?;
+
+        sqlx::query("UPDATE review_state SET updated_at = 0 WHERE repo = ? AND iid = ?")
+            .bind(repo)
+            .bind(iid as i64)
+            .execute(store.pool())
+            .await?;
+        store.clear_stale_in_progress(1).await?;
+
+        let restarted = store.begin_review(repo, iid, "sha2").await?;
+        assert_eq!(restarted, true);
+
+        store.finish_review(repo, iid, "sha1", "error").await?;
+        let row = sqlx::query(
+            "SELECT status, head_sha, result FROM review_state WHERE repo = ? AND iid = ?",
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .fetch_one(store.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let head_sha: String = row.try_get("head_sha")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "in_progress".to_string());
+        assert_eq!(head_sha, "sha2".to_string());
+        assert_eq!(result, None);
+
+        store.finish_review(repo, iid, "sha2", "pass").await?;
+        let row = sqlx::query(
+            "SELECT status, head_sha, result FROM review_state WHERE repo = ? AND iid = ?",
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .fetch_one(store.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let head_sha: String = row.try_get("head_sha")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done".to_string());
+        assert_eq!(head_sha, "sha2".to_string());
+        assert_eq!(result, Some("pass".to_string()));
         Ok(())
     }
 
@@ -373,6 +528,18 @@ mod tests {
         store.set_created_after("2025-01-02T03:04:05Z").await?;
         let loaded = store.get_created_after().await?;
         assert_eq!(loaded, Some("2025-01-02T03:04:05Z".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_owner_id_is_created_once_and_stable_across_calls() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+
+        let first = store.get_or_create_review_owner_id().await?;
+        assert!(!first.is_empty());
+
+        let second = store.get_or_create_review_owner_id().await?;
+        assert_eq!(second, first);
         Ok(())
     }
 }

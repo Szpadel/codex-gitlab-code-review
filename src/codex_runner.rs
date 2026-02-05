@@ -3,13 +3,13 @@ use crate::docker_utils::{connect_docker, ensure_image, normalize_image_referenc
 use crate::gitlab::MergeRequest;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
-    AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder,
-    StartContainerOptionsBuilder,
+    AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, ListContainersOptionsBuilder,
+    RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
 };
-use bollard::Docker;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -36,9 +36,16 @@ pub enum CodexResult {
     Comment { summary: String, body: String },
 }
 
+const REVIEW_CONTAINER_NAME_PREFIX: &str = "codex-review-";
+const REVIEW_OWNER_LABEL_KEY: &str = "codex.gitlab.review.owner";
+
 #[async_trait]
 pub trait CodexRunner: Send + Sync {
     async fn run_review(&self, ctx: ReviewContext) -> Result<CodexResult>;
+
+    async fn stop_active_reviews(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct DockerCodexRunner {
@@ -48,6 +55,7 @@ pub struct DockerCodexRunner {
     git_base: Url,
     gitlab_token: String,
     log_all_json: bool,
+    owner_id: String,
 }
 
 impl DockerCodexRunner {
@@ -58,6 +66,7 @@ impl DockerCodexRunner {
         git_base: Url,
         gitlab_token: String,
         log_all_json: bool,
+        owner_id: String,
     ) -> Result<Self> {
         let docker = connect_docker(&docker_cfg)?;
         Ok(Self {
@@ -67,6 +76,7 @@ impl DockerCodexRunner {
             git_base,
             gitlab_token,
             log_all_json,
+            owner_id,
         })
     }
 
@@ -351,15 +361,111 @@ exec codex app-server
             .await;
     }
 
+    fn is_review_container_name(name: &str) -> bool {
+        name.trim_start_matches('/')
+            .starts_with(REVIEW_CONTAINER_NAME_PREFIX)
+    }
+
+    fn review_container_labels(owner_id: &str) -> HashMap<String, String> {
+        HashMap::from([(REVIEW_OWNER_LABEL_KEY.to_string(), owner_id.to_string())])
+    }
+
+    fn review_container_filters(owner_id: &str) -> HashMap<String, Vec<String>> {
+        HashMap::from([
+            (
+                "name".to_string(),
+                vec![REVIEW_CONTAINER_NAME_PREFIX.to_string()],
+            ),
+            (
+                "label".to_string(),
+                vec![format!("{REVIEW_OWNER_LABEL_KEY}={owner_id}")],
+            ),
+        ])
+    }
+
+    fn has_review_owner_label(labels: Option<&HashMap<String, String>>, owner_id: &str) -> bool {
+        labels
+            .and_then(|labels| labels.get(REVIEW_OWNER_LABEL_KEY))
+            .map(|value| value == owner_id)
+            .unwrap_or(false)
+    }
+
+    async fn stop_active_review_containers_best_effort(&self) {
+        let filters = Self::review_container_filters(&self.owner_id);
+        let options = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+
+        let containers = match self.docker.list_containers(Some(options)).await {
+            Ok(containers) => containers,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to list docker containers while stopping active codex reviews"
+                );
+                return;
+            }
+        };
+
+        for container in containers {
+            let names = container.names.unwrap_or_default();
+            if !names
+                .iter()
+                .any(|name| Self::is_review_container_name(name))
+            {
+                continue;
+            }
+            if !Self::has_review_owner_label(container.labels.as_ref(), &self.owner_id) {
+                continue;
+            }
+
+            let Some(id) = container.id.as_deref() else {
+                let names_value = if names.is_empty() {
+                    "<unknown>".to_string()
+                } else {
+                    names.join(",")
+                };
+                warn!(
+                    container_names = names_value.as_str(),
+                    "skipping codex review container without id"
+                );
+                continue;
+            };
+
+            if let Err(err) = self
+                .docker
+                .remove_container(
+                    id,
+                    Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+                )
+                .await
+            {
+                let container_name = names
+                    .iter()
+                    .find(|name| Self::is_review_container_name(name))
+                    .map(|name| name.trim_start_matches('/'))
+                    .unwrap_or("<unknown>");
+                warn!(
+                    container_id = id,
+                    container_name,
+                    error = %err,
+                    "failed to remove codex review container"
+                );
+            }
+        }
+    }
+
     async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
         let script = self.command(ctx)?;
         let image_ref = Self::normalize_image_reference(&self.codex.image);
         ensure_image(&self.docker, &image_ref).await?;
-        let name = format!("codex-review-{}", Uuid::new_v4());
+        let name = format!("{}{}", REVIEW_CONTAINER_NAME_PREFIX, Uuid::new_v4());
         let config = ContainerCreateBody {
             image: Some(image_ref.clone()),
             cmd: Some(Self::app_server_cmd(script)),
             env: Some(self.env_vars()),
+            labels: Some(Self::review_container_labels(&self.owner_id)),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             attach_stdin: Some(true),
@@ -501,6 +607,11 @@ impl CodexRunner for DockerCodexRunner {
                 ctx.repo, ctx.mr.iid
             )
         })
+    }
+
+    async fn stop_active_reviews(&self) -> Result<()> {
+        self.stop_active_review_containers_best_effort().await;
+        Ok(())
     }
 }
 
@@ -1157,5 +1268,55 @@ mod tests {
             DockerCodexRunner::normalize_image_reference(image),
             "localhost:5000/codex-universal:canary"
         );
+    }
+
+    #[test]
+    fn review_container_prefix_matcher_handles_docker_name_format() {
+        assert!(DockerCodexRunner::is_review_container_name(
+            "codex-review-abc"
+        ));
+        assert!(DockerCodexRunner::is_review_container_name(
+            "/codex-review-def"
+        ));
+        assert!(!DockerCodexRunner::is_review_container_name(
+            "/codex-auth-ghi"
+        ));
+    }
+
+    #[test]
+    fn review_container_labels_include_owner_label() {
+        let labels = DockerCodexRunner::review_container_labels("worker-a");
+        assert_eq!(
+            labels.get(REVIEW_OWNER_LABEL_KEY),
+            Some(&"worker-a".to_string())
+        );
+        assert_eq!(labels.len(), 1);
+    }
+
+    #[test]
+    fn review_container_filters_include_name_prefix_and_owner_label() {
+        let filters = DockerCodexRunner::review_container_filters("worker-a");
+        assert_eq!(
+            filters.get("name"),
+            Some(&vec![REVIEW_CONTAINER_NAME_PREFIX.to_string()])
+        );
+        assert_eq!(
+            filters.get("label"),
+            Some(&vec![format!("{REVIEW_OWNER_LABEL_KEY}=worker-a")])
+        );
+    }
+
+    #[test]
+    fn has_review_owner_label_requires_exact_owner_match() {
+        let labels = HashMap::from([(REVIEW_OWNER_LABEL_KEY.to_string(), "worker-a".to_string())]);
+        assert!(DockerCodexRunner::has_review_owner_label(
+            Some(&labels),
+            "worker-a"
+        ));
+        assert!(!DockerCodexRunner::has_review_owner_label(
+            Some(&labels),
+            "worker-b"
+        ));
+        assert!(!DockerCodexRunner::has_review_owner_label(None, "worker-a"));
     }
 }

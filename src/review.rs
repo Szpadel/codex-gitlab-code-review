@@ -6,6 +6,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use futures::future::join_all;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
@@ -117,6 +118,7 @@ pub struct ReviewService {
     created_after: DateTime<Utc>,
     semaphore: Arc<Semaphore>,
     retry_backoff: Arc<RetryBackoff>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl ReviewService {
@@ -130,6 +132,7 @@ impl ReviewService {
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.review.max_concurrent));
         let retry_backoff = Arc::new(RetryBackoff::new(Duration::hours(1)));
+        let shutdown = Arc::new(AtomicBool::new(false));
         Self {
             config,
             gitlab,
@@ -139,6 +142,7 @@ impl ReviewService {
             created_after,
             semaphore,
             retry_backoff,
+            shutdown,
         }
     }
 
@@ -150,7 +154,80 @@ impl ReviewService {
         self.scan(ScanMode::Incremental).await
     }
 
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn recover_in_progress_reviews(&self) -> Result<()> {
+        if let Err(err) = self.codex.stop_active_reviews().await {
+            warn!(error = %err, "failed to stop active codex review containers");
+        }
+
+        let in_progress = self.state.list_in_progress_reviews().await?;
+        if in_progress.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            count = in_progress.len(),
+            "recovering interrupted in-progress reviews"
+        );
+        for review in in_progress {
+            let retry_key =
+                RetryKey::new(review.repo.as_str(), review.iid, review.head_sha.as_str());
+            if self.config.review.dry_run {
+                info!(
+                    repo = review.repo.as_str(),
+                    iid = review.iid,
+                    "dry run: skipping eyes removal during recovery"
+                );
+            } else if let Err(err) = remove_eyes(
+                self.gitlab.as_ref(),
+                review.repo.as_str(),
+                review.iid,
+                self.bot_user_id,
+                &self.config.review.eyes_emoji,
+            )
+            .await
+            {
+                warn!(
+                    repo = review.repo.as_str(),
+                    iid = review.iid,
+                    error = %err,
+                    "failed to remove eyes award while recovering review"
+                );
+            }
+            self.retry_backoff.clear(&retry_key);
+            if let Err(err) = self
+                .state
+                .finish_review(
+                    review.repo.as_str(),
+                    review.iid,
+                    review.head_sha.as_str(),
+                    "cancelled",
+                )
+                .await
+            {
+                warn!(
+                    repo = review.repo.as_str(),
+                    iid = review.iid,
+                    error = %err,
+                    "failed to mark interrupted review as cancelled"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
     async fn scan(&self, mode: ScanMode) -> Result<()> {
+        if self.shutdown_requested() {
+            info!("scan skipped: shutdown requested");
+            return Ok(());
+        }
         match mode {
             ScanMode::Full => info!("starting scan"),
             ScanMode::Incremental => info!("starting incremental scan"),
@@ -166,6 +243,10 @@ impl ReviewService {
         let mut tasks = Vec::new();
         let mut counters = ScanCounters::default();
         for repo in &repos {
+            if self.shutdown_requested() {
+                info!("stopping scan early: shutdown requested");
+                break;
+            }
             let activity_marker = self.load_latest_mr_activity_marker(repo).await;
             if matches!(mode, ScanMode::Incremental) {
                 if let Some(marker) = activity_marker.as_ref() {
@@ -190,12 +271,20 @@ impl ReviewService {
                 }
             }
             let mrs = self.gitlab.list_open_mrs(repo).await?;
-            self.scan_repo_mrs(repo, mrs, &mut counters, &mut tasks)
+            let repo_scan_complete = self
+                .scan_repo_mrs(repo, mrs, &mut counters, &mut tasks)
                 .await?;
-            if let Some(marker) = activity_marker {
-                self.state
-                    .set_project_last_mr_activity(repo, &marker)
-                    .await?;
+            if repo_scan_complete {
+                if let Some(marker) = activity_marker {
+                    self.state
+                        .set_project_last_mr_activity(repo, &marker)
+                        .await?;
+                }
+            } else {
+                debug!(
+                    repo = repo.as_str(),
+                    "skip: not advancing activity marker because scan was interrupted"
+                );
             }
         }
         let _ = join_all(tasks).await;
@@ -403,10 +492,14 @@ impl ReviewService {
         mrs: Vec<MergeRequest>,
         counters: &mut ScanCounters,
         tasks: &mut Vec<tokio::task::JoinHandle<()>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         counters.total_mrs += mrs.len();
         info!(repo = repo, count = mrs.len(), "loaded open MRs");
         for mr in mrs {
+            if self.shutdown_requested() {
+                info!(repo = repo, "stopping MR scheduling: shutdown requested");
+                return Ok(false);
+            }
             let mut mr = mr;
             if mr.head_sha().is_none() || mr.created_at.is_none() {
                 mr = self.gitlab.get_mr(repo, mr.iid).await?;
@@ -474,12 +567,19 @@ impl ReviewService {
                 );
                 continue;
             }
+            if self.shutdown_requested() {
+                self.state
+                    .finish_review(repo, mr.iid, &head_sha, "cancelled")
+                    .await?;
+                return Ok(false);
+            }
             let permit = self.semaphore.clone().acquire_owned().await?;
             let repo_name = repo.to_string();
             let gitlab = Arc::clone(&self.gitlab);
             let codex = Arc::clone(&self.codex);
             let state = Arc::clone(&self.state);
             let retry_backoff = Arc::clone(&self.retry_backoff);
+            let shutdown = Arc::clone(&self.shutdown);
             let config = self.config.clone();
             let bot_user_id = self.bot_user_id;
             let review_context = ReviewRunContext {
@@ -489,6 +589,7 @@ impl ReviewService {
                 state,
                 retry_backoff,
                 bot_user_id,
+                shutdown,
             };
             counters.scheduled += 1;
             tasks.push(tokio::spawn(async move {
@@ -498,10 +599,14 @@ impl ReviewService {
                 }
             }));
         }
-        Ok(())
+        Ok(true)
     }
 
     pub async fn review_mr(&self, repo: &str, iid: u64) -> Result<()> {
+        if self.shutdown_requested() {
+            info!(repo = repo, iid = iid, "skip: shutdown requested");
+            return Ok(());
+        }
         let mr = self.gitlab.get_mr(repo, iid).await?;
         let created_at = match mr.created_at.as_ref() {
             Some(value) => value,
@@ -548,6 +653,12 @@ impl ReviewService {
         if !self.state.begin_review(repo, mr.iid, &head_sha).await? {
             return Ok(());
         }
+        if self.shutdown_requested() {
+            self.state
+                .finish_review(repo, mr.iid, &head_sha, "cancelled")
+                .await?;
+            return Ok(());
+        }
         let _permit = self.semaphore.clone().acquire_owned().await?;
         let review_context = ReviewRunContext {
             config: self.config.clone(),
@@ -556,6 +667,7 @@ impl ReviewService {
             state: Arc::clone(&self.state),
             retry_backoff: Arc::clone(&self.retry_backoff),
             bot_user_id: self.bot_user_id,
+            shutdown: Arc::clone(&self.shutdown),
         };
         review_context.run(repo, mr, &head_sha).await
     }
@@ -568,10 +680,61 @@ struct ReviewRunContext {
     state: Arc<ReviewStateStore>,
     retry_backoff: Arc<RetryBackoff>,
     bot_user_id: u64,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl ReviewRunContext {
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    async fn remove_eyes_best_effort(&self, repo: &str, iid: u64) {
+        if self.config.review.dry_run {
+            info!(repo = repo, iid = iid, "dry run: skipping eyes removal");
+            return;
+        }
+        if let Err(err) = remove_eyes(
+            self.gitlab.as_ref(),
+            repo,
+            iid,
+            self.bot_user_id,
+            &self.config.review.eyes_emoji,
+        )
+        .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                error = %err,
+                "failed to remove eyes award"
+            );
+        }
+    }
+
+    async fn finalize_cancelled(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        retry_key: &RetryKey,
+    ) -> Result<()> {
+        self.remove_eyes_best_effort(repo, iid).await;
+        self.retry_backoff.clear(retry_key);
+        self.state
+            .finish_review(repo, iid, head_sha, "cancelled")
+            .await?;
+        info!(repo = repo, iid = iid, "review cancelled due to shutdown");
+        Ok(())
+    }
+
     async fn run(&self, repo: &str, mr: MergeRequest, head_sha: &str) -> Result<()> {
+        let retry_key = RetryKey::new(repo, mr.iid, head_sha);
+        if self.shutdown_requested() {
+            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+                .await?;
+            return Ok(());
+        }
+
         if self.config.review.dry_run {
             info!(repo = repo, iid = mr.iid, "dry run: skipping eyes award");
         } else {
@@ -588,29 +751,32 @@ impl ReviewRunContext {
             head_sha: head_sha.to_string(),
         };
 
+        if self.shutdown_requested() {
+            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+                .await?;
+            return Ok(());
+        }
+
         let result = self.codex.run_review(review_ctx).await;
-        let retry_key = RetryKey::new(repo, mr.iid, head_sha);
-        if self.config.review.dry_run {
-            info!(repo = repo, iid = mr.iid, "dry run: skipping eyes removal");
-        } else if let Err(err) = remove_eyes(
-            self.gitlab.as_ref(),
-            repo,
-            mr.iid,
-            self.bot_user_id,
-            &self.config.review.eyes_emoji,
-        )
-        .await
-        {
-            warn!(
-                repo = repo,
-                iid = mr.iid,
-                error = %err,
-                "failed to remove eyes award"
-            );
+        if self.shutdown_requested() {
+            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+                .await?;
+            return Ok(());
+        }
+        self.remove_eyes_best_effort(repo, mr.iid).await;
+        if self.shutdown_requested() {
+            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+                .await?;
+            return Ok(());
         }
 
         match result {
             Ok(CodexResult::Pass { summary }) => {
+                if self.shutdown_requested() {
+                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+                        .await?;
+                    return Ok(());
+                }
                 if self.config.review.dry_run {
                     info!(repo = repo, iid = mr.iid, "dry run: skipping thumbs up");
                 } else {
@@ -630,6 +796,11 @@ impl ReviewRunContext {
                 );
             }
             Ok(CodexResult::Comment { summary, body }) => {
+                if self.shutdown_requested() {
+                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+                        .await?;
+                    return Ok(());
+                }
                 let full_body = format!(
                     "{}\n\n{}{} -->",
                     body, self.config.review.comment_marker_prefix, head_sha
@@ -651,7 +822,9 @@ impl ReviewRunContext {
                 );
             }
             Err(err) => {
-                let next_retry_at = self.retry_backoff.record_failure(retry_key, Utc::now());
+                let next_retry_at = self
+                    .retry_backoff
+                    .record_failure(retry_key.clone(), Utc::now());
                 error!(
                     repo = repo,
                     iid = mr.iid,
@@ -659,6 +832,11 @@ impl ReviewRunContext {
                     next_retry_at = %next_retry_at,
                     "review failed"
                 );
+                if self.shutdown_requested() {
+                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+                        .await?;
+                    return Ok(());
+                }
                 self.state
                     .finish_review(repo, mr.iid, head_sha, "error")
                     .await?;
@@ -720,6 +898,7 @@ mod tests {
     use sqlx::Row;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct FakeGitLab {
         bot_user: GitLabUser,
@@ -894,6 +1073,221 @@ mod tests {
         async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
             *self.calls.lock().unwrap() += 1;
             Err(anyhow!("runner failed"))
+        }
+    }
+
+    struct RecoveryRunner {
+        stop_calls: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl CodexRunner for RecoveryRunner {
+        async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+            Err(anyhow!("run_review should not be called in recovery test"))
+        }
+
+        async fn stop_active_reviews(&self) -> Result<()> {
+            *self.stop_calls.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    struct ShutdownTriggerRunner {
+        shutdown: Arc<AtomicBool>,
+        calls: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl CodexRunner for ShutdownTriggerRunner {
+        async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+            *self.calls.lock().unwrap() += 1;
+            self.shutdown.store(true, Ordering::SeqCst);
+            Ok(CodexResult::Pass {
+                summary: "ok".to_string(),
+            })
+        }
+    }
+
+    struct ShutdownOnEyesAwardGitLab {
+        inner: Arc<FakeGitLab>,
+        shutdown: Arc<AtomicBool>,
+        eyes_emoji: String,
+    }
+
+    #[async_trait]
+    impl GitLabApi for ShutdownOnEyesAwardGitLab {
+        async fn current_user(&self) -> Result<GitLabUser> {
+            self.inner.current_user().await
+        }
+
+        async fn list_projects(&self) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+            self.inner.list_projects().await
+        }
+
+        async fn list_group_projects(
+            &self,
+            group: &str,
+        ) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+            self.inner.list_group_projects(group).await
+        }
+
+        async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>> {
+            self.inner.list_open_mrs(project).await
+        }
+
+        async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>> {
+            self.inner.get_latest_open_mr_activity(project).await
+        }
+
+        async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest> {
+            self.inner.get_mr(project, iid).await
+        }
+
+        async fn get_project(&self, project: &str) -> Result<crate::gitlab::GitLabProject> {
+            self.inner.get_project(project).await
+        }
+
+        async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>> {
+            self.inner.list_awards(project, iid).await
+        }
+
+        async fn add_award(&self, project: &str, iid: u64, name: &str) -> Result<()> {
+            if name == self.eyes_emoji {
+                self.shutdown.store(true, Ordering::SeqCst);
+            }
+            self.inner.add_award(project, iid, name).await
+        }
+
+        async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()> {
+            self.inner.delete_award(project, iid, award_id).await
+        }
+
+        async fn list_notes(&self, project: &str, iid: u64) -> Result<Vec<Note>> {
+            self.inner.list_notes(project, iid).await
+        }
+
+        async fn create_note(&self, project: &str, iid: u64, body: &str) -> Result<()> {
+            self.inner.create_note(project, iid, body).await
+        }
+    }
+
+    struct ShutdownOnListOpenGitLab {
+        inner: Arc<FakeGitLab>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl GitLabApi for ShutdownOnListOpenGitLab {
+        async fn current_user(&self) -> Result<GitLabUser> {
+            self.inner.current_user().await
+        }
+
+        async fn list_projects(&self) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+            self.inner.list_projects().await
+        }
+
+        async fn list_group_projects(
+            &self,
+            group: &str,
+        ) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+            self.inner.list_group_projects(group).await
+        }
+
+        async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>> {
+            self.shutdown.store(true, Ordering::SeqCst);
+            self.inner.list_open_mrs(project).await
+        }
+
+        async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>> {
+            self.inner.get_latest_open_mr_activity(project).await
+        }
+
+        async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest> {
+            self.inner.get_mr(project, iid).await
+        }
+
+        async fn get_project(&self, project: &str) -> Result<crate::gitlab::GitLabProject> {
+            self.inner.get_project(project).await
+        }
+
+        async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>> {
+            self.inner.list_awards(project, iid).await
+        }
+
+        async fn add_award(&self, project: &str, iid: u64, name: &str) -> Result<()> {
+            self.inner.add_award(project, iid, name).await
+        }
+
+        async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()> {
+            self.inner.delete_award(project, iid, award_id).await
+        }
+
+        async fn list_notes(&self, project: &str, iid: u64) -> Result<Vec<Note>> {
+            self.inner.list_notes(project, iid).await
+        }
+
+        async fn create_note(&self, project: &str, iid: u64, body: &str) -> Result<()> {
+            self.inner.create_note(project, iid, body).await
+        }
+    }
+
+    struct ShutdownOnListAwardsGitLab {
+        inner: Arc<FakeGitLab>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl GitLabApi for ShutdownOnListAwardsGitLab {
+        async fn current_user(&self) -> Result<GitLabUser> {
+            self.inner.current_user().await
+        }
+
+        async fn list_projects(&self) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+            self.inner.list_projects().await
+        }
+
+        async fn list_group_projects(
+            &self,
+            group: &str,
+        ) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+            self.inner.list_group_projects(group).await
+        }
+
+        async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>> {
+            self.inner.list_open_mrs(project).await
+        }
+
+        async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>> {
+            self.inner.get_latest_open_mr_activity(project).await
+        }
+
+        async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest> {
+            self.inner.get_mr(project, iid).await
+        }
+
+        async fn get_project(&self, project: &str) -> Result<crate::gitlab::GitLabProject> {
+            self.inner.get_project(project).await
+        }
+
+        async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>> {
+            self.shutdown.store(true, Ordering::SeqCst);
+            self.inner.list_awards(project, iid).await
+        }
+
+        async fn add_award(&self, project: &str, iid: u64, name: &str) -> Result<()> {
+            self.inner.add_award(project, iid, name).await
+        }
+
+        async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()> {
+            self.inner.delete_award(project, iid, award_id).await
+        }
+
+        async fn list_notes(&self, project: &str, iid: u64) -> Result<Vec<Note>> {
+            self.inner.list_notes(project, iid).await
+        }
+
+        async fn create_note(&self, project: &str, iid: u64, body: &str) -> Result<()> {
+            self.inner.create_note(project, iid, body).await
         }
     }
 
@@ -1346,6 +1740,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_does_not_advance_marker_when_repo_scan_is_interrupted() -> Result<()> {
+        let config = test_config();
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let base_gitlab = Arc::new(FakeGitLab {
+            bot_user,
+            mrs: Mutex::new(vec![mr(12, "sha12")]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let gitlab = Arc::new(ShutdownOnListOpenGitLab {
+            inner: Arc::clone(&base_gitlab),
+            shutdown: Arc::clone(&shutdown),
+        });
+        let runner = Arc::new(FakeRunner {
+            result: Mutex::new(None),
+            calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let previous_marker = format!(
+            "{}|{}",
+            (default_created_at() - Duration::days(1)).to_rfc3339(),
+            12
+        );
+        state
+            .set_project_last_mr_activity("group/repo", &previous_marker)
+            .await?;
+        let mut service = ReviewService::new(
+            config,
+            gitlab,
+            state.clone(),
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+        service.shutdown = shutdown;
+
+        service.scan_once_incremental().await?;
+
+        assert_eq!(*base_gitlab.list_open_calls.lock().unwrap(), 1);
+        assert_eq!(*runner.calls.lock().unwrap(), 0);
+        let stored = state.get_project_last_mr_activity("group/repo").await?;
+        assert_eq!(stored, Some(previous_marker));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn incremental_uses_cached_project_catalog() -> Result<()> {
         let mut config = test_config();
         config.gitlab.targets.repos = TargetSelector::All;
@@ -1503,6 +1956,385 @@ mod tests {
             .await?;
         let status: String = row.try_get("status")?;
         assert_eq!(status, "done");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_reviews_cancels_and_removes_eyes() -> Result<()> {
+        let config = test_config();
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(Vec::new()),
+            awards: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 20),
+                vec![AwardEmoji {
+                    id: 200,
+                    name: "eyes".to_string(),
+                    user: bot_user,
+                }],
+            )])),
+            notes: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(RecoveryRunner {
+            stop_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state.begin_review("group/repo", 20, "sha20").await?;
+        let service = ReviewService::new(
+            config,
+            gitlab.clone(),
+            state.clone(),
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+
+        service.recover_in_progress_reviews().await?;
+
+        assert_eq!(*runner.stop_calls.lock().unwrap(), 1);
+        let calls = gitlab.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "delete_award:group/repo:20:200")
+        );
+        drop(calls);
+        let row = sqlx::query("SELECT status, result FROM review_state WHERE repo = ? AND iid = ?")
+            .bind("group/repo")
+            .bind(20i64)
+            .fetch_one(state.pool())
+            .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done");
+        assert_eq!(result, Some("cancelled".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_request_skips_new_review_runs() -> Result<()> {
+        let config = test_config();
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user,
+            mrs: Mutex::new(vec![mr(21, "sha21")]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(FakeRunner {
+            result: Mutex::new(None),
+            calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let service = ReviewService::new(
+            config,
+            gitlab.clone(),
+            state,
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+        service.request_shutdown();
+
+        service.review_mr("group/repo", 21).await?;
+
+        assert_eq!(*runner.calls.lock().unwrap(), 0);
+        assert_eq!(gitlab.calls.lock().unwrap().len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes() -> Result<()> {
+        let config = test_config();
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(Vec::new()),
+            awards: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 22),
+                vec![AwardEmoji {
+                    id: 220,
+                    name: "eyes".to_string(),
+                    user: bot_user,
+                }],
+            )])),
+            notes: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state.begin_review("group/repo", 22, "sha22").await?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runner = Arc::new(ShutdownTriggerRunner {
+            shutdown: Arc::clone(&shutdown),
+            calls: Mutex::new(0),
+        });
+        let review_context = ReviewRunContext {
+            config,
+            gitlab: gitlab.clone(),
+            codex: runner.clone(),
+            state: state.clone(),
+            retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
+            bot_user_id: 1,
+            shutdown,
+        };
+
+        review_context
+            .run("group/repo", mr(22, "sha22"), "sha22")
+            .await?;
+
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
+        let calls = gitlab.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "add_award:group/repo:22:eyes")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "delete_award:group/repo:22:220")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call == "add_award:group/repo:22:thumbsup")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("create_note:group/repo:22"))
+        );
+        drop(calls);
+
+        let row = sqlx::query("SELECT status, result FROM review_state WHERE repo = ? AND iid = ?")
+            .bind("group/repo")
+            .bind(22i64)
+            .fetch_one(state.pool())
+            .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done");
+        assert_eq!(result, Some("cancelled".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_during_eyes_award()
+    -> Result<()> {
+        let config = test_config();
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let base_gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(Vec::new()),
+            awards: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 23),
+                vec![AwardEmoji {
+                    id: 230,
+                    name: "eyes".to_string(),
+                    user: bot_user,
+                }],
+            )])),
+            notes: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let gitlab = Arc::new(ShutdownOnEyesAwardGitLab {
+            inner: Arc::clone(&base_gitlab),
+            shutdown: Arc::clone(&shutdown),
+            eyes_emoji: config.review.eyes_emoji.clone(),
+        });
+        let runner = Arc::new(FakeRunner {
+            result: Mutex::new(None),
+            calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state.begin_review("group/repo", 23, "sha23").await?;
+        let review_context = ReviewRunContext {
+            config,
+            gitlab,
+            codex: runner.clone(),
+            state: state.clone(),
+            retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
+            bot_user_id: 1,
+            shutdown,
+        };
+
+        review_context
+            .run("group/repo", mr(23, "sha23"), "sha23")
+            .await?;
+
+        assert_eq!(*runner.calls.lock().unwrap(), 0);
+        let calls = base_gitlab.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "add_award:group/repo:23:eyes")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "delete_award:group/repo:23:230")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call == "add_award:group/repo:23:thumbsup")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("create_note:group/repo:23"))
+        );
+        drop(calls);
+
+        let row = sqlx::query("SELECT status, result FROM review_state WHERE repo = ? AND iid = ?")
+            .bind("group/repo")
+            .bind(23i64)
+            .fetch_one(state.pool())
+            .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done");
+        assert_eq!(result, Some("cancelled".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() -> Result<()> {
+        let config = test_config();
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let base_gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(Vec::new()),
+            awards: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 24),
+                vec![AwardEmoji {
+                    id: 240,
+                    name: "eyes".to_string(),
+                    user: bot_user,
+                }],
+            )])),
+            notes: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let gitlab = Arc::new(ShutdownOnListAwardsGitLab {
+            inner: Arc::clone(&base_gitlab),
+            shutdown: Arc::clone(&shutdown),
+        });
+        let runner = Arc::new(FakeRunner {
+            result: Mutex::new(Some(CodexResult::Pass {
+                summary: "ok".to_string(),
+            })),
+            calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state.begin_review("group/repo", 24, "sha24").await?;
+        let review_context = ReviewRunContext {
+            config,
+            gitlab,
+            codex: runner.clone(),
+            state: state.clone(),
+            retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
+            bot_user_id: 1,
+            shutdown,
+        };
+
+        review_context
+            .run("group/repo", mr(24, "sha24"), "sha24")
+            .await?;
+
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
+        let calls = base_gitlab.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "add_award:group/repo:24:eyes")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "delete_award:group/repo:24:240")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call == "add_award:group/repo:24:thumbsup")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("create_note:group/repo:24"))
+        );
+        drop(calls);
+
+        let row = sqlx::query("SELECT status, result FROM review_state WHERE repo = ? AND iid = ?")
+            .bind("group/repo")
+            .bind(24i64)
+            .fetch_one(state.pool())
+            .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done");
+        assert_eq!(result, Some("cancelled".to_string()));
         Ok(())
     }
 

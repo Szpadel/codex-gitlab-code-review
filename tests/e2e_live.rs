@@ -93,6 +93,7 @@ async fn e2e_live_dry_run() -> Result<()> {
     };
 
     let state = Arc::new(ReviewStateStore::new(&config.database.path).await?);
+    let review_owner_id = state.get_or_create_review_owner_id().await?;
     let runner = DockerCodexRunner::new(
         config.docker.clone(),
         config.codex.clone(),
@@ -100,6 +101,7 @@ async fn e2e_live_dry_run() -> Result<()> {
         git_base,
         config.gitlab.token.clone(),
         false,
+        review_owner_id,
     )?;
     let service = ReviewService::new(
         config.clone(),

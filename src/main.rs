@@ -5,11 +5,12 @@ use cron::Schedule;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
+use codex_gitlab_code_review::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
 use codex_gitlab_code_review::codex_runner::DockerCodexRunner;
 use codex_gitlab_code_review::config::Config;
-use codex_gitlab_code_review::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::review::ReviewService;
 use codex_gitlab_code_review::state::ReviewStateStore;
@@ -111,6 +112,7 @@ async fn main() -> Result<()> {
         created_after = %created_after,
         "using merge request created_after cutoff"
     );
+    let review_owner_id = state.get_or_create_review_owner_id().await?;
     let runner = DockerCodexRunner::new(
         config.docker.clone(),
         config.codex.clone(),
@@ -118,18 +120,23 @@ async fn main() -> Result<()> {
         git_base,
         config.gitlab.token.clone(),
         cli.debug,
+        review_owner_id,
     )?;
 
-    let service = ReviewService::new(
+    let service = Arc::new(ReviewService::new(
         config.clone(),
         Arc::new(gitlab_client),
         state,
         Arc::new(runner),
         bot_user_id,
         created_after,
-    );
+    ));
 
     tokio::spawn(run_health_server(config.server.bind_addr.clone()));
+
+    if let Err(err) = service.recover_in_progress_reviews().await {
+        warn!(error = %err, "startup recovery of interrupted reviews failed");
+    }
 
     if run_once {
         info!("running single scan");
@@ -151,7 +158,40 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    run_schedule_loop(&service, schedule, tz).await
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let scheduled_service = Arc::clone(&service);
+    let mut scheduled_loop = tokio::spawn(async move {
+        run_schedule_loop(scheduled_service.as_ref(), schedule, tz, shutdown_rx).await
+    });
+
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+    tokio::select! {
+        signal_result = &mut shutdown_signal => {
+            signal_result?;
+            info!("shutdown signal received");
+        }
+        scheduled_result = &mut scheduled_loop => {
+            return match scheduled_result {
+                Ok(Ok(())) => Err(anyhow::anyhow!(
+                    "scheduler task exited before receiving a shutdown signal"
+                )),
+                Ok(Err(err)) => Err(err),
+                Err(err) => Err(err.into()),
+            };
+        }
+    }
+
+    service.request_shutdown();
+    let _ = shutdown_tx.send(true);
+    if let Err(err) = service.recover_in_progress_reviews().await {
+        warn!(error = %err, "shutdown recovery of interrupted reviews failed");
+    }
+
+    match scheduled_loop.await {
+        Ok(result) => result,
+        Err(err) => Err(err.into()),
+    }
 }
 
 async fn run_health_server(bind_addr: String) {
@@ -216,8 +256,13 @@ async fn run_schedule_loop(
     service: &ReviewService,
     schedule: Schedule,
     tz: chrono_tz::Tz,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
+        if *shutdown_rx.borrow() {
+            info!("stopping schedule loop: shutdown requested");
+            return Ok(());
+        }
         let now = Utc::now().with_timezone(&tz);
         let mut upcoming = schedule.upcoming(tz);
         let next = upcoming
@@ -226,9 +271,43 @@ async fn run_schedule_loop(
         let delay = (next - now)
             .to_std()
             .unwrap_or_else(|_| Duration::from_secs(0));
-        tokio::time::sleep(delay).await;
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        tokio::select! {
+            _ = &mut sleep => {}
+            changed = shutdown_rx.changed() => match changed {
+                Ok(()) if *shutdown_rx.borrow() => {
+                    info!("stopping schedule loop: shutdown requested");
+                    return Ok(());
+                }
+                Ok(()) => continue,
+                Err(_) => return Ok(()),
+            },
+        }
+        if *shutdown_rx.borrow() {
+            info!("stopping schedule loop: shutdown requested");
+            return Ok(());
+        }
         if let Err(err) = service.scan_once_incremental().await {
             warn!(error = %err, "scheduled scan failed");
         }
+    }
+}
+
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.context("listen for Ctrl+C")
     }
 }
