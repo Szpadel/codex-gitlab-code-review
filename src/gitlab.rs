@@ -130,6 +130,35 @@ pub trait GitLabApi: Send + Sync {
     ) -> Result<()> {
         self.create_note(project, iid, body).await
     }
+    async fn list_discussion_note_awards(
+        &self,
+        _project: &str,
+        _iid: u64,
+        _discussion_id: &str,
+        _note_id: u64,
+    ) -> Result<Vec<AwardEmoji>> {
+        Ok(Vec::new())
+    }
+    async fn add_discussion_note_award(
+        &self,
+        _project: &str,
+        _iid: u64,
+        _discussion_id: &str,
+        _note_id: u64,
+        _name: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn delete_discussion_note_award(
+        &self,
+        _project: &str,
+        _iid: u64,
+        _discussion_id: &str,
+        _note_id: u64,
+        _award_id: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
     async fn get_user(&self, user_id: u64) -> Result<GitLabUserDetail> {
         Err(anyhow!(
             "get_user not implemented for this gitlab client (user_id={user_id})"
@@ -407,6 +436,64 @@ impl GitLabApi for GitLabClient {
             encoded_discussion_id
         );
         self.post_note(&url, body).await
+    }
+
+    async fn list_discussion_note_awards(
+        &self,
+        project: &str,
+        iid: u64,
+        discussion_id: &str,
+        note_id: u64,
+    ) -> Result<Vec<AwardEmoji>> {
+        let encoded_discussion_id = urlencoding::encode(discussion_id);
+        let url = format!(
+            "{}/merge_requests/{}/discussions/{}/notes/{}/award_emoji",
+            self.project_path(project),
+            iid,
+            encoded_discussion_id,
+            note_id
+        );
+        self.get_paginated(&url).await
+    }
+
+    async fn add_discussion_note_award(
+        &self,
+        project: &str,
+        iid: u64,
+        discussion_id: &str,
+        note_id: u64,
+        name: &str,
+    ) -> Result<()> {
+        let encoded_discussion_id = urlencoding::encode(discussion_id);
+        let url = format!(
+            "{}/merge_requests/{}/discussions/{}/notes/{}/award_emoji?name={}",
+            self.project_path(project),
+            iid,
+            encoded_discussion_id,
+            note_id,
+            name
+        );
+        self.post_empty(&url).await
+    }
+
+    async fn delete_discussion_note_award(
+        &self,
+        project: &str,
+        iid: u64,
+        discussion_id: &str,
+        note_id: u64,
+        award_id: u64,
+    ) -> Result<()> {
+        let encoded_discussion_id = urlencoding::encode(discussion_id);
+        let url = format!(
+            "{}/merge_requests/{}/discussions/{}/notes/{}/award_emoji/{}",
+            self.project_path(project),
+            iid,
+            encoded_discussion_id,
+            note_id,
+            award_id
+        );
+        self.delete_empty(&url).await
     }
 
     async fn get_user(&self, user_id: u64) -> Result<GitLabUserDetail> {
@@ -716,6 +803,64 @@ mod tests {
         let client = GitLabClient::new(&server.uri(), "token")?;
         client
             .create_discussion_note("group/repo", 3, "discussion-123", "working on it")
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discussion_note_award_endpoints_use_discussion_note_path() -> Result<()> {
+        let server = MockServer::start().await;
+        let list_response = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "")
+            .set_body_json(vec![serde_json::json!({
+                "id": 501,
+                "name": "eyes",
+                "user": { "id": 1, "username": "botuser", "name": "Bot User" }
+            })]);
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/merge_requests/3/discussions/discussion-123/notes/777/award_emoji",
+            ))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(list_response)
+            .mount(&server)
+            .await;
+
+        let add_response = ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 777
+        }));
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/merge_requests/3/discussions/discussion-123/notes/777/award_emoji",
+            ))
+            .and(query_param("name", "eyes"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(add_response)
+            .mount(&server)
+            .await;
+
+        let delete_response = ResponseTemplate::new(204);
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/merge_requests/3/discussions/discussion-123/notes/777/award_emoji/501",
+            ))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(delete_response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let awards = client
+            .list_discussion_note_awards("group/repo", 3, "discussion-123", 777)
+            .await?;
+        assert_eq!(awards.len(), 1);
+        client
+            .add_discussion_note_award("group/repo", 3, "discussion-123", 777, "eyes")
+            .await?;
+        client
+            .delete_discussion_note_award("group/repo", 3, "discussion-123", 777, 501)
             .await?;
         Ok(())
     }

@@ -990,6 +990,7 @@ struct AppServerClient {
     buffer: Vec<u8>,
     pending_notifications: VecDeque<Value>,
     reasoning_buffers: HashMap<String, ReasoningBuffer>,
+    recent_runner_errors: VecDeque<String>,
     log_all_json: bool,
 }
 
@@ -1007,6 +1008,7 @@ impl AppServerClient {
             buffer: Vec::new(),
             pending_notifications: VecDeque::new(),
             reasoning_buffers: HashMap::new(),
+            recent_runner_errors: VecDeque::new(),
             log_all_json,
         }
     }
@@ -1527,6 +1529,7 @@ impl AppServerClient {
                 }
                 if trimmed.starts_with("codex-runner-error:") {
                     warn!("{}", trimmed);
+                    self.push_runner_error(trimmed);
                     continue;
                 }
                 if trimmed.starts_with("codex-install:") {
@@ -1535,6 +1538,7 @@ impl AppServerClient {
                 }
                 if trimmed.starts_with("codex-install-error:") {
                     warn!("{}", trimmed);
+                    self.push_runner_error(trimmed);
                     continue;
                 }
                 match serde_json::from_str::<Value>(trimmed) {
@@ -1562,9 +1566,27 @@ impl AppServerClient {
                     }
                     LogOutput::StdIn { .. } => {}
                 },
-                Some(Err(err)) => return Err(anyhow!(err).context("read codex app-server output")),
-                None => bail!("codex app-server closed stdout"),
+                Some(Err(err)) => {
+                    return Err(with_recent_runner_errors(
+                        anyhow!(err).context("read codex app-server output"),
+                        &self.recent_runner_errors,
+                    ));
+                }
+                None => {
+                    return Err(with_recent_runner_errors(
+                        anyhow!("codex app-server closed stdout"),
+                        &self.recent_runner_errors,
+                    ));
+                }
             }
+        }
+    }
+
+    fn push_runner_error(&mut self, line: &str) {
+        const MAX_RECENT_RUNNER_ERRORS: usize = 8;
+        self.recent_runner_errors.push_back(line.to_string());
+        while self.recent_runner_errors.len() > MAX_RECENT_RUNNER_ERRORS {
+            self.recent_runner_errors.pop_front();
         }
     }
 }
@@ -1648,6 +1670,24 @@ fn extract_json_block(text: &str) -> Option<String> {
     Some(text[start..=end].to_string())
 }
 
+fn with_recent_runner_errors(
+    err: anyhow::Error,
+    recent_runner_errors: &VecDeque<String>,
+) -> anyhow::Error {
+    if recent_runner_errors.is_empty() {
+        err
+    } else {
+        err.context(format!(
+            "recent runner errors: {}",
+            recent_runner_errors
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CodexOutput {
     verdict: String,
@@ -1710,6 +1750,32 @@ mod tests {
             }
             _ => bail!("expected comment"),
         }
+    }
+
+    #[test]
+    fn with_recent_runner_errors_adds_context() {
+        let err = anyhow!("codex app-server closed stdout");
+        let recent = VecDeque::from(vec![
+            "codex-runner-error: codex install failed".to_string(),
+            "codex-runner-error: npm ERR! network".to_string(),
+        ]);
+        let wrapped = with_recent_runner_errors(err, &recent);
+        let chain = format!("{wrapped:#}");
+        assert!(chain.contains("codex app-server closed stdout"));
+        assert!(chain.contains("recent runner errors:"));
+        assert!(chain.contains("codex-runner-error: codex install failed"));
+        assert!(chain.contains("codex-runner-error: npm ERR! network"));
+    }
+
+    #[test]
+    fn with_recent_runner_errors_is_noop_when_empty() {
+        let err = anyhow!("codex app-server closed stdout");
+        let recent = VecDeque::new();
+        let wrapped = with_recent_runner_errors(err, &recent);
+        assert_eq!(
+            wrapped.to_string(),
+            "codex app-server closed stdout".to_string()
+        );
     }
 
     #[test]

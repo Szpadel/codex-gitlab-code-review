@@ -246,6 +246,34 @@ impl ReviewService {
             );
         }
         for mention in mention_in_progress {
+            if self.config.review.dry_run {
+                info!(
+                    repo = mention.key.repo.as_str(),
+                    iid = mention.key.iid,
+                    discussion_id = mention.key.discussion_id.as_str(),
+                    trigger_note_id = mention.key.trigger_note_id,
+                    "dry run: skipping stale mention-command eyes-reaction cleanup during recovery"
+                );
+            } else if let Err(err) = remove_eyes_from_discussion_note(
+                self.gitlab.as_ref(),
+                mention.key.repo.as_str(),
+                mention.key.iid,
+                mention.key.discussion_id.as_str(),
+                mention.key.trigger_note_id,
+                self.bot_user_id,
+                &self.config.review.eyes_emoji,
+            )
+            .await
+            {
+                warn!(
+                    repo = mention.key.repo.as_str(),
+                    iid = mention.key.iid,
+                    discussion_id = mention.key.discussion_id.as_str(),
+                    trigger_note_id = mention.key.trigger_note_id,
+                    error = %err,
+                    "failed to remove stale mention-command eyes reaction during recovery"
+                );
+            }
             if let Err(err) = self
                 .state
                 .finish_mention_command(
@@ -570,6 +598,8 @@ impl ReviewService {
             let command_repo_name = command_repo.clone();
             let mr_copy = mr.clone();
             let head_sha_copy = head_sha.to_string();
+            let eyes_emoji = self.config.review.eyes_emoji.clone();
+            let bot_user_id = self.bot_user_id;
             let requester = self
                 .resolve_requester_identity(&trigger.trigger_note.author)
                 .await;
@@ -623,13 +653,16 @@ impl ReviewService {
                     &effective_head_sha,
                     &trigger,
                 );
-                let start_message = format!(
-                    "Starting mention command for note {} on `{}` at `{}`.",
-                    trigger_note_id, repo_name, effective_head_sha
-                );
-                if let Err(err) = gitlab
-                    .create_discussion_note(&repo_name, mr_copy.iid, &discussion_id, &start_message)
-                    .await
+                if let Err(err) = add_eyes_to_discussion_note(
+                    gitlab.as_ref(),
+                    &repo_name,
+                    mr_copy.iid,
+                    &discussion_id,
+                    trigger_note_id,
+                    bot_user_id,
+                    &eyes_emoji,
+                )
+                .await
                 {
                     warn!(
                         repo = repo_name.as_str(),
@@ -637,7 +670,7 @@ impl ReviewService {
                         discussion_id = discussion_id.as_str(),
                         trigger_note_id,
                         error = %err,
-                        "failed to post mention-command start status"
+                        "failed to add in-progress eyes reaction to mention trigger note"
                     );
                 }
 
@@ -687,12 +720,14 @@ impl ReviewService {
                         },
                     ),
                     Err(err) => {
+                        let error_chain = format!("{err:#}");
                         warn!(
                             repo = repo_name.as_str(),
                             iid = mr_copy.iid,
                             discussion_id = discussion_id.as_str(),
                             trigger_note_id,
                             error = %err,
+                            error_chain = error_chain.as_str(),
                             "mention command execution failed"
                         );
                         (
@@ -820,6 +855,26 @@ impl ReviewService {
                             "error",
                         )
                         .await;
+                }
+                if let Err(err) = remove_eyes_from_discussion_note(
+                    gitlab.as_ref(),
+                    &repo_name,
+                    mr_copy.iid,
+                    &discussion_id,
+                    trigger_note_id,
+                    bot_user_id,
+                    &eyes_emoji,
+                )
+                .await
+                {
+                    warn!(
+                        repo = repo_name.as_str(),
+                        iid = mr_copy.iid,
+                        discussion_id = discussion_id.as_str(),
+                        trigger_note_id,
+                        error = %err,
+                        "failed to remove in-progress eyes reaction from mention trigger note"
+                    );
                 }
             }));
         }
@@ -1626,6 +1681,58 @@ async fn remove_eyes(
     Ok(())
 }
 
+async fn add_eyes_to_discussion_note(
+    gitlab: &dyn GitLabApi,
+    repo: &str,
+    iid: u64,
+    discussion_id: &str,
+    note_id: u64,
+    bot_user_id: u64,
+    eyes: &str,
+) -> Result<()> {
+    if bot_user_id == 0 {
+        return Ok(());
+    }
+    let awards = gitlab
+        .list_discussion_note_awards(repo, iid, discussion_id, note_id)
+        .await?;
+    if awards
+        .iter()
+        .any(|award| award.user.id == bot_user_id && award.name == eyes)
+    {
+        return Ok(());
+    }
+    gitlab
+        .add_discussion_note_award(repo, iid, discussion_id, note_id, eyes)
+        .await?;
+    Ok(())
+}
+
+async fn remove_eyes_from_discussion_note(
+    gitlab: &dyn GitLabApi,
+    repo: &str,
+    iid: u64,
+    discussion_id: &str,
+    note_id: u64,
+    bot_user_id: u64,
+    eyes: &str,
+) -> Result<()> {
+    if bot_user_id == 0 {
+        return Ok(());
+    }
+    let awards = gitlab
+        .list_discussion_note_awards(repo, iid, discussion_id, note_id)
+        .await?;
+    for award in awards {
+        if award.user.id == bot_user_id && award.name == eyes {
+            gitlab
+                .delete_discussion_note_award(repo, iid, discussion_id, note_id, award.id)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1813,6 +1920,58 @@ mod tests {
         ) -> Result<()> {
             self.calls.lock().unwrap().push(format!(
                 "create_discussion_note:{project}:{iid}:{discussion_id}"
+            ));
+            Ok(())
+        }
+
+        async fn list_discussion_note_awards(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            note_id: u64,
+        ) -> Result<Vec<AwardEmoji>> {
+            let calls = self.calls.lock().unwrap();
+            let add_prefix =
+                format!("add_discussion_note_award:{project}:{iid}:{discussion_id}:{note_id}:");
+            let delete_prefix =
+                format!("delete_discussion_note_award:{project}:{iid}:{discussion_id}:{note_id}:");
+            let has_add = calls.iter().any(|call| call.starts_with(&add_prefix));
+            let has_delete = calls.iter().any(|call| call.starts_with(&delete_prefix));
+            if has_add && !has_delete {
+                return Ok(vec![AwardEmoji {
+                    id: note_id + 10_000,
+                    name: "eyes".to_string(),
+                    user: self.bot_user.clone(),
+                }]);
+            }
+            Ok(Vec::new())
+        }
+
+        async fn add_discussion_note_award(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            note_id: u64,
+            name: &str,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "add_discussion_note_award:{project}:{iid}:{discussion_id}:{note_id}:{name}"
+            ));
+            Ok(())
+        }
+
+        async fn delete_discussion_note_award(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            note_id: u64,
+            award_id: u64,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "delete_discussion_note_award:{project}:{iid}:{discussion_id}:{note_id}:{award_id}"
             ));
             Ok(())
         }
@@ -2924,9 +3083,14 @@ mod tests {
                 .begin_mention_command("group/repo", 21, "discussion-1", 901, "sha21")
                 .await?
         );
+        gitlab
+            .calls
+            .lock()
+            .unwrap()
+            .push("add_discussion_note_award:group/repo:21:discussion-1:901:eyes".to_string());
         let service = ReviewService::new(
             config,
-            gitlab,
+            gitlab.clone(),
             state.clone(),
             runner.clone(),
             1,
@@ -2936,6 +3100,10 @@ mod tests {
         service.recover_in_progress_reviews().await?;
 
         assert_eq!(*runner.stop_calls.lock().unwrap(), 1);
+        let calls = gitlab.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|call| {
+            call.as_str() == "delete_discussion_note_award:group/repo:21:discussion-1:901:10901"
+        }));
         let row = sqlx::query(
             "SELECT status, result FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
         )
@@ -2943,6 +3111,76 @@ mod tests {
         .bind(21i64)
         .bind("discussion-1")
         .bind(901i64)
+        .fetch_one(state.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done");
+        assert_eq!(result, Some("error".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_in_progress_reviews_dry_run_skips_mention_reaction_cleanup() -> Result<()> {
+        let mut config = test_config();
+        config.review.dry_run = true;
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user,
+            mrs: Mutex::new(Vec::new()),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(RecoveryRunner {
+            stop_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        assert!(
+            state
+                .begin_mention_command("group/repo", 22, "discussion-2", 902, "sha22")
+                .await?
+        );
+        gitlab
+            .calls
+            .lock()
+            .unwrap()
+            .push("add_discussion_note_award:group/repo:22:discussion-2:902:eyes".to_string());
+        let service = ReviewService::new(
+            config,
+            gitlab.clone(),
+            state.clone(),
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+
+        service.recover_in_progress_reviews().await?;
+
+        let calls = gitlab.calls.lock().unwrap().clone();
+        assert!(!calls.iter().any(|call| {
+            call.starts_with("delete_discussion_note_award:group/repo:22:discussion-2:902:")
+        }));
+        let row = sqlx::query(
+            "SELECT status, result FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
+        )
+        .bind("group/repo")
+        .bind(22i64)
+        .bind("discussion-2")
+        .bind(902i64)
         .fetch_one(state.pool())
         .await?;
         let status: String = row.try_get("status")?;
@@ -3429,6 +3667,21 @@ mod tests {
                 .iter()
                 .any(|call| call == "create_discussion_note:group/repo:30:discussion-1")
         );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| {
+                    call.as_str() == "create_discussion_note:group/repo:30:discussion-1"
+                })
+                .count(),
+            1
+        );
+        assert!(calls.iter().any(|call| {
+            call.as_str() == "add_discussion_note_award:group/repo:30:discussion-1:901:eyes"
+        }));
+        assert!(calls.iter().any(|call| {
+            call.as_str() == "delete_discussion_note_award:group/repo:30:discussion-1:901:10901"
+        }));
         let row = sqlx::query(
             "SELECT status, result FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
         )
@@ -3526,6 +3779,23 @@ mod tests {
                 .iter()
                 .any(|call| call == "create_discussion_note:group/repo:33:discussion-standalone")
         );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| {
+                    call.as_str() == "create_discussion_note:group/repo:33:discussion-standalone"
+                })
+                .count(),
+            1
+        );
+        assert!(calls.iter().any(|call| {
+            call.as_str()
+                == "add_discussion_note_award:group/repo:33:discussion-standalone:930:eyes"
+        }));
+        assert!(calls.iter().any(|call| {
+            call.as_str()
+                == "delete_discussion_note_award:group/repo:33:discussion-standalone:930:10930"
+        }));
         let row = sqlx::query(
             "SELECT status, result FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
         )
@@ -3633,6 +3903,21 @@ mod tests {
                 .iter()
                 .any(|call| call == "create_discussion_note:group/repo:34:discussion-reply")
         );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| {
+                    call.as_str() == "create_discussion_note:group/repo:34:discussion-reply"
+                })
+                .count(),
+            1
+        );
+        assert!(calls.iter().any(|call| {
+            call.as_str() == "add_discussion_note_award:group/repo:34:discussion-reply:941:eyes"
+        }));
+        assert!(calls.iter().any(|call| {
+            call.as_str() == "delete_discussion_note_award:group/repo:34:discussion-reply:941:10941"
+        }));
         let row = sqlx::query(
             "SELECT status, result FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
         )
