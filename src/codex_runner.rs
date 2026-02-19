@@ -1148,6 +1148,12 @@ impl AppServerClient {
                             .or_else(|| message_deltas.borrow_mut().remove(item_id))
                             .unwrap_or_default();
                         if !extracted.trim().is_empty() {
+                            info!(
+                                item_id,
+                                kind = "agent",
+                                message = extracted.as_str(),
+                                "codex item message"
+                            );
                             *final_message.borrow_mut() = Some(extracted);
                         }
                     }
@@ -1196,7 +1202,6 @@ impl AppServerClient {
                         .and_then(|value| value.as_str())
                         .unwrap_or("<unknown>");
                     on_agent_message_delta(item_id, delta);
-                    info!(item_id, kind = "agent", message = %delta, "codex item message");
                 }
             }
             "item/commandExecution/outputDelta" => {
