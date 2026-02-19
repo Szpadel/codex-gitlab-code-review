@@ -1,13 +1,13 @@
 use crate::config::{CodexConfig, DockerConfig, ProxyConfig};
 use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
 use anyhow::{Context, Result, anyhow, bail};
+use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::models::{ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder,
     StartContainerOptionsBuilder, WaitContainerOptionsBuilder,
 };
-use bollard::Docker;
 use futures::StreamExt;
 use std::io::Write;
 use std::pin::Pin;
@@ -126,7 +126,11 @@ impl AuthRunner {
                     .as_ref()
                     .and_then(|err| err.message.clone())
                     .unwrap_or_else(|| "unknown error".to_string());
-                bail!("auth command failed with status {}: {}", result.status_code, message);
+                bail!(
+                    "auth command failed with status {}: {}",
+                    result.status_code,
+                    message
+                );
             }
             None => bail!("auth container exited without status"),
         }
@@ -198,7 +202,9 @@ exec codex -c cli_auth_credentials_store="file" {action_args}
 }
 
 async fn stream_output(
-    mut output: Pin<Box<dyn futures::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>,
+    mut output: Pin<
+        Box<dyn futures::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>,
+    >,
 ) -> Result<()> {
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();

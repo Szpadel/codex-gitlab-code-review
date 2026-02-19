@@ -171,6 +171,18 @@ async fn main() -> Result<()> {
             );
         }
     }
+    if config.review.mention_commands.enabled {
+        if let Some(bot_username) = config.review.mention_commands.bot_username.as_deref() {
+            info!(
+                bot_username = bot_username,
+                "mention commands enabled (scanning MR discussions for standalone comments and replies)"
+            );
+        } else {
+            warn!("mention commands enabled but inactive: bot username unavailable");
+        }
+    } else {
+        info!("mention commands disabled");
+    }
     let git_base = gitlab_client.git_base_url()?;
 
     let state = Arc::new(ReviewStateStore::new(&config.database.path).await?);

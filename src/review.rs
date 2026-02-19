@@ -417,13 +417,6 @@ impl ReviewService {
         triggers
     }
 
-    fn is_mention_author_allowed(&self, mr: &MergeRequest, author: &GitLabUser) -> bool {
-        mr.author
-            .as_ref()
-            .map(|mr_author| mr_author.id == author.id)
-            .unwrap_or(false)
-    }
-
     fn build_mention_prompt(
         repo: &str,
         mr: &MergeRequest,
@@ -514,6 +507,8 @@ impl ReviewService {
         if self.shutdown_requested() {
             return Ok(false);
         }
+        // GitLab merge request discussions cover both standalone comments
+        // (individual_note discussions) and threaded replies.
         let discussions = match self.gitlab.list_discussions(repo, mr.iid).await {
             Ok(discussions) => discussions,
             Err(err) => {
@@ -543,18 +538,6 @@ impl ReviewService {
         for trigger in triggers {
             if self.shutdown_requested() {
                 break;
-            }
-            if !self.is_mention_author_allowed(mr, &trigger.trigger_note.author) {
-                warn!(
-                    repo = repo,
-                    iid = mr.iid,
-                    discussion_id = trigger.discussion_id.as_str(),
-                    trigger_note_id = trigger.trigger_note.id,
-                    author_id = trigger.trigger_note.author.id,
-                    "skipping mention command trigger from unauthorized author"
-                );
-                counters.mention_skipped_processed += 1;
-                continue;
             }
             let trigger_note_id = trigger.trigger_note.id;
             if !self
@@ -3453,6 +3436,210 @@ mod tests {
         .bind(30i64)
         .bind("discussion-1")
         .bind(901i64)
+        .fetch_one(state.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done");
+        assert_eq!(result, Some("committed".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_runs_mention_command_for_standalone_discussion_comment() -> Result<()> {
+        let mut config = test_config();
+        config.review.mention_commands.enabled = true;
+        config.review.mention_commands.bot_username = Some("botuser".to_string());
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let standalone_author = GitLabUser {
+            id: 42,
+            username: Some("reviewer".to_string()),
+            name: Some("Reviewer".to_string()),
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(vec![mr(33, "sha33")]),
+            awards: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 33),
+                vec![AwardEmoji {
+                    id: 331,
+                    name: "thumbsup".to_string(),
+                    user: bot_user,
+                }],
+            )])),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 33),
+                vec![MergeRequestDiscussion {
+                    id: "discussion-standalone".to_string(),
+                    notes: vec![DiscussionNote {
+                        id: 930,
+                        body: "@botuser please handle this standalone comment".to_string(),
+                        author: standalone_author,
+                        system: false,
+                        in_reply_to_id: None,
+                        created_at: None,
+                    }],
+                }],
+            )])),
+            users: Mutex::new(HashMap::from([(
+                42,
+                GitLabUserDetail {
+                    id: 42,
+                    username: Some("reviewer".to_string()),
+                    name: Some("Reviewer".to_string()),
+                    public_email: Some("reviewer@example.com".to_string()),
+                },
+            )])),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(MentionRunner {
+            mention_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let service = ReviewService::new(
+            config,
+            gitlab.clone(),
+            state.clone(),
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+
+        service.scan_once().await?;
+
+        assert_eq!(*runner.mention_calls.lock().unwrap(), 1);
+        let calls = gitlab.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "create_discussion_note:group/repo:33:discussion-standalone")
+        );
+        let row = sqlx::query(
+            "SELECT status, result FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
+        )
+        .bind("group/repo")
+        .bind(33i64)
+        .bind("discussion-standalone")
+        .bind(930i64)
+        .fetch_one(state.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done");
+        assert_eq!(result, Some("committed".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_runs_mention_command_for_reply_from_non_mr_author() -> Result<()> {
+        let mut config = test_config();
+        config.review.mention_commands.enabled = true;
+        config.review.mention_commands.bot_username = Some("botuser".to_string());
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let reviewer = GitLabUser {
+            id: 44,
+            username: Some("reviewer2".to_string()),
+            name: Some("Reviewer Two".to_string()),
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(vec![mr(34, "sha34")]),
+            awards: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 34),
+                vec![AwardEmoji {
+                    id: 341,
+                    name: "thumbsup".to_string(),
+                    user: bot_user.clone(),
+                }],
+            )])),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 34),
+                vec![MergeRequestDiscussion {
+                    id: "discussion-reply".to_string(),
+                    notes: vec![
+                        DiscussionNote {
+                            id: 940,
+                            body: "Initial review thread note".to_string(),
+                            author: bot_user,
+                            system: false,
+                            in_reply_to_id: None,
+                            created_at: None,
+                        },
+                        DiscussionNote {
+                            id: 941,
+                            body: "@botuser please implement this follow-up".to_string(),
+                            author: reviewer,
+                            system: false,
+                            in_reply_to_id: Some(940),
+                            created_at: None,
+                        },
+                    ],
+                }],
+            )])),
+            users: Mutex::new(HashMap::from([(
+                44,
+                GitLabUserDetail {
+                    id: 44,
+                    username: Some("reviewer2".to_string()),
+                    name: Some("Reviewer Two".to_string()),
+                    public_email: Some("reviewer2@example.com".to_string()),
+                },
+            )])),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(MentionRunner {
+            mention_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let service = ReviewService::new(
+            config,
+            gitlab.clone(),
+            state.clone(),
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+
+        service.scan_once().await?;
+
+        assert_eq!(*runner.mention_calls.lock().unwrap(), 1);
+        let calls = gitlab.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "create_discussion_note:group/repo:34:discussion-reply")
+        );
+        let row = sqlx::query(
+            "SELECT status, result FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
+        )
+        .bind("group/repo")
+        .bind(34i64)
+        .bind("discussion-reply")
+        .bind(941i64)
         .fetch_one(state.pool())
         .await?;
         let status: String = row.try_get("status")?;
