@@ -718,9 +718,10 @@ exec codex app-server
         review_result.map_err(|_| anyhow!("codex review timed out"))?
     }
 
-    async fn run_mention_container(
+    async fn run_mention_container_with_sandbox(
         &self,
         ctx: &MentionCommandContext,
+        sandbox_mode: &str,
     ) -> Result<MentionCommandResult> {
         let clone_url = self.clone_url(&ctx.repo)?;
         let repo_dir = "/work/repo";
@@ -737,7 +738,7 @@ exec codex app-server
                     json!({
                         "cwd": repo_dir,
                         "approvalPolicy": "never",
-                        "sandbox": self.sandbox_mode_value(),
+                        "sandbox": sandbox_mode,
                         "developerInstructions": Self::mention_developer_instructions(ctx),
                     }),
                 )
@@ -759,6 +760,7 @@ exec codex app-server
                     ],
                     Some(repo_dir),
                     None,
+                    sandbox_mode,
                 )
                 .await?;
             client
@@ -771,6 +773,7 @@ exec codex app-server
                     ],
                     Some(repo_dir),
                     None,
+                    sandbox_mode,
                 )
                 .await?;
             client
@@ -785,6 +788,7 @@ exec codex app-server
                     ],
                     Some(repo_dir),
                     None,
+                    sandbox_mode,
                 )
                 .await?;
             let before_sha = client
@@ -796,6 +800,7 @@ exec codex app-server
                     ],
                     Some(repo_dir),
                     None,
+                    sandbox_mode,
                 )
                 .await?
                 .stdout
@@ -832,6 +837,7 @@ exec codex app-server
                     ],
                     Some(repo_dir),
                     None,
+                    sandbox_mode,
                 )
                 .await?
                 .stdout
@@ -855,6 +861,7 @@ exec codex app-server
                         ],
                         Some(repo_dir),
                         None,
+                        sandbox_mode,
                     )
                     .await
                 {
@@ -870,6 +877,7 @@ exec codex app-server
                         ],
                         Some(repo_dir),
                         None,
+                        sandbox_mode,
                     )
                     .await?;
                 let commit_count = commit_count_output
@@ -895,6 +903,7 @@ exec codex app-server
                         ],
                         Some(repo_dir),
                         None,
+                        sandbox_mode,
                     )
                     .await?;
                 client
@@ -907,6 +916,7 @@ exec codex app-server
                         ],
                         Some(repo_dir),
                         None,
+                        sandbox_mode,
                     )
                     .await?;
                 (MentionCommandStatus::Committed, Some(after_sha))
@@ -920,6 +930,7 @@ exec codex app-server
                         ],
                         Some(repo_dir),
                         None,
+                        sandbox_mode,
                     )
                     .await?;
                 if !worktree_state.stdout.trim().is_empty() {
@@ -939,6 +950,14 @@ exec codex app-server
         self.remove_container_best_effort(&id).await;
 
         mention_result.map_err(|_| anyhow!("codex mention command timed out"))?
+    }
+
+    async fn run_mention_container(
+        &self,
+        ctx: &MentionCommandContext,
+    ) -> Result<MentionCommandResult> {
+        self.run_mention_container_with_sandbox(ctx, self.sandbox_mode_value())
+            .await
     }
 }
 
@@ -1383,6 +1402,7 @@ impl AppServerClient {
         command: Vec<String>,
         cwd: Option<&str>,
         timeout_ms: Option<u64>,
+        sandbox_mode: &str,
     ) -> Result<ExecOneOffCommandOutput> {
         let response = self
             .request(
@@ -1391,6 +1411,7 @@ impl AppServerClient {
                     "command": command,
                     "cwd": cwd,
                     "timeoutMs": timeout_ms,
+                    "sandboxPolicy": exec_one_off_sandbox_policy(sandbox_mode),
                 }),
             )
             .await?;
@@ -1588,6 +1609,14 @@ impl AppServerClient {
         while self.recent_runner_errors.len() > MAX_RECENT_RUNNER_ERRORS {
             self.recent_runner_errors.pop_front();
         }
+    }
+}
+
+fn exec_one_off_sandbox_policy(sandbox_mode: &str) -> Value {
+    match sandbox_mode {
+        "read-only" => json!({ "type": "read-only" }),
+        "workspace-write" => json!({ "type": "workspace-write" }),
+        _ => json!({ "type": "danger-full-access" }),
     }
 }
 

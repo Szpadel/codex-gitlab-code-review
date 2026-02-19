@@ -265,12 +265,14 @@ impl ReviewService {
             )
             .await
             {
+                let error_chain = format!("{err:#}");
                 warn!(
                     repo = mention.key.repo.as_str(),
                     iid = mention.key.iid,
                     discussion_id = mention.key.discussion_id.as_str(),
                     trigger_note_id = mention.key.trigger_note_id,
                     error = %err,
+                    error_chain = error_chain.as_str(),
                     "failed to remove stale mention-command eyes reaction during recovery"
                 );
             }
@@ -664,12 +666,14 @@ impl ReviewService {
                 )
                 .await
                 {
+                    let error_chain = format!("{err:#}");
                     warn!(
                         repo = repo_name.as_str(),
                         iid = mr_copy.iid,
                         discussion_id = discussion_id.as_str(),
                         trigger_note_id,
                         error = %err,
+                        error_chain = error_chain.as_str(),
                         "failed to add in-progress eyes reaction to mention trigger note"
                     );
                 }
@@ -867,12 +871,14 @@ impl ReviewService {
                 )
                 .await
                 {
+                    let error_chain = format!("{err:#}");
                     warn!(
                         repo = repo_name.as_str(),
                         iid = mr_copy.iid,
                         discussion_id = discussion_id.as_str(),
                         trigger_note_id,
                         error = %err,
+                        error_chain = error_chain.as_str(),
                         "failed to remove in-progress eyes reaction from mention trigger note"
                     );
                 }
