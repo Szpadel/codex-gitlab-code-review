@@ -147,6 +147,10 @@ pub struct ReviewMentionCommandsConfig {
     pub enabled: bool,
     #[serde(default)]
     pub bot_username: Option<String>,
+    #[serde(default)]
+    pub eyes_emoji: Option<String>,
+    #[serde(default)]
+    pub additional_developer_instructions: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -337,6 +341,70 @@ docker:
         let config = load_from_yaml(&yaml);
         assert!(!config.review.mention_commands.enabled);
         assert_eq!(config.review.mention_commands.bot_username, None);
+        assert_eq!(config.review.mention_commands.eyes_emoji, None);
+        assert_eq!(
+            config
+                .review
+                .mention_commands
+                .additional_developer_instructions,
+            None
+        );
+    }
+
+    #[test]
+    fn loads_mention_commands_overrides() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+  mention_commands:
+    enabled: true
+    bot_username: "botuser"
+    eyes_emoji: "inspect"
+    additional_developer_instructions: "Prefer small commits."
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let config = load_from_yaml(yaml);
+        assert!(config.review.mention_commands.enabled);
+        assert_eq!(
+            config.review.mention_commands.bot_username.as_deref(),
+            Some("botuser")
+        );
+        assert_eq!(
+            config.review.mention_commands.eyes_emoji.as_deref(),
+            Some("inspect")
+        );
+        assert_eq!(
+            config
+                .review
+                .mention_commands
+                .additional_developer_instructions
+                .as_deref(),
+            Some("Prefer small commits.")
+        );
     }
 
     #[test]

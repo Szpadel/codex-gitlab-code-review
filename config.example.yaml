@@ -58,6 +58,10 @@ review:
     enabled: false
     # Optional. Override @mention username. null means auto-detect from token user.
     bot_username: null
+    # Optional. Mention-specific in-progress emoji. null falls back to review.eyes_emoji.
+    eyes_emoji: null
+    # Optional. Extra developer instructions appended for mention-triggered reviews.
+    additional_developer_instructions: null
 
 codex:
   # Required. Docker image containing the Codex app-server.

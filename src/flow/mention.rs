@@ -66,6 +66,7 @@ impl MentionFlow {
                 "recovering interrupted in-progress mention commands"
             );
         }
+        let mention_eyes_emoji = self.mention_eyes_emoji();
         for mention in mention_in_progress {
             if self.shared.config.review.dry_run {
                 info!(
@@ -82,7 +83,7 @@ impl MentionFlow {
                 mention.key.discussion_id.as_str(),
                 mention.key.trigger_note_id,
                 self.shared.bot_user_id,
-                &self.shared.config.review.eyes_emoji,
+                &mention_eyes_emoji,
             )
             .await
             {
@@ -142,6 +143,19 @@ impl MentionFlow {
                     Some(trimmed)
                 }
             })
+    }
+
+    fn mention_eyes_emoji(&self) -> String {
+        self.shared
+            .config
+            .review
+            .mention_commands
+            .eyes_emoji
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(self.shared.config.review.eyes_emoji.as_str())
+            .to_string()
     }
 
     fn gitlab_host(&self) -> String {
@@ -384,6 +398,14 @@ impl MentionFlow {
                 return Ok(outcome);
             }
         };
+        let mention_eyes_emoji = self.mention_eyes_emoji();
+        let additional_developer_instructions = self
+            .shared
+            .config
+            .review
+            .mention_commands
+            .additional_developer_instructions
+            .clone();
         for trigger in triggers {
             if self.shared.shutdown_requested() {
                 break;
@@ -420,8 +442,9 @@ impl MentionFlow {
             let command_repo_name = command_repo.clone();
             let mr_copy = mr.clone();
             let head_sha_copy = head_sha.to_string();
-            let eyes_emoji = self.shared.config.review.eyes_emoji.clone();
+            let eyes_emoji = mention_eyes_emoji.clone();
             let bot_user_id = self.shared.bot_user_id;
+            let additional_developer_instructions = additional_developer_instructions.clone();
             let requester = self
                 .resolve_requester_identity(&trigger.trigger_note.author)
                 .await;
@@ -507,6 +530,7 @@ impl MentionFlow {
                     trigger_note_id,
                     requester_name: requester.name.clone(),
                     requester_email: requester.email.clone(),
+                    additional_developer_instructions,
                     prompt,
                 };
                 let outcome = codex.run_mention_command(command_context).await;

@@ -33,6 +33,10 @@ config:
     mentionCommands:
       enabled: false
       botUsername: null
+      # Optional. Mention-specific in-progress emoji. null falls back to config.review.eyesEmoji.
+      eyesEmoji: null
+      # Optional. Extra developer instructions appended to mention flow.
+      additionalDeveloperInstructions: null
   codex:
     image: "ghcr.io/openai/codex-universal:latest"
     timeoutSeconds: 1800

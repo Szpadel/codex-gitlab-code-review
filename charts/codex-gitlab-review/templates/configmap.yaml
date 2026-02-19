@@ -66,6 +66,17 @@ data:
 {{- else }}
         bot_username: null
 {{- end }}
+{{- if .Values.config.review.mentionCommands.eyesEmoji }}
+        eyes_emoji: {{ .Values.config.review.mentionCommands.eyesEmoji | quote }}
+{{- else }}
+        eyes_emoji: null
+{{- end }}
+{{- if .Values.config.review.mentionCommands.additionalDeveloperInstructions }}
+        additional_developer_instructions: |-
+{{ .Values.config.review.mentionCommands.additionalDeveloperInstructions | nindent 10 }}
+{{- else }}
+        additional_developer_instructions: null
+{{- end }}
     codex:
       image: {{ .Values.config.codex.image | quote }}
       timeout_seconds: {{ .Values.config.codex.timeoutSeconds }}

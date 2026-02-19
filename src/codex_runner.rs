@@ -41,6 +41,7 @@ pub struct MentionCommandContext {
     pub trigger_note_id: u64,
     pub requester_name: String,
     pub requester_email: String,
+    pub additional_developer_instructions: Option<String>,
     pub prompt: String,
 }
 
@@ -198,7 +199,7 @@ impl DockerCodexRunner {
     }
 
     fn mention_developer_instructions(ctx: &MentionCommandContext) -> String {
-        format!(
+        let mut instructions = format!(
             "You are handling a GitLab mention command request.\n\
              \n\
              Git identity for commits is configured as:\n\
@@ -213,7 +214,17 @@ impl DockerCodexRunner {
              - Keep the response focused on what you changed or answered.",
             name = ctx.requester_name,
             email = ctx.requester_email
-        )
+        );
+        if let Some(extra) = ctx
+            .additional_developer_instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            instructions.push_str("\n\nAdditional instructions:\n");
+            instructions.push_str(extra);
+        }
+        instructions
     }
 
     fn build_mention_command_script(
@@ -1867,6 +1878,7 @@ mod tests {
             trigger_note_id: 77,
             requester_name: "Alice Example".to_string(),
             requester_email: "alice@example.com".to_string(),
+            additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
         };
         let script = DockerCodexRunner::build_mention_command_script(
@@ -1910,6 +1922,7 @@ mod tests {
             trigger_note_id: 77,
             requester_name: "Alice Example".to_string(),
             requester_email: "alice@example.com".to_string(),
+            additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
         };
         let instructions = DockerCodexRunner::mention_developer_instructions(&ctx);
@@ -1918,6 +1931,43 @@ mod tests {
         assert!(instructions.contains("no commit was created"));
         assert!(instructions.contains("Name: Alice Example"));
         assert!(instructions.contains("Email: alice@example.com"));
+        assert!(!instructions.contains("Additional instructions:"));
+    }
+
+    #[test]
+    fn mention_developer_instructions_include_additional_section_when_configured() {
+        let ctx = MentionCommandContext {
+            repo: "group/repo".to_string(),
+            project_path: "group/repo".to_string(),
+            mr: MergeRequest {
+                iid: 11,
+                title: Some("Title".to_string()),
+                web_url: Some(
+                    "https://gitlab.example.com/group/repo/-/merge_requests/11".to_string(),
+                ),
+                created_at: None,
+                updated_at: None,
+                sha: Some("abc123".to_string()),
+                source_branch: None,
+                target_branch: Some("main".to_string()),
+                author: None,
+                source_project_id: None,
+                target_project_id: None,
+                diff_refs: None,
+            },
+            head_sha: "abc123".to_string(),
+            discussion_id: "discussion-1".to_string(),
+            trigger_note_id: 77,
+            requester_name: "Alice Example".to_string(),
+            requester_email: "alice@example.com".to_string(),
+            additional_developer_instructions: Some(
+                "  Prefer minimal diffs and include tests.  ".to_string(),
+            ),
+            prompt: "Do the change".to_string(),
+        };
+        let instructions = DockerCodexRunner::mention_developer_instructions(&ctx);
+        assert!(instructions.contains("Additional instructions:"));
+        assert!(instructions.contains("Prefer minimal diffs and include tests."));
     }
 
     #[test]

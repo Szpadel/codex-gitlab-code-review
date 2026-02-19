@@ -778,12 +778,15 @@ mod tests {
                 format!("add_discussion_note_award:{project}:{iid}:{discussion_id}:{note_id}:");
             let delete_prefix =
                 format!("delete_discussion_note_award:{project}:{iid}:{discussion_id}:{note_id}:");
-            let has_add = calls.iter().any(|call| call.starts_with(&add_prefix));
+            let added_emoji = calls
+                .iter()
+                .rev()
+                .find_map(|call| call.strip_prefix(&add_prefix).map(ToOwned::to_owned));
             let has_delete = calls.iter().any(|call| call.starts_with(&delete_prefix));
-            if has_add && !has_delete {
+            if let Some(name) = added_emoji.filter(|_| !has_delete) {
                 return Ok(vec![AwardEmoji {
                     id: note_id + 10_000,
-                    name: "eyes".to_string(),
+                    name,
                     user: self.bot_user.clone(),
                 }]);
             }
@@ -2415,6 +2418,7 @@ mod tests {
         let mut config = test_config();
         config.review.mention_commands.enabled = true;
         config.review.mention_commands.bot_username = Some("botuser".to_string());
+        config.review.mention_commands.eyes_emoji = Some("inspect".to_string());
         let bot_user = GitLabUser {
             id: 1,
             username: Some("botuser".to_string()),
@@ -2515,7 +2519,7 @@ mod tests {
             1
         );
         assert!(calls.iter().any(|call| {
-            call.as_str() == "add_discussion_note_award:group/repo:30:discussion-1:901:eyes"
+            call.as_str() == "add_discussion_note_award:group/repo:30:discussion-1:901:inspect"
         }));
         assert!(calls.iter().any(|call| {
             call.as_str() == "delete_discussion_note_award:group/repo:30:discussion-1:901:10901"
