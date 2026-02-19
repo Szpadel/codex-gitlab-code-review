@@ -137,6 +137,16 @@ pub struct ReviewConfig {
     pub stale_in_progress_minutes: u64,
     #[serde(default)]
     pub dry_run: bool,
+    #[serde(default)]
+    pub mention_commands: ReviewMentionCommandsConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReviewMentionCommandsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bot_username: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -169,6 +179,15 @@ impl Default for DockerConfig {
     fn default() -> Self {
         Self {
             host: default_docker_host(),
+        }
+    }
+}
+
+impl Default for ReviewMentionCommandsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_username: None,
         }
     }
 }
@@ -319,6 +338,14 @@ docker:
         assert_eq!(config.proxy.http_proxy, None);
         assert_eq!(config.proxy.https_proxy, None);
         assert_eq!(config.proxy.no_proxy, None);
+    }
+
+    #[test]
+    fn defaults_mention_commands_when_missing() {
+        let yaml = base_config_yaml("");
+        let config = load_from_yaml(&yaml);
+        assert!(!config.review.mention_commands.enabled);
+        assert_eq!(config.review.mention_commands.bot_username, None);
     }
 
     #[test]

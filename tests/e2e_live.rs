@@ -3,7 +3,7 @@ use chrono::{Duration, Utc};
 use codex_gitlab_code_review::codex_runner::DockerCodexRunner;
 use codex_gitlab_code_review::config::{
     CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets, ProxyConfig,
-    ReviewConfig, ScheduleConfig, ServerConfig, TargetSelector,
+    ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
 };
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::review::ReviewService;
@@ -53,6 +53,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
             stale_in_progress_minutes: 60,
             dry_run: true,
+            mention_commands: ReviewMentionCommandsConfig::default(),
         },
         codex: CodexConfig {
             image: "ghcr.io/openai/codex-universal:latest".to_string(),

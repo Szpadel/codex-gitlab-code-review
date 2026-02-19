@@ -96,14 +96,81 @@ async fn main() -> Result<()> {
         "starting codex gitlab review"
     );
     let gitlab_client = GitLabClient::new(&config.gitlab.base_url, &config.gitlab.token)?;
+    let needs_current_user_for_bot_user_id = config.gitlab.bot_user_id.is_none();
+    let needs_current_user_for_mention = config.review.mention_commands.enabled
+        && config.review.mention_commands.bot_username.is_none();
+    let current_user = if config.gitlab.token.is_empty() {
+        None
+    } else if needs_current_user_for_bot_user_id {
+        Some(gitlab_client.current_user().await?)
+    } else if needs_current_user_for_mention {
+        match gitlab_client.current_user().await {
+            Ok(user) => Some(user),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to resolve bot username for mention commands; mention triggers will be skipped"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let bot_user_id = match config.gitlab.bot_user_id {
         Some(id) => id,
         None if config.gitlab.token.is_empty() => {
             warn!("missing gitlab token; cannot determine bot user id");
             0
         }
-        None => gitlab_client.current_user().await?.id,
+        None => current_user
+            .as_ref()
+            .map(|user| user.id)
+            .ok_or_else(|| anyhow::anyhow!("failed to resolve bot user id"))?,
     };
+    if config.review.mention_commands.enabled
+        && config.review.mention_commands.bot_username.is_none()
+    {
+        if let Some(configured_bot_user_id) = config.gitlab.bot_user_id {
+            if config.gitlab.token.is_empty() {
+                warn!(
+                    "mention commands enabled with configured bot_user_id but gitlab token is missing; mention triggers will be skipped"
+                );
+            } else {
+                match gitlab_client.get_user(configured_bot_user_id).await {
+                    Ok(user) => {
+                        config.review.mention_commands.bot_username = user.username;
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            bot_user_id = configured_bot_user_id,
+                            "failed to resolve mention bot username from configured bot_user_id"
+                        );
+                        if let Some(username) = current_user
+                            .as_ref()
+                            .filter(|user| user.id == configured_bot_user_id)
+                            .and_then(|user| user.username.clone())
+                        {
+                            warn!(
+                                bot_user_id = configured_bot_user_id,
+                                "falling back to current_user username for mention commands"
+                            );
+                            config.review.mention_commands.bot_username = Some(username);
+                        }
+                    }
+                }
+            }
+        } else {
+            config.review.mention_commands.bot_username =
+                current_user.as_ref().and_then(|user| user.username.clone());
+        }
+        if config.review.mention_commands.bot_username.is_none() {
+            warn!(
+                "mention commands enabled but bot username could not be resolved; mention triggers will be skipped"
+            );
+        }
+    }
     let git_base = gitlab_client.git_base_url()?;
 
     let state = Arc::new(ReviewStateStore::new(&config.database.path).await?);

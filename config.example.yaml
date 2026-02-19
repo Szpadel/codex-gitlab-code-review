@@ -52,6 +52,12 @@ review:
   stale_in_progress_minutes: 120
   # Optional. If true, skip all GitLab writes (awards/notes).
   dry_run: false
+  # Optional. Mention-triggered thread commands configuration.
+  mention_commands:
+    # Optional. Enable mention-triggered command execution from MR discussions.
+    enabled: false
+    # Optional. Override @mention username. null means auto-detect from token user.
+    bot_username: null
 
 codex:
   # Required. Docker image containing the Codex app-server.

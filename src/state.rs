@@ -21,6 +21,20 @@ pub struct InProgressReview {
     pub head_sha: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MentionCommandStateKey {
+    pub repo: String,
+    pub iid: u64,
+    pub discussion_id: String,
+    pub trigger_note_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InProgressMentionCommand {
+    pub key: MentionCommandStateKey,
+    pub head_sha: String,
+}
+
 impl ReviewStateStore {
     pub async fn new(path: &str) -> Result<Self> {
         if path != ":memory:" {
@@ -167,6 +181,149 @@ impl ReviewStateStore {
         .await
         .context("mark stale reviews")?;
         Ok(())
+    }
+
+    pub async fn clear_stale_in_progress_mentions(&self, max_age_minutes: u64) -> Result<()> {
+        let cutoff = Utc::now().timestamp() - (max_age_minutes as i64 * 60);
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            r#"
+            UPDATE mention_command_state
+            SET status = 'done', result = 'error', updated_at = ?
+            WHERE status = 'in_progress' AND updated_at < ?
+            "#,
+        )
+        .bind(now)
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .context("mark stale mention commands")?;
+        Ok(())
+    }
+
+    pub async fn begin_mention_command(
+        &self,
+        repo: &str,
+        iid: u64,
+        discussion_id: &str,
+        trigger_note_id: u64,
+        head_sha: &str,
+    ) -> Result<bool> {
+        let now = Utc::now().timestamp();
+        let result = sqlx::query(
+            r#"
+            INSERT INTO mention_command_state (
+                repo,
+                iid,
+                discussion_id,
+                trigger_note_id,
+                head_sha,
+                status,
+                started_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?)
+            ON CONFLICT(repo, iid, discussion_id, trigger_note_id) DO UPDATE
+            SET head_sha = excluded.head_sha,
+                status = 'in_progress',
+                started_at = excluded.started_at,
+                updated_at = excluded.updated_at,
+                result = NULL
+            WHERE mention_command_state.status != 'in_progress'
+              AND (
+                  mention_command_state.result = 'cancelled'
+                  OR mention_command_state.result IS NULL
+              )
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(discussion_id)
+        .bind(trigger_note_id as i64)
+        .bind(head_sha)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("insert mention command state")?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn finish_mention_command(
+        &self,
+        repo: &str,
+        iid: u64,
+        discussion_id: &str,
+        trigger_note_id: u64,
+        head_sha: &str,
+        result: &str,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            r#"
+            UPDATE mention_command_state
+            SET status = 'done', result = ?, updated_at = ?
+            WHERE repo = ?
+              AND iid = ?
+              AND discussion_id = ?
+              AND trigger_note_id = ?
+              AND head_sha = ?
+              AND status = 'in_progress'
+            "#,
+        )
+        .bind(result)
+        .bind(now)
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(discussion_id)
+        .bind(trigger_note_id as i64)
+        .bind(head_sha)
+        .execute(&self.pool)
+        .await
+        .context("update mention command state")?;
+        Ok(())
+    }
+
+    pub async fn list_in_progress_mention_commands(&self) -> Result<Vec<InProgressMentionCommand>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT repo, iid, discussion_id, trigger_note_id, head_sha
+            FROM mention_command_state
+            WHERE status = 'in_progress'
+            ORDER BY repo, iid, discussion_id, trigger_note_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list in-progress mention commands")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let repo: String = row.try_get("repo").context("read mention command repo")?;
+                let iid_raw: i64 = row.try_get("iid").context("read mention command iid")?;
+                let iid = u64::try_from(iid_raw).context("convert mention command iid to u64")?;
+                let discussion_id: String = row
+                    .try_get("discussion_id")
+                    .context("read mention command discussion id")?;
+                let trigger_note_id_raw: i64 = row
+                    .try_get("trigger_note_id")
+                    .context("read mention command trigger note id")?;
+                let trigger_note_id = u64::try_from(trigger_note_id_raw)
+                    .context("convert mention command trigger note id to u64")?;
+                let head_sha: String = row
+                    .try_get("head_sha")
+                    .context("read mention command head sha")?;
+                Ok(InProgressMentionCommand {
+                    key: MentionCommandStateKey {
+                        repo,
+                        iid,
+                        discussion_id,
+                        trigger_note_id,
+                    },
+                    head_sha,
+                })
+            })
+            .collect()
     }
 
     pub async fn get_project_last_mr_activity(&self, repo: &str) -> Result<Option<String>> {
@@ -361,6 +518,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clear_stale_mentions_mark_error_and_block_replay() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let repo = "group/repo";
+        let iid = 11u64;
+        let discussion_id = "discussion-1";
+        let trigger_note_id = 22u64;
+        store
+            .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1")
+            .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE mention_command_state
+            SET updated_at = 0
+            WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(discussion_id)
+        .bind(trigger_note_id as i64)
+        .execute(store.pool())
+        .await?;
+
+        store.clear_stale_in_progress_mentions(1).await?;
+        let again = store
+            .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha2")
+            .await?;
+
+        assert_eq!(again, false);
+        let row = sqlx::query(
+            r#"
+            SELECT status, result
+            FROM mention_command_state
+            WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(discussion_id)
+        .bind(trigger_note_id as i64)
+        .fetch_one(store.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done".to_string());
+        assert_eq!(result, Some("error".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn list_in_progress_reviews_returns_only_active_rows() -> Result<()> {
         let store = ReviewStateStore::new(":memory:").await?;
         store.begin_review("group/repo-a", 1, "sha1").await?;
@@ -453,6 +661,182 @@ mod tests {
         assert_eq!(status, "done".to_string());
         assert_eq!(head_sha, "sha2".to_string());
         assert_eq!(result, Some("pass".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn begin_mention_command_is_idempotent() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let repo = "group/repo";
+        let iid = 11u64;
+        let discussion_id = "discussion-1";
+        let trigger_note_id = 22u64;
+
+        let first = store
+            .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1")
+            .await?;
+        let second = store
+            .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha2")
+            .await?;
+        assert_eq!(first, true);
+        assert_eq!(second, false);
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, head_sha, result
+            FROM mention_command_state
+            WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(discussion_id)
+        .bind(trigger_note_id as i64)
+        .fetch_one(store.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let head_sha: String = row.try_get("head_sha")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "in_progress".to_string());
+        assert_eq!(head_sha, "sha1".to_string());
+        assert_eq!(result, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn begin_mention_command_retries_after_cancelled_but_not_error() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let repo = "group/repo";
+        let iid = 12u64;
+        let discussion_id = "discussion-2";
+        let trigger_note_id = 23u64;
+
+        assert!(
+            store
+                .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1")
+                .await?
+        );
+        store
+            .finish_mention_command(
+                repo,
+                iid,
+                discussion_id,
+                trigger_note_id,
+                "sha1",
+                "cancelled",
+            )
+            .await?;
+        assert!(
+            store
+                .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha2")
+                .await?
+        );
+
+        store
+            .finish_mention_command(repo, iid, discussion_id, trigger_note_id, "sha2", "error")
+            .await?;
+        assert!(
+            !store
+                .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha3")
+                .await?
+        );
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, head_sha, result
+            FROM mention_command_state
+            WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(discussion_id)
+        .bind(trigger_note_id as i64)
+        .fetch_one(store.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let head_sha: String = row.try_get("head_sha")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done".to_string());
+        assert_eq!(head_sha, "sha2".to_string());
+        assert_eq!(result, Some("error".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finish_mention_command_transitions_only_in_progress_rows() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let repo = "group/repo";
+        let iid = 13u64;
+        let discussion_id = "discussion-3";
+        let trigger_note_id = 24u64;
+
+        let started = store
+            .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1")
+            .await?;
+        assert_eq!(started, true);
+
+        store
+            .finish_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1", "pass")
+            .await?;
+        store
+            .finish_mention_command(
+                repo,
+                iid,
+                discussion_id,
+                trigger_note_id,
+                "sha1",
+                "overwritten",
+            )
+            .await?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, result
+            FROM mention_command_state
+            WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(discussion_id)
+        .bind(trigger_note_id as i64)
+        .fetch_one(store.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done".to_string());
+        assert_eq!(result, Some("pass".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_in_progress_mention_commands_returns_only_active_rows() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+
+        store
+            .begin_mention_command("group/repo-a", 1, "discussion-a", 101, "sha-a")
+            .await?;
+        store
+            .begin_mention_command("group/repo-b", 2, "discussion-b", 102, "sha-b")
+            .await?;
+        store
+            .finish_mention_command("group/repo-b", 2, "discussion-b", 102, "sha-b", "pass")
+            .await?;
+
+        let in_progress = store.list_in_progress_mention_commands().await?;
+        assert_eq!(
+            in_progress,
+            vec![InProgressMentionCommand {
+                key: MentionCommandStateKey {
+                    repo: "group/repo-a".to_string(),
+                    iid: 1,
+                    discussion_id: "discussion-a".to_string(),
+                    trigger_note_id: 101,
+                },
+                head_sha: "sha-a".to_string(),
+            }]
+        );
         Ok(())
     }
 

@@ -22,11 +22,19 @@ pub struct MergeRequest {
     pub sha: Option<String>,
     pub source_branch: Option<String>,
     pub target_branch: Option<String>,
+    #[serde(default)]
+    pub author: Option<GitLabUser>,
+    #[serde(default)]
+    pub source_project_id: Option<u64>,
+    #[serde(default)]
+    pub target_project_id: Option<u64>,
     pub diff_refs: Option<DiffRefs>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitLabProject {
+    #[serde(default)]
+    pub path_with_namespace: Option<String>,
     pub last_activity_at: Option<String>,
 }
 
@@ -63,6 +71,35 @@ pub struct Note {
     pub author: GitLabUser,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MergeRequestDiscussion {
+    pub id: String,
+    #[serde(default)]
+    pub notes: Vec<DiscussionNote>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DiscussionNote {
+    pub id: u64,
+    pub body: String,
+    pub author: GitLabUser,
+    #[serde(default)]
+    pub system: bool,
+    #[serde(default)]
+    pub in_reply_to_id: Option<u64>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GitLabUserDetail {
+    pub id: u64,
+    pub username: Option<String>,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub public_email: Option<String>,
+}
+
 #[async_trait]
 pub trait GitLabApi: Send + Sync {
     async fn current_user(&self) -> Result<GitLabUser>;
@@ -77,6 +114,27 @@ pub trait GitLabApi: Send + Sync {
     async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()>;
     async fn list_notes(&self, project: &str, iid: u64) -> Result<Vec<Note>>;
     async fn create_note(&self, project: &str, iid: u64, body: &str) -> Result<()>;
+    async fn list_discussions(
+        &self,
+        _project: &str,
+        _iid: u64,
+    ) -> Result<Vec<MergeRequestDiscussion>> {
+        Ok(Vec::new())
+    }
+    async fn create_discussion_note(
+        &self,
+        project: &str,
+        iid: u64,
+        _discussion_id: &str,
+        body: &str,
+    ) -> Result<()> {
+        self.create_note(project, iid, body).await
+    }
+    async fn get_user(&self, user_id: u64) -> Result<GitLabUserDetail> {
+        Err(anyhow!(
+            "get_user not implemented for this gitlab client (user_id={user_id})"
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -320,6 +378,41 @@ impl GitLabApi for GitLabClient {
         );
         self.post_note(&url, body).await
     }
+
+    async fn list_discussions(
+        &self,
+        project: &str,
+        iid: u64,
+    ) -> Result<Vec<MergeRequestDiscussion>> {
+        let url = format!(
+            "{}/merge_requests/{}/discussions",
+            self.project_path(project),
+            iid
+        );
+        self.get_paginated(&url).await
+    }
+
+    async fn create_discussion_note(
+        &self,
+        project: &str,
+        iid: u64,
+        discussion_id: &str,
+        body: &str,
+    ) -> Result<()> {
+        let encoded_discussion_id = urlencoding::encode(discussion_id);
+        let url = format!(
+            "{}/merge_requests/{}/discussions/{}/notes",
+            self.project_path(project),
+            iid,
+            encoded_discussion_id
+        );
+        self.post_note(&url, body).await
+    }
+
+    async fn get_user(&self, user_id: u64) -> Result<GitLabUserDetail> {
+        let url = format!("{}/users/{}", self.api_base, user_id);
+        self.get_json(&url).await
+    }
 }
 
 async fn ensure_success<T: for<'de> Deserialize<'de>>(response: Response) -> Result<T> {
@@ -561,6 +654,93 @@ mod tests {
             project.last_activity_at,
             Some("2025-01-01T00:00:00Z".to_string())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_discussions_reads_thread_notes() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(vec![serde_json::json!({
+            "id": "discussion-1",
+            "notes": [
+                {
+                    "id": 101,
+                    "body": "root",
+                    "system": false,
+                    "author": { "id": 1, "username": "alice", "name": "Alice" }
+                },
+                {
+                    "id": 102,
+                    "body": "@botuser please fix",
+                    "system": false,
+                    "in_reply_to_id": 101,
+                    "author": { "id": 2, "username": "bob", "name": "Bob" }
+                }
+            ]
+        })]);
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/merge_requests/9/discussions",
+            ))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let discussions = client.list_discussions("group/repo", 9).await?;
+        assert_eq!(discussions.len(), 1);
+        assert_eq!(discussions[0].id, "discussion-1");
+        assert_eq!(discussions[0].notes.len(), 2);
+        assert_eq!(discussions[0].notes[1].in_reply_to_id, Some(101));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_discussion_note_posts_to_discussion_endpoint() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 777
+        }));
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/merge_requests/3/discussions/discussion-123/notes",
+            ))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        client
+            .create_discussion_note("group/repo", 3, "discussion-123", "working on it")
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_user_reads_public_email() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 44,
+            "username": "dev-user",
+            "name": "Dev User",
+            "public_email": "dev@example.com"
+        }));
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users/44"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let user = client.get_user(44).await?;
+        assert_eq!(user.id, 44);
+        assert_eq!(user.username.as_deref(), Some("dev-user"));
+        assert_eq!(user.public_email.as_deref(), Some("dev@example.com"));
         Ok(())
     }
 }

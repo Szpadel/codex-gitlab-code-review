@@ -30,6 +30,9 @@ config:
     commentMarkerPrefix: "<!-- codex-review:sha="
     staleInProgressMinutes: 120
     dryRun: false
+    mentionCommands:
+      enabled: false
+      botUsername: null
   codex:
     image: "ghcr.io/openai/codex-universal:latest"
     timeoutSeconds: 1800

@@ -31,9 +31,35 @@ pub struct ReviewContext {
 }
 
 #[derive(Debug, Clone)]
+pub struct MentionCommandContext {
+    pub repo: String,
+    pub project_path: String,
+    pub mr: MergeRequest,
+    pub head_sha: String,
+    pub discussion_id: String,
+    pub trigger_note_id: u64,
+    pub requester_name: String,
+    pub requester_email: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum CodexResult {
     Pass { summary: String },
     Comment { summary: String, body: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MentionCommandStatus {
+    Committed,
+    NoChanges,
+}
+
+#[derive(Debug, Clone)]
+pub struct MentionCommandResult {
+    pub status: MentionCommandStatus,
+    pub commit_sha: Option<String>,
+    pub reply_message: String,
 }
 
 const REVIEW_CONTAINER_NAME_PREFIX: &str = "codex-review-";
@@ -42,6 +68,13 @@ const REVIEW_OWNER_LABEL_KEY: &str = "codex.gitlab.review.owner";
 #[async_trait]
 pub trait CodexRunner: Send + Sync {
     async fn run_review(&self, ctx: ReviewContext) -> Result<CodexResult>;
+
+    async fn run_mention_command(
+        &self,
+        _ctx: MentionCommandContext,
+    ) -> Result<MentionCommandResult> {
+        bail!("mention command execution is not implemented by this runner")
+    }
 
     async fn stop_active_reviews(&self) -> Result<()> {
         Ok(())
@@ -161,6 +194,90 @@ impl DockerCodexRunner {
                 .filter(|value| !value.is_empty()),
             self.codex.deps.enabled,
         ))
+    }
+
+    fn mention_developer_instructions(ctx: &MentionCommandContext) -> String {
+        format!(
+            "You are handling a GitLab mention command request.\n\
+             \n\
+             Git identity for commits is configured as:\n\
+             - Name: {name}\n\
+             - Email: {email}\n\
+             \n\
+             Requirements:\n\
+             - If code changes are required, create at least one commit before you finish.\n\
+             - In your final response, include the commit SHA(s) you created.\n\
+             - If no code changes are required, explicitly say that no commit was created.\n\
+             - Do not push to remote.\n\
+             - Keep the response focused on what you changed or answered.",
+            name = ctx.requester_name,
+            email = ctx.requester_email
+        )
+    }
+
+    fn build_mention_command_script(
+        ctx: &MentionCommandContext,
+        clone_url: &str,
+        auth_mount_path: &str,
+    ) -> String {
+        let clone_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
+        let head_sha_q = shell_quote(&ctx.head_sha);
+        let auth_mount_path_q = shell_quote(auth_mount_path);
+        format!(
+            r#"set -eu
+repo_dir='/work/repo'
+log_file="/tmp/codex-mention-git.log"
+mkdir -p /work
+cd /work
+run_git() {{
+  action="$1"
+  shift
+  if [ "${{CODEX_RUNNER_DEBUG:-}}" = "1" ]; then
+    "$@" || {{ echo "codex-runner-error: git ${{action}} failed"; exit 1; }}
+  else
+    if ! "$@" >"$log_file" 2>&1; then
+      echo "codex-runner-error: git ${{action}} failed"
+      tail -n 50 "$log_file" | sed 's/^/codex-runner-error: /'
+      exit 1
+    fi
+  fi
+}}
+run_git clone git clone --depth 1 --recurse-submodules "{clone_url_dq}" "$repo_dir"
+cd "$repo_dir"
+run_git fetch git fetch --depth 1 origin {head_sha_q}
+run_git checkout git checkout {head_sha_q}
+run_git submodule_update git submodule update --init --recursive
+origin_url="$(git remote get-url origin || true)"
+if [ -n "$origin_url" ]; then
+  sanitized_origin="$(printf '%s' "$origin_url" | sed -E 's#(https?://)oauth2:[^@]*@#\1#')"
+  run_git set_url git remote set-url origin "$sanitized_origin"
+fi
+run_git set_pushurl git remote set-url --push origin "no_push://disabled"
+mkdir -p {auth_mount_path_q}
+export CODEX_HOME={auth_mount_path_q}
+if ! command -v codex >/dev/null 2>&1; then
+  echo "codex-runner: codex not found, installing"
+  if command -v npm >/dev/null 2>&1; then
+    if [ "${{CODEX_RUNNER_DEBUG:-}}" = "1" ]; then
+      npm install -g @openai/codex
+    else
+      if ! npm install -g @openai/codex >/tmp/codex-install.log 2>&1; then
+        echo "codex-runner-error: codex install failed"
+        tail -n 50 /tmp/codex-install.log | sed 's/^/codex-runner-error: /'
+        exit 1
+      fi
+    fi
+  else
+    echo "codex-runner-error: npm not found; provide a base image with node/npm or preinstall codex"
+    exit 1
+  fi
+fi
+exec codex app-server
+"#,
+            clone_url_dq = clone_url_dq,
+            head_sha_q = head_sha_q,
+            auth_mount_path_q = auth_mount_path_q,
+        )
     }
 
     fn build_command_script(
@@ -456,11 +573,19 @@ exec codex app-server
         }
     }
 
-    async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
-        let script = self.command(ctx)?;
+    async fn start_app_server_container(
+        &self,
+        script: String,
+        extra_binds: Vec<String>,
+    ) -> Result<(String, AppServerClient)> {
         let image_ref = Self::normalize_image_reference(&self.codex.image);
         ensure_image(&self.docker, &image_ref).await?;
         let name = format!("{}{}", REVIEW_CONTAINER_NAME_PREFIX, Uuid::new_v4());
+        let mut binds = vec![format!(
+            "{}:{}:rw",
+            self.codex.auth_host_path, self.codex.auth_mount_path
+        )];
+        binds.extend(extra_binds);
         let config = ContainerCreateBody {
             image: Some(image_ref.clone()),
             cmd: Some(Self::app_server_cmd(script)),
@@ -472,10 +597,7 @@ exec codex app-server
             open_stdin: Some(true),
             tty: Some(false),
             host_config: Some(HostConfig {
-                binds: Some(vec![format!(
-                    "{}:{}:rw",
-                    self.codex.auth_host_path, self.codex.auth_mount_path
-                )]),
+                binds: Some(binds),
                 auto_remove: Some(false),
                 ..Default::default()
             }),
@@ -527,6 +649,12 @@ exec codex app-server
             }
         };
 
+        Ok((id, AppServerClient::new(attach, self.log_all_json)))
+    }
+
+    async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
+        let script = self.command(ctx)?;
+        let (id, mut client) = self.start_app_server_container(script, Vec::new()).await?;
         let repo_path = "/work/repo";
         let instructions = self.review_instructions(ctx);
         let base_branch = ctx
@@ -539,7 +667,6 @@ exec codex app-server
         } else {
             json!({ "type": "custom", "instructions": instructions.clone() })
         };
-        let mut client = AppServerClient::new(attach, self.log_all_json);
 
         let review_result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
             client.initialize().await?;
@@ -590,6 +717,229 @@ exec codex app-server
 
         review_result.map_err(|_| anyhow!("codex review timed out"))?
     }
+
+    async fn run_mention_container(
+        &self,
+        ctx: &MentionCommandContext,
+    ) -> Result<MentionCommandResult> {
+        let clone_url = self.clone_url(&ctx.repo)?;
+        let repo_dir = "/work/repo";
+        let script =
+            Self::build_mention_command_script(ctx, &clone_url, &self.codex.auth_mount_path);
+        let (id, mut client) = self.start_app_server_container(script, Vec::new()).await?;
+
+        let mention_result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
+            client.initialize().await?;
+            client.initialized().await?;
+            let thread_response = client
+                .request(
+                    "thread/start",
+                    json!({
+                        "cwd": repo_dir,
+                        "approvalPolicy": "never",
+                        "sandbox": self.sandbox_mode_value(),
+                        "developerInstructions": Self::mention_developer_instructions(ctx),
+                    }),
+                )
+                .await?;
+            let thread_id = thread_response
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(|id| id.as_str())
+                .ok_or_else(|| anyhow!("thread/start missing thread id"))?
+                .to_string();
+
+            client
+                .exec_one_off_command(
+                    vec![
+                        "git".to_string(),
+                        "config".to_string(),
+                        "user.name".to_string(),
+                        ctx.requester_name.clone(),
+                    ],
+                    Some(repo_dir),
+                    None,
+                )
+                .await?;
+            client
+                .exec_one_off_command(
+                    vec![
+                        "git".to_string(),
+                        "config".to_string(),
+                        "user.email".to_string(),
+                        ctx.requester_email.clone(),
+                    ],
+                    Some(repo_dir),
+                    None,
+                )
+                .await?;
+            client
+                .exec_one_off_command(
+                    vec![
+                        "git".to_string(),
+                        "remote".to_string(),
+                        "set-url".to_string(),
+                        "--push".to_string(),
+                        "origin".to_string(),
+                        "no_push://disabled".to_string(),
+                    ],
+                    Some(repo_dir),
+                    None,
+                )
+                .await?;
+            let before_sha = client
+                .exec_one_off_command(
+                    vec![
+                        "git".to_string(),
+                        "rev-parse".to_string(),
+                        "HEAD".to_string(),
+                    ],
+                    Some(repo_dir),
+                    None,
+                )
+                .await?
+                .stdout
+                .trim()
+                .to_string();
+
+            let turn_response = client
+                .request(
+                    "turn/start",
+                    json!({
+                        "threadId": thread_id.as_str(),
+                        "cwd": repo_dir,
+                        "input": [{ "type": "text", "text": ctx.prompt.as_str() }],
+                    }),
+                )
+                .await?;
+            let turn_id = turn_response
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(|id| id.as_str())
+                .ok_or_else(|| anyhow!("turn/start missing turn id"))?
+                .to_string();
+            let mut reply_message = client.stream_turn_message(&thread_id, &turn_id).await?;
+            if reply_message.trim().is_empty() {
+                reply_message = "Mention command completed.".to_string();
+            }
+
+            let after_sha = client
+                .exec_one_off_command(
+                    vec![
+                        "git".to_string(),
+                        "rev-parse".to_string(),
+                        "HEAD".to_string(),
+                    ],
+                    Some(repo_dir),
+                    None,
+                )
+                .await?
+                .stdout
+                .trim()
+                .to_string();
+            let (status, commit_sha) = if after_sha != before_sha {
+                let source_branch = ctx
+                    .mr
+                    .source_branch
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow!("merge request source branch is missing"))?;
+                if let Err(err) = client
+                    .exec_one_off_command(
+                        vec![
+                            "git".to_string(),
+                            "merge-base".to_string(),
+                            "--is-ancestor".to_string(),
+                            before_sha.clone(),
+                            after_sha.clone(),
+                        ],
+                        Some(repo_dir),
+                        None,
+                    )
+                    .await
+                {
+                    bail!("mention command moved HEAD outside MR ancestry: {err}");
+                }
+                let commit_count_output = client
+                    .exec_one_off_command(
+                        vec![
+                            "git".to_string(),
+                            "rev-list".to_string(),
+                            "--count".to_string(),
+                            format!("{before_sha}..{after_sha}"),
+                        ],
+                        Some(repo_dir),
+                        None,
+                    )
+                    .await?;
+                let commit_count = commit_count_output
+                    .stdout
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| {
+                        format!(
+                            "parse commit count for mention command range {}..{}",
+                            before_sha, after_sha
+                        )
+                    })?;
+                if commit_count == 0 {
+                    bail!("mention command moved HEAD without producing new commits");
+                }
+                let push_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
+                client
+                    .exec_one_off_command(
+                        vec![
+                            "bash".to_string(),
+                            "-lc".to_string(),
+                            format!("git remote set-url --push origin \"{push_url_dq}\""),
+                        ],
+                        Some(repo_dir),
+                        None,
+                    )
+                    .await?;
+                client
+                    .exec_one_off_command(
+                        vec![
+                            "git".to_string(),
+                            "push".to_string(),
+                            "origin".to_string(),
+                            format!("HEAD:{source_branch}"),
+                        ],
+                        Some(repo_dir),
+                        None,
+                    )
+                    .await?;
+                (MentionCommandStatus::Committed, Some(after_sha))
+            } else {
+                let worktree_state = client
+                    .exec_one_off_command(
+                        vec![
+                            "git".to_string(),
+                            "status".to_string(),
+                            "--porcelain".to_string(),
+                        ],
+                        Some(repo_dir),
+                        None,
+                    )
+                    .await?;
+                if !worktree_state.stdout.trim().is_empty() {
+                    bail!("mention command left uncommitted changes without creating a commit");
+                }
+                (MentionCommandStatus::NoChanges, None)
+            };
+
+            Ok::<MentionCommandResult, anyhow::Error>(MentionCommandResult {
+                status,
+                commit_sha,
+                reply_message,
+            })
+        })
+        .await;
+
+        self.remove_container_best_effort(&id).await;
+
+        mention_result.map_err(|_| anyhow!("codex mention command timed out"))?
+    }
 }
 
 #[async_trait]
@@ -605,6 +955,25 @@ impl CodexRunner for DockerCodexRunner {
             format!(
                 "parse codex review output for repo {} merge request {}",
                 ctx.repo, ctx.mr.iid
+            )
+        })
+    }
+
+    async fn run_mention_command(
+        &self,
+        ctx: MentionCommandContext,
+    ) -> Result<MentionCommandResult> {
+        info!(
+            repo = ctx.repo.as_str(),
+            iid = ctx.mr.iid,
+            discussion_id = ctx.discussion_id.as_str(),
+            trigger_note_id = ctx.trigger_note_id,
+            "starting codex mention command"
+        );
+        self.run_mention_container(&ctx).await.with_context(|| {
+            format!(
+                "run mention command for repo {} merge request {} discussion {} note {}",
+                ctx.repo, ctx.mr.iid, ctx.discussion_id, ctx.trigger_note_id
             )
         })
     }
@@ -895,6 +1264,153 @@ impl AppServerClient {
         review_text.ok_or_else(|| anyhow!("codex review missing review text"))
     }
 
+    async fn stream_turn_message(&mut self, thread_id: &str, turn_id: &str) -> Result<String> {
+        let mut final_message = None;
+        let mut message_deltas: HashMap<String, String> = HashMap::new();
+        loop {
+            let message = self.next_notification().await?;
+            let method = message
+                .get("method")
+                .and_then(|value| value.as_str())
+                .unwrap_or("<unknown>");
+            let params = message.get("params");
+            if !matches_thread_turn(params, thread_id, turn_id) {
+                continue;
+            }
+
+            match method {
+                "turn/started" => {
+                    info!(thread_id, turn_id, "codex turn started");
+                }
+                "item/agentMessage/delta" => {
+                    if let Some(delta) = params
+                        .and_then(|value| value.get("delta"))
+                        .and_then(|value| value.as_str())
+                    {
+                        let item_id = params
+                            .and_then(|value| value.get("itemId"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("<unknown>");
+                        if item_id != "<unknown>" {
+                            message_deltas
+                                .entry(item_id.to_string())
+                                .or_default()
+                                .push_str(delta);
+                        }
+                        info!(item_id, kind = "agent", message = %delta, "codex item message");
+                    }
+                }
+                "item/commandExecution/outputDelta" => {
+                    if let Some(delta) = params
+                        .and_then(|value| value.get("delta"))
+                        .and_then(|value| value.as_str())
+                    {
+                        let item_id = params
+                            .and_then(|value| value.get("itemId"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("<unknown>");
+                        info!(item_id, kind = "command", output = %delta, "codex command output");
+                    }
+                }
+                "item/completed" => {
+                    if let Some(item) = params.and_then(|value| value.get("item")) {
+                        if matches!(
+                            item.get("type").and_then(|value| value.as_str()),
+                            Some("agentMessage") | Some("AgentMessage")
+                        ) {
+                            let item_id = item
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("<unknown>");
+                            let extracted = extract_agent_message_text(item)
+                                .or_else(|| message_deltas.remove(item_id))
+                                .unwrap_or_default();
+                            if !extracted.trim().is_empty() {
+                                final_message = Some(extracted);
+                            }
+                        }
+                    }
+                }
+                "turn/completed" => {
+                    let status = params
+                        .and_then(|value| value.get("turn"))
+                        .and_then(|value| value.get("status"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    info!(status, "codex turn completed");
+                    if status == "failed" {
+                        let error_message = params
+                            .and_then(|value| value.get("turn"))
+                            .and_then(|value| value.get("error"))
+                            .and_then(|value| value.get("message"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown error");
+                        return Err(anyhow!("codex turn failed: {}", error_message));
+                    }
+                    break;
+                }
+                "error" => {
+                    if let Some(error_message) = params
+                        .and_then(|value| value.get("error"))
+                        .and_then(|value| value.get("message"))
+                        .and_then(|value| value.as_str())
+                    {
+                        warn!(error_message, "codex error");
+                    }
+                }
+                _ => {
+                    if self.log_all_json {
+                        debug!(method, "codex notification");
+                    }
+                }
+            }
+        }
+
+        if let Some(message) = final_message {
+            return Ok(message);
+        }
+        let fallback = message_deltas
+            .into_values()
+            .find(|value| !value.trim().is_empty())
+            .unwrap_or_default();
+        Ok(fallback)
+    }
+
+    async fn exec_one_off_command(
+        &mut self,
+        command: Vec<String>,
+        cwd: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<ExecOneOffCommandOutput> {
+        let response = self
+            .request(
+                "execOneOffCommand",
+                json!({
+                    "command": command,
+                    "cwd": cwd,
+                    "timeoutMs": timeout_ms,
+                }),
+            )
+            .await?;
+        let parsed: ExecOneOffCommandOutput =
+            serde_json::from_value(response).context("parse execOneOffCommand response")?;
+        if parsed.exit_code != 0 {
+            let stderr = parsed.stderr.trim();
+            if stderr.is_empty() {
+                bail!(
+                    "execOneOffCommand failed with exit code {}",
+                    parsed.exit_code
+                );
+            }
+            bail!(
+                "execOneOffCommand failed with exit code {}: {}",
+                parsed.exit_code,
+                stderr
+            );
+        }
+        Ok(parsed)
+    }
+
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = Value::String(Uuid::new_v4().to_string());
         let request = json!({
@@ -1070,6 +1586,24 @@ fn matches_thread_turn(params: Option<&Value>, thread_id: &str, turn_id: &str) -
     thread_matches && turn_matches
 }
 
+fn extract_agent_message_text(item: &Value) -> Option<String> {
+    let content = item.get("content")?.as_array()?;
+    let mut parts = Vec::new();
+    for entry in content {
+        if entry.get("type").and_then(|value| value.as_str()) == Some("Text")
+            && let Some(text) = entry.get("text").and_then(|value| value.as_str())
+            && !text.trim().is_empty()
+        {
+            parts.push(text.to_string());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
 fn parse_review_output(text: &str) -> Result<CodexResult> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1119,6 +1653,18 @@ struct CodexOutput {
     verdict: String,
     summary: String,
     comment_markdown: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecOneOffCommandOutput {
+    #[serde(rename = "exitCode")]
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]
@@ -1223,6 +1769,85 @@ mod tests {
         );
         assert!(script.contains("prefetch_deps()"));
         assert!(script.contains("composer install"));
+    }
+
+    #[test]
+    fn mention_command_script_clones_repo_and_starts_app_server() {
+        let ctx = MentionCommandContext {
+            repo: "group/repo".to_string(),
+            project_path: "group/repo".to_string(),
+            mr: MergeRequest {
+                iid: 11,
+                title: Some("Title".to_string()),
+                web_url: Some(
+                    "https://gitlab.example.com/group/repo/-/merge_requests/11".to_string(),
+                ),
+                created_at: None,
+                updated_at: None,
+                sha: Some("abc123".to_string()),
+                source_branch: None,
+                target_branch: Some("main".to_string()),
+                author: None,
+                source_project_id: None,
+                target_project_id: None,
+                diff_refs: None,
+            },
+            head_sha: "abc123".to_string(),
+            discussion_id: "discussion-1".to_string(),
+            trigger_note_id: 77,
+            requester_name: "Alice Example".to_string(),
+            requester_email: "alice@example.com".to_string(),
+            prompt: "Do the change".to_string(),
+        };
+        let script = DockerCodexRunner::build_mention_command_script(
+            &ctx,
+            "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "/root/.codex",
+        );
+        assert!(
+            script.contains("git clone --depth 1 --recurse-submodules \"https://oauth2:${GITLAB_TOKEN}@example.com/repo.git\"")
+        );
+        assert!(!script.contains("rm -rf"));
+        assert!(script.contains("git remote set-url --push origin \"no_push://disabled\""));
+        assert!(script.contains("exec codex app-server"));
+        assert!(!script.contains("codex exec --sandbox workspace-write"));
+        assert!(!script.contains("GIT_AUTHOR_NAME="));
+    }
+
+    #[test]
+    fn mention_developer_instructions_require_commit_and_sha_reporting() {
+        let ctx = MentionCommandContext {
+            repo: "group/repo".to_string(),
+            project_path: "group/repo".to_string(),
+            mr: MergeRequest {
+                iid: 11,
+                title: Some("Title".to_string()),
+                web_url: Some(
+                    "https://gitlab.example.com/group/repo/-/merge_requests/11".to_string(),
+                ),
+                created_at: None,
+                updated_at: None,
+                sha: Some("abc123".to_string()),
+                source_branch: None,
+                target_branch: Some("main".to_string()),
+                author: None,
+                source_project_id: None,
+                target_project_id: None,
+                diff_refs: None,
+            },
+            head_sha: "abc123".to_string(),
+            discussion_id: "discussion-1".to_string(),
+            trigger_note_id: 77,
+            requester_name: "Alice Example".to_string(),
+            requester_email: "alice@example.com".to_string(),
+            prompt: "Do the change".to_string(),
+        };
+        let instructions = DockerCodexRunner::mention_developer_instructions(&ctx);
+        assert!(instructions.contains("create at least one commit before you finish"));
+        assert!(instructions.contains("include the commit SHA"));
+        assert!(instructions.contains("no commit was created"));
+        assert!(instructions.contains("Name: Alice Example"));
+        assert!(instructions.contains("Email: alice@example.com"));
     }
 
     #[test]

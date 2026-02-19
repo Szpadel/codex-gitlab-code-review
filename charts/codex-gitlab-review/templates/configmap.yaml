@@ -59,6 +59,13 @@ data:
       comment_marker_prefix: {{ .Values.config.review.commentMarkerPrefix | quote }}
       stale_in_progress_minutes: {{ .Values.config.review.staleInProgressMinutes }}
       dry_run: {{ .Values.config.review.dryRun }}
+      mention_commands:
+        enabled: {{ .Values.config.review.mentionCommands.enabled }}
+{{- if .Values.config.review.mentionCommands.botUsername }}
+        bot_username: {{ .Values.config.review.mentionCommands.botUsername | quote }}
+{{- else }}
+        bot_username: null
+{{- end }}
     codex:
       image: {{ .Values.config.codex.image | quote }}
       timeout_seconds: {{ .Values.config.codex.timeoutSeconds }}
