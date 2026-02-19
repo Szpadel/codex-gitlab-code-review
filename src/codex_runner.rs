@@ -13,6 +13,7 @@ use bollard::query_parameters::{
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::time::Duration;
@@ -1019,6 +1020,12 @@ struct ReasoningBuffer {
     text: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnStreamNotificationOutcome {
+    Continue,
+    TurnCompleted,
+}
+
 impl AppServerClient {
     fn new(attach: bollard::container::AttachContainerResults, log_all_json: bool) -> Self {
         Self {
@@ -1066,219 +1073,23 @@ impl AppServerClient {
                 continue;
             }
 
-            match method {
-                "turn/started" => {
-                    info!(thread_id, turn_id, "codex turn started");
-                }
-                "item/agentMessage/delta" => {
-                    if let Some(delta) = params
-                        .and_then(|value| value.get("delta"))
-                        .and_then(|value| value.as_str())
+            let outcome = self.handle_turn_notification(
+                method,
+                params,
+                thread_id,
+                turn_id,
+                |_, _| {},
+                |item| {
+                    if let Some(review) = item.get("review").and_then(|value| value.as_str())
+                        && item.get("type").and_then(|value| value.as_str())
+                            == Some("exitedReviewMode")
                     {
-                        let item_id = params
-                            .and_then(|value| value.get("itemId"))
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("<unknown>");
-                        info!(item_id, kind = "agent", message = %delta, "codex item message");
+                        review_text = Some(review.to_string());
                     }
-                }
-                "item/commandExecution/outputDelta" => {
-                    if let Some(delta) = params
-                        .and_then(|value| value.get("delta"))
-                        .and_then(|value| value.as_str())
-                    {
-                        let item_id = params
-                            .and_then(|value| value.get("itemId"))
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("<unknown>");
-                        info!(item_id, kind = "command", output = %delta, "codex command output");
-                    }
-                }
-                "item/reasoning/summaryTextDelta" => {
-                    if let Some(delta) = params
-                        .and_then(|value| value.get("delta"))
-                        .and_then(|value| value.as_str())
-                    {
-                        let item_id = params
-                            .and_then(|value| value.get("itemId"))
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("<unknown>");
-                        if item_id != "<unknown>" {
-                            self.reasoning_buffers
-                                .entry(item_id.to_string())
-                                .or_default()
-                                .summary
-                                .push_str(delta);
-                        }
-                    }
-                }
-                "item/reasoning/textDelta" => {
-                    if let Some(delta) = params
-                        .and_then(|value| value.get("delta"))
-                        .and_then(|value| value.as_str())
-                    {
-                        let item_id = params
-                            .and_then(|value| value.get("itemId"))
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("<unknown>");
-                        if item_id != "<unknown>" {
-                            self.reasoning_buffers
-                                .entry(item_id.to_string())
-                                .or_default()
-                                .text
-                                .push_str(delta);
-                        }
-                    }
-                }
-                "item/reasoning/summaryPartAdded" => {
-                    let item_id = params
-                        .and_then(|value| value.get("itemId"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("<unknown>");
-                    if item_id != "<unknown>" {
-                        let entry = self
-                            .reasoning_buffers
-                            .entry(item_id.to_string())
-                            .or_default();
-                        if !entry.summary.is_empty() {
-                            entry.summary.push('\n');
-                        }
-                    }
-                }
-                "item/started" => {
-                    if let Some(item) = params.and_then(|value| value.get("item")) {
-                        if let Some(item_type) = item.get("type").and_then(|value| value.as_str()) {
-                            match item_type {
-                                "commandExecution" => {
-                                    let item_id = item
-                                        .get("id")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or("<unknown>");
-                                    let command = item
-                                        .get("command")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or("<unknown>");
-                                    let cwd = item
-                                        .get("cwd")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or("<unknown>");
-                                    let status = item
-                                        .get("status")
-                                        .and_then(|value| value.as_str())
-                                        .unwrap_or("<unknown>");
-                                    info!(item_id, command, cwd, status, "codex command started");
-                                }
-                                "reasoning" => {
-                                    if self.log_all_json {
-                                        debug!(item_type, "codex item started");
-                                    }
-                                }
-                                _ => {
-                                    info!(item_type, "codex item started");
-                                }
-                            }
-                        }
-                    }
-                }
-                "item/completed" => {
-                    if let Some(item) = params.and_then(|value| value.get("item")) {
-                        if let Some(item_type) = item.get("type").and_then(|value| value.as_str()) {
-                            if item_type == "reasoning" {
-                                if let Some(item_id) =
-                                    item.get("id").and_then(|value| value.as_str())
-                                {
-                                    if let Some(buffer) = self.reasoning_buffers.remove(item_id) {
-                                        let reasoning = if !buffer.summary.trim().is_empty() {
-                                            buffer.summary
-                                        } else {
-                                            buffer.text
-                                        };
-                                        if !reasoning.trim().is_empty() {
-                                            info!(
-                                                item_id,
-                                                reasoning = reasoning.as_str(),
-                                                "codex reasoning completed"
-                                            );
-                                        }
-                                    }
-                                }
-                            } else if item_type == "commandExecution" {
-                                let item_id = item
-                                    .get("id")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("<unknown>");
-                                let command = item
-                                    .get("command")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("<unknown>");
-                                let cwd = item
-                                    .get("cwd")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("<unknown>");
-                                let status = item
-                                    .get("status")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("<unknown>");
-                                let exit_code =
-                                    item.get("exitCode").and_then(|value| value.as_i64());
-                                let duration_ms =
-                                    item.get("durationMs").and_then(|value| value.as_i64());
-                                info!(
-                                    item_id,
-                                    command,
-                                    cwd,
-                                    status,
-                                    exit_code,
-                                    duration_ms,
-                                    "codex command completed"
-                                );
-                            } else {
-                                info!(item_type, "codex item completed");
-                            }
-                            if let Some(review) =
-                                item.get("review").and_then(|value| value.as_str())
-                            {
-                                if item.get("type").and_then(|value| value.as_str())
-                                    == Some("exitedReviewMode")
-                                {
-                                    review_text = Some(review.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                "turn/completed" => {
-                    let status = params
-                        .and_then(|value| value.get("turn"))
-                        .and_then(|value| value.get("status"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown");
-                    info!(status, "codex turn completed");
-                    if status == "failed" {
-                        let error_message = params
-                            .and_then(|value| value.get("turn"))
-                            .and_then(|value| value.get("error"))
-                            .and_then(|value| value.get("message"))
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("unknown error");
-                        return Err(anyhow!("codex turn failed: {}", error_message));
-                    }
-                    break;
-                }
-                "error" => {
-                    if let Some(error_message) = params
-                        .and_then(|value| value.get("error"))
-                        .and_then(|value| value.get("message"))
-                        .and_then(|value| value.as_str())
-                    {
-                        warn!(error_message, "codex error");
-                    }
-                }
-                _ => {
-                    if self.log_all_json {
-                        debug!(method, "codex notification");
-                    }
-                }
+                },
+            )?;
+            if outcome == TurnStreamNotificationOutcome::TurnCompleted {
+                break;
             }
         }
 
@@ -1286,8 +1097,8 @@ impl AppServerClient {
     }
 
     async fn stream_turn_message(&mut self, thread_id: &str, turn_id: &str) -> Result<String> {
-        let mut final_message = None;
-        let mut message_deltas: HashMap<String, String> = HashMap::new();
+        let final_message = RefCell::new(None);
+        let message_deltas: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
         loop {
             let message = self.next_notification().await?;
             let method = message
@@ -1299,102 +1110,266 @@ impl AppServerClient {
                 continue;
             }
 
-            match method {
-                "turn/started" => {
-                    info!(thread_id, turn_id, "codex turn started");
-                }
-                "item/agentMessage/delta" => {
-                    if let Some(delta) = params
-                        .and_then(|value| value.get("delta"))
-                        .and_then(|value| value.as_str())
-                    {
-                        let item_id = params
-                            .and_then(|value| value.get("itemId"))
+            let outcome = self.handle_turn_notification(
+                method,
+                params,
+                thread_id,
+                turn_id,
+                |item_id, delta| {
+                    if item_id != "<unknown>" {
+                        message_deltas
+                            .borrow_mut()
+                            .entry(item_id.to_string())
+                            .or_default()
+                            .push_str(delta);
+                    }
+                },
+                |item| {
+                    if matches!(
+                        item.get("type").and_then(|value| value.as_str()),
+                        Some("agentMessage") | Some("AgentMessage")
+                    ) {
+                        let item_id = item
+                            .get("id")
                             .and_then(|value| value.as_str())
                             .unwrap_or("<unknown>");
-                        if item_id != "<unknown>" {
-                            message_deltas
-                                .entry(item_id.to_string())
-                                .or_default()
-                                .push_str(delta);
-                        }
-                        info!(item_id, kind = "agent", message = %delta, "codex item message");
-                    }
-                }
-                "item/commandExecution/outputDelta" => {
-                    if let Some(delta) = params
-                        .and_then(|value| value.get("delta"))
-                        .and_then(|value| value.as_str())
-                    {
-                        let item_id = params
-                            .and_then(|value| value.get("itemId"))
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("<unknown>");
-                        info!(item_id, kind = "command", output = %delta, "codex command output");
-                    }
-                }
-                "item/completed" => {
-                    if let Some(item) = params.and_then(|value| value.get("item")) {
-                        if matches!(
-                            item.get("type").and_then(|value| value.as_str()),
-                            Some("agentMessage") | Some("AgentMessage")
-                        ) {
-                            let item_id = item
-                                .get("id")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("<unknown>");
-                            let extracted = extract_agent_message_text(item)
-                                .or_else(|| message_deltas.remove(item_id))
-                                .unwrap_or_default();
-                            if !extracted.trim().is_empty() {
-                                final_message = Some(extracted);
-                            }
+                        let extracted = extract_agent_message_text(item)
+                            .or_else(|| message_deltas.borrow_mut().remove(item_id))
+                            .unwrap_or_default();
+                        if !extracted.trim().is_empty() {
+                            *final_message.borrow_mut() = Some(extracted);
                         }
                     }
-                }
-                "turn/completed" => {
-                    let status = params
-                        .and_then(|value| value.get("turn"))
-                        .and_then(|value| value.get("status"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown");
-                    info!(status, "codex turn completed");
-                    if status == "failed" {
-                        let error_message = params
-                            .and_then(|value| value.get("turn"))
-                            .and_then(|value| value.get("error"))
-                            .and_then(|value| value.get("message"))
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("unknown error");
-                        return Err(anyhow!("codex turn failed: {}", error_message));
-                    }
-                    break;
-                }
-                "error" => {
-                    if let Some(error_message) = params
-                        .and_then(|value| value.get("error"))
-                        .and_then(|value| value.get("message"))
-                        .and_then(|value| value.as_str())
-                    {
-                        warn!(error_message, "codex error");
-                    }
-                }
-                _ => {
-                    if self.log_all_json {
-                        debug!(method, "codex notification");
-                    }
-                }
+                },
+            )?;
+            if outcome == TurnStreamNotificationOutcome::TurnCompleted {
+                break;
             }
         }
 
-        if let Some(message) = final_message {
+        if let Some(message) = final_message.into_inner() {
             return Ok(message);
         }
         let fallback = message_deltas
+            .into_inner()
             .into_values()
             .find(|value| !value.trim().is_empty())
             .unwrap_or_default();
         Ok(fallback)
+    }
+
+    fn handle_turn_notification<FDelta, FCompleted>(
+        &mut self,
+        method: &str,
+        params: Option<&Value>,
+        thread_id: &str,
+        turn_id: &str,
+        mut on_agent_message_delta: FDelta,
+        mut on_item_completed: FCompleted,
+    ) -> Result<TurnStreamNotificationOutcome>
+    where
+        FDelta: FnMut(&str, &str),
+        FCompleted: FnMut(&Value),
+    {
+        match method {
+            "turn/started" => {
+                info!(thread_id, turn_id, "codex turn started");
+            }
+            "item/agentMessage/delta" => {
+                if let Some(delta) = params
+                    .and_then(|value| value.get("delta"))
+                    .and_then(|value| value.as_str())
+                {
+                    let item_id = params
+                        .and_then(|value| value.get("itemId"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<unknown>");
+                    on_agent_message_delta(item_id, delta);
+                    info!(item_id, kind = "agent", message = %delta, "codex item message");
+                }
+            }
+            "item/commandExecution/outputDelta" => {
+                if let Some(delta) = params
+                    .and_then(|value| value.get("delta"))
+                    .and_then(|value| value.as_str())
+                {
+                    let item_id = params
+                        .and_then(|value| value.get("itemId"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<unknown>");
+                    info!(item_id, kind = "command", output = %delta, "codex command output");
+                }
+            }
+            "item/reasoning/summaryTextDelta" => {
+                if let Some(delta) = params
+                    .and_then(|value| value.get("delta"))
+                    .and_then(|value| value.as_str())
+                {
+                    let item_id = params
+                        .and_then(|value| value.get("itemId"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<unknown>");
+                    if item_id != "<unknown>" {
+                        self.reasoning_buffers
+                            .entry(item_id.to_string())
+                            .or_default()
+                            .summary
+                            .push_str(delta);
+                    }
+                }
+            }
+            "item/reasoning/textDelta" => {
+                if let Some(delta) = params
+                    .and_then(|value| value.get("delta"))
+                    .and_then(|value| value.as_str())
+                {
+                    let item_id = params
+                        .and_then(|value| value.get("itemId"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("<unknown>");
+                    if item_id != "<unknown>" {
+                        self.reasoning_buffers
+                            .entry(item_id.to_string())
+                            .or_default()
+                            .text
+                            .push_str(delta);
+                    }
+                }
+            }
+            "item/reasoning/summaryPartAdded" => {
+                let item_id = params
+                    .and_then(|value| value.get("itemId"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("<unknown>");
+                if item_id != "<unknown>" {
+                    let entry = self
+                        .reasoning_buffers
+                        .entry(item_id.to_string())
+                        .or_default();
+                    if !entry.summary.is_empty() {
+                        entry.summary.push('\n');
+                    }
+                }
+            }
+            "item/started" => {
+                if let Some(item) = params.and_then(|value| value.get("item"))
+                    && let Some(item_type) = item.get("type").and_then(|value| value.as_str())
+                {
+                    match item_type {
+                        "commandExecution" => {
+                            let item_id = item
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("<unknown>");
+                            let command = item
+                                .get("command")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("<unknown>");
+                            let cwd = item
+                                .get("cwd")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("<unknown>");
+                            let status = item
+                                .get("status")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("<unknown>");
+                            info!(item_id, command, cwd, status, "codex command started");
+                        }
+                        "reasoning" => {
+                            if self.log_all_json {
+                                debug!(item_type, "codex item started");
+                            }
+                        }
+                        _ => {
+                            info!(item_type, "codex item started");
+                        }
+                    }
+                }
+            }
+            "item/completed" => {
+                if let Some(item) = params.and_then(|value| value.get("item"))
+                    && let Some(item_type) = item.get("type").and_then(|value| value.as_str())
+                {
+                    if item_type == "reasoning" {
+                        if let Some(item_id) = item.get("id").and_then(|value| value.as_str())
+                            && let Some(buffer) = self.reasoning_buffers.remove(item_id)
+                        {
+                            let reasoning = if !buffer.summary.trim().is_empty() {
+                                buffer.summary
+                            } else {
+                                buffer.text
+                            };
+                            if !reasoning.trim().is_empty() {
+                                info!(
+                                    item_id,
+                                    reasoning = reasoning.as_str(),
+                                    "codex reasoning completed"
+                                );
+                            }
+                        }
+                    } else if item_type == "commandExecution" {
+                        let item_id = item
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("<unknown>");
+                        let command = item
+                            .get("command")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("<unknown>");
+                        let cwd = item
+                            .get("cwd")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("<unknown>");
+                        let status = item
+                            .get("status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("<unknown>");
+                        let exit_code = item.get("exitCode").and_then(|value| value.as_i64());
+                        let duration_ms = item.get("durationMs").and_then(|value| value.as_i64());
+                        info!(
+                            item_id,
+                            command, cwd, status, exit_code, duration_ms, "codex command completed"
+                        );
+                    } else {
+                        info!(item_type, "codex item completed");
+                    }
+                    on_item_completed(item);
+                }
+            }
+            "turn/completed" => {
+                let status = params
+                    .and_then(|value| value.get("turn"))
+                    .and_then(|value| value.get("status"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                info!(status, "codex turn completed");
+                if status == "failed" {
+                    let error_message = params
+                        .and_then(|value| value.get("turn"))
+                        .and_then(|value| value.get("error"))
+                        .and_then(|value| value.get("message"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown error");
+                    return Err(anyhow!("codex turn failed: {}", error_message));
+                }
+                return Ok(TurnStreamNotificationOutcome::TurnCompleted);
+            }
+            "error" => {
+                if let Some(error_message) = params
+                    .and_then(|value| value.get("error"))
+                    .and_then(|value| value.get("message"))
+                    .and_then(|value| value.as_str())
+                {
+                    warn!(error_message, "codex error");
+                }
+            }
+            _ => {
+                if self.log_all_json {
+                    debug!(method, "codex notification");
+                }
+            }
+        }
+        Ok(TurnStreamNotificationOutcome::Continue)
     }
 
     async fn exec_one_off_command(
@@ -1663,19 +1638,19 @@ fn parse_review_output(text: &str) -> Result<CodexResult> {
         });
     }
 
-    if let Some(json_text) = extract_json_block(trimmed) {
-        if let Ok(parsed) = serde_json::from_str::<CodexOutput>(&json_text) {
-            return match parsed.verdict.as_str() {
-                "pass" => Ok(CodexResult::Pass {
-                    summary: parsed.summary,
-                }),
-                "comment" => Ok(CodexResult::Comment {
-                    summary: parsed.summary,
-                    body: parsed.comment_markdown,
-                }),
-                other => Err(anyhow!("unknown verdict: {}", other)),
-            };
-        }
+    if let Some(json_text) = extract_json_block(trimmed)
+        && let Ok(parsed) = serde_json::from_str::<CodexOutput>(&json_text)
+    {
+        return match parsed.verdict.as_str() {
+            "pass" => Ok(CodexResult::Pass {
+                summary: parsed.summary,
+            }),
+            "comment" => Ok(CodexResult::Comment {
+                summary: parsed.summary,
+                body: parsed.comment_markdown,
+            }),
+            other => Err(anyhow!("unknown verdict: {}", other)),
+        };
     }
 
     let summary = trimmed

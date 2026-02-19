@@ -42,12 +42,11 @@ impl ReviewStateStore {
             if path_obj.is_dir() {
                 bail!("database path is a directory: {}", path_obj.display());
             }
-            if let Some(parent) = path_obj.parent() {
-                if !parent.as_os_str().is_empty() {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("create database directory {}", parent.display())
-                    })?;
-                }
+            if let Some(parent) = path_obj.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create database directory {}", parent.display()))?;
             }
             if !path_obj.exists() {
                 OpenOptions::new()

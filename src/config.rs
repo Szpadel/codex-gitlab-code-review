@@ -141,7 +141,7 @@ pub struct ReviewConfig {
     pub mention_commands: ReviewMentionCommandsConfig,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct ReviewMentionCommandsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -179,15 +179,6 @@ impl Default for DockerConfig {
     fn default() -> Self {
         Self {
             host: default_docker_host(),
-        }
-    }
-}
-
-impl Default for ReviewMentionCommandsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            bot_username: None,
         }
     }
 }
