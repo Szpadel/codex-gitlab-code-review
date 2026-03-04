@@ -44,6 +44,11 @@ config:
     # Must be writable to persist refreshed auth.json credentials.
     authHostPath: ""
     authMountPath: "/root/.codex"
+    # Optional fallback auth accounts in descending priority order.
+    # Every account should use a distinct host path so each auth.json is isolated.
+    fallbackAuthAccounts: []
+    # Fallback cooldown in seconds when usage-limit reset timestamp cannot be parsed.
+    usageLimitFallbackCooldownSeconds: 3600
     execSandbox: "danger-full-access"
   docker:
     host: "unix:///var/run/docker.sock"

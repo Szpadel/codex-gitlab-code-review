@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
+use std::collections::HashSet;
 use std::env;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -162,7 +163,17 @@ pub struct CodexConfig {
     pub auth_mount_path: String,
     pub exec_sandbox: String,
     #[serde(default)]
+    pub fallback_auth_accounts: Vec<FallbackAuthAccountConfig>,
+    #[serde(default = "default_usage_limit_fallback_cooldown_seconds")]
+    pub usage_limit_fallback_cooldown_seconds: u64,
+    #[serde(default)]
     pub deps: DepsConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct FallbackAuthAccountConfig {
+    pub name: String,
+    pub auth_host_path: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -177,6 +188,10 @@ fn default_refresh_seconds() -> u64 {
 
 fn default_docker_host() -> String {
     "unix:///var/run/docker.sock".to_string()
+}
+
+fn default_usage_limit_fallback_cooldown_seconds() -> u64 {
+    3600
 }
 
 impl Default for DockerConfig {
@@ -226,8 +241,47 @@ impl Config {
         if config.docker.host.trim().is_empty() {
             config.docker.host = default_docker_host();
         }
+        validate_codex_auth_accounts(&config.codex)?;
         Ok(config)
     }
+}
+
+fn validate_codex_auth_accounts(codex: &CodexConfig) -> Result<()> {
+    anyhow::ensure!(
+        !codex.auth_host_path.trim().is_empty(),
+        "codex.auth_host_path must not be empty"
+    );
+
+    let mut names = HashSet::new();
+    let mut host_paths = HashSet::new();
+    host_paths.insert(codex.auth_host_path.as_str());
+
+    for account in &codex.fallback_auth_accounts {
+        anyhow::ensure!(
+            !account.name.trim().is_empty(),
+            "codex.fallback_auth_accounts[].name must not be empty"
+        );
+        anyhow::ensure!(
+            account.name != "primary",
+            "codex.fallback_auth_accounts[].name 'primary' is reserved"
+        );
+        anyhow::ensure!(
+            !account.auth_host_path.trim().is_empty(),
+            "codex.fallback_auth_accounts[].auth_host_path must not be empty"
+        );
+        anyhow::ensure!(
+            names.insert(account.name.as_str()),
+            "duplicate codex fallback account name: {}",
+            account.name
+        );
+        anyhow::ensure!(
+            host_paths.insert(account.auth_host_path.as_str()),
+            "duplicate codex auth_host_path across primary/fallback accounts: {}",
+            account.auth_host_path
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -349,6 +403,8 @@ docker:
                 .additional_developer_instructions,
             None
         );
+        assert!(config.codex.fallback_auth_accounts.is_empty());
+        assert_eq!(config.codex.usage_limit_fallback_cooldown_seconds, 3600);
     }
 
     #[test]
@@ -473,5 +529,179 @@ server:
 "#;
         let result = try_load_from_yaml(yaml);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn loads_fallback_auth_accounts_in_declared_order() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  usage_limit_fallback_cooldown_seconds: 120
+  fallback_auth_accounts:
+    - name: "backup-high"
+      auth_host_path: "/root/.codex-backup-high"
+    - name: "backup-low"
+      auth_host_path: "/root/.codex-backup-low"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let config = load_from_yaml(yaml);
+        assert_eq!(config.codex.usage_limit_fallback_cooldown_seconds, 120);
+        assert_eq!(config.codex.fallback_auth_accounts.len(), 2);
+        assert_eq!(config.codex.fallback_auth_accounts[0].name, "backup-high");
+        assert_eq!(
+            config.codex.fallback_auth_accounts[0].auth_host_path,
+            "/root/.codex-backup-high"
+        );
+        assert_eq!(config.codex.fallback_auth_accounts[1].name, "backup-low");
+        assert_eq!(
+            config.codex.fallback_auth_accounts[1].auth_host_path,
+            "/root/.codex-backup-low"
+        );
+    }
+
+    #[test]
+    fn errors_on_duplicate_fallback_account_name() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  fallback_auth_accounts:
+    - name: "backup"
+      auth_host_path: "/root/.codex-backup-a"
+    - name: "backup"
+      auth_host_path: "/root/.codex-backup-b"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("duplicate codex fallback account name"));
+    }
+
+    #[test]
+    fn errors_on_duplicate_auth_host_path_between_primary_and_fallback() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  fallback_auth_accounts:
+    - name: "backup"
+      auth_host_path: "/root/.codex"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("duplicate codex auth_host_path"));
+    }
+
+    #[test]
+    fn errors_on_reserved_primary_fallback_name() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  fallback_auth_accounts:
+    - name: "primary"
+      auth_host_path: "/root/.codex-backup"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("name 'primary' is reserved"));
     }
 }

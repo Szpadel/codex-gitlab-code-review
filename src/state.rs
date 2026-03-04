@@ -5,6 +5,8 @@ use std::fs::{self, OpenOptions};
 use std::path::Path;
 use uuid::Uuid;
 
+const AUTH_LIMIT_RESET_KEY_PREFIX: &str = "codex_auth_limit_reset_at::";
+
 pub struct ReviewStateStore {
     pool: SqlitePool,
 }
@@ -461,9 +463,67 @@ impl ReviewStateStore {
         Ok(owner_id)
     }
 
+    pub async fn get_auth_limit_reset_at(&self, account_name: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
+            .bind(auth_limit_reset_key(account_name))
+            .fetch_optional(&self.pool)
+            .await
+            .with_context(|| {
+                format!("load codex auth limit reset state for account {account_name}")
+            })?;
+        match row {
+            Some(row) => {
+                let value: String = row.try_get("value").with_context(|| {
+                    format!("read codex auth limit reset state for account {account_name}")
+                })?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn set_auth_limit_reset_at(&self, account_name: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO service_state (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = CASE
+                    WHEN julianday(service_state.value) IS NULL THEN excluded.value
+                    WHEN julianday(excluded.value) IS NULL THEN service_state.value
+                    WHEN julianday(excluded.value) > julianday(service_state.value) THEN excluded.value
+                    ELSE service_state.value
+                END
+            "#,
+        )
+        .bind(auth_limit_reset_key(account_name))
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .with_context(|| {
+            format!("upsert codex auth limit reset state for account {account_name}")
+        })?;
+        Ok(())
+    }
+
+    pub async fn clear_auth_limit_reset_at(&self, account_name: &str) -> Result<()> {
+        sqlx::query("DELETE FROM service_state WHERE key = ?")
+            .bind(auth_limit_reset_key(account_name))
+            .execute(&self.pool)
+            .await
+            .with_context(|| {
+                format!("delete codex auth limit reset state for account {account_name}")
+            })?;
+        Ok(())
+    }
+
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+fn auth_limit_reset_key(account_name: &str) -> String {
+    format!("{AUTH_LIMIT_RESET_KEY_PREFIX}{account_name}")
 }
 
 fn sqlite_url(path: &str) -> String {
@@ -923,6 +983,65 @@ mod tests {
 
         let second = store.get_or_create_review_owner_id().await?;
         assert_eq!(second, first);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_limit_reset_roundtrip_and_clear() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let account = "backup-1";
+
+        let missing = store.get_auth_limit_reset_at(account).await?;
+        assert_eq!(missing, None);
+
+        store
+            .set_auth_limit_reset_at(account, "2026-03-02T10:15:00Z")
+            .await?;
+        let loaded = store.get_auth_limit_reset_at(account).await?;
+        assert_eq!(loaded, Some("2026-03-02T10:15:00Z".to_string()));
+
+        store.clear_auth_limit_reset_at(account).await?;
+        let cleared = store.get_auth_limit_reset_at(account).await?;
+        assert_eq!(cleared, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_limit_reset_tracks_accounts_independently() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        store
+            .set_auth_limit_reset_at("primary", "2026-03-02T10:15:00Z")
+            .await?;
+        store
+            .set_auth_limit_reset_at("backup-1", "2026-03-02T12:00:00Z")
+            .await?;
+
+        let primary = store.get_auth_limit_reset_at("primary").await?;
+        let backup = store.get_auth_limit_reset_at("backup-1").await?;
+        assert_eq!(primary, Some("2026-03-02T10:15:00Z".to_string()));
+        assert_eq!(backup, Some("2026-03-02T12:00:00Z".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_limit_reset_keeps_latest_timestamp_for_account() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let account = "backup-1";
+
+        store
+            .set_auth_limit_reset_at(account, "2026-03-02T12:00:00Z")
+            .await?;
+        store
+            .set_auth_limit_reset_at(account, "2026-03-02T10:00:00Z")
+            .await?;
+        let after_older_write = store.get_auth_limit_reset_at(account).await?;
+        assert_eq!(after_older_write, Some("2026-03-02T12:00:00Z".to_string()));
+
+        store
+            .set_auth_limit_reset_at(account, "2026-03-02T13:30:00Z")
+            .await?;
+        let after_newer_write = store.get_auth_limit_reset_at(account).await?;
+        assert_eq!(after_newer_write, Some("2026-03-02T13:30:00Z".to_string()));
         Ok(())
     }
 }

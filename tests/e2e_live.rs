@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::{Duration, Utc};
-use codex_gitlab_code_review::codex_runner::DockerCodexRunner;
+use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
 use codex_gitlab_code_review::config::{
     CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets, ProxyConfig,
     ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
@@ -61,6 +61,8 @@ async fn e2e_live_dry_run() -> Result<()> {
             auth_host_path,
             auth_mount_path: "/root/.codex".to_string(),
             exec_sandbox: "danger-full-access".to_string(),
+            fallback_auth_accounts: Vec::new(),
+            usage_limit_fallback_cooldown_seconds: 3600,
             deps: codex_gitlab_code_review::config::DepsConfig { enabled: false },
         },
         docker: DockerConfig { host: docker_host },
@@ -100,9 +102,12 @@ async fn e2e_live_dry_run() -> Result<()> {
         config.codex.clone(),
         config.proxy.clone(),
         git_base,
-        config.gitlab.token.clone(),
-        false,
-        review_owner_id,
+        Arc::clone(&state),
+        RunnerRuntimeOptions {
+            gitlab_token: config.gitlab.token.clone(),
+            log_all_json: false,
+            owner_id: review_owner_id,
+        },
     )?;
     let service = ReviewService::new(
         config.clone(),

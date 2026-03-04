@@ -1,6 +1,17 @@
-{{- $authSubPath := "codex-auth" -}}
-{{- $authHostPath := default .Values.config.codex.authMountPath .Values.config.codex.authHostPath -}}
+{{- $primaryAuthSubPath := "codex-auth" -}}
+{{- $primaryAuthHostPath := default .Values.config.codex.authMountPath .Values.config.codex.authHostPath -}}
 {{- $authMountPath := .Values.config.codex.authMountPath -}}
+{{- $authAccountMounts := list (dict "hostPath" $primaryAuthHostPath "subPath" $primaryAuthSubPath) -}}
+{{- $allAuthHostPaths := list $primaryAuthHostPath -}}
+{{- range $index, $account := .Values.config.codex.fallbackAuthAccounts -}}
+{{- $fallbackSubPath := printf "codex-auth-fallback-%s" ((sha256sum $account.authHostPath) | trunc 12) -}}
+{{- $authAccountMounts = append $authAccountMounts (dict "hostPath" $account.authHostPath "subPath" $fallbackSubPath) -}}
+{{- $allAuthHostPaths = append $allAuthHostPaths $account.authHostPath -}}
+{{- end -}}
+{{- $containerAuthMounts := $authAccountMounts -}}
+{{- if and (ne $primaryAuthHostPath $authMountPath) (not (has $authMountPath $allAuthHostPaths)) -}}
+{{- $containerAuthMounts = append $containerAuthMounts (dict "hostPath" $authMountPath "subPath" $primaryAuthSubPath) -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,12 +50,14 @@ spec:
           args:
             - |
                 set -eu
-                auth_dir="/mnt/data/{{ $authSubPath }}"
+{{- range $authAccountMounts }}
+                auth_dir="/mnt/data/{{ .subPath }}"
                 mkdir -p "$auth_dir"
                 if [ -f "/seed-config/config.toml" ]; then
                   cp "/seed-config/config.toml" "${auth_dir}/config.toml"
                   chmod 0600 "${auth_dir}/config.toml"
                 fi
+{{- end }}
           volumeMounts:
             - name: data
               mountPath: /mnt/data
@@ -72,13 +85,10 @@ spec:
               mountPath: /etc/codex
             - name: data
               mountPath: /data
+{{- range $containerAuthMounts }}
             - name: data
-              mountPath: {{ $authHostPath }}
-              subPath: {{ $authSubPath }}
-{{- if ne $authHostPath $authMountPath }}
-            - name: data
-              mountPath: {{ $authMountPath }}
-              subPath: {{ $authSubPath }}
+              mountPath: {{ .hostPath }}
+              subPath: {{ .subPath }}
 {{- end }}
             - name: docker-socket
               mountPath: /var/run
@@ -99,13 +109,10 @@ spec:
               mountPath: /var/lib/docker
             - name: docker-socket
               mountPath: /var/run
+{{- range $containerAuthMounts }}
             - name: data
-              mountPath: {{ $authHostPath }}
-              subPath: {{ $authSubPath }}
-{{- if ne $authHostPath $authMountPath }}
-            - name: data
-              mountPath: {{ $authMountPath }}
-              subPath: {{ $authSubPath }}
+              mountPath: {{ .hostPath }}
+              subPath: {{ .subPath }}
 {{- end }}
           resources:
 {{ toYaml .Values.dind.resources | indent 12 }}

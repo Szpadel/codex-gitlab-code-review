@@ -1,6 +1,7 @@
 use crate::config::{CodexConfig, DockerConfig, ProxyConfig};
 use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
 use crate::gitlab::MergeRequest;
+use crate::state::ReviewStateStore;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bollard::Docker;
@@ -10,12 +11,14 @@ use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, ListContainersOptionsBuilder,
     RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
 };
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
@@ -66,6 +69,22 @@ pub struct MentionCommandResult {
 
 const REVIEW_CONTAINER_NAME_PREFIX: &str = "codex-review-";
 const REVIEW_OWNER_LABEL_KEY: &str = "codex.gitlab.review.owner";
+const PRIMARY_AUTH_ACCOUNT_NAME: &str = "primary";
+
+#[derive(Debug, Clone)]
+struct AuthAccount {
+    name: String,
+    auth_host_path: String,
+    state_key: String,
+    is_primary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthFailureKind {
+    UsageLimited { reset_at: DateTime<Utc> },
+    AuthUnavailable,
+    Other,
+}
 
 #[async_trait]
 pub trait CodexRunner: Send + Sync {
@@ -91,6 +110,15 @@ pub struct DockerCodexRunner {
     gitlab_token: String,
     log_all_json: bool,
     owner_id: String,
+    state: Arc<ReviewStateStore>,
+    auth_accounts: Vec<AuthAccount>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerRuntimeOptions {
+    pub gitlab_token: String,
+    pub log_all_json: bool,
+    pub owner_id: String,
 }
 
 impl DockerCodexRunner {
@@ -99,20 +127,43 @@ impl DockerCodexRunner {
         codex: CodexConfig,
         proxy: ProxyConfig,
         git_base: Url,
-        gitlab_token: String,
-        log_all_json: bool,
-        owner_id: String,
+        state: Arc<ReviewStateStore>,
+        runtime: RunnerRuntimeOptions,
     ) -> Result<Self> {
         let docker = connect_docker(&docker_cfg)?;
+        let auth_accounts = Self::build_auth_accounts(&codex);
         Ok(Self {
             docker,
             codex,
             proxy,
             git_base,
-            gitlab_token,
-            log_all_json,
-            owner_id,
+            gitlab_token: runtime.gitlab_token,
+            log_all_json: runtime.log_all_json,
+            owner_id: runtime.owner_id,
+            state,
+            auth_accounts,
         })
+    }
+
+    fn build_auth_accounts(codex: &CodexConfig) -> Vec<AuthAccount> {
+        let mut accounts = vec![AuthAccount {
+            name: PRIMARY_AUTH_ACCOUNT_NAME.to_string(),
+            auth_host_path: codex.auth_host_path.clone(),
+            state_key: auth_account_state_key(PRIMARY_AUTH_ACCOUNT_NAME, &codex.auth_host_path),
+            is_primary: true,
+        }];
+        accounts.extend(
+            codex
+                .fallback_auth_accounts
+                .iter()
+                .map(|account| AuthAccount {
+                    name: account.name.clone(),
+                    auth_host_path: account.auth_host_path.clone(),
+                    state_key: auth_account_state_key(&account.name, &account.auth_host_path),
+                    is_primary: false,
+                }),
+        );
+        accounts
     }
 
     fn clone_url(&self, repo: &str) -> Result<String> {
@@ -585,9 +636,90 @@ exec codex app-server
         }
     }
 
+    async fn account_is_temporarily_blocked(
+        &self,
+        account: &AuthAccount,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let Some(raw_reset_at) = self
+            .state
+            .get_auth_limit_reset_at(&account.state_key)
+            .await?
+        else {
+            return Ok(false);
+        };
+        match DateTime::parse_from_rfc3339(&raw_reset_at) {
+            Ok(parsed) => Ok(parsed.with_timezone(&Utc) > now),
+            Err(err) => {
+                warn!(
+                    account = account.name.as_str(),
+                    raw_reset_at = raw_reset_at.as_str(),
+                    error = %err,
+                    "invalid account reset timestamp in state; clearing stale entry"
+                );
+                self.state
+                    .clear_auth_limit_reset_at(&account.state_key)
+                    .await?;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn available_auth_accounts(&self, now: DateTime<Utc>) -> Result<Vec<AuthAccount>> {
+        let mut available = Vec::new();
+        for account in &self.auth_accounts {
+            if self.account_is_temporarily_blocked(account, now).await? {
+                continue;
+            }
+            available.push(account.clone());
+        }
+        Ok(available)
+    }
+
+    async fn clear_limit_reset_if_stale(
+        &self,
+        account: &AuthAccount,
+        attempt_started_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let Some(raw_reset_at) = self
+            .state
+            .get_auth_limit_reset_at(&account.state_key)
+            .await?
+        else {
+            return Ok(());
+        };
+        match DateTime::parse_from_rfc3339(&raw_reset_at) {
+            Ok(parsed) => {
+                let reset_at = parsed.with_timezone(&Utc);
+                if should_clear_limit_reset(reset_at, attempt_started_at) {
+                    self.state
+                        .clear_auth_limit_reset_at(&account.state_key)
+                        .await?;
+                }
+            }
+            Err(_) => {
+                self.state
+                    .clear_auth_limit_reset_at(&account.state_key)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn mark_limit_reset_at(
+        &self,
+        account: &AuthAccount,
+        reset_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.state
+            .set_auth_limit_reset_at(&account.state_key, &reset_at.to_rfc3339())
+            .await
+    }
+
     async fn start_app_server_container(
         &self,
         script: String,
+        auth_host_path: &str,
         extra_binds: Vec<String>,
     ) -> Result<(String, AppServerClient)> {
         let image_ref = Self::normalize_image_reference(&self.codex.image);
@@ -595,7 +727,7 @@ exec codex app-server
         let name = format!("{}{}", REVIEW_CONTAINER_NAME_PREFIX, Uuid::new_v4());
         let mut binds = vec![format!(
             "{}:{}:rw",
-            self.codex.auth_host_path, self.codex.auth_mount_path
+            auth_host_path, self.codex.auth_mount_path
         )];
         binds.extend(extra_binds);
         let config = ContainerCreateBody {
@@ -664,9 +796,15 @@ exec codex app-server
         Ok((id, AppServerClient::new(attach, self.log_all_json)))
     }
 
-    async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
+    async fn run_app_server_review_with_account(
+        &self,
+        ctx: &ReviewContext,
+        account: &AuthAccount,
+    ) -> Result<String> {
         let script = self.command(ctx)?;
-        let (id, mut client) = self.start_app_server_container(script, Vec::new()).await?;
+        let (id, mut client) = self
+            .start_app_server_container(script, &account.auth_host_path, Vec::new())
+            .await?;
         let repo_path = "/work/repo";
         let instructions = self.review_instructions(ctx);
         let base_branch = ctx
@@ -730,16 +868,95 @@ exec codex app-server
         review_result.map_err(|_| anyhow!("codex review timed out"))?
     }
 
+    async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
+        let now = Utc::now();
+        let available_accounts = self.available_auth_accounts(now).await?;
+        if available_accounts.is_empty() {
+            bail!(
+                "no available codex auth accounts (all accounts are waiting for usage-limit reset)"
+            );
+        }
+
+        let mut auth_fallback_errors = Vec::new();
+        for account in &available_accounts {
+            let attempt_started_at = Utc::now();
+            info!(
+                account = account.name.as_str(),
+                is_primary = account.is_primary,
+                repo = ctx.repo.as_str(),
+                iid = ctx.mr.iid,
+                "running codex review with auth account"
+            );
+            match self.run_app_server_review_with_account(ctx, account).await {
+                Ok(output) => {
+                    self.clear_limit_reset_if_stale(account, attempt_started_at)
+                        .await?;
+                    return Ok(output);
+                }
+                Err(err) => {
+                    let kind = classify_auth_failure(
+                        &err,
+                        Utc::now(),
+                        self.codex.usage_limit_fallback_cooldown_seconds,
+                    );
+                    let kind = classify_auth_failure_for_account(kind, &err, account);
+                    match kind {
+                        AuthFailureKind::UsageLimited { reset_at } => {
+                            self.mark_limit_reset_at(account, reset_at).await?;
+                            warn!(
+                                account = account.name.as_str(),
+                                is_primary = account.is_primary,
+                                reset_at = %reset_at,
+                                error = %err,
+                                "codex auth account usage-limited; trying next account"
+                            );
+                            auth_fallback_errors.push(format!(
+                                "account '{}' usage-limited until {}: {}",
+                                account.name, reset_at, err
+                            ));
+                        }
+                        AuthFailureKind::AuthUnavailable => {
+                            warn!(
+                                account = account.name.as_str(),
+                                is_primary = account.is_primary,
+                                error = %err,
+                                "codex auth account unavailable; trying next account"
+                            );
+                            auth_fallback_errors
+                                .push(format!("account '{}' unavailable: {}", account.name, err));
+                        }
+                        AuthFailureKind::Other => {
+                            return Err(err).with_context(|| {
+                                format!(
+                                    "codex review failed for account '{}' without fallback classification",
+                                    account.name
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        bail!(
+            "all codex auth accounts failed with usage-limit/auth errors: {}",
+            auth_fallback_errors.join(" | ")
+        );
+    }
+
     async fn run_mention_container_with_sandbox(
         &self,
         ctx: &MentionCommandContext,
         sandbox_mode: &str,
+        account: &AuthAccount,
     ) -> Result<MentionCommandResult> {
         let clone_url = self.clone_url(&ctx.repo)?;
         let repo_dir = "/work/repo";
         let script =
             Self::build_mention_command_script(ctx, &clone_url, &self.codex.auth_mount_path);
-        let (id, mut client) = self.start_app_server_container(script, Vec::new()).await?;
+        let (id, mut client) = self
+            .start_app_server_container(script, &account.auth_host_path, Vec::new())
+            .await?;
 
         let mention_result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
             client.initialize().await?;
@@ -968,8 +1185,84 @@ exec codex app-server
         &self,
         ctx: &MentionCommandContext,
     ) -> Result<MentionCommandResult> {
-        self.run_mention_container_with_sandbox(ctx, self.sandbox_mode_value())
-            .await
+        let now = Utc::now();
+        let available_accounts = self.available_auth_accounts(now).await?;
+        if available_accounts.is_empty() {
+            bail!(
+                "no available codex auth accounts (all accounts are waiting for usage-limit reset)"
+            );
+        }
+
+        let mut auth_fallback_errors = Vec::new();
+        for account in &available_accounts {
+            let attempt_started_at = Utc::now();
+            info!(
+                account = account.name.as_str(),
+                is_primary = account.is_primary,
+                repo = ctx.repo.as_str(),
+                iid = ctx.mr.iid,
+                discussion_id = ctx.discussion_id.as_str(),
+                trigger_note_id = ctx.trigger_note_id,
+                "running codex mention command with auth account"
+            );
+            match self
+                .run_mention_container_with_sandbox(ctx, self.sandbox_mode_value(), account)
+                .await
+            {
+                Ok(result) => {
+                    self.clear_limit_reset_if_stale(account, attempt_started_at)
+                        .await?;
+                    return Ok(result);
+                }
+                Err(err) => {
+                    let kind = classify_auth_failure(
+                        &err,
+                        Utc::now(),
+                        self.codex.usage_limit_fallback_cooldown_seconds,
+                    );
+                    let kind = classify_auth_failure_for_account(kind, &err, account);
+                    match kind {
+                        AuthFailureKind::UsageLimited { reset_at } => {
+                            self.mark_limit_reset_at(account, reset_at).await?;
+                            warn!(
+                                account = account.name.as_str(),
+                                is_primary = account.is_primary,
+                                reset_at = %reset_at,
+                                error = %err,
+                                "codex auth account usage-limited for mention command; trying next account"
+                            );
+                            auth_fallback_errors.push(format!(
+                                "account '{}' usage-limited until {}: {}",
+                                account.name, reset_at, err
+                            ));
+                        }
+                        AuthFailureKind::AuthUnavailable => {
+                            warn!(
+                                account = account.name.as_str(),
+                                is_primary = account.is_primary,
+                                error = %err,
+                                "codex auth account unavailable for mention command; trying next account"
+                            );
+                            auth_fallback_errors
+                                .push(format!("account '{}' unavailable: {}", account.name, err));
+                        }
+                        AuthFailureKind::Other => {
+                            return Err(err).with_context(|| {
+                                format!(
+                                    "mention command failed for account '{}' without fallback classification",
+                                    account.name
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        bail!(
+            "all codex auth accounts failed with usage-limit/auth errors for mention command: {}",
+            auth_fallback_errors.join(" | ")
+        );
     }
 }
 
@@ -1708,6 +2001,260 @@ fn with_recent_runner_errors(
     }
 }
 
+fn classify_auth_failure(
+    err: &anyhow::Error,
+    now: DateTime<Utc>,
+    fallback_cooldown_seconds: u64,
+) -> AuthFailureKind {
+    let chain = format!("{err:#}");
+    let chain_lower = chain.to_ascii_lowercase();
+    if is_usage_limit_error(&chain_lower) {
+        let reset_at = parse_usage_limit_reset_at(&chain, now)
+            .unwrap_or_else(|| safe_reset_at_from_cooldown(now, fallback_cooldown_seconds));
+        return AuthFailureKind::UsageLimited { reset_at };
+    }
+    if is_auth_unavailable_error(&chain_lower) {
+        return AuthFailureKind::AuthUnavailable;
+    }
+    AuthFailureKind::Other
+}
+
+fn classify_auth_failure_for_account(
+    base: AuthFailureKind,
+    err: &anyhow::Error,
+    account: &AuthAccount,
+) -> AuthFailureKind {
+    if base != AuthFailureKind::Other {
+        return base;
+    }
+    let chain_lower = format!("{err:#}").to_ascii_lowercase();
+    if is_account_startup_failure(&chain_lower, &account.auth_host_path) {
+        AuthFailureKind::AuthUnavailable
+    } else {
+        AuthFailureKind::Other
+    }
+}
+
+fn is_usage_limit_error(error_text_lower: &str) -> bool {
+    let explicit = [
+        "rate_limit_exceeded",
+        "insufficient_quota",
+        "x-ratelimit",
+        "usage limit exceeded",
+    ]
+    .iter()
+    .any(|needle| error_text_lower.contains(needle));
+    let reached_with_retry_hint = error_text_lower.contains("rate limit reached")
+        && error_text_lower.contains("try again in");
+    explicit || reached_with_retry_hint
+}
+
+fn is_auth_unavailable_error(error_text_lower: &str) -> bool {
+    [
+        "not authenticated",
+        "authentication required",
+        "invalid credentials",
+        "invalid api key",
+        "auth.json",
+        "please run codex auth login",
+    ]
+    .iter()
+    .any(|needle| error_text_lower.contains(needle))
+}
+
+fn is_account_startup_failure(error_text_lower: &str, auth_host_path: &str) -> bool {
+    let path_lower = auth_host_path.to_ascii_lowercase();
+    if path_lower.is_empty() || !error_text_lower.contains(path_lower.as_str()) {
+        return false;
+    }
+    [
+        "invalid mount config",
+        "bind source path does not exist",
+        "no such file or directory",
+        "mount",
+    ]
+    .iter()
+    .any(|needle| error_text_lower.contains(needle))
+}
+
+fn parse_usage_limit_reset_at(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let absolute = parse_rfc3339_reset_timestamp(text, now);
+    let relative = parse_relative_reset_timestamp(text, now);
+    match (absolute, relative) {
+        (Some(abs), Some(rel)) => Some(abs.min(rel)),
+        (Some(abs), None) => Some(abs),
+        (None, Some(rel)) => Some(rel),
+        (None, None) => None,
+    }
+}
+
+fn parse_rfc3339_reset_timestamp(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let mut candidates = Vec::new();
+    for token in text.split_whitespace() {
+        let cleaned = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';' | '.' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+            )
+        });
+        if cleaned.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = DateTime::parse_from_rfc3339(cleaned) {
+            let utc = parsed.with_timezone(&Utc);
+            if utc > now {
+                candidates.push(utc);
+            }
+        }
+    }
+    candidates.into_iter().min()
+}
+
+fn parse_relative_reset_timestamp(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let lower = text.to_ascii_lowercase();
+    for anchor in ["try again in", "resets in", "retry in"] {
+        if let Some(idx) = lower.find(anchor) {
+            let slice = &lower[idx + anchor.len()..];
+            if let Some(seconds) = parse_duration_seconds_from_text(slice) {
+                let duration = safe_duration_from_seconds(seconds);
+                return now.checked_add_signed(duration);
+            }
+        }
+    }
+    None
+}
+
+fn parse_duration_seconds_from_text(text: &str) -> Option<i64> {
+    let tokens = text
+        .split_whitespace()
+        .map(|raw_token| {
+            raw_token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    ',' | ';' | '.' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+                )
+            })
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut total = 0i64;
+    let mut consumed = false;
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        if let Some(seconds) = parse_duration_token_seconds(tokens[idx]) {
+            total = total.saturating_add(seconds);
+            consumed = true;
+            idx += 1;
+            continue;
+        }
+
+        if let Ok(value) = tokens[idx].parse::<f64>()
+            && let Some(unit_token) = tokens.get(idx + 1)
+            && let Some(unit_seconds) = duration_unit_seconds(unit_token)
+        {
+            total = total.saturating_add(seconds_from_numeric_value(value, unit_seconds));
+            consumed = true;
+            idx += 2;
+            continue;
+        }
+
+        if consumed && matches!(tokens[idx], "and" | "then") {
+            idx += 1;
+            continue;
+        }
+
+        if consumed {
+            break;
+        }
+        idx += 1;
+    }
+
+    if consumed && total > 0i64 {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+fn parse_duration_token_seconds(token: &str) -> Option<i64> {
+    let mut numeric_end = 0usize;
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    for (idx, ch) in token.char_indices() {
+        if ch.is_ascii_digit() {
+            seen_digit = true;
+            numeric_end = idx + ch.len_utf8();
+            continue;
+        }
+        if ch == '.' && seen_digit && !seen_dot {
+            seen_dot = true;
+            numeric_end = idx + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if !seen_digit || numeric_end == 0 || numeric_end >= token.len() {
+        return None;
+    }
+    let value = token[..numeric_end].parse::<f64>().ok()?;
+    let unit = &token[numeric_end..];
+    duration_unit_seconds(unit).map(|seconds| seconds_from_numeric_value(value, seconds))
+}
+
+fn duration_unit_seconds(unit: &str) -> Option<i64> {
+    match unit {
+        "d" | "day" | "days" => Some(86_400),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(3_600),
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(60),
+        "s" | "sec" | "secs" | "second" | "seconds" => Some(1),
+        _ => None,
+    }
+}
+
+fn seconds_from_numeric_value(value: f64, unit_seconds: i64) -> i64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0;
+    }
+    let total = value * unit_seconds as f64;
+    if total >= i64::MAX as f64 {
+        i64::MAX
+    } else {
+        total.ceil() as i64
+    }
+}
+
+fn safe_cooldown_duration(cooldown_seconds: u64) -> ChronoDuration {
+    let seconds = i64::try_from(cooldown_seconds).ok().unwrap_or(i64::MAX);
+    safe_duration_from_seconds(seconds)
+}
+
+fn safe_duration_from_seconds(seconds: i64) -> ChronoDuration {
+    const MAX_CHRONO_SECONDS: i64 = i64::MAX / 1000;
+    let clamped = seconds.clamp(0, MAX_CHRONO_SECONDS);
+    ChronoDuration::seconds(clamped)
+}
+
+fn safe_reset_at_from_cooldown(now: DateTime<Utc>, cooldown_seconds: u64) -> DateTime<Utc> {
+    let cooldown = safe_cooldown_duration(cooldown_seconds);
+    if let Some(reset_at) = now.checked_add_signed(cooldown) {
+        return reset_at;
+    }
+    now.checked_add_signed(ChronoDuration::days(3650))
+        .unwrap_or(now)
+}
+
+fn should_clear_limit_reset(
+    existing_reset_at: DateTime<Utc>,
+    attempt_started_at: DateTime<Utc>,
+) -> bool {
+    existing_reset_at <= attempt_started_at
+}
+
+fn auth_account_state_key(name: &str, auth_host_path: &str) -> String {
+    format!("{name}::{auth_host_path}")
+}
+
 #[derive(Debug, Deserialize)]
 struct CodexOutput {
     verdict: String,
@@ -1730,6 +2277,8 @@ fn shell_quote(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DepsConfig, FallbackAuthAccountConfig};
+    use chrono::TimeZone;
 
     #[test]
     fn parse_review_output_json_pass() -> Result<()> {
@@ -1770,6 +2319,305 @@ mod tests {
             }
             _ => bail!("expected comment"),
         }
+    }
+
+    #[test]
+    fn parse_usage_limit_reset_at_supports_rfc3339() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let text = "rate limit reached; resets at 2026-03-02T12:30:00Z";
+        let reset = parse_usage_limit_reset_at(text, now).expect("parsed reset");
+        assert_eq!(
+            reset,
+            Utc.with_ymd_and_hms(2026, 3, 2, 12, 30, 0)
+                .single()
+                .expect("valid")
+        );
+    }
+
+    #[test]
+    fn parse_usage_limit_reset_at_supports_compact_relative_duration() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let text = "usage limit exceeded, try again in 1h 20m";
+        let reset = parse_usage_limit_reset_at(text, now).expect("parsed reset");
+        assert_eq!(
+            reset,
+            Utc.with_ymd_and_hms(2026, 3, 2, 11, 20, 0)
+                .single()
+                .expect("valid")
+        );
+    }
+
+    #[test]
+    fn parse_usage_limit_reset_at_supports_spaced_relative_duration() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let text = "quota reached; try again in 1 hour 30 minutes";
+        let reset = parse_usage_limit_reset_at(text, now).expect("parsed reset");
+        assert_eq!(
+            reset,
+            Utc.with_ymd_and_hms(2026, 3, 2, 11, 30, 0)
+                .single()
+                .expect("valid")
+        );
+    }
+
+    #[test]
+    fn parse_usage_limit_reset_at_supports_conjunction_in_duration() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let text = "usage limit exceeded; try again in 1 hour and 30 minutes";
+        let reset = parse_usage_limit_reset_at(text, now).expect("parsed reset");
+        assert_eq!(
+            reset,
+            Utc.with_ymd_and_hms(2026, 3, 2, 11, 30, 0)
+                .single()
+                .expect("valid")
+        );
+    }
+
+    #[test]
+    fn parse_usage_limit_reset_at_supports_fractional_seconds() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let text = "usage limit exceeded; try again in 2.3s";
+        let reset = parse_usage_limit_reset_at(text, now).expect("parsed reset");
+        assert_eq!(
+            reset,
+            Utc.with_ymd_and_hms(2026, 3, 2, 10, 0, 3)
+                .single()
+                .expect("valid")
+        );
+    }
+
+    #[test]
+    fn classify_auth_failure_usage_limit_falls_back_to_default_cooldown_when_unparseable() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let err = anyhow!("codex turn failed: usage limit exceeded");
+        let kind = classify_auth_failure(&err, now, 3600);
+        assert_eq!(
+            kind,
+            AuthFailureKind::UsageLimited {
+                reset_at: Utc
+                    .with_ymd_and_hms(2026, 3, 2, 11, 0, 0)
+                    .single()
+                    .expect("valid"),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_auth_failure_handles_huge_cooldown_without_panicking() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let err = anyhow!("codex turn failed: usage limit exceeded");
+        let kind = classify_auth_failure(&err, now, u64::MAX);
+        match kind {
+            AuthFailureKind::UsageLimited { reset_at } => {
+                assert!(reset_at > now);
+            }
+            _ => panic!("expected usage-limited classification"),
+        }
+    }
+
+    #[test]
+    fn classify_auth_failure_detects_rate_limit_reached_phrase() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let err = anyhow!("codex turn failed: Rate limit reached, try again in 45m");
+        let kind = classify_auth_failure(&err, now, 3600);
+        assert!(matches!(kind, AuthFailureKind::UsageLimited { .. }));
+    }
+
+    #[test]
+    fn classify_auth_failure_handles_huge_relative_retry_hint_without_panicking() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let err =
+            anyhow!("codex turn failed: usage limit exceeded, try again in 9223372036854775807s");
+        let kind = classify_auth_failure(&err, now, 3600);
+        match kind {
+            AuthFailureKind::UsageLimited { reset_at } => {
+                assert!(reset_at > now);
+            }
+            _ => panic!("expected usage-limited classification"),
+        }
+    }
+
+    #[test]
+    fn classify_auth_failure_detects_auth_unavailable() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let err = anyhow!("codex app-server error: not authenticated, run codex auth login");
+        let kind = classify_auth_failure(&err, now, 3600);
+        assert_eq!(kind, AuthFailureKind::AuthUnavailable);
+    }
+
+    #[test]
+    fn classify_auth_failure_preserves_non_auth_errors() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let err = anyhow!("codex app-server closed stdout");
+        let kind = classify_auth_failure(&err, now, 3600);
+        assert_eq!(kind, AuthFailureKind::Other);
+    }
+
+    #[test]
+    fn classify_auth_failure_ignores_non_codex_rate_limit_errors() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let err = anyhow!("git clone failed: received HTTP 429 from gitlab");
+        let kind = classify_auth_failure(&err, now, 3600);
+        assert_eq!(kind, AuthFailureKind::Other);
+    }
+
+    #[test]
+    fn classify_auth_failure_ignores_generic_app_server_429_without_codex_limit_context() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let err = anyhow!(
+            "codex app-server closed stdout: recent runner errors: git clone failed with 429"
+        );
+        let kind = classify_auth_failure(&err, now, 3600);
+        assert_eq!(kind, AuthFailureKind::Other);
+    }
+
+    #[test]
+    fn classify_auth_failure_ignores_openai_package_install_429() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let err = anyhow!("codex-runner-error: npm install -g @openai/codex failed with 429");
+        let kind = classify_auth_failure(&err, now, 3600);
+        assert_eq!(kind, AuthFailureKind::Other);
+    }
+
+    #[test]
+    fn classify_auth_failure_ignores_disk_quota_exceeded_errors() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let err = anyhow!("write failed: disk quota exceeded");
+        let kind = classify_auth_failure(&err, now, 3600);
+        assert_eq!(kind, AuthFailureKind::Other);
+    }
+
+    #[test]
+    fn classify_auth_failure_for_account_marks_mount_path_errors_as_unavailable() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let account = AuthAccount {
+            name: "backup".to_string(),
+            auth_host_path: "/missing/codex-auth".to_string(),
+            state_key: auth_account_state_key("backup", "/missing/codex-auth"),
+            is_primary: false,
+        };
+        let err = anyhow!(
+            "create docker container failed: invalid mount config for type \"bind\": bind source path does not exist: /missing/codex-auth"
+        );
+        let base = classify_auth_failure(&err, now, 3600);
+        let kind = classify_auth_failure_for_account(base, &err, &account);
+        assert_eq!(kind, AuthFailureKind::AuthUnavailable);
+    }
+
+    #[test]
+    fn should_clear_limit_reset_only_when_marker_is_not_newer_than_attempt() {
+        let attempt_started_at = Utc
+            .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+            .single()
+            .expect("valid");
+        let older_reset = Utc
+            .with_ymd_and_hms(2026, 3, 2, 9, 0, 0)
+            .single()
+            .expect("valid");
+        let newer_reset = Utc
+            .with_ymd_and_hms(2026, 3, 2, 11, 0, 0)
+            .single()
+            .expect("valid");
+
+        assert!(should_clear_limit_reset(older_reset, attempt_started_at));
+        assert!(should_clear_limit_reset(
+            attempt_started_at,
+            attempt_started_at
+        ));
+        assert!(!should_clear_limit_reset(newer_reset, attempt_started_at));
+    }
+
+    #[test]
+    fn build_auth_accounts_keeps_primary_first_then_fallback_order() {
+        let codex = CodexConfig {
+            image: "ghcr.io/openai/codex-universal:latest".to_string(),
+            timeout_seconds: 300,
+            auth_host_path: "/root/.codex-primary".to_string(),
+            auth_mount_path: "/root/.codex".to_string(),
+            exec_sandbox: "danger-full-access".to_string(),
+            fallback_auth_accounts: vec![
+                FallbackAuthAccountConfig {
+                    name: "backup-high".to_string(),
+                    auth_host_path: "/root/.codex-backup-high".to_string(),
+                },
+                FallbackAuthAccountConfig {
+                    name: "backup-low".to_string(),
+                    auth_host_path: "/root/.codex-backup-low".to_string(),
+                },
+            ],
+            usage_limit_fallback_cooldown_seconds: 3600,
+            deps: DepsConfig { enabled: false },
+        };
+
+        let accounts = DockerCodexRunner::build_auth_accounts(&codex);
+        assert_eq!(accounts.len(), 3);
+        assert_eq!(accounts[0].name, PRIMARY_AUTH_ACCOUNT_NAME);
+        assert_eq!(accounts[0].auth_host_path, "/root/.codex-primary");
+        assert_eq!(
+            accounts[0].state_key,
+            auth_account_state_key(PRIMARY_AUTH_ACCOUNT_NAME, "/root/.codex-primary")
+        );
+        assert!(accounts[0].is_primary);
+        assert_eq!(accounts[1].name, "backup-high");
+        assert_eq!(accounts[2].name, "backup-low");
+        assert_eq!(
+            accounts[1].state_key,
+            auth_account_state_key("backup-high", "/root/.codex-backup-high")
+        );
+        assert_eq!(
+            accounts[2].state_key,
+            auth_account_state_key("backup-low", "/root/.codex-backup-low")
+        );
+        assert!(!accounts[1].is_primary);
+        assert!(!accounts[2].is_primary);
     }
 
     #[test]

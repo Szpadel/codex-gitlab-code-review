@@ -80,8 +80,18 @@ data:
     codex:
       image: {{ .Values.config.codex.image | quote }}
       timeout_seconds: {{ .Values.config.codex.timeoutSeconds }}
-      auth_host_path: {{ .Values.config.codex.authHostPath | quote }}
+      auth_host_path: {{ default .Values.config.codex.authMountPath .Values.config.codex.authHostPath | quote }}
       auth_mount_path: {{ .Values.config.codex.authMountPath | quote }}
+{{- if .Values.config.codex.fallbackAuthAccounts }}
+      fallback_auth_accounts:
+{{- range .Values.config.codex.fallbackAuthAccounts }}
+        - name: {{ .name | quote }}
+          auth_host_path: {{ .authHostPath | quote }}
+{{- end }}
+{{- else }}
+      fallback_auth_accounts: []
+{{- end }}
+      usage_limit_fallback_cooldown_seconds: {{ .Values.config.codex.usageLimitFallbackCooldownSeconds }}
       exec_sandbox: {{ .Values.config.codex.execSandbox | quote }}
     docker:
       host: {{ .Values.config.docker.host | quote }}

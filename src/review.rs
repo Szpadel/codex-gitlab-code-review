@@ -1161,6 +1161,8 @@ mod tests {
                 auth_host_path: "/root/.codex".to_string(),
                 auth_mount_path: "/root/.codex".to_string(),
                 exec_sandbox: "danger-full-access".to_string(),
+                fallback_auth_accounts: Vec::new(),
+                usage_limit_fallback_cooldown_seconds: 3600,
                 deps: crate::config::DepsConfig { enabled: false },
             },
             docker: DockerConfig {

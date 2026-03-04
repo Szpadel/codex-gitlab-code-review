@@ -73,6 +73,15 @@ codex:
   auth_host_path: "/root/.codex"
   # Required. Container path to mount auth/config from host (read-only).
   auth_mount_path: "/root/.codex"
+  # Optional. Additional Codex auth accounts in priority order (highest priority first).
+  # Primary auth_host_path is always preferred when available again.
+  fallback_auth_accounts:
+    - name: "backup-1"
+      auth_host_path: "/root/.codex-backup-1"
+    - name: "backup-2"
+      auth_host_path: "/root/.codex-backup-2"
+  # Optional. Cooldown in seconds when usage-limit reset time cannot be parsed from error output.
+  usage_limit_fallback_cooldown_seconds: 3600
   # Required. Sandbox mode passed to Codex: "read-only", "workspace-write", or "danger-full-access".
   exec_sandbox: "danger-full-access"
   # Optional. Prefetch dependency sources before running Codex (root-only detection).

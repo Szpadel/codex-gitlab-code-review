@@ -9,7 +9,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use codex_gitlab_code_review::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
-use codex_gitlab_code_review::codex_runner::DockerCodexRunner;
+use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
 use codex_gitlab_code_review::config::Config;
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::review::ReviewService;
@@ -197,9 +197,12 @@ async fn main() -> Result<()> {
         config.codex.clone(),
         config.proxy.clone(),
         git_base,
-        config.gitlab.token.clone(),
-        cli.debug,
-        review_owner_id,
+        Arc::clone(&state),
+        RunnerRuntimeOptions {
+            gitlab_token: config.gitlab.token.clone(),
+            log_all_json: cli.debug,
+            owner_id: review_owner_id,
+        },
     )?;
 
     let service = Arc::new(ReviewService::new(
