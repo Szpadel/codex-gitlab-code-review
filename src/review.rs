@@ -578,8 +578,9 @@ mod tests {
         MentionCommandStatus, ReviewContext,
     };
     use crate::config::{
-        CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets, ProxyConfig,
-        ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
+        CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
+        McpServerOverridesConfig, ProxyConfig, ReviewConfig, ReviewMentionCommandsConfig,
+        ScheduleConfig, ServerConfig, TargetSelector,
     };
     use crate::flow::mention::{contains_mention, extract_parent_chain};
     use crate::flow::review::{RetryKey, ReviewRunContext};
@@ -1164,6 +1165,7 @@ mod tests {
                 fallback_auth_accounts: Vec::new(),
                 usage_limit_fallback_cooldown_seconds: 3600,
                 deps: crate::config::DepsConfig { enabled: false },
+                mcp_server_overrides: McpServerOverridesConfig::default(),
             },
             docker: DockerConfig {
                 host: "tcp://localhost:2375".to_string(),

@@ -84,6 +84,16 @@ codex:
   usage_limit_fallback_cooldown_seconds: 3600
   # Required. Sandbox mode passed to Codex: "read-only", "workspace-write", or "danger-full-access".
   exec_sandbox: "danger-full-access"
+  # Optional. Per-mode runtime overrides for MCP servers already configured in Codex config.toml.
+  # Each entry maps MCP server name -> enabled flag and becomes:
+  #   codex -c mcp_servers.<name>.enabled=<true|false> app-server
+  mcp_server_overrides:
+    review:
+      github: true
+      playwright: false
+    mention:
+      github: false
+      playwright: true
   # Optional. Prefetch dependency sources before running Codex (root-only detection).
   # Note: prefetch runs before Codex and counts toward timeout_seconds.
   deps:

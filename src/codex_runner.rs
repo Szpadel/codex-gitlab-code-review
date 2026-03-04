@@ -16,7 +16,7 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -246,6 +246,7 @@ impl DockerCodexRunner {
                 .as_deref()
                 .filter(|value| !value.is_empty()),
             self.codex.deps.enabled,
+            &self.codex.mcp_server_overrides.review,
         ))
     }
 
@@ -282,10 +283,12 @@ impl DockerCodexRunner {
         ctx: &MentionCommandContext,
         clone_url: &str,
         auth_mount_path: &str,
+        mcp_server_overrides: &BTreeMap<String, bool>,
     ) -> String {
         let clone_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
         let head_sha_q = shell_quote(&ctx.head_sha);
         let auth_mount_path_q = shell_quote(auth_mount_path);
+        let app_server_exec_cmd = codex_app_server_exec_command(mcp_server_overrides);
         format!(
             r#"set -eu
 repo_dir='/work/repo'
@@ -335,11 +338,12 @@ if ! command -v codex >/dev/null 2>&1; then
     exit 1
   fi
 fi
-exec codex app-server
+{app_server_exec_cmd}
 "#,
             clone_url_dq = clone_url_dq,
             head_sha_q = head_sha_q,
             auth_mount_path_q = auth_mount_path_q,
+            app_server_exec_cmd = app_server_exec_cmd,
         )
     }
 
@@ -349,6 +353,7 @@ exec codex app-server
         auth_mount_path: &str,
         target_branch: Option<&str>,
         deps_enabled: bool,
+        mcp_server_overrides: &BTreeMap<String, bool>,
     ) -> String {
         let target_branch_script = target_branch
             .map(|branch| {
@@ -460,6 +465,7 @@ export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
         } else {
             ""
         };
+        let app_server_exec_cmd = codex_app_server_exec_command(mcp_server_overrides);
         format!(
             r#"set -eu
 mkdir -p /work
@@ -504,13 +510,14 @@ if ! command -v codex >/dev/null 2>&1; then
     exit 1
   fi
 fi
-exec codex app-server
+{app_server_exec_cmd}
 "#,
             clone_url = clone_url,
             head_sha = head_sha,
             auth_mount_path = auth_mount_path,
             target_branch_script = target_branch_script,
-            deps_prefetch_script = deps_prefetch_script
+            deps_prefetch_script = deps_prefetch_script,
+            app_server_exec_cmd = app_server_exec_cmd
         )
     }
 
@@ -952,8 +959,12 @@ exec codex app-server
     ) -> Result<MentionCommandResult> {
         let clone_url = self.clone_url(&ctx.repo)?;
         let repo_dir = "/work/repo";
-        let script =
-            Self::build_mention_command_script(ctx, &clone_url, &self.codex.auth_mount_path);
+        let script = Self::build_mention_command_script(
+            ctx,
+            &clone_url,
+            &self.codex.auth_mount_path,
+            &self.codex.mcp_server_overrides.mention,
+        );
         let (id, mut client) = self
             .start_app_server_container(script, &account.auth_host_path, Vec::new())
             .await?;
@@ -2274,11 +2285,26 @@ fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
+fn codex_app_server_exec_command(mcp_server_overrides: &BTreeMap<String, bool>) -> String {
+    if mcp_server_overrides.is_empty() {
+        return "exec codex app-server".to_string();
+    }
+
+    let mut cmd_parts = vec!["exec codex".to_string()];
+    for (server_name, enabled) in mcp_server_overrides {
+        let override_value = format!("mcp_servers.{server_name}.enabled={enabled}");
+        cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
+    }
+    cmd_parts.push("app-server".to_string());
+    cmd_parts.join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DepsConfig, FallbackAuthAccountConfig};
+    use crate::config::{DepsConfig, FallbackAuthAccountConfig, McpServerOverridesConfig};
     use chrono::TimeZone;
+    use std::collections::BTreeMap;
 
     #[test]
     fn parse_review_output_json_pass() -> Result<()> {
@@ -2595,6 +2621,7 @@ mod tests {
             ],
             usage_limit_fallback_cooldown_seconds: 3600,
             deps: DepsConfig { enabled: false },
+            mcp_server_overrides: McpServerOverridesConfig::default(),
         };
 
         let accounts = DockerCodexRunner::build_auth_accounts(&codex);
@@ -2653,6 +2680,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_app_server_exec_command_without_mcp_overrides_is_plain() {
+        let overrides = BTreeMap::new();
+        let cmd = codex_app_server_exec_command(&overrides);
+        assert_eq!(cmd, "exec codex app-server");
+    }
+
+    #[test]
+    fn codex_app_server_exec_command_renders_sorted_mcp_overrides() {
+        let overrides =
+            BTreeMap::from([("serena".to_string(), false), ("github".to_string(), true)]);
+        let cmd = codex_app_server_exec_command(&overrides);
+        assert_eq!(
+            cmd,
+            "exec codex -c 'mcp_servers.github.enabled=true' -c 'mcp_servers.serena.enabled=false' app-server"
+        );
+    }
+
+    #[test]
     fn build_command_script_sets_writable_codex_home() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
@@ -2660,6 +2705,7 @@ mod tests {
             "/root/.codex",
             None,
             false,
+            &BTreeMap::new(),
         );
         assert!(script.contains("export CODEX_HOME=\"/root/.codex\""));
         assert!(script.contains("mkdir -p \"/root/.codex\""));
@@ -2673,6 +2719,7 @@ mod tests {
             "/root/.codex",
             Some("main"),
             false,
+            &BTreeMap::new(),
         );
         assert!(script.contains("git fetch --depth 1 origin \"main\""));
         assert!(script.contains("git branch --force \"main\" FETCH_HEAD"));
@@ -2687,6 +2734,7 @@ mod tests {
             "/root/.codex",
             None,
             false,
+            &BTreeMap::new(),
         );
         assert!(script.contains("git clone --depth 1 --recurse-submodules"));
         assert!(script.contains("git submodule update --init --recursive"));
@@ -2700,9 +2748,24 @@ mod tests {
             "/root/.codex",
             None,
             true,
+            &BTreeMap::new(),
         );
         assert!(script.contains("prefetch_deps()"));
         assert!(script.contains("composer install"));
+    }
+
+    #[test]
+    fn build_command_script_includes_mcp_server_overrides() {
+        let overrides = BTreeMap::from([("github".to_string(), false)]);
+        let script = DockerCodexRunner::build_command_script(
+            "https://example.com/repo.git",
+            "abc",
+            "/root/.codex",
+            None,
+            false,
+            &overrides,
+        );
+        assert!(script.contains("exec codex -c 'mcp_servers.github.enabled=false' app-server"));
     }
 
     #[test]
@@ -2738,6 +2801,7 @@ mod tests {
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
             "/root/.codex",
+            &BTreeMap::new(),
         );
         assert!(
             script.contains("git clone --depth 1 --recurse-submodules \"https://oauth2:${GITLAB_TOKEN}@example.com/repo.git\"")
@@ -2747,6 +2811,45 @@ mod tests {
         assert!(script.contains("exec codex app-server"));
         assert!(!script.contains("codex exec --sandbox workspace-write"));
         assert!(!script.contains("GIT_AUTHOR_NAME="));
+    }
+
+    #[test]
+    fn mention_command_script_includes_mcp_server_overrides() {
+        let ctx = MentionCommandContext {
+            repo: "group/repo".to_string(),
+            project_path: "group/repo".to_string(),
+            mr: MergeRequest {
+                iid: 11,
+                title: Some("Title".to_string()),
+                web_url: Some(
+                    "https://gitlab.example.com/group/repo/-/merge_requests/11".to_string(),
+                ),
+                created_at: None,
+                updated_at: None,
+                sha: Some("abc123".to_string()),
+                source_branch: None,
+                target_branch: Some("main".to_string()),
+                author: None,
+                source_project_id: None,
+                target_project_id: None,
+                diff_refs: None,
+            },
+            head_sha: "abc123".to_string(),
+            discussion_id: "discussion-1".to_string(),
+            trigger_note_id: 77,
+            requester_name: "Alice Example".to_string(),
+            requester_email: "alice@example.com".to_string(),
+            additional_developer_instructions: None,
+            prompt: "Do the change".to_string(),
+        };
+        let overrides = BTreeMap::from([("playwright".to_string(), true)]);
+        let script = DockerCodexRunner::build_mention_command_script(
+            &ctx,
+            "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "/root/.codex",
+            &overrides,
+        );
+        assert!(script.contains("exec codex -c 'mcp_servers.playwright.enabled=true' app-server"));
     }
 
     #[test]

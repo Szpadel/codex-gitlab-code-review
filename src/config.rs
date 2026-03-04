@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -168,6 +168,16 @@ pub struct CodexConfig {
     pub usage_limit_fallback_cooldown_seconds: u64,
     #[serde(default)]
     pub deps: DepsConfig,
+    #[serde(default)]
+    pub mcp_server_overrides: McpServerOverridesConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct McpServerOverridesConfig {
+    #[serde(default)]
+    pub review: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub mention: BTreeMap<String, bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -242,6 +252,7 @@ impl Config {
             config.docker.host = default_docker_host();
         }
         validate_codex_auth_accounts(&config.codex)?;
+        validate_mcp_server_overrides(&config.codex)?;
         Ok(config)
     }
 }
@@ -281,6 +292,21 @@ fn validate_codex_auth_accounts(codex: &CodexConfig) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn validate_mcp_server_overrides(codex: &CodexConfig) -> Result<()> {
+    for server in codex
+        .mcp_server_overrides
+        .review
+        .keys()
+        .chain(codex.mcp_server_overrides.mention.keys())
+    {
+        anyhow::ensure!(
+            !server.trim().is_empty(),
+            "codex.mcp_server_overrides keys must not be empty"
+        );
+    }
     Ok(())
 }
 
@@ -405,6 +431,8 @@ docker:
         );
         assert!(config.codex.fallback_auth_accounts.is_empty());
         assert_eq!(config.codex.usage_limit_fallback_cooldown_seconds, 3600);
+        assert!(config.codex.mcp_server_overrides.review.is_empty());
+        assert!(config.codex.mcp_server_overrides.mention.is_empty());
     }
 
     #[test]
@@ -460,6 +488,63 @@ server:
                 .additional_developer_instructions
                 .as_deref(),
             Some("Prefer small commits.")
+        );
+    }
+
+    #[test]
+    fn loads_mcp_server_overrides() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  mcp_server_overrides:
+    review:
+      github: false
+      memory: true
+    mention:
+      github: true
+      playwright: false
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let config = load_from_yaml(yaml);
+        assert_eq!(
+            config.codex.mcp_server_overrides.review.get("github"),
+            Some(&false)
+        );
+        assert_eq!(
+            config.codex.mcp_server_overrides.review.get("memory"),
+            Some(&true)
+        );
+        assert_eq!(
+            config.codex.mcp_server_overrides.mention.get("github"),
+            Some(&true)
+        );
+        assert_eq!(
+            config.codex.mcp_server_overrides.mention.get("playwright"),
+            Some(&false)
         );
     }
 

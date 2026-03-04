@@ -92,6 +92,19 @@ data:
       fallback_auth_accounts: []
 {{- end }}
       usage_limit_fallback_cooldown_seconds: {{ .Values.config.codex.usageLimitFallbackCooldownSeconds }}
+      mcp_server_overrides:
+        review:
+{{- if .Values.config.codex.mcpServerOverrides.review }}
+{{- toYaml .Values.config.codex.mcpServerOverrides.review | nindent 10 }}
+{{- else }}
+          {}
+{{- end }}
+        mention:
+{{- if .Values.config.codex.mcpServerOverrides.mention }}
+{{- toYaml .Values.config.codex.mcpServerOverrides.mention | nindent 10 }}
+{{- else }}
+          {}
+{{- end }}
       exec_sandbox: {{ .Values.config.codex.execSandbox | quote }}
     docker:
       host: {{ .Values.config.docker.host | quote }}

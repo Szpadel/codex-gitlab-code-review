@@ -2,8 +2,9 @@ use anyhow::{Result, anyhow};
 use chrono::{Duration, Utc};
 use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
 use codex_gitlab_code_review::config::{
-    CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets, ProxyConfig,
-    ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
+    CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
+    McpServerOverridesConfig, ProxyConfig, ReviewConfig, ReviewMentionCommandsConfig,
+    ScheduleConfig, ServerConfig, TargetSelector,
 };
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::review::ReviewService;
@@ -64,6 +65,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             fallback_auth_accounts: Vec::new(),
             usage_limit_fallback_cooldown_seconds: 3600,
             deps: codex_gitlab_code_review::config::DepsConfig { enabled: false },
+            mcp_server_overrides: McpServerOverridesConfig::default(),
         },
         docker: DockerConfig { host: docker_host },
         database: DatabaseConfig {

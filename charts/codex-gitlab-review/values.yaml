@@ -49,6 +49,11 @@ config:
     fallbackAuthAccounts: []
     # Fallback cooldown in seconds when usage-limit reset timestamp cannot be parsed.
     usageLimitFallbackCooldownSeconds: 3600
+    # Optional. Per-mode MCP server enabled flags for servers defined in Codex config.toml.
+    # Converted to codex CLI overrides: -c mcp_servers.<name>.enabled=<true|false>
+    mcpServerOverrides:
+      review: {}
+      mention: {}
     execSandbox: "danger-full-access"
   docker:
     host: "unix:///var/run/docker.sock"
