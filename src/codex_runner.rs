@@ -6,7 +6,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::LogOutput;
-use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::exec::{StartExecOptions, StartExecResults};
+use bollard::models::{ContainerCreateBody, ExecConfig, HostConfig};
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, ListContainersOptionsBuilder,
     RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
@@ -548,6 +549,111 @@ fi
             .await;
     }
 
+    async fn exec_container_command(
+        &self,
+        container_id: &str,
+        command: Vec<String>,
+        cwd: Option<&str>,
+    ) -> Result<ContainerExecOutput> {
+        let command_display = format_command_for_log(&command);
+        let cwd_display = cwd.unwrap_or("<default>");
+        info!(
+            container_id,
+            command = command_display.as_str(),
+            cwd = cwd_display,
+            "running docker exec command"
+        );
+
+        // Deliberately bypass app-server command RPC and its sandbox semantics for
+        // mention auxiliary git operations.
+        let exec = self
+            .docker
+            .create_exec(
+                container_id,
+                ExecConfig {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(command.clone()),
+                    working_dir: cwd.map(|value| value.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "create docker exec command '{}' in container {}",
+                    command_display, container_id
+                )
+            })?;
+
+        let start_result = self
+            .docker
+            .start_exec(&exec.id, None::<StartExecOptions>)
+            .await
+            .with_context(|| {
+                format!(
+                    "start docker exec command '{}' in container {}",
+                    command_display, container_id
+                )
+            })?;
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        match start_result {
+            StartExecResults::Attached { mut output, .. } => {
+                while let Some(message) = output.next().await {
+                    match message.with_context(|| {
+                        format!(
+                            "read docker exec output for command '{}' in container {}",
+                            command_display, container_id
+                        )
+                    })? {
+                        LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                            stdout.push_str(String::from_utf8_lossy(&message).as_ref());
+                        }
+                        LogOutput::StdErr { message } => {
+                            stderr.push_str(String::from_utf8_lossy(&message).as_ref());
+                        }
+                        LogOutput::StdIn { .. } => {}
+                    }
+                }
+            }
+            StartExecResults::Detached => {
+                bail!(
+                    "docker exec command '{}' unexpectedly detached in container {}",
+                    command_display,
+                    container_id
+                );
+            }
+        }
+
+        let inspect = self.docker.inspect_exec(&exec.id).await.with_context(|| {
+            format!(
+                "inspect docker exec command '{}' in container {}",
+                command_display, container_id
+            )
+        })?;
+        let output = validate_container_exec_result(
+            &command,
+            cwd,
+            ContainerExecOutput {
+                exit_code: inspect.exit_code.unwrap_or(-1),
+                stdout,
+                stderr,
+            },
+        )?;
+
+        info!(
+            container_id,
+            command = command_display.as_str(),
+            cwd = cwd_display,
+            exit_code = output.exit_code,
+            "docker exec command completed"
+        );
+
+        Ok(output)
+    }
+
     fn is_review_container_name(name: &str) -> bool {
         name.trim_start_matches('/')
             .starts_with(REVIEW_CONTAINER_NAME_PREFIX)
@@ -990,57 +1096,50 @@ fi
                 .ok_or_else(|| anyhow!("thread/start missing thread id"))?
                 .to_string();
 
-            client
-                .exec_one_off_command(
-                    vec![
-                        "git".to_string(),
-                        "config".to_string(),
-                        "user.name".to_string(),
-                        ctx.requester_name.clone(),
-                    ],
-                    Some(repo_dir),
-                    None,
-                    sandbox_mode,
-                )
-                .await?;
-            client
-                .exec_one_off_command(
-                    vec![
-                        "git".to_string(),
-                        "config".to_string(),
-                        "user.email".to_string(),
-                        ctx.requester_email.clone(),
-                    ],
-                    Some(repo_dir),
-                    None,
-                    sandbox_mode,
-                )
-                .await?;
-            client
-                .exec_one_off_command(
-                    vec![
-                        "git".to_string(),
-                        "remote".to_string(),
-                        "set-url".to_string(),
-                        "--push".to_string(),
-                        "origin".to_string(),
-                        "no_push://disabled".to_string(),
-                    ],
-                    Some(repo_dir),
-                    None,
-                    sandbox_mode,
-                )
-                .await?;
-            let before_sha = client
-                .exec_one_off_command(
+            self.exec_container_command(
+                &id,
+                vec![
+                    "git".to_string(),
+                    "config".to_string(),
+                    "user.name".to_string(),
+                    ctx.requester_name.clone(),
+                ],
+                Some(repo_dir),
+            )
+            .await?;
+            self.exec_container_command(
+                &id,
+                vec![
+                    "git".to_string(),
+                    "config".to_string(),
+                    "user.email".to_string(),
+                    ctx.requester_email.clone(),
+                ],
+                Some(repo_dir),
+            )
+            .await?;
+            self.exec_container_command(
+                &id,
+                vec![
+                    "git".to_string(),
+                    "remote".to_string(),
+                    "set-url".to_string(),
+                    "--push".to_string(),
+                    "origin".to_string(),
+                    "no_push://disabled".to_string(),
+                ],
+                Some(repo_dir),
+            )
+            .await?;
+            let before_sha = self
+                .exec_container_command(
+                    &id,
                     vec![
                         "git".to_string(),
                         "rev-parse".to_string(),
                         "HEAD".to_string(),
                     ],
                     Some(repo_dir),
-                    None,
-                    sandbox_mode,
                 )
                 .await?
                 .stdout
@@ -1068,16 +1167,15 @@ fi
                 reply_message = "Mention command completed.".to_string();
             }
 
-            let after_sha = client
-                .exec_one_off_command(
+            let after_sha = self
+                .exec_container_command(
+                    &id,
                     vec![
                         "git".to_string(),
                         "rev-parse".to_string(),
                         "HEAD".to_string(),
                     ],
                     Some(repo_dir),
-                    None,
-                    sandbox_mode,
                 )
                 .await?
                 .stdout
@@ -1090,8 +1188,9 @@ fi
                     .as_deref()
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| anyhow!("merge request source branch is missing"))?;
-                if let Err(err) = client
-                    .exec_one_off_command(
+                if let Err(err) = self
+                    .exec_container_command(
+                        &id,
                         vec![
                             "git".to_string(),
                             "merge-base".to_string(),
@@ -1100,15 +1199,14 @@ fi
                             after_sha.clone(),
                         ],
                         Some(repo_dir),
-                        None,
-                        sandbox_mode,
                     )
                     .await
                 {
                     bail!("mention command moved HEAD outside MR ancestry: {err}");
                 }
-                let commit_count_output = client
-                    .exec_one_off_command(
+                let commit_count_output = self
+                    .exec_container_command(
+                        &id,
                         vec![
                             "git".to_string(),
                             "rev-list".to_string(),
@@ -1116,8 +1214,6 @@ fi
                             format!("{before_sha}..{after_sha}"),
                         ],
                         Some(repo_dir),
-                        None,
-                        sandbox_mode,
                     )
                     .await?;
                 let commit_count = commit_count_output
@@ -1134,43 +1230,38 @@ fi
                     bail!("mention command moved HEAD without producing new commits");
                 }
                 let push_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
-                client
-                    .exec_one_off_command(
-                        vec![
-                            "bash".to_string(),
-                            "-lc".to_string(),
-                            format!("git remote set-url --push origin \"{push_url_dq}\""),
-                        ],
-                        Some(repo_dir),
-                        None,
-                        sandbox_mode,
-                    )
-                    .await?;
-                client
-                    .exec_one_off_command(
-                        vec![
-                            "git".to_string(),
-                            "push".to_string(),
-                            "origin".to_string(),
-                            format!("HEAD:{source_branch}"),
-                        ],
-                        Some(repo_dir),
-                        None,
-                        sandbox_mode,
-                    )
-                    .await?;
+                self.exec_container_command(
+                    &id,
+                    vec![
+                        "bash".to_string(),
+                        "-lc".to_string(),
+                        format!("git remote set-url --push origin \"{push_url_dq}\""),
+                    ],
+                    Some(repo_dir),
+                )
+                .await?;
+                self.exec_container_command(
+                    &id,
+                    vec![
+                        "git".to_string(),
+                        "push".to_string(),
+                        "origin".to_string(),
+                        format!("HEAD:{source_branch}"),
+                    ],
+                    Some(repo_dir),
+                )
+                .await?;
                 (MentionCommandStatus::Committed, Some(after_sha))
             } else {
-                let worktree_state = client
-                    .exec_one_off_command(
+                let worktree_state = self
+                    .exec_container_command(
+                        &id,
                         vec![
                             "git".to_string(),
                             "status".to_string(),
                             "--porcelain".to_string(),
                         ],
                         Some(repo_dir),
-                        None,
-                        sandbox_mode,
                     )
                     .await?;
                 if !worktree_state.stdout.trim().is_empty() {
@@ -1692,43 +1783,6 @@ impl AppServerClient {
         Ok(TurnStreamNotificationOutcome::Continue)
     }
 
-    async fn exec_one_off_command(
-        &mut self,
-        command: Vec<String>,
-        cwd: Option<&str>,
-        timeout_ms: Option<u64>,
-        sandbox_mode: &str,
-    ) -> Result<ExecOneOffCommandOutput> {
-        let response = self
-            .request(
-                "execOneOffCommand",
-                json!({
-                    "command": command,
-                    "cwd": cwd,
-                    "timeoutMs": timeout_ms,
-                    "sandboxPolicy": exec_one_off_sandbox_policy(sandbox_mode),
-                }),
-            )
-            .await?;
-        let parsed: ExecOneOffCommandOutput =
-            serde_json::from_value(response).context("parse execOneOffCommand response")?;
-        if parsed.exit_code != 0 {
-            let stderr = parsed.stderr.trim();
-            if stderr.is_empty() {
-                bail!(
-                    "execOneOffCommand failed with exit code {}",
-                    parsed.exit_code
-                );
-            }
-            bail!(
-                "execOneOffCommand failed with exit code {}: {}",
-                parsed.exit_code,
-                stderr
-            );
-        }
-        Ok(parsed)
-    }
-
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = Value::String(Uuid::new_v4().to_string());
         let request = json!({
@@ -1904,14 +1958,6 @@ impl AppServerClient {
         while self.recent_runner_errors.len() > MAX_RECENT_RUNNER_ERRORS {
             self.recent_runner_errors.pop_front();
         }
-    }
-}
-
-fn exec_one_off_sandbox_policy(sandbox_mode: &str) -> Value {
-    match sandbox_mode {
-        "read-only" => json!({ "type": "read-only" }),
-        "workspace-write" => json!({ "type": "workspace-write" }),
-        _ => json!({ "type": "danger-full-access" }),
     }
 }
 
@@ -2273,12 +2319,49 @@ struct CodexOutput {
     comment_markdown: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ExecOneOffCommandOutput {
-    #[serde(rename = "exitCode")]
-    exit_code: i32,
+#[derive(Debug)]
+struct ContainerExecOutput {
+    exit_code: i64,
     stdout: String,
     stderr: String,
+}
+
+fn validate_container_exec_result(
+    command: &[String],
+    cwd: Option<&str>,
+    output: ContainerExecOutput,
+) -> Result<ContainerExecOutput> {
+    if output.exit_code == 0 {
+        return Ok(output);
+    }
+
+    let command_display = format_command_for_log(command);
+    let cwd_display = cwd.unwrap_or("<default>");
+    let stderr = output.stderr.trim();
+    if stderr.is_empty() {
+        bail!(
+            "docker exec command failed with exit code {} (command: {}, cwd: {})",
+            output.exit_code,
+            command_display,
+            cwd_display
+        );
+    }
+
+    bail!(
+        "docker exec command failed with exit code {} (command: {}, cwd: {}): {}",
+        output.exit_code,
+        command_display,
+        cwd_display,
+        stderr
+    );
+}
+
+fn format_command_for_log(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|value| shell_quote(value))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn shell_quote(input: &str) -> String {
@@ -2671,6 +2754,52 @@ mod tests {
             wrapped.to_string(),
             "codex app-server closed stdout".to_string()
         );
+    }
+
+    #[test]
+    fn validate_container_exec_result_accepts_zero_exit_code() -> Result<()> {
+        let command = vec!["git".to_string(), "status".to_string()];
+        let output = ContainerExecOutput {
+            exit_code: 0,
+            stdout: "clean\n".to_string(),
+            stderr: String::new(),
+        };
+        let validated = validate_container_exec_result(&command, Some("/work/repo"), output)?;
+        assert_eq!(validated.stdout, "clean\n");
+        Ok(())
+    }
+
+    #[test]
+    fn validate_container_exec_result_rejects_nonzero_exit_with_stderr() {
+        let command = vec!["git".to_string(), "status".to_string()];
+        let output = ContainerExecOutput {
+            exit_code: 128,
+            stdout: String::new(),
+            stderr: "fatal: not a git repository\n".to_string(),
+        };
+        let err = validate_container_exec_result(&command, Some("/work/repo"), output)
+            .expect_err("expected command failure");
+        let text = err.to_string();
+        assert!(text.contains("docker exec command failed with exit code 128"));
+        assert!(text.contains("'git' 'status'"));
+        assert!(text.contains("/work/repo"));
+        assert!(text.contains("fatal: not a git repository"));
+    }
+
+    #[test]
+    fn validate_container_exec_result_rejects_nonzero_exit_without_stderr() {
+        let command = vec!["git".to_string(), "status".to_string()];
+        let output = ContainerExecOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: " \n ".to_string(),
+        };
+        let err = validate_container_exec_result(&command, Some("/work/repo"), output)
+            .expect_err("expected command failure");
+        let text = err.to_string();
+        assert!(text.contains("docker exec command failed with exit code 1"));
+        assert!(text.contains("'git' 'status'"));
+        assert!(text.contains("/work/repo"));
     }
 
     #[test]
