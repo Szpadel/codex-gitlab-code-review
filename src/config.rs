@@ -169,7 +169,29 @@ pub struct CodexConfig {
     #[serde(default)]
     pub deps: DepsConfig,
     #[serde(default)]
+    pub browser_mcp: BrowserMcpConfig,
+    #[serde(default)]
     pub mcp_server_overrides: McpServerOverridesConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BrowserMcpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_browser_mcp_server_name")]
+    pub server_name: String,
+    #[serde(default = "default_browser_mcp_image")]
+    pub browser_image: String,
+    #[serde(default)]
+    pub browser_entrypoint: Vec<String>,
+    #[serde(default = "default_browser_mcp_remote_debugging_port")]
+    pub remote_debugging_port: u16,
+    #[serde(default)]
+    pub browser_args: Vec<String>,
+    #[serde(default = "default_browser_mcp_command")]
+    pub mcp_command: String,
+    #[serde(default = "default_browser_mcp_args")]
+    pub mcp_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -204,10 +226,45 @@ fn default_usage_limit_fallback_cooldown_seconds() -> u64 {
     3600
 }
 
+fn default_browser_mcp_server_name() -> String {
+    "chrome-devtools".to_string()
+}
+
+fn default_browser_mcp_image() -> String {
+    "chromedp/headless-shell:latest".to_string()
+}
+
+fn default_browser_mcp_remote_debugging_port() -> u16 {
+    9222
+}
+
+fn default_browser_mcp_command() -> String {
+    "npx".to_string()
+}
+
+fn default_browser_mcp_args() -> Vec<String> {
+    vec!["-y".to_string(), "chrome-devtools-mcp@latest".to_string()]
+}
+
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
             host: default_docker_host(),
+        }
+    }
+}
+
+impl Default for BrowserMcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_name: default_browser_mcp_server_name(),
+            browser_image: default_browser_mcp_image(),
+            browser_entrypoint: Vec::new(),
+            remote_debugging_port: default_browser_mcp_remote_debugging_port(),
+            browser_args: Vec::new(),
+            mcp_command: default_browser_mcp_command(),
+            mcp_args: default_browser_mcp_args(),
         }
     }
 }
@@ -252,6 +309,7 @@ impl Config {
             config.docker.host = default_docker_host();
         }
         validate_codex_auth_accounts(&config.codex)?;
+        validate_browser_mcp(&config.codex)?;
         validate_mcp_server_overrides(&config.codex)?;
         Ok(config)
     }
@@ -307,6 +365,52 @@ fn validate_mcp_server_overrides(codex: &CodexConfig) -> Result<()> {
             "codex.mcp_server_overrides keys must not be empty"
         );
     }
+    Ok(())
+}
+
+fn validate_browser_mcp(codex: &CodexConfig) -> Result<()> {
+    if !codex.browser_mcp.enabled {
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        !codex.browser_mcp.server_name.trim().is_empty(),
+        "codex.browser_mcp.server_name must not be empty"
+    );
+    anyhow::ensure!(
+        codex
+            .browser_mcp
+            .server_name
+            .chars()
+            .all(|ch| !ch.is_control()),
+        "codex.browser_mcp.server_name must not contain control characters"
+    );
+    anyhow::ensure!(
+        !codex.browser_mcp.browser_image.trim().is_empty(),
+        "codex.browser_mcp.browser_image must not be empty"
+    );
+    anyhow::ensure!(
+        !codex.browser_mcp.mcp_command.trim().is_empty(),
+        "codex.browser_mcp.mcp_command must not be empty"
+    );
+    anyhow::ensure!(
+        codex.browser_mcp.remote_debugging_port != 0,
+        "codex.browser_mcp.remote_debugging_port must be greater than zero"
+    );
+    for arg in &codex.browser_mcp.browser_args {
+        let trimmed = arg.trim();
+        anyhow::ensure!(
+            trimmed != "--remote-debugging-port"
+                && !trimmed.starts_with("--remote-debugging-port="),
+            "codex.browser_mcp.browser_args must not override --remote-debugging-port"
+        );
+        anyhow::ensure!(
+            trimmed != "--remote-debugging-address"
+                && !trimmed.starts_with("--remote-debugging-address="),
+            "codex.browser_mcp.browser_args must not override --remote-debugging-address"
+        );
+    }
+
     Ok(())
 }
 
@@ -433,6 +537,7 @@ docker:
         assert_eq!(config.codex.usage_limit_fallback_cooldown_seconds, 3600);
         assert!(config.codex.mcp_server_overrides.review.is_empty());
         assert!(config.codex.mcp_server_overrides.mention.is_empty());
+        assert_eq!(config.codex.browser_mcp, BrowserMcpConfig::default());
     }
 
     #[test]
@@ -546,6 +651,238 @@ server:
             config.codex.mcp_server_overrides.mention.get("playwright"),
             Some(&false)
         );
+    }
+
+    #[test]
+    fn loads_browser_mcp_config() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  browser_mcp:
+    enabled: true
+    server_name: "chrome-devtools"
+    browser_image: "chromedp/headless-shell:latest"
+    remote_debugging_port: 9333
+    browser_args:
+      - "--disable-gpu"
+      - "--no-sandbox"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let config = load_from_yaml(yaml);
+        assert!(config.codex.browser_mcp.enabled);
+        assert_eq!(config.codex.browser_mcp.server_name, "chrome-devtools");
+        assert_eq!(
+            config.codex.browser_mcp.browser_image,
+            "chromedp/headless-shell:latest"
+        );
+        assert_eq!(config.codex.browser_mcp.remote_debugging_port, 9333);
+        assert_eq!(
+            config.codex.browser_mcp.browser_args,
+            vec!["--disable-gpu".to_string(), "--no-sandbox".to_string()]
+        );
+        assert!(config.codex.browser_mcp.browser_entrypoint.is_empty());
+        assert_eq!(config.codex.browser_mcp.mcp_command, "npx");
+        assert_eq!(
+            config.codex.browser_mcp.mcp_args,
+            vec!["-y".to_string(), "chrome-devtools-mcp@latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn errors_on_browser_mcp_zero_port() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  browser_mcp:
+    enabled: true
+    server_name: "chrome-devtools"
+    browser_image: "chromedp/headless-shell:latest"
+    remote_debugging_port: 0
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("codex.browser_mcp.remote_debugging_port"));
+    }
+
+    #[test]
+    fn errors_on_browser_mcp_browser_args_overriding_debug_endpoint() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  browser_mcp:
+    enabled: true
+    server_name: "chrome-devtools"
+    browser_image: "chromedp/headless-shell:latest"
+    remote_debugging_port: 9222
+    browser_args:
+      - "--remote-debugging-port=9333"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("must not override --remote-debugging-port"));
+    }
+
+    #[test]
+    fn errors_on_browser_mcp_browser_args_overriding_debug_endpoint_split_form() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  browser_mcp:
+    enabled: true
+    server_name: "chrome-devtools"
+    browser_image: "chromedp/headless-shell:latest"
+    remote_debugging_port: 9222
+    browser_args:
+      - "--remote-debugging-address"
+      - "127.0.0.2"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("must not override --remote-debugging-address"));
+    }
+
+    #[test]
+    fn errors_on_browser_mcp_server_name_with_control_characters() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  browser_mcp:
+    enabled: true
+    server_name: "chrome\ndevtools"
+    browser_image: "chromedp/headless-shell:latest"
+    remote_debugging_port: 9222
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("must not contain control characters"));
     }
 
     #[test]

@@ -92,6 +92,30 @@ data:
       fallback_auth_accounts: []
 {{- end }}
       usage_limit_fallback_cooldown_seconds: {{ .Values.config.codex.usageLimitFallbackCooldownSeconds }}
+      browser_mcp:
+        enabled: {{ .Values.config.codex.browserMcp.enabled }}
+        server_name: {{ .Values.config.codex.browserMcp.serverName | quote }}
+        browser_image: {{ .Values.config.codex.browserMcp.browserImage | quote }}
+{{- if .Values.config.codex.browserMcp.browserEntrypoint }}
+        browser_entrypoint:
+{{ toYaml .Values.config.codex.browserMcp.browserEntrypoint | indent 10 }}
+{{- else }}
+        browser_entrypoint: []
+{{- end }}
+        remote_debugging_port: {{ .Values.config.codex.browserMcp.remoteDebuggingPort }}
+{{- if .Values.config.codex.browserMcp.browserArgs }}
+        browser_args:
+{{ toYaml .Values.config.codex.browserMcp.browserArgs | indent 10 }}
+{{- else }}
+        browser_args: []
+{{- end }}
+        mcp_command: {{ .Values.config.codex.browserMcp.mcpCommand | quote }}
+{{- if .Values.config.codex.browserMcp.mcpArgs }}
+        mcp_args:
+{{ toYaml .Values.config.codex.browserMcp.mcpArgs | indent 10 }}
+{{- else }}
+        mcp_args: []
+{{- end }}
       mcp_server_overrides:
         review:
 {{- if .Values.config.codex.mcpServerOverrides.review }}

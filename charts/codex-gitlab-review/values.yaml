@@ -49,7 +49,26 @@ config:
     fallbackAuthAccounts: []
     # Fallback cooldown in seconds when usage-limit reset timestamp cannot be parsed.
     usageLimitFallbackCooldownSeconds: 3600
+    browserMcp:
+      enabled: false
+      # MCP server name injected into Codex runtime config.
+      serverName: "chrome-devtools"
+      # Browser container image launched inside dind for each Codex run.
+      browserImage: "chromedp/headless-shell:latest"
+      # Optional override for images that need an explicit browser entrypoint.
+      browserEntrypoint: []
+      remoteDebuggingPort: 9222
+      # Extra Chrome/headless-shell args appended after the default remote-debugging flags.
+      # Do not set --remote-debugging-address or --remote-debugging-port here.
+      browserArgs: []
+      # MCP launcher command inside the Codex image. Default requires npm access or warm cache.
+      mcpCommand: "npx"
+      # Extra MCP launcher args before the injected --browserUrl flag.
+      mcpArgs:
+        - "-y"
+        - "chrome-devtools-mcp@latest"
     # Optional. Per-mode MCP server enabled flags for servers defined in Codex config.toml.
+    # This also applies to browserMcp.serverName, so review/mention can disable the injected browser MCP independently.
     # Converted to codex CLI overrides: -c mcp_servers.<name>.enabled=<true|false>
     mcpServerOverrides:
       review: {}
@@ -79,6 +98,8 @@ gitlab:
     secretKey: "token"
     value: ""
 
+# Optional raw Codex config.toml content copied into the auth directory.
+# browserMcp runtime injection is handled by the review service at run start.
 codexToml: ""
 
 proxy:

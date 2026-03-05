@@ -1165,6 +1165,7 @@ mod tests {
                 fallback_auth_accounts: Vec::new(),
                 usage_limit_fallback_cooldown_seconds: 3600,
                 deps: crate::config::DepsConfig { enabled: false },
+                browser_mcp: crate::config::BrowserMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
             },
             docker: DockerConfig {

@@ -84,7 +84,33 @@ codex:
   usage_limit_fallback_cooldown_seconds: 3600
   # Required. Sandbox mode passed to Codex: "read-only", "workspace-write", or "danger-full-access".
   exec_sandbox: "danger-full-access"
+  browser_mcp:
+    # Optional. Start a sibling browser container inside Docker and make it reachable
+    # from the Codex app-server at http://127.0.0.1:<remote_debugging_port>.
+    # The review service injects the matching MCP server via Codex CLI config overrides.
+    enabled: false
+    # Optional. MCP server name injected into the Codex runtime config when enabled.
+    server_name: "chrome-devtools"
+    # Optional. Browser image launched inside Docker for each review/mention run.
+    browser_image: "chromedp/headless-shell:latest"
+    # Optional. Override the browser image entrypoint when the image does not already launch Chromium.
+    browser_entrypoint: []
+    # Optional. Chrome remote debugging port shared with the Codex container network namespace.
+    remote_debugging_port: 9222
+    # Optional. Extra browser args appended after the default remote-debugging flags.
+    # Must not override --remote-debugging-address or --remote-debugging-port.
+    browser_args:
+      - "--no-sandbox"
+    # Optional. MCP launcher command inside the Codex image.
+    # Default uses `npx` and therefore needs npm access or a warm cache.
+    mcp_command: "npx"
+    # Optional. Extra MCP launcher args before the injected --browserUrl flag.
+    # Override this to pin a version or use a preinstalled binary wrapper.
+    mcp_args:
+      - "-y"
+      - "chrome-devtools-mcp@latest"
   # Optional. Per-mode runtime overrides for MCP servers already configured in Codex config.toml.
+  # This also applies to browser_mcp.server_name, so review/mention can disable the injected browser MCP independently.
   # Each entry maps MCP server name -> enabled flag and becomes:
   #   codex -c mcp_servers.<name>.enabled=<true|false> app-server
   mcp_server_overrides:

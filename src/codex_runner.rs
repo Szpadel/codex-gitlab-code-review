@@ -1,4 +1,4 @@
-use crate::config::{CodexConfig, DockerConfig, ProxyConfig};
+use crate::config::{BrowserMcpConfig, CodexConfig, DockerConfig, ProxyConfig};
 use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
 use crate::gitlab::MergeRequest;
 use crate::state::ReviewStateStore;
@@ -69,6 +69,7 @@ pub struct MentionCommandResult {
 }
 
 const REVIEW_CONTAINER_NAME_PREFIX: &str = "codex-review-";
+const BROWSER_CONTAINER_NAME_PREFIX: &str = "codex-browser-";
 const REVIEW_OWNER_LABEL_KEY: &str = "codex.gitlab.review.owner";
 const PRIMARY_AUTH_ACCOUNT_NAME: &str = "primary";
 
@@ -78,6 +79,12 @@ struct AuthAccount {
     auth_host_path: String,
     state_key: String,
     is_primary: bool,
+}
+
+struct StartedAppServer {
+    container_id: String,
+    browser_container_id: Option<String>,
+    client: AppServerClient,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +228,15 @@ impl DockerCodexRunner {
             format!("GITLAB_TOKEN={}", self.gitlab_token),
             "HOME=/root".to_string(),
         ];
+        env.extend(self.proxy_env_vars());
+        if self.log_all_json {
+            env.push("CODEX_RUNNER_DEBUG=1".to_string());
+        }
+        env
+    }
+
+    fn proxy_env_vars(&self) -> Vec<String> {
+        let mut env = Vec::new();
         if let Some(value) = &self.proxy.http_proxy {
             env.push(format!("HTTP_PROXY={value}"));
         }
@@ -230,13 +246,14 @@ impl DockerCodexRunner {
         if let Some(value) = &self.proxy.no_proxy {
             env.push(format!("NO_PROXY={value}"));
         }
-        if self.log_all_json {
-            env.push("CODEX_RUNNER_DEBUG=1".to_string());
-        }
         env
     }
 
-    fn command(&self, ctx: &ReviewContext) -> Result<String> {
+    fn command(
+        &self,
+        ctx: &ReviewContext,
+        browser_mcp: Option<&BrowserMcpConfig>,
+    ) -> Result<String> {
         let clone_url = self.clone_url(&ctx.repo)?;
         Ok(Self::build_command_script(
             &clone_url,
@@ -247,8 +264,23 @@ impl DockerCodexRunner {
                 .as_deref()
                 .filter(|value| !value.is_empty()),
             self.codex.deps.enabled,
+            browser_mcp,
             &self.codex.mcp_server_overrides.review,
         ))
+    }
+
+    fn browser_mcp(&self) -> Option<&BrowserMcpConfig> {
+        self.codex
+            .browser_mcp
+            .enabled
+            .then_some(&self.codex.browser_mcp)
+    }
+
+    fn effective_browser_mcp(
+        &self,
+        mcp_server_overrides: &BTreeMap<String, bool>,
+    ) -> Option<&BrowserMcpConfig> {
+        effective_browser_mcp(self.browser_mcp(), mcp_server_overrides)
     }
 
     fn mention_developer_instructions(ctx: &MentionCommandContext) -> String {
@@ -284,12 +316,15 @@ impl DockerCodexRunner {
         ctx: &MentionCommandContext,
         clone_url: &str,
         auth_mount_path: &str,
+        browser_mcp: Option<&BrowserMcpConfig>,
         mcp_server_overrides: &BTreeMap<String, bool>,
     ) -> String {
         let clone_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
         let head_sha_q = shell_quote(&ctx.head_sha);
         let auth_mount_path_q = shell_quote(auth_mount_path);
-        let app_server_exec_cmd = codex_app_server_exec_command(mcp_server_overrides);
+        let browser_prereq_script = browser_mcp_prereq_script(browser_mcp);
+        let browser_wait_script = browser_wait_script(browser_mcp);
+        let app_server_exec_cmd = codex_app_server_exec_command(browser_mcp, mcp_server_overrides);
         format!(
             r#"set -eu
 repo_dir='/work/repo'
@@ -339,11 +374,15 @@ if ! command -v codex >/dev/null 2>&1; then
     exit 1
   fi
 fi
+{browser_prereq_script}
+{browser_wait_script}
 {app_server_exec_cmd}
 "#,
             clone_url_dq = clone_url_dq,
             head_sha_q = head_sha_q,
             auth_mount_path_q = auth_mount_path_q,
+            browser_prereq_script = browser_prereq_script,
+            browser_wait_script = browser_wait_script,
             app_server_exec_cmd = app_server_exec_cmd,
         )
     }
@@ -354,6 +393,7 @@ fi
         auth_mount_path: &str,
         target_branch: Option<&str>,
         deps_enabled: bool,
+        browser_mcp: Option<&BrowserMcpConfig>,
         mcp_server_overrides: &BTreeMap<String, bool>,
     ) -> String {
         let target_branch_script = target_branch
@@ -466,7 +506,9 @@ export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
         } else {
             ""
         };
-        let app_server_exec_cmd = codex_app_server_exec_command(mcp_server_overrides);
+        let browser_prereq_script = browser_mcp_prereq_script(browser_mcp);
+        let browser_wait_script = browser_wait_script(browser_mcp);
+        let app_server_exec_cmd = codex_app_server_exec_command(browser_mcp, mcp_server_overrides);
         format!(
             r#"set -eu
 mkdir -p /work
@@ -511,6 +553,8 @@ if ! command -v codex >/dev/null 2>&1; then
     exit 1
   fi
 fi
+{browser_prereq_script}
+{browser_wait_script}
 {app_server_exec_cmd}
 "#,
             clone_url = clone_url,
@@ -518,8 +562,25 @@ fi
             auth_mount_path = auth_mount_path,
             target_branch_script = target_branch_script,
             deps_prefetch_script = deps_prefetch_script,
+            browser_prereq_script = browser_prereq_script,
+            browser_wait_script = browser_wait_script,
             app_server_exec_cmd = app_server_exec_cmd
         )
+    }
+
+    fn browser_container_cmd(browser_mcp: &BrowserMcpConfig) -> Vec<String> {
+        let mut cmd = vec![
+            "--no-sandbox".to_string(),
+            "--remote-debugging-address=0.0.0.0".to_string(),
+            format!(
+                "--remote-debugging-port={}",
+                browser_mcp.remote_debugging_port
+            ),
+            "--disable-gpu".to_string(),
+            "--enable-unsafe-swiftshader".to_string(),
+        ];
+        cmd.extend(browser_mcp.browser_args.clone());
+        cmd
     }
 
     fn app_server_cmd(script: String) -> Vec<String> {
@@ -547,6 +608,18 @@ fi
                 Some(RemoveContainerOptionsBuilder::new().force(true).build()),
             )
             .await;
+    }
+
+    async fn cleanup_app_server_containers(
+        &self,
+        container_id: &str,
+        browser_container_id: Option<&str>,
+    ) {
+        self.remove_container_best_effort(container_id).await;
+        if let Some(browser_container_id) = browser_container_id {
+            self.remove_container_best_effort(browser_container_id)
+                .await;
+        }
     }
 
     async fn exec_container_command(
@@ -654,9 +727,10 @@ fi
         Ok(output)
     }
 
-    fn is_review_container_name(name: &str) -> bool {
-        name.trim_start_matches('/')
-            .starts_with(REVIEW_CONTAINER_NAME_PREFIX)
+    fn is_managed_container_name(name: &str) -> bool {
+        let name = name.trim_start_matches('/');
+        name.starts_with(REVIEW_CONTAINER_NAME_PREFIX)
+            || name.starts_with(BROWSER_CONTAINER_NAME_PREFIX)
     }
 
     fn review_container_labels(owner_id: &str) -> HashMap<String, String> {
@@ -667,7 +741,10 @@ fi
         HashMap::from([
             (
                 "name".to_string(),
-                vec![REVIEW_CONTAINER_NAME_PREFIX.to_string()],
+                vec![
+                    REVIEW_CONTAINER_NAME_PREFIX.to_string(),
+                    BROWSER_CONTAINER_NAME_PREFIX.to_string(),
+                ],
             ),
             (
                 "label".to_string(),
@@ -705,7 +782,7 @@ fi
             let names = container.names.unwrap_or_default();
             if !names
                 .iter()
-                .any(|name| Self::is_review_container_name(name))
+                .any(|name| Self::is_managed_container_name(name))
             {
                 continue;
             }
@@ -721,7 +798,7 @@ fi
                 };
                 warn!(
                     container_names = names_value.as_str(),
-                    "skipping codex review container without id"
+                    "skipping managed codex container without id"
                 );
                 continue;
             };
@@ -736,14 +813,14 @@ fi
             {
                 let container_name = names
                     .iter()
-                    .find(|name| Self::is_review_container_name(name))
+                    .find(|name| Self::is_managed_container_name(name))
                     .map(|name| name.trim_start_matches('/'))
                     .unwrap_or("<unknown>");
                 warn!(
                     container_id = id,
                     container_name,
                     error = %err,
-                    "failed to remove codex review container"
+                    "failed to remove managed codex container"
                 );
             }
         }
@@ -834,9 +911,15 @@ fi
         script: String,
         auth_host_path: &str,
         extra_binds: Vec<String>,
-    ) -> Result<(String, AppServerClient)> {
+        browser_mcp: Option<&BrowserMcpConfig>,
+    ) -> Result<StartedAppServer> {
         let image_ref = Self::normalize_image_reference(&self.codex.image);
         ensure_image(&self.docker, &image_ref).await?;
+        let browser_container_id = if let Some(browser_mcp) = browser_mcp {
+            Some(self.start_browser_container(browser_mcp).await?)
+        } else {
+            None
+        };
         let name = format!("{}{}", REVIEW_CONTAINER_NAME_PREFIX, Uuid::new_v4());
         let mut binds = vec![format!(
             "{}:{}:rw",
@@ -855,22 +938,32 @@ fi
             tty: Some(false),
             host_config: Some(HostConfig {
                 binds: Some(binds),
+                network_mode: browser_container_id
+                    .as_ref()
+                    .map(|id| format!("container:{id}")),
                 auto_remove: Some(false),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
-        let create = self
+        let create = match self
             .docker
             .create_container(
                 Some(CreateContainerOptionsBuilder::new().name(&name).build()),
                 config,
             )
             .await
-            .with_context(|| {
-                format!("create docker container {} with image {}", name, image_ref)
-            })?;
+            .with_context(|| format!("create docker container {} with image {}", name, image_ref))
+        {
+            Ok(create) => create,
+            Err(err) => {
+                if let Some(browser_id) = browser_container_id.as_deref() {
+                    self.remove_container_best_effort(browser_id).await;
+                }
+                return Err(err);
+            }
+        };
         let id = create.id;
         let start_result = self
             .docker
@@ -879,6 +972,9 @@ fi
             .with_context(|| format!("start docker container {}", id));
         if let Err(err) = start_result {
             self.remove_container_best_effort(&id).await;
+            if let Some(browser_id) = browser_container_id.as_deref() {
+                self.remove_container_best_effort(browser_id).await;
+            }
             return Err(err);
         }
 
@@ -902,11 +998,62 @@ fi
             Ok(attach) => attach,
             Err(err) => {
                 self.remove_container_best_effort(&id).await;
+                if let Some(browser_id) = browser_container_id.as_deref() {
+                    self.remove_container_best_effort(browser_id).await;
+                }
                 return Err(err);
             }
         };
 
-        Ok((id, AppServerClient::new(attach, self.log_all_json)))
+        Ok(StartedAppServer {
+            container_id: id,
+            browser_container_id,
+            client: AppServerClient::new(attach, self.log_all_json),
+        })
+    }
+
+    async fn start_browser_container(&self, browser_mcp: &BrowserMcpConfig) -> Result<String> {
+        let image_ref = Self::normalize_image_reference(&browser_mcp.browser_image);
+        ensure_image(&self.docker, &image_ref).await?;
+        let name = format!("{}{}", BROWSER_CONTAINER_NAME_PREFIX, Uuid::new_v4());
+        let config = ContainerCreateBody {
+            image: Some(image_ref.clone()),
+            entrypoint: (!browser_mcp.browser_entrypoint.is_empty())
+                .then(|| browser_mcp.browser_entrypoint.clone()),
+            cmd: Some(Self::browser_container_cmd(browser_mcp)),
+            env: Some(self.proxy_env_vars()),
+            labels: Some(Self::review_container_labels(&self.owner_id)),
+            host_config: Some(HostConfig {
+                auto_remove: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let create = self
+            .docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                config,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "create docker browser container {} with image {}",
+                    name, image_ref
+                )
+            })?;
+        let id = create.id;
+        let start_result = self
+            .docker
+            .start_container(&id, Some(StartContainerOptionsBuilder::new().build()))
+            .await
+            .with_context(|| format!("start docker browser container {}", id));
+        if let Err(err) = start_result {
+            self.remove_container_best_effort(&id).await;
+            return Err(err);
+        }
+        Ok(id)
     }
 
     async fn run_app_server_review_with_account(
@@ -914,9 +1061,14 @@ fi
         ctx: &ReviewContext,
         account: &AuthAccount,
     ) -> Result<String> {
-        let script = self.command(ctx)?;
-        let (id, mut client) = self
-            .start_app_server_container(script, &account.auth_host_path, Vec::new())
+        let browser_mcp = self.effective_browser_mcp(&self.codex.mcp_server_overrides.review);
+        let script = self.command(ctx, browser_mcp)?;
+        let StartedAppServer {
+            container_id,
+            browser_container_id,
+            mut client,
+        } = self
+            .start_app_server_container(script, &account.auth_host_path, Vec::new(), browser_mcp)
             .await?;
         let repo_path = "/work/repo";
         let instructions = self.review_instructions(ctx);
@@ -976,7 +1128,8 @@ fi
         })
         .await;
 
-        self.remove_container_best_effort(&id).await;
+        self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
+            .await;
 
         review_result.map_err(|_| anyhow!("codex review timed out"))?
     }
@@ -1065,14 +1218,20 @@ fi
     ) -> Result<MentionCommandResult> {
         let clone_url = self.clone_url(&ctx.repo)?;
         let repo_dir = "/work/repo";
+        let browser_mcp = self.effective_browser_mcp(&self.codex.mcp_server_overrides.mention);
         let script = Self::build_mention_command_script(
             ctx,
             &clone_url,
             &self.codex.auth_mount_path,
+            browser_mcp,
             &self.codex.mcp_server_overrides.mention,
         );
-        let (id, mut client) = self
-            .start_app_server_container(script, &account.auth_host_path, Vec::new())
+        let StartedAppServer {
+            container_id,
+            browser_container_id,
+            mut client,
+        } = self
+            .start_app_server_container(script, &account.auth_host_path, Vec::new(), browser_mcp)
             .await?;
 
         let mention_result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
@@ -1097,7 +1256,7 @@ fi
                 .to_string();
 
             self.exec_container_command(
-                &id,
+                &container_id,
                 vec![
                     "git".to_string(),
                     "config".to_string(),
@@ -1108,7 +1267,7 @@ fi
             )
             .await?;
             self.exec_container_command(
-                &id,
+                &container_id,
                 vec![
                     "git".to_string(),
                     "config".to_string(),
@@ -1119,7 +1278,7 @@ fi
             )
             .await?;
             self.exec_container_command(
-                &id,
+                &container_id,
                 vec![
                     "git".to_string(),
                     "remote".to_string(),
@@ -1133,7 +1292,7 @@ fi
             .await?;
             let before_sha = self
                 .exec_container_command(
-                    &id,
+                    &container_id,
                     vec![
                         "git".to_string(),
                         "rev-parse".to_string(),
@@ -1169,7 +1328,7 @@ fi
 
             let after_sha = self
                 .exec_container_command(
-                    &id,
+                    &container_id,
                     vec![
                         "git".to_string(),
                         "rev-parse".to_string(),
@@ -1190,7 +1349,7 @@ fi
                     .ok_or_else(|| anyhow!("merge request source branch is missing"))?;
                 if let Err(err) = self
                     .exec_container_command(
-                        &id,
+                        &container_id,
                         vec![
                             "git".to_string(),
                             "merge-base".to_string(),
@@ -1206,7 +1365,7 @@ fi
                 }
                 let commit_count_output = self
                     .exec_container_command(
-                        &id,
+                        &container_id,
                         vec![
                             "git".to_string(),
                             "rev-list".to_string(),
@@ -1231,7 +1390,7 @@ fi
                 }
                 let push_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
                 self.exec_container_command(
-                    &id,
+                    &container_id,
                     vec![
                         "bash".to_string(),
                         "-lc".to_string(),
@@ -1241,7 +1400,7 @@ fi
                 )
                 .await?;
                 self.exec_container_command(
-                    &id,
+                    &container_id,
                     vec![
                         "git".to_string(),
                         "push".to_string(),
@@ -1255,7 +1414,7 @@ fi
             } else {
                 let worktree_state = self
                     .exec_container_command(
-                        &id,
+                        &container_id,
                         vec![
                             "git".to_string(),
                             "status".to_string(),
@@ -1278,7 +1437,8 @@ fi
         })
         .await;
 
-        self.remove_container_best_effort(&id).await;
+        self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
+            .await;
 
         mention_result.map_err(|_| anyhow!("codex mention command timed out"))?
     }
@@ -2368,14 +2528,116 @@ fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
-fn codex_app_server_exec_command(mcp_server_overrides: &BTreeMap<String, bool>) -> String {
-    if mcp_server_overrides.is_empty() {
+fn escape_toml_basic_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn toml_basic_string(value: &str) -> String {
+    format!("\"{}\"", escape_toml_basic_string(value))
+}
+
+fn toml_dotted_key_segment(value: &str) -> String {
+    format!("\"{}\"", escape_toml_basic_string(value))
+}
+
+fn browser_mcp_prereq_script(browser_mcp: Option<&BrowserMcpConfig>) -> String {
+    let Some(browser_mcp) = browser_mcp else {
+        return String::new();
+    };
+    let command_q = shell_quote(&browser_mcp.mcp_command);
+    format!(
+        r#"browser_mcp_command={command_q}
+if ! command -v "$browser_mcp_command" >/dev/null 2>&1; then
+  echo "codex-runner-error: browser MCP requires $browser_mcp_command in the Codex image"
+  exit 1
+fi
+"#,
+    )
+}
+
+fn effective_browser_mcp<'a>(
+    browser_mcp: Option<&'a BrowserMcpConfig>,
+    mcp_server_overrides: &BTreeMap<String, bool>,
+) -> Option<&'a BrowserMcpConfig> {
+    let browser_mcp = browser_mcp?;
+    if matches!(
+        mcp_server_overrides.get(browser_mcp.server_name.as_str()),
+        Some(false)
+    ) {
+        return None;
+    }
+    Some(browser_mcp)
+}
+
+fn browser_wait_script(browser_mcp: Option<&BrowserMcpConfig>) -> String {
+    let Some(browser_mcp) = browser_mcp else {
+        return String::new();
+    };
+    format!(
+        r#"wait_for_browser_mcp() {{
+  deadline=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if exec 3<>/dev/tcp/127.0.0.1/{port} 2>/dev/null; then
+      printf 'GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3
+      if IFS= read -r status_line <&3 && printf '%s' "$status_line" | grep -q ' 200 '; then
+        exec 3<&-
+        exec 3>&-
+        return 0
+      fi
+      exec 3<&-
+      exec 3>&-
+    fi
+    sleep 1
+  done
+  echo "codex-runner-error: browser MCP endpoint did not become ready at http://127.0.0.1:{port}/json/version"
+  exit 1
+}}
+wait_for_browser_mcp
+"#,
+        port = browser_mcp.remote_debugging_port,
+    )
+}
+
+fn codex_app_server_exec_command(
+    browser_mcp: Option<&BrowserMcpConfig>,
+    mcp_server_overrides: &BTreeMap<String, bool>,
+) -> String {
+    if browser_mcp.is_none() && mcp_server_overrides.is_empty() {
         return "exec codex app-server".to_string();
     }
 
     let mut cmd_parts = vec!["exec codex".to_string()];
+    if let Some(browser_mcp) = browser_mcp {
+        let server_key = toml_dotted_key_segment(&browser_mcp.server_name);
+        let args_override = format!(
+            "mcp_servers.{server_key}.args=[{args}]",
+            args = browser_mcp
+                .mcp_args
+                .iter()
+                .map(|arg| toml_basic_string(arg))
+                .chain(std::iter::once(toml_basic_string(&format!(
+                    "--browserUrl=http://127.0.0.1:{}",
+                    browser_mcp.remote_debugging_port
+                ))))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for override_value in [
+            format!(
+                "mcp_servers.{server_key}.command={}",
+                toml_basic_string(&browser_mcp.mcp_command)
+            ),
+            args_override,
+            format!("mcp_servers.{server_key}.enabled=true"),
+        ] {
+            cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
+        }
+    }
     for (server_name, enabled) in mcp_server_overrides {
-        let override_value = format!("mcp_servers.{server_name}.enabled={enabled}");
+        let override_value = format!(
+            "mcp_servers.{}.enabled={enabled}",
+            toml_dotted_key_segment(server_name)
+        );
         cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
     }
     cmd_parts.push("app-server".to_string());
@@ -2704,6 +2966,7 @@ mod tests {
             ],
             usage_limit_fallback_cooldown_seconds: 3600,
             deps: DepsConfig { enabled: false },
+            browser_mcp: BrowserMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
         };
 
@@ -2811,7 +3074,7 @@ mod tests {
     #[test]
     fn codex_app_server_exec_command_without_mcp_overrides_is_plain() {
         let overrides = BTreeMap::new();
-        let cmd = codex_app_server_exec_command(&overrides);
+        let cmd = codex_app_server_exec_command(None, &overrides);
         assert_eq!(cmd, "exec codex app-server");
     }
 
@@ -2819,11 +3082,93 @@ mod tests {
     fn codex_app_server_exec_command_renders_sorted_mcp_overrides() {
         let overrides =
             BTreeMap::from([("serena".to_string(), false), ("github".to_string(), true)]);
-        let cmd = codex_app_server_exec_command(&overrides);
+        let cmd = codex_app_server_exec_command(None, &overrides);
         assert_eq!(
             cmd,
-            "exec codex -c 'mcp_servers.github.enabled=true' -c 'mcp_servers.serena.enabled=false' app-server"
+            "exec codex -c 'mcp_servers.\"github\".enabled=true' -c 'mcp_servers.\"serena\".enabled=false' app-server"
         );
+    }
+
+    #[test]
+    fn codex_app_server_exec_command_includes_browser_mcp_config() {
+        let cmd = codex_app_server_exec_command(
+            Some(&BrowserMcpConfig {
+                enabled: true,
+                server_name: "chrome-devtools".to_string(),
+                browser_image: "chromedp/headless-shell:latest".to_string(),
+                browser_args: vec![],
+                remote_debugging_port: 9222,
+                ..BrowserMcpConfig::default()
+            }),
+            &BTreeMap::new(),
+        );
+        assert!(cmd.contains("mcp_servers.\"chrome-devtools\".command=\"npx\""));
+        assert!(cmd.contains("chrome-devtools-mcp@latest"));
+        assert!(cmd.contains("--browserUrl=http://127.0.0.1:9222"));
+        assert!(cmd.contains("mcp_servers.\"chrome-devtools\".enabled=true"));
+    }
+
+    #[test]
+    fn codex_app_server_exec_command_allows_mode_overrides_to_disable_browser_mcp() {
+        let cmd = codex_app_server_exec_command(
+            Some(&BrowserMcpConfig {
+                enabled: true,
+                server_name: "chrome-devtools".to_string(),
+                browser_image: "chromedp/headless-shell:latest".to_string(),
+                browser_entrypoint: Vec::new(),
+                remote_debugging_port: 9222,
+                browser_args: vec![],
+                mcp_command: "npx".to_string(),
+                mcp_args: vec!["-y".to_string(), "chrome-devtools-mcp@latest".to_string()],
+            }),
+            &BTreeMap::from([("chrome-devtools".to_string(), false)]),
+        );
+        let expected_enable = "-c 'mcp_servers.\"chrome-devtools\".enabled=true'";
+        let expected_disable = "-c 'mcp_servers.\"chrome-devtools\".enabled=false'";
+        assert!(cmd.contains(expected_enable));
+        assert!(cmd.contains(expected_disable));
+        assert!(cmd.find(expected_enable) < cmd.find(expected_disable));
+    }
+
+    #[test]
+    fn effective_browser_mcp_disables_sidecar_when_mode_override_is_false() {
+        let browser_mcp = BrowserMcpConfig {
+            enabled: true,
+            server_name: "chrome-devtools".to_string(),
+            browser_image: "chromedp/headless-shell:latest".to_string(),
+            ..BrowserMcpConfig::default()
+        };
+        let effective = effective_browser_mcp(
+            Some(&browser_mcp),
+            &BTreeMap::from([("chrome-devtools".to_string(), false)]),
+        );
+        assert!(effective.is_none());
+    }
+
+    #[test]
+    fn effective_browser_mcp_keeps_sidecar_when_mode_override_is_true() {
+        let browser_mcp = BrowserMcpConfig {
+            enabled: true,
+            server_name: "chrome-devtools".to_string(),
+            browser_image: "chromedp/headless-shell:latest".to_string(),
+            ..BrowserMcpConfig::default()
+        };
+        let effective = effective_browser_mcp(
+            Some(&browser_mcp),
+            &BTreeMap::from([("chrome-devtools".to_string(), true)]),
+        );
+        assert_eq!(effective, Some(&browser_mcp));
+    }
+
+    #[test]
+    fn browser_container_cmd_includes_no_sandbox_by_default() {
+        let cmd = DockerCodexRunner::browser_container_cmd(&BrowserMcpConfig {
+            enabled: true,
+            server_name: "chrome-devtools".to_string(),
+            browser_image: "chromedp/headless-shell:latest".to_string(),
+            ..BrowserMcpConfig::default()
+        });
+        assert!(cmd.iter().any(|arg| arg == "--no-sandbox"));
     }
 
     #[test]
@@ -2834,6 +3179,7 @@ mod tests {
             "/root/.codex",
             None,
             false,
+            None,
             &BTreeMap::new(),
         );
         assert!(script.contains("export CODEX_HOME=\"/root/.codex\""));
@@ -2848,6 +3194,7 @@ mod tests {
             "/root/.codex",
             Some("main"),
             false,
+            None,
             &BTreeMap::new(),
         );
         assert!(script.contains("git fetch --depth 1 origin \"main\""));
@@ -2863,6 +3210,7 @@ mod tests {
             "/root/.codex",
             None,
             false,
+            None,
             &BTreeMap::new(),
         );
         assert!(script.contains("git clone --depth 1 --recurse-submodules"));
@@ -2877,6 +3225,7 @@ mod tests {
             "/root/.codex",
             None,
             true,
+            None,
             &BTreeMap::new(),
         );
         assert!(script.contains("prefetch_deps()"));
@@ -2892,9 +3241,54 @@ mod tests {
             "/root/.codex",
             None,
             false,
+            None,
             &overrides,
         );
-        assert!(script.contains("exec codex -c 'mcp_servers.github.enabled=false' app-server"));
+        assert!(script.contains("exec codex -c 'mcp_servers.\"github\".enabled=false' app-server"));
+    }
+
+    #[test]
+    fn build_command_script_waits_for_browser_when_enabled() {
+        let script = DockerCodexRunner::build_command_script(
+            "https://example.com/repo.git",
+            "abc",
+            "/root/.codex",
+            None,
+            false,
+            Some(&BrowserMcpConfig {
+                enabled: true,
+                server_name: "chrome-devtools".to_string(),
+                browser_image: "chromedp/headless-shell:latest".to_string(),
+                remote_debugging_port: 9222,
+                browser_args: vec!["--no-sandbox".to_string()],
+                ..BrowserMcpConfig::default()
+            }),
+            &BTreeMap::new(),
+        );
+        assert!(script.contains("browser_mcp_command='npx'"));
+        assert!(script.contains("browser MCP requires $browser_mcp_command"));
+        assert!(script.contains("127.0.0.1:9222/json/version"));
+        assert!(script.contains("browser MCP endpoint did not become ready"));
+    }
+
+    #[test]
+    fn browser_mcp_prereq_script_requires_npx_when_enabled() {
+        let script = browser_mcp_prereq_script(Some(&BrowserMcpConfig {
+            enabled: true,
+            server_name: "chrome-devtools".to_string(),
+            browser_image: "chromedp/headless-shell:latest".to_string(),
+            remote_debugging_port: 9222,
+            browser_args: vec![],
+            ..BrowserMcpConfig::default()
+        }));
+        assert!(script.contains("browser_mcp_command='npx'"));
+        assert!(script.contains("browser MCP requires $browser_mcp_command"));
+    }
+
+    #[test]
+    fn browser_mcp_prereq_script_is_empty_when_disabled() {
+        let script = browser_mcp_prereq_script(None);
+        assert!(script.is_empty());
     }
 
     #[test]
@@ -2930,6 +3324,7 @@ mod tests {
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
             "/root/.codex",
+            None,
             &BTreeMap::new(),
         );
         assert!(
@@ -2976,9 +3371,61 @@ mod tests {
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
             "/root/.codex",
+            None,
             &overrides,
         );
-        assert!(script.contains("exec codex -c 'mcp_servers.playwright.enabled=true' app-server"));
+        assert!(
+            script.contains("exec codex -c 'mcp_servers.\"playwright\".enabled=true' app-server")
+        );
+    }
+
+    #[test]
+    fn mention_command_script_waits_for_browser_when_enabled() {
+        let ctx = MentionCommandContext {
+            repo: "group/repo".to_string(),
+            project_path: "group/repo".to_string(),
+            mr: MergeRequest {
+                iid: 11,
+                title: Some("Title".to_string()),
+                web_url: Some(
+                    "https://gitlab.example.com/group/repo/-/merge_requests/11".to_string(),
+                ),
+                created_at: None,
+                updated_at: None,
+                sha: Some("abc123".to_string()),
+                source_branch: None,
+                target_branch: Some("main".to_string()),
+                author: None,
+                source_project_id: None,
+                target_project_id: None,
+                diff_refs: None,
+            },
+            head_sha: "abc123".to_string(),
+            discussion_id: "discussion-1".to_string(),
+            trigger_note_id: 77,
+            requester_name: "Alice Example".to_string(),
+            requester_email: "alice@example.com".to_string(),
+            additional_developer_instructions: None,
+            prompt: "Do the change".to_string(),
+        };
+        let script = DockerCodexRunner::build_mention_command_script(
+            &ctx,
+            "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "/root/.codex",
+            Some(&BrowserMcpConfig {
+                enabled: true,
+                server_name: "chrome-devtools".to_string(),
+                browser_image: "chromedp/headless-shell:latest".to_string(),
+                remote_debugging_port: 9222,
+                browser_args: vec![],
+                ..BrowserMcpConfig::default()
+            }),
+            &BTreeMap::new(),
+        );
+        assert!(script.contains("browser_mcp_command='npx'"));
+        assert!(script.contains("browser MCP requires $browser_mcp_command"));
+        assert!(script.contains("127.0.0.1:9222/json/version"));
+        assert!(script.contains("browser MCP endpoint did not become ready"));
     }
 
     #[test]
@@ -3102,13 +3549,16 @@ mod tests {
 
     #[test]
     fn review_container_prefix_matcher_handles_docker_name_format() {
-        assert!(DockerCodexRunner::is_review_container_name(
+        assert!(DockerCodexRunner::is_managed_container_name(
             "codex-review-abc"
         ));
-        assert!(DockerCodexRunner::is_review_container_name(
+        assert!(DockerCodexRunner::is_managed_container_name(
             "/codex-review-def"
         ));
-        assert!(!DockerCodexRunner::is_review_container_name(
+        assert!(DockerCodexRunner::is_managed_container_name(
+            "/codex-browser-jkl"
+        ));
+        assert!(!DockerCodexRunner::is_managed_container_name(
             "/codex-auth-ghi"
         ));
     }
@@ -3128,7 +3578,10 @@ mod tests {
         let filters = DockerCodexRunner::review_container_filters("worker-a");
         assert_eq!(
             filters.get("name"),
-            Some(&vec![REVIEW_CONTAINER_NAME_PREFIX.to_string()])
+            Some(&vec![
+                REVIEW_CONTAINER_NAME_PREFIX.to_string(),
+                BROWSER_CONTAINER_NAME_PREFIX.to_string()
+            ])
         );
         assert_eq!(
             filters.get("label"),

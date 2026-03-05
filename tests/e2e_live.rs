@@ -65,6 +65,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             fallback_auth_accounts: Vec::new(),
             usage_limit_fallback_cooldown_seconds: 3600,
             deps: codex_gitlab_code_review::config::DepsConfig { enabled: false },
+            browser_mcp: codex_gitlab_code_review::config::BrowserMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
         },
         docker: DockerConfig { host: docker_host },
