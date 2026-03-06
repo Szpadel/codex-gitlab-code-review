@@ -3,8 +3,8 @@ use chrono::{Duration, Utc};
 use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
 use codex_gitlab_code_review::config::{
     CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
-    McpServerOverridesConfig, ProxyConfig, ReviewConfig, ReviewMentionCommandsConfig,
-    ScheduleConfig, ServerConfig, TargetSelector,
+    McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
+    ServerConfig, TargetSelector,
 };
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::review::ReviewService;
@@ -77,11 +77,6 @@ async fn e2e_live_dry_run() -> Result<()> {
         server: ServerConfig {
             bind_addr: "127.0.0.1:0".to_string(),
         },
-        proxy: ProxyConfig {
-            http_proxy: None,
-            https_proxy: None,
-            no_proxy: None,
-        },
     };
 
     let gitlab_client = GitLabClient::new(&config.gitlab.base_url, &config.gitlab.token)?;
@@ -105,7 +100,6 @@ async fn e2e_live_dry_run() -> Result<()> {
     let runner = DockerCodexRunner::new(
         config.docker.clone(),
         config.codex.clone(),
-        config.proxy.clone(),
         git_base,
         Arc::clone(&state),
         RunnerRuntimeOptions {

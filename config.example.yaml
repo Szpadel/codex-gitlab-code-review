@@ -150,11 +150,3 @@ database:
 server:
   # Required. Health server bind address.
   bind_addr: "0.0.0.0:8080"
-
-proxy:
-  # Optional. HTTP proxy forwarded to the Codex container.
-  http_proxy: "http://localhost:3128"
-  # Optional. HTTPS proxy forwarded to the Codex container.
-  https_proxy: "http://localhost:3128"
-  # Optional. Comma-separated NO_PROXY list forwarded to the Codex container.
-  no_proxy: "localhost,127.0.0.1,.svc,.cluster.local"

@@ -1,5 +1,5 @@
 use crate::config::{
-    BROWSER_MCP_REMOTE_DEBUGGING_PORT, BrowserMcpConfig, CodexConfig, DockerConfig, ProxyConfig,
+    BROWSER_MCP_REMOTE_DEBUGGING_PORT, BrowserMcpConfig, CodexConfig, DockerConfig,
 };
 use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
 use crate::gitlab::MergeRequest;
@@ -250,7 +250,6 @@ pub trait CodexRunner: Send + Sync {
 pub struct DockerCodexRunner {
     docker: Docker,
     codex: CodexConfig,
-    proxy: ProxyConfig,
     git_base: Url,
     gitlab_token: String,
     log_all_json: bool,
@@ -270,7 +269,6 @@ impl DockerCodexRunner {
     pub fn new(
         docker_cfg: DockerConfig,
         codex: CodexConfig,
-        proxy: ProxyConfig,
         git_base: Url,
         state: Arc<ReviewStateStore>,
         runtime: RunnerRuntimeOptions,
@@ -280,7 +278,6 @@ impl DockerCodexRunner {
         Ok(Self {
             docker,
             codex,
-            proxy,
             git_base,
             gitlab_token: runtime.gitlab_token,
             log_all_json: runtime.log_all_json,
@@ -365,23 +362,8 @@ impl DockerCodexRunner {
             format!("GITLAB_TOKEN={}", self.gitlab_token),
             "HOME=/root".to_string(),
         ];
-        env.extend(self.proxy_env_vars());
         if self.log_all_json {
             env.push("CODEX_RUNNER_DEBUG=1".to_string());
-        }
-        env
-    }
-
-    fn proxy_env_vars(&self) -> Vec<String> {
-        let mut env = Vec::new();
-        if let Some(value) = &self.proxy.http_proxy {
-            env.push(format!("HTTP_PROXY={value}"));
-        }
-        if let Some(value) = &self.proxy.https_proxy {
-            env.push(format!("HTTPS_PROXY={value}"));
-        }
-        if let Some(value) = &self.proxy.no_proxy {
-            env.push(format!("NO_PROXY={value}"));
         }
         env
     }
@@ -1342,7 +1324,6 @@ fi
             image: Some(image_ref.clone()),
             entrypoint: (!launch.entrypoint.is_empty()).then(|| launch.entrypoint.clone()),
             cmd: (!launch.cmd.is_empty()).then(|| launch.cmd.clone()),
-            env: Some(self.proxy_env_vars()),
             labels: Some(Self::review_container_labels(&self.owner_id)),
             host_config: Some(HostConfig {
                 auto_remove: Some(false),
@@ -3483,6 +3464,47 @@ mod tests {
         );
         assert!(!accounts[1].is_primary);
         assert!(!accounts[2].is_primary);
+    }
+
+    #[test]
+    fn runner_env_vars_do_not_include_proxy_settings() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let runner = DockerCodexRunner {
+            docker: connect_docker(&DockerConfig {
+                host: "tcp://127.0.0.1:2375".to_string(),
+            })
+            .expect("docker client"),
+            codex: CodexConfig {
+                image: "ghcr.io/openai/codex-universal:latest".to_string(),
+                timeout_seconds: 300,
+                auth_host_path: "/root/.codex".to_string(),
+                auth_mount_path: "/root/.codex".to_string(),
+                exec_sandbox: "danger-full-access".to_string(),
+                fallback_auth_accounts: Vec::new(),
+                usage_limit_fallback_cooldown_seconds: 3600,
+                deps: DepsConfig { enabled: false },
+                browser_mcp: BrowserMcpConfig::default(),
+                mcp_server_overrides: McpServerOverridesConfig::default(),
+                reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+            },
+            git_base: Url::parse("https://gitlab.example.com").expect("url"),
+            gitlab_token: "token".to_string(),
+            log_all_json: false,
+            owner_id: "owner-id".to_string(),
+            state: Arc::new(
+                runtime
+                    .block_on(ReviewStateStore::new(":memory:"))
+                    .expect("state"),
+            ),
+            auth_accounts: Vec::new(),
+        };
+
+        let env = runner.env_vars();
+
+        assert_eq!(
+            env,
+            vec!["GITLAB_TOKEN=token".to_string(), "HOME=/root".to_string(),]
+        );
     }
 
     #[test]

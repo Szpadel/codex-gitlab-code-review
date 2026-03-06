@@ -579,8 +579,8 @@ mod tests {
     };
     use crate::config::{
         CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
-        McpServerOverridesConfig, ProxyConfig, ReviewConfig, ReviewMentionCommandsConfig,
-        ScheduleConfig, ServerConfig, TargetSelector,
+        McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
+        ServerConfig, TargetSelector,
     };
     use crate::flow::mention::{contains_mention, extract_parent_chain};
     use crate::flow::review::{RetryKey, ReviewRunContext};
@@ -1177,11 +1177,6 @@ mod tests {
             },
             server: ServerConfig {
                 bind_addr: "127.0.0.1:0".to_string(),
-            },
-            proxy: ProxyConfig {
-                http_proxy: None,
-                https_proxy: None,
-                no_proxy: None,
             },
         }
     }

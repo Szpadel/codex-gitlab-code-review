@@ -91,10 +91,6 @@ config:
     host: "unix:///var/run/docker.sock"
   server:
     bindAddr: "0.0.0.0:8080"
-  proxy:
-    httpProxy: "http://localhost:3128"
-    httpsProxy: "http://localhost:3128"
-    noProxy: "localhost,127.0.0.1,.svc,.cluster.local"
 
 gitlab:
   baseUrl: "https://gitlab.example.com"
@@ -113,23 +109,10 @@ gitlab:
 
 # Optional raw Codex config.toml content copied into the auth directory.
 # browserMcp runtime injection is handled by the review service at run start.
+# Built-in proxy and egress-firewall support are intentionally not provided by this chart.
+# Use platform-native networking controls outside the chart when restricted egress is required.
 codexToml: ""
-
-proxy:
-  enabled: true
-  image: "ubuntu/squid:5.2-22.04_beta"
-  port: 3128
-  allowedHosts: []
-  extraConfig: ""
-  command: []
-  args: []
-  resources: {}
 
 dind:
   image: "docker:dind"
   resources: {}
-
-networkPolicy:
-  enabled: false
-  allowedNamespaces: []
-  allowedIPs: []

@@ -36,7 +36,6 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         checksum/codex-config: {{ include (print $.Template.BasePath "/codex-auth-configmap.yaml") . | sha256sum }}
-        checksum/proxy-config: {{ include (print $.Template.BasePath "/proxy-configmap.yaml") . | sha256sum }}
         checksum/gitlab-token: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "codex-gitlab-review.serviceAccountName" . }}
@@ -116,26 +115,6 @@ spec:
 {{- end }}
           resources:
 {{ toYaml .Values.dind.resources | indent 12 }}
-{{- if .Values.proxy.enabled }}
-        - name: egress-proxy
-          image: {{ .Values.proxy.image }}
-{{- if .Values.proxy.command }}
-          command:
-{{ toYaml .Values.proxy.command | indent 12 }}
-{{- end }}
-{{- if .Values.proxy.args }}
-          args:
-{{ toYaml .Values.proxy.args | indent 12 }}
-{{- end }}
-          ports:
-            - name: proxy
-              containerPort: {{ .Values.proxy.port }}
-          volumeMounts:
-            - name: proxy-config
-              mountPath: /etc/squid
-          resources:
-{{ toYaml .Values.proxy.resources | indent 12 }}
-{{- end }}
       volumes:
         - name: config
           configMap:
@@ -151,9 +130,4 @@ spec:
         - name: codex-config
           configMap:
             name: {{ include "codex-gitlab-review.fullname" . }}-codex-config
-{{- end }}
-{{- if .Values.proxy.enabled }}
-        - name: proxy-config
-          configMap:
-            name: {{ include "codex-gitlab-review.fullname" . }}-proxy
 {{- end }}

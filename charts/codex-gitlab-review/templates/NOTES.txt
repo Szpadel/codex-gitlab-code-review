@@ -1,0 +1,6 @@
+{{- if or .Values.proxy .Values.networkPolicy }}
+WARNING:
+Built-in proxy and egress-firewall chart support has been removed.
+Any supplied `proxy.*` or `networkPolicy.*` values are ignored by this release.
+Configure restricted egress outside this chart if you still require it.
+{{- end }}

@@ -65,11 +65,7 @@ async fn main() -> Result<()> {
 
     let mut config = Config::load()?;
     if let Some(Command::Auth(auth_cmd)) = cli.command {
-        let runner = AuthRunner::new(
-            config.docker.clone(),
-            config.codex.clone(),
-            config.proxy.clone(),
-        )?;
+        let runner = AuthRunner::new(config.docker.clone(), config.codex.clone())?;
         let action = match auth_cmd.action {
             AuthSubcommand::Login => RunnerAuthAction::Login,
             AuthSubcommand::Status => RunnerAuthAction::Status,
@@ -195,7 +191,6 @@ async fn main() -> Result<()> {
     let runner = DockerCodexRunner::new(
         config.docker.clone(),
         config.codex.clone(),
-        config.proxy.clone(),
         git_base,
         Arc::clone(&state),
         RunnerRuntimeOptions {

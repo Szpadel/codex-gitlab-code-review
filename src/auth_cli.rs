@@ -1,4 +1,4 @@
-use crate::config::{CodexConfig, DockerConfig, ProxyConfig};
+use crate::config::{CodexConfig, DockerConfig};
 use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
 use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
@@ -22,17 +22,12 @@ pub enum AuthAction {
 pub struct AuthRunner {
     docker: Docker,
     codex: CodexConfig,
-    proxy: ProxyConfig,
 }
 
 impl AuthRunner {
-    pub fn new(docker_cfg: DockerConfig, codex: CodexConfig, proxy: ProxyConfig) -> Result<Self> {
+    pub fn new(docker_cfg: DockerConfig, codex: CodexConfig) -> Result<Self> {
         let docker = connect_docker(&docker_cfg)?;
-        Ok(Self {
-            docker,
-            codex,
-            proxy,
-        })
+        Ok(Self { docker, codex })
     }
 
     pub async fn run(&self, action: AuthAction, debug: bool) -> Result<()> {
@@ -141,15 +136,6 @@ impl AuthRunner {
             format!("CODEX_HOME={}", self.codex.auth_mount_path),
             "HOME=/root".to_string(),
         ];
-        if let Some(value) = &self.proxy.http_proxy {
-            env.push(format!("HTTP_PROXY={value}"));
-        }
-        if let Some(value) = &self.proxy.https_proxy {
-            env.push(format!("HTTPS_PROXY={value}"));
-        }
-        if let Some(value) = &self.proxy.no_proxy {
-            env.push(format!("NO_PROXY={value}"));
-        }
         if debug {
             env.push("CODEX_RUNNER_DEBUG=1".to_string());
         }
@@ -223,4 +209,47 @@ async fn stream_output(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BrowserMcpConfig, DepsConfig, McpServerOverridesConfig};
+
+    fn codex_config() -> CodexConfig {
+        CodexConfig {
+            image: "ghcr.io/openai/codex-universal:latest".to_string(),
+            timeout_seconds: 300,
+            auth_host_path: "/tmp/codex-auth".to_string(),
+            auth_mount_path: "/root/.codex".to_string(),
+            exec_sandbox: "danger-full-access".to_string(),
+            fallback_auth_accounts: Vec::new(),
+            usage_limit_fallback_cooldown_seconds: 3600,
+            deps: DepsConfig { enabled: false },
+            browser_mcp: BrowserMcpConfig::default(),
+            mcp_server_overrides: McpServerOverridesConfig::default(),
+            reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+        }
+    }
+
+    #[test]
+    fn auth_env_vars_do_not_include_proxy_settings() -> Result<()> {
+        let runner = AuthRunner {
+            docker: connect_docker(&DockerConfig {
+                host: "tcp://127.0.0.1:2375".to_string(),
+            })?,
+            codex: codex_config(),
+        };
+
+        let env = runner.env_vars(false);
+
+        assert_eq!(
+            env,
+            vec![
+                "CODEX_HOME=/root/.codex".to_string(),
+                "HOME=/root".to_string(),
+            ]
+        );
+        Ok(())
+    }
 }

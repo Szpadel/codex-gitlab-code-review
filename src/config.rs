@@ -18,8 +18,6 @@ pub struct Config {
     pub docker: DockerConfig,
     pub database: DatabaseConfig,
     pub server: ServerConfig,
-    #[serde(default)]
-    pub proxy: ProxyConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -293,13 +291,6 @@ pub struct ServerConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-pub struct ProxyConfig {
-    pub http_proxy: Option<String>,
-    pub https_proxy: Option<String>,
-    pub no_proxy: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
 pub struct DepsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -314,6 +305,11 @@ impl Config {
         let cfg = builder
             .build()
             .with_context(|| format!("load config from {}", path))?;
+        if legacy_proxy_config_present(&cfg) {
+            tracing::warn!(
+                "legacy proxy config detected but ignored; built-in proxy support has been removed"
+            );
+        }
         let mut config: Config = cfg.try_deserialize().context("deserialize config")?;
         if config.codex.auth_host_path.is_empty() {
             config.codex.auth_host_path = config.codex.auth_mount_path.clone();
@@ -327,6 +323,12 @@ impl Config {
         validate_reasoning_effort_overrides(&config.codex)?;
         Ok(config)
     }
+}
+
+fn legacy_proxy_config_present(cfg: &config::Config) -> bool {
+    cfg.get_table("proxy")
+        .map(|table| !table.is_empty())
+        .unwrap_or(false)
 }
 
 fn validate_codex_auth_accounts(codex: &CodexConfig) -> Result<()> {
@@ -570,15 +572,6 @@ docker:
     }
 
     #[test]
-    fn defaults_proxy_when_missing() {
-        let yaml = base_config_yaml("");
-        let config = load_from_yaml(&yaml);
-        assert_eq!(config.proxy.http_proxy, None);
-        assert_eq!(config.proxy.https_proxy, None);
-        assert_eq!(config.proxy.no_proxy, None);
-    }
-
-    #[test]
     fn defaults_mention_commands_when_missing() {
         let yaml = base_config_yaml("");
         let config = load_from_yaml(&yaml);
@@ -599,6 +592,39 @@ docker:
         assert_eq!(config.codex.reasoning_effort.review, None);
         assert_eq!(config.codex.reasoning_effort.mention, None);
         assert_eq!(config.codex.browser_mcp, BrowserMcpConfig::default());
+    }
+
+    #[test]
+    fn ignores_legacy_proxy_block() {
+        let yaml = base_config_yaml(
+            r#"
+proxy:
+  http_proxy: "http://proxy.internal:3128"
+  https_proxy: "http://proxy.internal:3128"
+  no_proxy: "localhost"
+"#,
+        );
+        let config = load_from_yaml(&yaml);
+        assert_eq!(config.docker.host, default_docker_host());
+        assert_eq!(config.server.bind_addr, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn detects_legacy_proxy_block() {
+        let yaml = base_config_yaml(
+            r#"
+proxy:
+  http_proxy: "http://proxy.internal:3128"
+"#,
+        );
+        let path = write_temp_config(&yaml);
+        let cfg = config::Config::builder()
+            .add_source(config::File::from(path.as_path()))
+            .build()
+            .expect("load raw config");
+        let _ = fs::remove_file(&path);
+
+        assert!(legacy_proxy_config_present(&cfg));
     }
 
     #[test]
