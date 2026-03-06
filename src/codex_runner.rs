@@ -75,7 +75,7 @@ const BROWSER_CONTAINER_NAME_PREFIX: &str = "codex-browser-";
 const REVIEW_OWNER_LABEL_KEY: &str = "codex.gitlab.review.owner";
 const PRIMARY_AUTH_ACCOUNT_NAME: &str = "primary";
 const BROWSER_CONTAINER_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const BROWSER_CONTAINER_RUNNING_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const BROWSER_CONTAINER_RUNNING_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const BROWSER_CONTAINER_LOG_FETCH_TAIL: &str = "50";
 const BROWSER_CONTAINER_LOG_LINE_LIMIT: usize = 12;
 const BROWSER_CONTAINER_LOG_LINE_MAX_CHARS: usize = 240;
@@ -2994,10 +2994,6 @@ fn toml_basic_string(value: &str) -> String {
     format!("\"{}\"", escape_toml_basic_string(value))
 }
 
-fn toml_dotted_key_segment(value: &str) -> String {
-    format!("\"{}\"", escape_toml_basic_string(value))
-}
-
 fn browser_mcp_prereq_script(browser_mcp: Option<&BrowserMcpConfig>) -> String {
     let Some(browser_mcp) = browser_mcp else {
         return String::new();
@@ -3066,9 +3062,13 @@ fn codex_app_server_exec_command(
 
     let mut cmd_parts = vec!["exec codex".to_string()];
     if let Some(browser_mcp) = browser_mcp {
-        let server_key = toml_dotted_key_segment(&browser_mcp.server_name);
+        // Codex CLI `-c key=value` overrides split nested paths on `.` before
+        // TOML parsing. Quoted TOML dotted-key segments therefore do not work
+        // here: `mcp_servers."foo.bar".enabled=true` is treated as a literal
+        // server name containing quotes, not as server `foo.bar`.
         let args_override = format!(
-            "mcp_servers.{server_key}.args=[{args}]",
+            "mcp_servers.{}.args=[{args}]",
+            browser_mcp.server_name,
             args = browser_mcp
                 .mcp_args
                 .iter()
@@ -3082,20 +3082,18 @@ fn codex_app_server_exec_command(
         );
         for override_value in [
             format!(
-                "mcp_servers.{server_key}.command={}",
+                "mcp_servers.{}.command={}",
+                browser_mcp.server_name,
                 toml_basic_string(&browser_mcp.mcp_command)
             ),
             args_override,
-            format!("mcp_servers.{server_key}.enabled=true"),
+            format!("mcp_servers.{}.enabled=true", browser_mcp.server_name),
         ] {
             cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
         }
     }
     for (server_name, enabled) in mcp_server_overrides {
-        let override_value = format!(
-            "mcp_servers.{}.enabled={enabled}",
-            toml_dotted_key_segment(server_name)
-        );
+        let override_value = format!("mcp_servers.{server_name}.enabled={enabled}");
         cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
     }
     cmd_parts.push("app-server".to_string());
@@ -3543,7 +3541,7 @@ mod tests {
         let cmd = codex_app_server_exec_command(None, &overrides);
         assert_eq!(
             cmd,
-            "exec codex -c 'mcp_servers.\"github\".enabled=true' -c 'mcp_servers.\"serena\".enabled=false' app-server"
+            "exec codex -c 'mcp_servers.github.enabled=true' -c 'mcp_servers.serena.enabled=false' app-server"
         );
     }
 
@@ -3560,10 +3558,10 @@ mod tests {
             }),
             &BTreeMap::new(),
         );
-        assert!(cmd.contains("mcp_servers.\"chrome-devtools\".command=\"npx\""));
+        assert!(cmd.contains("mcp_servers.chrome-devtools.command=\"npx\""));
         assert!(cmd.contains("chrome-devtools-mcp@latest"));
         assert!(cmd.contains("--browserUrl=http://127.0.0.1:9222"));
-        assert!(cmd.contains("mcp_servers.\"chrome-devtools\".enabled=true"));
+        assert!(cmd.contains("mcp_servers.chrome-devtools.enabled=true"));
     }
 
     #[test]
@@ -3581,8 +3579,8 @@ mod tests {
             }),
             &BTreeMap::from([("chrome-devtools".to_string(), false)]),
         );
-        let expected_enable = "-c 'mcp_servers.\"chrome-devtools\".enabled=true'";
-        let expected_disable = "-c 'mcp_servers.\"chrome-devtools\".enabled=false'";
+        let expected_enable = "-c 'mcp_servers.chrome-devtools.enabled=true'";
+        let expected_disable = "-c 'mcp_servers.chrome-devtools.enabled=false'";
         assert!(cmd.contains(expected_enable));
         assert!(cmd.contains(expected_disable));
         assert!(cmd.find(expected_enable) < cmd.find(expected_disable));
@@ -3753,6 +3751,11 @@ mod tests {
     }
 
     #[test]
+    fn browser_container_running_grace_period_is_ten_seconds() {
+        assert_eq!(BROWSER_CONTAINER_RUNNING_GRACE_PERIOD.as_secs(), 10);
+    }
+
+    #[test]
     fn browser_container_diagnostics_context_includes_state_and_logs() {
         let diagnostics = BrowserContainerDiagnostics {
             container_id: "browser-123".to_string(),
@@ -3886,7 +3889,7 @@ mod tests {
             None,
             &overrides,
         );
-        assert!(script.contains("exec codex -c 'mcp_servers.\"github\".enabled=false' app-server"));
+        assert!(script.contains("exec codex -c 'mcp_servers.github.enabled=false' app-server"));
     }
 
     #[test]
@@ -4017,7 +4020,7 @@ mod tests {
             &overrides,
         );
         assert!(
-            script.contains("exec codex -c 'mcp_servers.\"playwright\".enabled=true' app-server")
+            script.contains("exec codex -c 'mcp_servers.playwright.enabled=true' app-server")
         );
     }
 

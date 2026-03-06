@@ -52,6 +52,7 @@ config:
     browserMcp:
       enabled: false
       # MCP server name injected into Codex runtime config.
+      # Must match ^[a-zA-Z0-9_-]+$ because Codex CLI -c overrides use dotted paths.
       serverName: "chrome-devtools"
       # Browser container image launched inside dind for each Codex run.
       browserImage: "chromedp/headless-shell:latest"
@@ -73,6 +74,7 @@ config:
         - "-y"
         - "chrome-devtools-mcp@latest"
     # Optional. Per-mode MCP server enabled flags for servers defined in Codex config.toml.
+    # Override keys must match ^[a-zA-Z0-9_-]+$ because Codex CLI -c overrides use dotted paths.
     # This also applies to browserMcp.serverName, so review/mention can disable the injected browser MCP independently.
     # Converted to codex CLI overrides: -c mcp_servers.<name>.enabled=<true|false>
     mcpServerOverrides:

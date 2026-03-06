@@ -366,6 +366,10 @@ fn validate_mcp_server_overrides(codex: &CodexConfig) -> Result<()> {
             !server.trim().is_empty(),
             "codex.mcp_server_overrides keys must not be empty"
         );
+        anyhow::ensure!(
+            is_valid_mcp_server_name(server),
+            "codex.mcp_server_overrides keys must match ^[a-zA-Z0-9_-]+$"
+        );
     }
     Ok(())
 }
@@ -386,6 +390,10 @@ fn validate_browser_mcp(codex: &CodexConfig) -> Result<()> {
             .chars()
             .all(|ch| !ch.is_control()),
         "codex.browser_mcp.server_name must not contain control characters"
+    );
+    anyhow::ensure!(
+        is_valid_mcp_server_name(&codex.browser_mcp.server_name),
+        "codex.browser_mcp.server_name must match ^[a-zA-Z0-9_-]+$"
     );
     anyhow::ensure!(
         !codex.browser_mcp.browser_image.trim().is_empty(),
@@ -415,6 +423,17 @@ fn validate_browser_mcp(codex: &CodexConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_valid_mcp_server_name(name: &str) -> bool {
+    // Codex CLI `-c key=value` overrides split nested config paths on `.`, so
+    // names that require quoted TOML dotted-key segments cannot be targeted by
+    // our runtime override path. Codex itself also rejects MCP server names
+    // outside this upstream pattern during MCP startup.
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }
 
 #[cfg(test)]
@@ -886,6 +905,88 @@ server:
         assert!(result.is_err());
         let msg = format!("{:#}", result.expect_err("error"));
         assert!(msg.contains("must not contain control characters"));
+    }
+
+    #[test]
+    fn errors_on_browser_mcp_server_name_with_invalid_characters() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  browser_mcp:
+    enabled: true
+    server_name: "chrome.devtools"
+    browser_image: "chromedp/headless-shell:latest"
+    remote_debugging_port: 9222
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("must match ^[a-zA-Z0-9_-]+$"));
+    }
+
+    #[test]
+    fn errors_on_mcp_server_override_key_with_invalid_characters() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  mcp_server_overrides:
+    review:
+      chrome.devtools: false
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("keys must match ^[a-zA-Z0-9_-]+$"));
     }
 
     #[test]

@@ -90,6 +90,7 @@ codex:
     # The review service injects the matching MCP server via Codex CLI config overrides.
     enabled: false
     # Optional. MCP server name injected into the Codex runtime config when enabled.
+    # Must match ^[a-zA-Z0-9_-]+$ because Codex CLI -c overrides use dotted paths.
     server_name: "chrome-devtools"
     # Optional. Browser image launched inside Docker for each review/mention run.
     browser_image: "chromedp/headless-shell:latest"
@@ -114,6 +115,7 @@ codex:
       - "-y"
       - "chrome-devtools-mcp@latest"
   # Optional. Per-mode runtime overrides for MCP servers already configured in Codex config.toml.
+  # Override keys must match ^[a-zA-Z0-9_-]+$ because Codex CLI -c overrides use dotted paths.
   # This also applies to browser_mcp.server_name, so review/mention can disable the injected browser MCP independently.
   # Each entry maps MCP server name -> enabled flag and becomes:
   #   codex -c mcp_servers.<name>.enabled=<true|false> app-server
