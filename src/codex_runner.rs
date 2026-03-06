@@ -154,6 +154,13 @@ struct BrowserContainerDiagnostics {
     log_collection_error: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct AppServerCommandOptions<'a> {
+    browser_mcp: Option<&'a BrowserMcpConfig>,
+    mcp_server_overrides: &'a BTreeMap<String, bool>,
+    reasoning_effort: Option<&'a str>,
+}
+
 impl BrowserContainerDiagnostics {
     fn format_context(&self) -> String {
         let mut lines = vec![
@@ -385,6 +392,8 @@ impl DockerCodexRunner {
         browser_mcp: Option<&BrowserMcpConfig>,
     ) -> Result<String> {
         let clone_url = self.clone_url(&ctx.repo)?;
+        let reasoning_effort =
+            configured_reasoning_effort(self.codex.reasoning_effort.review.as_deref());
         Ok(Self::build_command_script(
             &clone_url,
             ctx.head_sha.as_str(),
@@ -394,8 +403,11 @@ impl DockerCodexRunner {
                 .as_deref()
                 .filter(|value| !value.is_empty()),
             self.codex.deps.enabled,
-            browser_mcp,
-            &self.codex.mcp_server_overrides.review,
+            AppServerCommandOptions {
+                browser_mcp,
+                mcp_server_overrides: &self.codex.mcp_server_overrides.review,
+                reasoning_effort,
+            },
         ))
     }
 
@@ -446,15 +458,18 @@ impl DockerCodexRunner {
         ctx: &MentionCommandContext,
         clone_url: &str,
         auth_mount_path: &str,
-        browser_mcp: Option<&BrowserMcpConfig>,
-        mcp_server_overrides: &BTreeMap<String, bool>,
+        app_server: AppServerCommandOptions<'_>,
     ) -> String {
         let clone_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
         let head_sha_q = shell_quote(&ctx.head_sha);
         let auth_mount_path_q = shell_quote(auth_mount_path);
-        let browser_prereq_script = browser_mcp_prereq_script(browser_mcp);
-        let browser_wait_script = browser_wait_script(browser_mcp);
-        let app_server_exec_cmd = codex_app_server_exec_command(browser_mcp, mcp_server_overrides);
+        let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
+        let browser_wait_script = browser_wait_script(app_server.browser_mcp);
+        let app_server_exec_cmd = codex_app_server_exec_command(
+            app_server.browser_mcp,
+            app_server.mcp_server_overrides,
+            app_server.reasoning_effort,
+        );
         format!(
             r#"set -eu
 repo_dir='/work/repo'
@@ -523,8 +538,7 @@ fi
         auth_mount_path: &str,
         target_branch: Option<&str>,
         deps_enabled: bool,
-        browser_mcp: Option<&BrowserMcpConfig>,
-        mcp_server_overrides: &BTreeMap<String, bool>,
+        app_server: AppServerCommandOptions<'_>,
     ) -> String {
         let target_branch_script = target_branch
             .map(|branch| {
@@ -636,9 +650,13 @@ export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
         } else {
             ""
         };
-        let browser_prereq_script = browser_mcp_prereq_script(browser_mcp);
-        let browser_wait_script = browser_wait_script(browser_mcp);
-        let app_server_exec_cmd = codex_app_server_exec_command(browser_mcp, mcp_server_overrides);
+        let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
+        let browser_wait_script = browser_wait_script(app_server.browser_mcp);
+        let app_server_exec_cmd = codex_app_server_exec_command(
+            app_server.browser_mcp,
+            app_server.mcp_server_overrides,
+            app_server.reasoning_effort,
+        );
         format!(
             r#"set -eu
 mkdir -p /work
@@ -1555,12 +1573,17 @@ fi
         let clone_url = self.clone_url(&ctx.repo)?;
         let repo_dir = "/work/repo";
         let browser_mcp = self.effective_browser_mcp(&self.codex.mcp_server_overrides.mention);
+        let reasoning_effort =
+            configured_reasoning_effort(self.codex.reasoning_effort.mention.as_deref());
         let script = Self::build_mention_command_script(
             ctx,
             &clone_url,
             &self.codex.auth_mount_path,
-            browser_mcp,
-            &self.codex.mcp_server_overrides.mention,
+            AppServerCommandOptions {
+                browser_mcp,
+                mcp_server_overrides: &self.codex.mcp_server_overrides.mention,
+                reasoning_effort,
+            },
         );
         let StartedAppServer {
             container_id,
@@ -3052,15 +3075,27 @@ wait_for_browser_mcp
     )
 }
 
+fn configured_reasoning_effort(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 fn codex_app_server_exec_command(
     browser_mcp: Option<&BrowserMcpConfig>,
     mcp_server_overrides: &BTreeMap<String, bool>,
+    reasoning_effort: Option<&str>,
 ) -> String {
-    if browser_mcp.is_none() && mcp_server_overrides.is_empty() {
+    if browser_mcp.is_none() && mcp_server_overrides.is_empty() && reasoning_effort.is_none() {
         return "exec codex app-server".to_string();
     }
 
     let mut cmd_parts = vec!["exec codex".to_string()];
+    if let Some(reasoning_effort) = reasoning_effort {
+        let override_value = format!(
+            "model_reasoning_effort={}",
+            toml_basic_string(reasoning_effort)
+        );
+        cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
+    }
     if let Some(browser_mcp) = browser_mcp {
         // Codex CLI `-c key=value` overrides split nested paths on `.` before
         // TOML parsing. Quoted TOML dotted-key segments therefore do not work
@@ -3424,6 +3459,7 @@ mod tests {
             deps: DepsConfig { enabled: false },
             browser_mcp: BrowserMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
+            reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
         };
 
         let accounts = DockerCodexRunner::build_auth_accounts(&codex);
@@ -3530,7 +3566,7 @@ mod tests {
     #[test]
     fn codex_app_server_exec_command_without_mcp_overrides_is_plain() {
         let overrides = BTreeMap::new();
-        let cmd = codex_app_server_exec_command(None, &overrides);
+        let cmd = codex_app_server_exec_command(None, &overrides, None);
         assert_eq!(cmd, "exec codex app-server");
     }
 
@@ -3538,10 +3574,19 @@ mod tests {
     fn codex_app_server_exec_command_renders_sorted_mcp_overrides() {
         let overrides =
             BTreeMap::from([("serena".to_string(), false), ("github".to_string(), true)]);
-        let cmd = codex_app_server_exec_command(None, &overrides);
+        let cmd = codex_app_server_exec_command(None, &overrides, None);
         assert_eq!(
             cmd,
             "exec codex -c 'mcp_servers.github.enabled=true' -c 'mcp_servers.serena.enabled=false' app-server"
+        );
+    }
+
+    #[test]
+    fn codex_app_server_exec_command_includes_reasoning_effort_override() {
+        let cmd = codex_app_server_exec_command(None, &BTreeMap::new(), Some("high"));
+        assert_eq!(
+            cmd,
+            "exec codex -c 'model_reasoning_effort=\"high\"' app-server"
         );
     }
 
@@ -3557,6 +3602,7 @@ mod tests {
                 ..BrowserMcpConfig::default()
             }),
             &BTreeMap::new(),
+            None,
         );
         assert!(cmd.contains("mcp_servers.chrome-devtools.command=\"npx\""));
         assert!(cmd.contains("chrome-devtools-mcp@latest"));
@@ -3578,12 +3624,24 @@ mod tests {
                 mcp_args: vec!["-y".to_string(), "chrome-devtools-mcp@latest".to_string()],
             }),
             &BTreeMap::from([("chrome-devtools".to_string(), false)]),
+            None,
         );
         let expected_enable = "-c 'mcp_servers.chrome-devtools.enabled=true'";
         let expected_disable = "-c 'mcp_servers.chrome-devtools.enabled=false'";
         assert!(cmd.contains(expected_enable));
         assert!(cmd.contains(expected_disable));
         assert!(cmd.find(expected_enable) < cmd.find(expected_disable));
+    }
+
+    #[test]
+    fn codex_app_server_exec_command_places_reasoning_effort_before_mcp_overrides() {
+        let overrides = BTreeMap::from([("github".to_string(), false)]);
+        let cmd = codex_app_server_exec_command(None, &overrides, Some("medium"));
+        let reasoning = "-c 'model_reasoning_effort=\"medium\"'";
+        let mcp = "-c 'mcp_servers.github.enabled=false'";
+        assert!(cmd.contains(reasoning));
+        assert!(cmd.contains(mcp));
+        assert!(cmd.find(reasoning) < cmd.find(mcp));
     }
 
     #[test]
@@ -3824,8 +3882,11 @@ mod tests {
             "/root/.codex",
             None,
             false,
-            None,
-            &BTreeMap::new(),
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_effort: None,
+            },
         );
         assert!(script.contains("export CODEX_HOME=\"/root/.codex\""));
         assert!(script.contains("mkdir -p \"/root/.codex\""));
@@ -3839,8 +3900,11 @@ mod tests {
             "/root/.codex",
             Some("main"),
             false,
-            None,
-            &BTreeMap::new(),
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_effort: None,
+            },
         );
         assert!(script.contains("git fetch --depth 1 origin \"main\""));
         assert!(script.contains("git branch --force \"main\" FETCH_HEAD"));
@@ -3855,8 +3919,11 @@ mod tests {
             "/root/.codex",
             None,
             false,
-            None,
-            &BTreeMap::new(),
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_effort: None,
+            },
         );
         assert!(script.contains("git clone --depth 1 --recurse-submodules"));
         assert!(script.contains("git submodule update --init --recursive"));
@@ -3870,8 +3937,11 @@ mod tests {
             "/root/.codex",
             None,
             true,
-            None,
-            &BTreeMap::new(),
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_effort: None,
+            },
         );
         assert!(script.contains("prefetch_deps()"));
         assert!(script.contains("composer install"));
@@ -3886,10 +3956,30 @@ mod tests {
             "/root/.codex",
             None,
             false,
-            None,
-            &overrides,
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &overrides,
+                reasoning_effort: None,
+            },
         );
         assert!(script.contains("exec codex -c 'mcp_servers.github.enabled=false' app-server"));
+    }
+
+    #[test]
+    fn build_command_script_includes_reasoning_effort_override() {
+        let script = DockerCodexRunner::build_command_script(
+            "https://example.com/repo.git",
+            "abc",
+            "/root/.codex",
+            None,
+            false,
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_effort: Some("high"),
+            },
+        );
+        assert!(script.contains("exec codex -c 'model_reasoning_effort=\"high\"' app-server"));
     }
 
     #[test]
@@ -3900,15 +3990,18 @@ mod tests {
             "/root/.codex",
             None,
             false,
-            Some(&BrowserMcpConfig {
-                enabled: true,
-                server_name: "chrome-devtools".to_string(),
-                browser_image: "chromedp/headless-shell:latest".to_string(),
-                remote_debugging_port: 9222,
-                browser_args: vec!["--no-sandbox".to_string()],
-                ..BrowserMcpConfig::default()
-            }),
-            &BTreeMap::new(),
+            AppServerCommandOptions {
+                browser_mcp: Some(&BrowserMcpConfig {
+                    enabled: true,
+                    server_name: "chrome-devtools".to_string(),
+                    browser_image: "chromedp/headless-shell:latest".to_string(),
+                    remote_debugging_port: 9222,
+                    browser_args: vec!["--no-sandbox".to_string()],
+                    ..BrowserMcpConfig::default()
+                }),
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_effort: None,
+            },
         );
         assert!(script.contains("browser_mcp_command='npx'"));
         assert!(script.contains("browser MCP requires $browser_mcp_command"));
@@ -3969,8 +4062,11 @@ mod tests {
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
             "/root/.codex",
-            None,
-            &BTreeMap::new(),
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_effort: None,
+            },
         );
         assert!(
             script.contains("git clone --depth 1 --recurse-submodules \"https://oauth2:${GITLAB_TOKEN}@example.com/repo.git\"")
@@ -4016,12 +4112,55 @@ mod tests {
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
             "/root/.codex",
-            None,
-            &overrides,
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &overrides,
+                reasoning_effort: None,
+            },
         );
-        assert!(
-            script.contains("exec codex -c 'mcp_servers.playwright.enabled=true' app-server")
+        assert!(script.contains("exec codex -c 'mcp_servers.playwright.enabled=true' app-server"));
+    }
+
+    #[test]
+    fn mention_command_script_includes_reasoning_effort_override() {
+        let ctx = MentionCommandContext {
+            repo: "group/repo".to_string(),
+            project_path: "group/repo".to_string(),
+            mr: MergeRequest {
+                iid: 11,
+                title: Some("Title".to_string()),
+                web_url: Some(
+                    "https://gitlab.example.com/group/repo/-/merge_requests/11".to_string(),
+                ),
+                created_at: None,
+                updated_at: None,
+                sha: Some("abc123".to_string()),
+                source_branch: None,
+                target_branch: Some("main".to_string()),
+                author: None,
+                source_project_id: None,
+                target_project_id: None,
+                diff_refs: None,
+            },
+            head_sha: "abc123".to_string(),
+            discussion_id: "discussion-1".to_string(),
+            trigger_note_id: 77,
+            requester_name: "Alice Example".to_string(),
+            requester_email: "alice@example.com".to_string(),
+            additional_developer_instructions: None,
+            prompt: "Do the change".to_string(),
+        };
+        let script = DockerCodexRunner::build_mention_command_script(
+            &ctx,
+            "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "/root/.codex",
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_effort: Some("low"),
+            },
         );
+        assert!(script.contains("exec codex -c 'model_reasoning_effort=\"low\"' app-server"));
     }
 
     #[test]
@@ -4057,15 +4196,18 @@ mod tests {
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
             "/root/.codex",
-            Some(&BrowserMcpConfig {
-                enabled: true,
-                server_name: "chrome-devtools".to_string(),
-                browser_image: "chromedp/headless-shell:latest".to_string(),
-                remote_debugging_port: 9222,
-                browser_args: vec![],
-                ..BrowserMcpConfig::default()
-            }),
-            &BTreeMap::new(),
+            AppServerCommandOptions {
+                browser_mcp: Some(&BrowserMcpConfig {
+                    enabled: true,
+                    server_name: "chrome-devtools".to_string(),
+                    browser_image: "chromedp/headless-shell:latest".to_string(),
+                    remote_debugging_port: 9222,
+                    browser_args: vec![],
+                    ..BrowserMcpConfig::default()
+                }),
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_effort: None,
+            },
         );
         assert!(script.contains("browser_mcp_command='npx'"));
         assert!(script.contains("browser MCP requires $browser_mcp_command"));

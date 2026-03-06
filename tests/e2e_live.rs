@@ -67,6 +67,8 @@ async fn e2e_live_dry_run() -> Result<()> {
             deps: codex_gitlab_code_review::config::DepsConfig { enabled: false },
             browser_mcp: codex_gitlab_code_review::config::BrowserMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
+            reasoning_effort:
+                codex_gitlab_code_review::config::ReasoningEffortOverridesConfig::default(),
         },
         docker: DockerConfig { host: docker_host },
         database: DatabaseConfig {

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 
 pub const BROWSER_MCP_REMOTE_DEBUGGING_PORT: u16 = 9222;
+const SUPPORTED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -174,6 +175,8 @@ pub struct CodexConfig {
     pub browser_mcp: BrowserMcpConfig,
     #[serde(default)]
     pub mcp_server_overrides: McpServerOverridesConfig,
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffortOverridesConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -202,6 +205,14 @@ pub struct McpServerOverridesConfig {
     pub review: BTreeMap<String, bool>,
     #[serde(default)]
     pub mention: BTreeMap<String, bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ReasoningEffortOverridesConfig {
+    #[serde(default)]
+    pub review: Option<String>,
+    #[serde(default)]
+    pub mention: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -313,6 +324,7 @@ impl Config {
         validate_codex_auth_accounts(&config.codex)?;
         validate_browser_mcp(&config.codex)?;
         validate_mcp_server_overrides(&config.codex)?;
+        validate_reasoning_effort_overrides(&config.codex)?;
         Ok(config)
     }
 }
@@ -422,6 +434,31 @@ fn validate_browser_mcp(codex: &CodexConfig) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn validate_reasoning_effort_overrides(codex: &CodexConfig) -> Result<()> {
+    for (field, value) in [
+        ("review", codex.reasoning_effort.review.as_deref()),
+        ("mention", codex.reasoning_effort.mention.as_deref()),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        anyhow::ensure!(
+            !value.trim().is_empty(),
+            "codex.reasoning_effort.{field} must not be empty"
+        );
+        anyhow::ensure!(
+            value.chars().all(|ch| !ch.is_control()),
+            "codex.reasoning_effort.{field} must not contain control characters"
+        );
+        anyhow::ensure!(
+            SUPPORTED_REASONING_EFFORTS.contains(&value),
+            "codex.reasoning_effort.{field} must be one of: {}",
+            SUPPORTED_REASONING_EFFORTS.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -559,6 +596,8 @@ docker:
         assert_eq!(config.codex.usage_limit_fallback_cooldown_seconds, 3600);
         assert!(config.codex.mcp_server_overrides.review.is_empty());
         assert!(config.codex.mcp_server_overrides.mention.is_empty());
+        assert_eq!(config.codex.reasoning_effort.review, None);
+        assert_eq!(config.codex.reasoning_effort.mention, None);
         assert_eq!(config.codex.browser_mcp, BrowserMcpConfig::default());
     }
 
@@ -672,6 +711,51 @@ server:
         assert_eq!(
             config.codex.mcp_server_overrides.mention.get("playwright"),
             Some(&false)
+        );
+    }
+
+    #[test]
+    fn loads_reasoning_effort_overrides() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  reasoning_effort:
+    review: "high"
+    mention: "low"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let config = load_from_yaml(yaml);
+        assert_eq!(
+            config.codex.reasoning_effort.review.as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            config.codex.reasoning_effort.mention.as_deref(),
+            Some("low")
         );
     }
 
@@ -987,6 +1071,86 @@ server:
         assert!(result.is_err());
         let msg = format!("{:#}", result.expect_err("error"));
         assert!(msg.contains("keys must match ^[a-zA-Z0-9_-]+$"));
+    }
+
+    #[test]
+    fn errors_on_empty_reasoning_effort_override() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  reasoning_effort:
+    review: "   "
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("codex.reasoning_effort.review must not be empty"));
+    }
+
+    #[test]
+    fn errors_on_unsupported_reasoning_effort_override() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  reasoning_effort:
+    mention: "fast"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(
+            msg.contains("codex.reasoning_effort.mention must be one of: low, medium, high, xhigh")
+        );
     }
 
     #[test]

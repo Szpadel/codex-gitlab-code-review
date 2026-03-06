@@ -80,6 +80,12 @@ config:
     mcpServerOverrides:
       review: {}
       mention: {}
+    # Optional. Per-mode reasoning effort overrides passed to Codex app-server.
+    # When unset, Codex uses the value from config.toml profiles or model defaults.
+    # Supported values: low, medium, high, xhigh.
+    reasoningEffort:
+      review: null
+      mention: null
     execSandbox: "danger-full-access"
   docker:
     host: "unix:///var/run/docker.sock"

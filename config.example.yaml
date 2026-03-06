@@ -126,6 +126,14 @@ codex:
     mention:
       github: false
       playwright: true
+  # Optional. Per-mode reasoning effort overrides for Codex app-server sessions.
+  # When unset, Codex uses the value from config.toml profiles or model defaults.
+  # Supported values: low, medium, high, xhigh.
+  # Each entry becomes:
+  #   codex -c model_reasoning_effort="<value>" app-server
+  reasoning_effort:
+    review: "high"
+    mention: "low"
   # Optional. Prefetch dependency sources before running Codex (root-only detection).
   # Note: prefetch runs before Codex and counts toward timeout_seconds.
   deps:

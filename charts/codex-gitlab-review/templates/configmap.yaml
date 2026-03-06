@@ -129,6 +129,17 @@ data:
 {{- else }}
           {}
 {{- end }}
+      reasoning_effort:
+{{- if .Values.config.codex.reasoningEffort.review }}
+        review: {{ .Values.config.codex.reasoningEffort.review | quote }}
+{{- else }}
+        review: null
+{{- end }}
+{{- if .Values.config.codex.reasoningEffort.mention }}
+        mention: {{ .Values.config.codex.reasoningEffort.mention | quote }}
+{{- else }}
+        mention: null
+{{- end }}
       exec_sandbox: {{ .Values.config.codex.execSandbox | quote }}
     docker:
       host: {{ .Values.config.docker.host | quote }}
