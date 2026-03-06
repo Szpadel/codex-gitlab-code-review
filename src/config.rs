@@ -5,6 +5,8 @@ use serde::de::{self, Deserializer};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 
+pub const BROWSER_MCP_REMOTE_DEBUGGING_PORT: u16 = 9222;
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub gitlab: GitLabConfig,
@@ -235,7 +237,7 @@ fn default_browser_mcp_image() -> String {
 }
 
 fn default_browser_mcp_remote_debugging_port() -> u16 {
-    9222
+    BROWSER_MCP_REMOTE_DEBUGGING_PORT
 }
 
 fn default_browser_mcp_command() -> String {
@@ -394,8 +396,9 @@ fn validate_browser_mcp(codex: &CodexConfig) -> Result<()> {
         "codex.browser_mcp.mcp_command must not be empty"
     );
     anyhow::ensure!(
-        codex.browser_mcp.remote_debugging_port != 0,
-        "codex.browser_mcp.remote_debugging_port must be greater than zero"
+        codex.browser_mcp.remote_debugging_port == BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+        "codex.browser_mcp.remote_debugging_port must be {}",
+        BROWSER_MCP_REMOTE_DEBUGGING_PORT
     );
     for arg in &codex.browser_mcp.browser_args {
         let trimmed = arg.trim();
@@ -683,7 +686,7 @@ codex:
     enabled: true
     server_name: "chrome-devtools"
     browser_image: "chromedp/headless-shell:latest"
-    remote_debugging_port: 9333
+    remote_debugging_port: 9222
     browser_args:
       - "--disable-gpu"
       - "--no-sandbox"
@@ -699,7 +702,7 @@ server:
             config.codex.browser_mcp.browser_image,
             "chromedp/headless-shell:latest"
         );
-        assert_eq!(config.codex.browser_mcp.remote_debugging_port, 9333);
+        assert_eq!(config.codex.browser_mcp.remote_debugging_port, 9222);
         assert_eq!(
             config.codex.browser_mcp.browser_args,
             vec!["--disable-gpu".to_string(), "--no-sandbox".to_string()]
@@ -713,7 +716,7 @@ server:
     }
 
     #[test]
-    fn errors_on_browser_mcp_zero_port() {
+    fn errors_on_browser_mcp_non_default_port() {
         let yaml = r#"
 gitlab:
   base_url: "https://gitlab.example.com"
@@ -742,7 +745,7 @@ codex:
     enabled: true
     server_name: "chrome-devtools"
     browser_image: "chromedp/headless-shell:latest"
-    remote_debugging_port: 0
+    remote_debugging_port: 9333
 database:
   path: "/tmp/state.sqlite"
 server:
@@ -751,7 +754,7 @@ server:
         let result = try_load_from_yaml(yaml);
         assert!(result.is_err());
         let msg = format!("{:#}", result.expect_err("error"));
-        assert!(msg.contains("codex.browser_mcp.remote_debugging_port"));
+        assert!(msg.contains("codex.browser_mcp.remote_debugging_port must be 9222"));
     }
 
     #[test]

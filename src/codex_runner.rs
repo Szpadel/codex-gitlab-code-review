@@ -1,4 +1,6 @@
-use crate::config::{BrowserMcpConfig, CodexConfig, DockerConfig, ProxyConfig};
+use crate::config::{
+    BROWSER_MCP_REMOTE_DEBUGGING_PORT, BrowserMcpConfig, CodexConfig, DockerConfig, ProxyConfig,
+};
 use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
 use crate::gitlab::MergeRequest;
 use crate::state::ReviewStateStore;
@@ -7,10 +9,10 @@ use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::{StartExecOptions, StartExecResults};
-use bollard::models::{ContainerCreateBody, ExecConfig, HostConfig};
+use bollard::models::{ContainerCreateBody, ContainerInspectResponse, ExecConfig, HostConfig};
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, ListContainersOptionsBuilder,
-    RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
+    LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::StreamExt;
@@ -22,7 +24,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::time::timeout;
+use tokio::time::{Instant, sleep, timeout};
 use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -72,7 +74,11 @@ const REVIEW_CONTAINER_NAME_PREFIX: &str = "codex-review-";
 const BROWSER_CONTAINER_NAME_PREFIX: &str = "codex-browser-";
 const REVIEW_OWNER_LABEL_KEY: &str = "codex.gitlab.review.owner";
 const PRIMARY_AUTH_ACCOUNT_NAME: &str = "primary";
-
+const BROWSER_CONTAINER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const BROWSER_CONTAINER_RUNNING_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const BROWSER_CONTAINER_LOG_FETCH_TAIL: &str = "50";
+const BROWSER_CONTAINER_LOG_LINE_LIMIT: usize = 12;
+const BROWSER_CONTAINER_LOG_LINE_MAX_CHARS: usize = 240;
 #[derive(Debug, Clone)]
 struct AuthAccount {
     name: String,
@@ -85,6 +91,130 @@ struct StartedAppServer {
     container_id: String,
     browser_container_id: Option<String>,
     client: AppServerClient,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserLaunchConfig {
+    image: String,
+    entrypoint: Vec<String>,
+    cmd: Vec<String>,
+}
+
+impl BrowserLaunchConfig {
+    fn from_browser_mcp(browser_mcp: &BrowserMcpConfig) -> Self {
+        let image = DockerCodexRunner::normalize_image_reference(&browser_mcp.browser_image);
+        Self {
+            image: image.clone(),
+            entrypoint: browser_mcp.browser_entrypoint.clone(),
+            cmd: browser_container_cmd(&image, &browser_mcp.browser_entrypoint, browser_mcp),
+        }
+    }
+
+    fn entrypoint_display(&self) -> String {
+        if self.entrypoint.is_empty() {
+            "<image-default>".to_string()
+        } else {
+            format_command_for_log(&self.entrypoint)
+        }
+    }
+
+    fn cmd_display(&self) -> String {
+        if self.cmd.is_empty() {
+            "<none>".to_string()
+        } else {
+            format_command_for_log(&self.cmd)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BrowserLogTail {
+    stdout: Vec<String>,
+    stderr: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserContainerStateSnapshot {
+    status: Option<String>,
+    running: Option<bool>,
+    exit_code: Option<i64>,
+    oom_killed: Option<bool>,
+    error: Option<String>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserContainerDiagnostics {
+    container_id: String,
+    launch: BrowserLaunchConfig,
+    state: Option<BrowserContainerStateSnapshot>,
+    state_collection_error: Option<String>,
+    log_tail: BrowserLogTail,
+    log_collection_error: Option<String>,
+}
+
+impl BrowserContainerDiagnostics {
+    fn format_context(&self) -> String {
+        let mut lines = vec![
+            "browser container diagnostics:".to_string(),
+            format!("  id={}", self.container_id),
+            format!(
+                "  launch image={} entrypoint={} cmd={}",
+                self.launch.image,
+                self.launch.entrypoint_display(),
+                self.launch.cmd_display()
+            ),
+        ];
+
+        match (&self.state, &self.state_collection_error) {
+            (Some(state), _) => lines.push(format!(
+                "  state status={} running={} exit_code={} oom_killed={} started_at={} finished_at={} error={}",
+                state.status.as_deref().unwrap_or("<unknown>"),
+                state
+                    .running
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                state
+                    .exit_code
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                state
+                    .oom_killed
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                state.started_at.as_deref().unwrap_or("<unknown>"),
+                state.finished_at.as_deref().unwrap_or("<unknown>"),
+                state.error.as_deref().unwrap_or("<none>")
+            )),
+            (None, Some(err)) => lines.push(format!("  state unavailable: {err}")),
+            (None, None) => lines.push("  state unavailable: <unknown>".to_string()),
+        }
+
+        match &self.log_collection_error {
+            Some(err) => lines.push(format!("  log tail unavailable: {err}")),
+            None => {
+                if self.log_tail.stdout.is_empty() {
+                    lines.push("  stdout tail: <empty>".to_string());
+                } else {
+                    lines.push("  stdout tail:".to_string());
+                    for line in &self.log_tail.stdout {
+                        lines.push(format!("    {line}"));
+                    }
+                }
+                if self.log_tail.stderr.is_empty() {
+                    lines.push("  stderr tail: <empty>".to_string());
+                } else {
+                    lines.push("  stderr tail:".to_string());
+                    for line in &self.log_tail.stderr {
+                        lines.push(format!("    {line}"));
+                    }
+                }
+            }
+        }
+
+        lines.join("\n")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -568,21 +698,6 @@ fi
         )
     }
 
-    fn browser_container_cmd(browser_mcp: &BrowserMcpConfig) -> Vec<String> {
-        let mut cmd = vec![
-            "--no-sandbox".to_string(),
-            "--remote-debugging-address=0.0.0.0".to_string(),
-            format!(
-                "--remote-debugging-port={}",
-                browser_mcp.remote_debugging_port
-            ),
-            "--disable-gpu".to_string(),
-            "--enable-unsafe-swiftshader".to_string(),
-        ];
-        cmd.extend(browser_mcp.browser_args.clone());
-        cmd
-    }
-
     fn app_server_cmd(script: String) -> Vec<String> {
         // The codex-universal entrypoint runs `bash --login "$@"`, so pass only bash flags + script.
         vec!["-lc".to_string(), script]
@@ -590,6 +705,184 @@ fi
 
     fn normalize_image_reference(image: &str) -> String {
         normalize_image_reference(image)
+    }
+
+    async fn collect_browser_container_diagnostics(
+        &self,
+        browser_container_id: &str,
+        launch: &BrowserLaunchConfig,
+    ) -> BrowserContainerDiagnostics {
+        let (state, state_collection_error) = match self
+            .docker
+            .inspect_container(
+                browser_container_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(inspect) => (browser_container_state_snapshot(inspect), None),
+            Err(err) => (
+                None,
+                Some(format!(
+                    "{:#}",
+                    anyhow!(err).context(format!(
+                        "inspect docker browser container {}",
+                        browser_container_id
+                    ))
+                )),
+            ),
+        };
+
+        let (log_tail, log_collection_error) = match self
+            .collect_browser_container_log_tail(browser_container_id)
+            .await
+        {
+            Ok(log_tail) => (log_tail, None),
+            Err(err) => (BrowserLogTail::default(), Some(format!("{err:#}"))),
+        };
+
+        BrowserContainerDiagnostics {
+            container_id: browser_container_id.to_string(),
+            launch: launch.clone(),
+            state,
+            state_collection_error,
+            log_tail,
+            log_collection_error,
+        }
+    }
+
+    async fn collect_browser_container_log_tail(
+        &self,
+        browser_container_id: &str,
+    ) -> Result<BrowserLogTail> {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut stream = self.docker.logs(
+            browser_container_id,
+            Some(
+                LogsOptionsBuilder::default()
+                    .follow(false)
+                    .stdout(true)
+                    .stderr(true)
+                    .tail(BROWSER_CONTAINER_LOG_FETCH_TAIL)
+                    .build(),
+            ),
+        );
+
+        while let Some(message) = stream.next().await {
+            match message.with_context(|| {
+                format!(
+                    "read docker browser container logs for {}",
+                    browser_container_id
+                )
+            })? {
+                LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                    stdout.push_str(String::from_utf8_lossy(&message).as_ref());
+                }
+                LogOutput::StdErr { message } => {
+                    stderr.push_str(String::from_utf8_lossy(&message).as_ref());
+                }
+                LogOutput::StdIn { .. } => {}
+            }
+        }
+
+        Ok(BrowserLogTail {
+            stdout: tail_log_lines(&stdout),
+            stderr: tail_log_lines(&stderr),
+        })
+    }
+
+    async fn enrich_error_with_browser_diagnostics(
+        &self,
+        err: anyhow::Error,
+        browser_container_id: Option<&str>,
+        browser_mcp: Option<&BrowserMcpConfig>,
+    ) -> anyhow::Error {
+        let (Some(browser_container_id), Some(browser_mcp)) = (browser_container_id, browser_mcp)
+        else {
+            return err;
+        };
+        let launch = BrowserLaunchConfig::from_browser_mcp(browser_mcp);
+        let diagnostics = self
+            .collect_browser_container_diagnostics(browser_container_id, &launch)
+            .await;
+        let formatted = diagnostics.format_context();
+        warn!(
+            container_id = browser_container_id,
+            diagnostics = %formatted,
+            "browser container diagnostics captured"
+        );
+        err.context(formatted)
+    }
+
+    async fn wait_for_browser_container_ready(
+        &self,
+        browser_container_id: &str,
+        launch: &BrowserLaunchConfig,
+    ) -> Result<()> {
+        info!(
+            container_id = browser_container_id,
+            expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+            timeout_secs = BROWSER_CONTAINER_READY_TIMEOUT.as_secs(),
+            "waiting for browser container readiness"
+        );
+        let deadline = Instant::now() + BROWSER_CONTAINER_READY_TIMEOUT;
+        let mut running_since = None;
+        loop {
+            let diagnostics = self
+                .collect_browser_container_diagnostics(browser_container_id, launch)
+                .await;
+            if browser_logs_report_ready(&diagnostics.log_tail, BROWSER_MCP_REMOTE_DEBUGGING_PORT) {
+                info!(
+                    container_id = browser_container_id,
+                    expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+                    "browser container reported DevTools readiness"
+                );
+                return Ok(());
+            }
+            if diagnostics.state.as_ref().and_then(|state| state.running) == Some(true) {
+                let running_since_ref = running_since.get_or_insert_with(Instant::now);
+                if running_since_ref.elapsed() >= BROWSER_CONTAINER_RUNNING_GRACE_PERIOD {
+                    info!(
+                        container_id = browser_container_id,
+                        expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+                        grace_period_secs = BROWSER_CONTAINER_RUNNING_GRACE_PERIOD.as_secs(),
+                        "browser container stayed running without a DevTools log marker; continuing"
+                    );
+                    return Ok(());
+                }
+            } else {
+                running_since = None;
+            }
+            if browser_container_has_exited(diagnostics.state.as_ref()) {
+                let formatted = diagnostics.format_context();
+                warn!(
+                    container_id = browser_container_id,
+                    diagnostics = %formatted,
+                    "browser container exited before readiness"
+                );
+                return Err(anyhow!(
+                    "browser container exited before reporting readiness on port {}",
+                    BROWSER_MCP_REMOTE_DEBUGGING_PORT
+                )
+                .context(formatted));
+            }
+            if Instant::now() >= deadline {
+                let formatted = diagnostics.format_context();
+                warn!(
+                    container_id = browser_container_id,
+                    diagnostics = %formatted,
+                    "browser container readiness timed out"
+                );
+                return Err(anyhow!(
+                    "browser container did not report readiness on port {} within {} seconds",
+                    BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+                    BROWSER_CONTAINER_READY_TIMEOUT.as_secs()
+                )
+                .context(formatted));
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
     }
 
     fn sandbox_mode_value(&self) -> &'static str {
@@ -1013,14 +1306,24 @@ fi
     }
 
     async fn start_browser_container(&self, browser_mcp: &BrowserMcpConfig) -> Result<String> {
-        let image_ref = Self::normalize_image_reference(&browser_mcp.browser_image);
+        let launch = BrowserLaunchConfig::from_browser_mcp(browser_mcp);
+        let image_ref = launch.image.clone();
         ensure_image(&self.docker, &image_ref).await?;
         let name = format!("{}{}", BROWSER_CONTAINER_NAME_PREFIX, Uuid::new_v4());
+        let entrypoint_display = launch.entrypoint_display();
+        let cmd_display = launch.cmd_display();
+        info!(
+            name = name.as_str(),
+            image = image_ref.as_str(),
+            entrypoint = entrypoint_display.as_str(),
+            cmd = cmd_display.as_str(),
+            expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+            "starting browser container"
+        );
         let config = ContainerCreateBody {
             image: Some(image_ref.clone()),
-            entrypoint: (!browser_mcp.browser_entrypoint.is_empty())
-                .then(|| browser_mcp.browser_entrypoint.clone()),
-            cmd: Some(Self::browser_container_cmd(browser_mcp)),
+            entrypoint: (!launch.entrypoint.is_empty()).then(|| launch.entrypoint.clone()),
+            cmd: (!launch.cmd.is_empty()).then(|| launch.cmd.clone()),
             env: Some(self.proxy_env_vars()),
             labels: Some(Self::review_container_labels(&self.owner_id)),
             host_config: Some(HostConfig {
@@ -1050,6 +1353,21 @@ fi
             .await
             .with_context(|| format!("start docker browser container {}", id));
         if let Err(err) = start_result {
+            let err = self
+                .enrich_error_with_browser_diagnostics(err, Some(&id), Some(browser_mcp))
+                .await;
+            self.remove_container_best_effort(&id).await;
+            return Err(err);
+        }
+        info!(
+            container_id = id.as_str(),
+            image = image_ref.as_str(),
+            entrypoint = entrypoint_display.as_str(),
+            cmd = cmd_display.as_str(),
+            expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+            "started browser container"
+        );
+        if let Err(err) = self.wait_for_browser_container_ready(&id, &launch).await {
             self.remove_container_best_effort(&id).await;
             return Err(err);
         }
@@ -1128,10 +1446,28 @@ fi
         })
         .await;
 
+        let review_result = match review_result {
+            Ok(Ok(review)) => Ok(review),
+            Ok(Err(err)) => Err(self
+                .enrich_error_with_browser_diagnostics(
+                    err,
+                    browser_container_id.as_deref(),
+                    browser_mcp,
+                )
+                .await),
+            Err(_) => Err(self
+                .enrich_error_with_browser_diagnostics(
+                    anyhow!("codex review timed out"),
+                    browser_container_id.as_deref(),
+                    browser_mcp,
+                )
+                .await),
+        };
+
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
             .await;
 
-        review_result.map_err(|_| anyhow!("codex review timed out"))?
+        review_result
     }
 
     async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
@@ -1437,10 +1773,28 @@ fi
         })
         .await;
 
+        let mention_result = match mention_result {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(err)) => Err(self
+                .enrich_error_with_browser_diagnostics(
+                    err,
+                    browser_container_id.as_deref(),
+                    browser_mcp,
+                )
+                .await),
+            Err(_) => Err(self
+                .enrich_error_with_browser_diagnostics(
+                    anyhow!("codex mention command timed out"),
+                    browser_container_id.as_deref(),
+                    browser_mcp,
+                )
+                .await),
+        };
+
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
             .await;
 
-        mention_result.map_err(|_| anyhow!("codex mention command timed out"))?
+        mention_result
     }
 
     async fn run_mention_container(
@@ -2524,6 +2878,110 @@ fn format_command_for_log(command: &[String]) -> String {
         .join(" ")
 }
 
+fn browser_container_cmd(
+    image: &str,
+    configured_entrypoint: &[String],
+    browser_mcp: &BrowserMcpConfig,
+) -> Vec<String> {
+    if uses_headless_shell_wrapper(image, configured_entrypoint) {
+        // chromedp/headless-shell's image-default /headless-shell/run.sh appends its argv to a
+        // wrapper that keeps the browser on 9223 and exposes 9222 externally via socat. Passing
+        // only browser_args here preserves that contract; injecting our own debug flags conflicts
+        // with the wrapper and breaks the externally reachable 9222 endpoint.
+        return browser_mcp.browser_args.clone();
+    }
+
+    let mut cmd = vec![
+        "--no-sandbox".to_string(),
+        "--remote-debugging-address=0.0.0.0".to_string(),
+        format!(
+            "--remote-debugging-port={}",
+            BROWSER_MCP_REMOTE_DEBUGGING_PORT
+        ),
+        "--disable-gpu".to_string(),
+        "--enable-unsafe-swiftshader".to_string(),
+    ];
+    cmd.extend(browser_mcp.browser_args.clone());
+    cmd
+}
+
+fn uses_headless_shell_wrapper(image: &str, configured_entrypoint: &[String]) -> bool {
+    configured_entrypoint.is_empty() && is_headless_shell_image(image)
+}
+
+fn is_headless_shell_image(image: &str) -> bool {
+    let repository = image_repository(image);
+    repository == "chromedp/headless-shell" || repository.ends_with("/chromedp/headless-shell")
+}
+
+fn image_repository(image: &str) -> &str {
+    let image = image.split('@').next().unwrap_or(image);
+    match image.rsplit_once(':') {
+        Some((repository, suffix)) if !suffix.contains('/') => repository,
+        _ => image,
+    }
+}
+
+fn tail_log_lines(text: &str) -> Vec<String> {
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| truncate_log_line(line, BROWSER_CONTAINER_LOG_LINE_MAX_CHARS))
+        .collect::<Vec<_>>();
+    if lines.len() > BROWSER_CONTAINER_LOG_LINE_LIMIT {
+        lines = lines[lines.len() - BROWSER_CONTAINER_LOG_LINE_LIMIT..].to_vec();
+    }
+    lines
+}
+
+fn truncate_log_line(line: &str, max_chars: usize) -> String {
+    let mut truncated = line.chars().take(max_chars).collect::<String>();
+    if line.chars().count() > max_chars {
+        truncated.push_str("...");
+    }
+    truncated
+}
+
+fn browser_logs_report_ready(log_tail: &BrowserLogTail, expected_port: u16) -> bool {
+    log_tail
+        .stdout
+        .iter()
+        .chain(log_tail.stderr.iter())
+        .filter_map(|line| extract_devtools_port(line))
+        .any(|port| port == expected_port)
+}
+
+fn extract_devtools_port(line: &str) -> Option<u16> {
+    let marker = "DevTools listening on ";
+    let url = line.split_once(marker)?.1.split_whitespace().next()?;
+    Url::parse(url).ok()?.port_or_known_default()
+}
+
+fn browser_container_has_exited(state: Option<&BrowserContainerStateSnapshot>) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    matches!(state.status.as_deref(), Some("exited" | "dead"))
+}
+
+fn browser_container_state_snapshot(
+    inspect: ContainerInspectResponse,
+) -> Option<BrowserContainerStateSnapshot> {
+    let state = inspect.state?;
+    Some(BrowserContainerStateSnapshot {
+        status: state
+            .status
+            .map(|value| format!("{value:?}").to_ascii_lowercase()),
+        running: state.running,
+        exit_code: state.exit_code,
+        oom_killed: state.oom_killed,
+        error: state.error.filter(|value| !value.trim().is_empty()),
+        started_at: state.started_at.filter(|value| !value.trim().is_empty()),
+        finished_at: state.finished_at.filter(|value| !value.trim().is_empty()),
+    })
+}
+
 fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
@@ -2570,9 +3028,9 @@ fn effective_browser_mcp<'a>(
 }
 
 fn browser_wait_script(browser_mcp: Option<&BrowserMcpConfig>) -> String {
-    let Some(browser_mcp) = browser_mcp else {
+    if browser_mcp.is_none() {
         return String::new();
-    };
+    }
     format!(
         r#"wait_for_browser_mcp() {{
   deadline=$((SECONDS + 30))
@@ -2594,7 +3052,7 @@ fn browser_wait_script(browser_mcp: Option<&BrowserMcpConfig>) -> String {
 }}
 wait_for_browser_mcp
 "#,
-        port = browser_mcp.remote_debugging_port,
+        port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
     )
 }
 
@@ -2617,7 +3075,7 @@ fn codex_app_server_exec_command(
                 .map(|arg| toml_basic_string(arg))
                 .chain(std::iter::once(toml_basic_string(&format!(
                     "--browserUrl=http://127.0.0.1:{}",
-                    browser_mcp.remote_debugging_port
+                    BROWSER_MCP_REMOTE_DEBUGGING_PORT
                 ))))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -3162,13 +3620,197 @@ mod tests {
 
     #[test]
     fn browser_container_cmd_includes_no_sandbox_by_default() {
-        let cmd = DockerCodexRunner::browser_container_cmd(&BrowserMcpConfig {
+        let cmd = browser_container_cmd(
+            "ghcr.io/acme/browser:latest",
+            &[],
+            &BrowserMcpConfig {
+                enabled: true,
+                server_name: "chrome-devtools".to_string(),
+                browser_image: "ghcr.io/acme/browser:latest".to_string(),
+                ..BrowserMcpConfig::default()
+            },
+        );
+        assert!(cmd.iter().any(|arg| arg == "--no-sandbox"));
+    }
+
+    #[test]
+    fn browser_container_cmd_skips_injected_debug_flags_for_headless_shell_wrapper() {
+        let cmd = browser_container_cmd(
+            "chromedp/headless-shell:latest",
+            &[],
+            &BrowserMcpConfig {
+                enabled: true,
+                server_name: "chrome-devtools".to_string(),
+                browser_image: "chromedp/headless-shell:latest".to_string(),
+                browser_args: vec!["--window-size=1280,720".to_string()],
+                ..BrowserMcpConfig::default()
+            },
+        );
+        assert_eq!(cmd, vec!["--window-size=1280,720".to_string()]);
+    }
+
+    #[test]
+    fn browser_launch_config_keeps_image_default_entrypoint_for_default_headless_shell_image() {
+        let launch = BrowserLaunchConfig::from_browser_mcp(&BrowserMcpConfig {
             enabled: true,
             server_name: "chrome-devtools".to_string(),
             browser_image: "chromedp/headless-shell:latest".to_string(),
+            browser_entrypoint: Vec::new(),
             ..BrowserMcpConfig::default()
         });
-        assert!(cmd.iter().any(|arg| arg == "--no-sandbox"));
+        assert!(launch.entrypoint.is_empty());
+        assert!(launch.cmd.is_empty());
+    }
+
+    #[test]
+    fn browser_launch_config_preserves_explicit_entrypoint_override() {
+        let launch = BrowserLaunchConfig::from_browser_mcp(&BrowserMcpConfig {
+            enabled: true,
+            server_name: "chrome-devtools".to_string(),
+            browser_image: "chromedp/headless-shell:latest".to_string(),
+            browser_entrypoint: vec!["/custom/entrypoint".to_string()],
+            ..BrowserMcpConfig::default()
+        });
+        assert_eq!(launch.entrypoint, vec!["/custom/entrypoint".to_string()]);
+        assert!(
+            launch
+                .cmd
+                .iter()
+                .any(|arg| arg == "--remote-debugging-address=0.0.0.0")
+        );
+    }
+
+    #[test]
+    fn browser_launch_config_keeps_other_images_on_image_default_entrypoint() {
+        let launch = BrowserLaunchConfig::from_browser_mcp(&BrowserMcpConfig {
+            enabled: true,
+            server_name: "chrome-devtools".to_string(),
+            browser_image: "ghcr.io/acme/browser:latest".to_string(),
+            browser_entrypoint: Vec::new(),
+            ..BrowserMcpConfig::default()
+        });
+        assert!(launch.entrypoint.is_empty());
+    }
+
+    #[test]
+    fn browser_logs_report_ready_requires_expected_port() {
+        let ready = browser_logs_report_ready(
+            &BrowserLogTail {
+                stdout: vec![],
+                stderr: vec![
+                    "DevTools listening on ws://127.0.0.1:9222/devtools/browser/abc".to_string(),
+                ],
+            },
+            9222,
+        );
+        let wrong_port = browser_logs_report_ready(
+            &BrowserLogTail {
+                stdout: vec![],
+                stderr: vec![
+                    "DevTools listening on ws://127.0.0.1:9223/devtools/browser/abc".to_string(),
+                ],
+            },
+            9222,
+        );
+        let prefix_port = browser_logs_report_ready(
+            &BrowserLogTail {
+                stdout: vec![],
+                stderr: vec![
+                    "DevTools listening on ws://127.0.0.1:9222/devtools/browser/abc".to_string(),
+                ],
+            },
+            922,
+        );
+        assert!(ready);
+        assert!(!wrong_port);
+        assert!(!prefix_port);
+    }
+
+    #[test]
+    fn browser_container_has_exited_only_for_terminal_states() {
+        assert!(!browser_container_has_exited(Some(
+            &BrowserContainerStateSnapshot {
+                status: Some("created".to_string()),
+                running: Some(false),
+                exit_code: None,
+                oom_killed: None,
+                error: None,
+                started_at: None,
+                finished_at: None,
+            },
+        )));
+        assert!(browser_container_has_exited(Some(
+            &BrowserContainerStateSnapshot {
+                status: Some("exited".to_string()),
+                running: Some(false),
+                exit_code: Some(1),
+                oom_killed: Some(false),
+                error: Some("boom".to_string()),
+                started_at: None,
+                finished_at: Some("2026-03-06T07:22:00Z".to_string()),
+            },
+        )));
+    }
+
+    #[test]
+    fn browser_container_diagnostics_context_includes_state_and_logs() {
+        let diagnostics = BrowserContainerDiagnostics {
+            container_id: "browser-123".to_string(),
+            launch: BrowserLaunchConfig {
+                image: "chromedp/headless-shell:latest".to_string(),
+                entrypoint: vec!["/headless-shell/headless-shell".to_string()],
+                cmd: vec!["--remote-debugging-port=9222".to_string()],
+            },
+            state: Some(BrowserContainerStateSnapshot {
+                status: Some("running".to_string()),
+                running: Some(true),
+                exit_code: Some(0),
+                oom_killed: Some(false),
+                error: None,
+                started_at: Some("2026-03-06T07:20:00Z".to_string()),
+                finished_at: None,
+            }),
+            state_collection_error: None,
+            log_tail: BrowserLogTail {
+                stdout: vec!["browser stdout line".to_string()],
+                stderr: vec![
+                    "DevTools listening on ws://127.0.0.1:9222/devtools/browser/abc".to_string(),
+                ],
+            },
+            log_collection_error: None,
+        };
+
+        let formatted = diagnostics.format_context();
+
+        assert!(formatted.contains("browser container diagnostics"));
+        assert!(formatted.contains("browser-123"));
+        assert!(formatted.contains("chromedp/headless-shell:latest"));
+        assert!(formatted.contains("/headless-shell/headless-shell"));
+        assert!(formatted.contains("status=running"));
+        assert!(formatted.contains("browser stdout line"));
+        assert!(formatted.contains("DevTools listening on ws://127.0.0.1:9222"));
+    }
+
+    #[test]
+    fn browser_container_diagnostics_context_includes_collection_errors() {
+        let diagnostics = BrowserContainerDiagnostics {
+            container_id: "browser-123".to_string(),
+            launch: BrowserLaunchConfig {
+                image: "chromedp/headless-shell:latest".to_string(),
+                entrypoint: vec![],
+                cmd: vec!["--remote-debugging-port=9222".to_string()],
+            },
+            state: None,
+            state_collection_error: Some("inspect failed".to_string()),
+            log_tail: BrowserLogTail::default(),
+            log_collection_error: Some("log fetch failed".to_string()),
+        };
+
+        let formatted = diagnostics.format_context();
+
+        assert!(formatted.contains("state unavailable: inspect failed"));
+        assert!(formatted.contains("log tail unavailable: log fetch failed"));
+        assert!(formatted.contains("entrypoint=<image-default>"));
     }
 
     #[test]

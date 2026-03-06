@@ -55,8 +55,13 @@ config:
       serverName: "chrome-devtools"
       # Browser container image launched inside dind for each Codex run.
       browserImage: "chromedp/headless-shell:latest"
-      # Optional override for images that need an explicit browser entrypoint.
+      # Optional override for the browser image entrypoint.
+      # When unset, the default chromedp/headless-shell image keeps its image default
+      # wrapper entrypoint and the review service skips injecting debug-port/address flags.
+      # Other images still use their image default entrypoint when this stays empty.
       browserEntrypoint: []
+      # Remote debugging port shared with the Codex container network namespace.
+      # Only 9222 is supported.
       remoteDebuggingPort: 9222
       # Extra Chrome/headless-shell args appended after the default remote-debugging flags.
       # Do not set --remote-debugging-address or --remote-debugging-port here.
