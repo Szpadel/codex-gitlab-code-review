@@ -30,6 +30,9 @@ config:
     commentMarkerPrefix: "<!-- codex-review:sha="
     staleInProgressMinutes: 120
     dryRun: false
+    # Optional. Extra review instructions appended to a synced copy of Codex's
+    # upstream review target prompt templates when set.
+    additionalDeveloperInstructions: null
     mentionCommands:
       enabled: false
       botUsername: null

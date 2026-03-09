@@ -197,6 +197,10 @@ async fn main() -> Result<()> {
             gitlab_token: config.gitlab.token.clone(),
             log_all_json: cli.debug,
             owner_id: review_owner_id,
+            review_additional_developer_instructions: config
+                .review
+                .additional_developer_instructions
+                .clone(),
         },
     )?;
 

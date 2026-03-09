@@ -3,6 +3,11 @@ use crate::config::{
 };
 use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
 use crate::gitlab::MergeRequest;
+use crate::review_prompt_templates::{
+    append_additional_review_instructions, build_base_branch_review_prompt,
+    build_commit_review_prompt, upstream_review_prompt_source_commit,
+    upstream_review_prompt_source_path,
+};
 use crate::state::ReviewStateStore;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -55,6 +60,12 @@ pub struct MentionCommandContext {
 pub enum CodexResult {
     Pass { summary: String },
     Comment { summary: String, body: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewTargetRequest {
+    NativeBaseBranch { branch: String },
+    Custom { instructions: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +261,7 @@ pub trait CodexRunner: Send + Sync {
 pub struct DockerCodexRunner {
     docker: Docker,
     codex: CodexConfig,
+    review_additional_developer_instructions: Option<String>,
     git_base: Url,
     gitlab_token: String,
     log_all_json: bool,
@@ -263,6 +275,7 @@ pub struct RunnerRuntimeOptions {
     pub gitlab_token: String,
     pub log_all_json: bool,
     pub owner_id: String,
+    pub review_additional_developer_instructions: Option<String>,
 }
 
 impl DockerCodexRunner {
@@ -278,6 +291,8 @@ impl DockerCodexRunner {
         Ok(Self {
             docker,
             codex,
+            review_additional_developer_instructions: runtime
+                .review_additional_developer_instructions,
             git_base,
             gitlab_token: runtime.gitlab_token,
             log_all_json: runtime.log_all_json,
@@ -335,26 +350,154 @@ impl DockerCodexRunner {
         }
     }
 
-    fn review_instructions(&self, ctx: &ReviewContext) -> String {
-        let title = ctx
-            .mr
-            .title
-            .clone()
-            .unwrap_or_else(|| "(no title)".to_string());
-        let url = ctx
-            .mr
-            .web_url
-            .clone()
-            .unwrap_or_else(|| "(no url)".to_string());
-        let target_branch = ctx
+    fn review_additional_developer_instructions(&self) -> Option<String> {
+        self.review_additional_developer_instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
+    fn fallback_review_target_instructions(
+        ctx: &ReviewContext,
+        additional_developer_instructions: Option<&str>,
+    ) -> String {
+        let mut prompt = format!(
+            "{} GitLab did not provide target branch metadata for this merge request, so this fallback reviews the checked-out head commit instead of a merge diff.",
+            build_commit_review_prompt(ctx.head_sha.as_str(), ctx.mr.title.as_deref())
+        );
+        if let Some(additional_developer_instructions) = additional_developer_instructions {
+            prompt =
+                append_additional_review_instructions(&prompt, additional_developer_instructions);
+        }
+        prompt
+    }
+
+    // Drift note:
+    // This mirrors only Codex upstream review target prompt construction from
+    // `codex-rs/core/src/review_prompts.rs` via the synced generated templates.
+    // Upstream source metadata is recorded in `generated_review_prompt_templates.rs`.
+    //
+    // Local alteration:
+    // - default path keeps native `review/start { type: "baseBranch" }`
+    // - when `review.additional_developer_instructions` is configured, we switch
+    //   to `review/start { type: "custom" }` and append those instructions to the
+    //   synced upstream target prompt so the Codex-owned review rubric remains in
+    //   the runtime image instead of being copied into this service.
+    fn review_target_request(
+        ctx: &ReviewContext,
+        merge_base_sha: Option<&str>,
+        additional_developer_instructions: Option<&str>,
+    ) -> ReviewTargetRequest {
+        let base_branch = ctx
             .mr
             .target_branch
-            .clone()
-            .unwrap_or_else(|| "(unknown)".to_string());
-        format!(
-            "You are a senior code reviewer. Review only the changes introduced by this merge request (diff against the target branch) and return JSON only.\n\nRepo: {}\nMR: {}\nURL: {}\nHead SHA: {}\nTarget branch: {}\n\nReturn JSON with fields verdict (pass or comment), summary, and comment_markdown. If verdict is pass, comment_markdown can be an empty string.",
-            ctx.repo, title, url, ctx.head_sha, target_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        match (base_branch, additional_developer_instructions) {
+            (Some(branch), None) => ReviewTargetRequest::NativeBaseBranch {
+                branch: branch.to_string(),
+            },
+            (Some(branch), Some(additional_developer_instructions)) => {
+                let prompt = build_base_branch_review_prompt(branch, merge_base_sha);
+                ReviewTargetRequest::Custom {
+                    instructions: append_additional_review_instructions(
+                        &prompt,
+                        additional_developer_instructions,
+                    ),
+                }
+            }
+            (None, additional_developer_instructions) => ReviewTargetRequest::Custom {
+                instructions: Self::fallback_review_target_instructions(
+                    ctx,
+                    additional_developer_instructions,
+                ),
+            },
+        }
+    }
+
+    async fn resolve_review_target_request(
+        &self,
+        ctx: &ReviewContext,
+        container_id: &str,
+        repo_path: &str,
+    ) -> ReviewTargetRequest {
+        let additional_developer_instructions = self.review_additional_developer_instructions();
+        let merge_base_sha = if let Some(branch) = ctx
+            .mr
+            .target_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if additional_developer_instructions.is_some() {
+                self.try_resolve_review_merge_base(container_id, repo_path, branch)
+                    .await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Self::review_target_request(
+            ctx,
+            merge_base_sha.as_deref(),
+            additional_developer_instructions.as_deref(),
         )
+    }
+
+    async fn try_resolve_review_merge_base(
+        &self,
+        container_id: &str,
+        repo_path: &str,
+        branch: &str,
+    ) -> Option<String> {
+        let command = vec![
+            "git".to_string(),
+            "merge-base".to_string(),
+            "HEAD".to_string(),
+            branch.to_string(),
+        ];
+        let output = match self
+            .exec_container_command(container_id, command, Some(repo_path))
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                warn!(
+                    branch,
+                    upstream_prompt_path = upstream_review_prompt_source_path(),
+                    upstream_prompt_commit = upstream_review_prompt_source_commit(),
+                    error = %err,
+                    "failed to resolve review merge-base locally; falling back to synced upstream backup prompt"
+                );
+                return None;
+            }
+        };
+        let merge_base_sha = output.stdout.trim();
+        if merge_base_sha.is_empty() {
+            warn!(
+                branch,
+                upstream_prompt_path = upstream_review_prompt_source_path(),
+                upstream_prompt_commit = upstream_review_prompt_source_commit(),
+                "review merge-base command returned empty output; falling back to synced upstream backup prompt"
+            );
+            None
+        } else {
+            Some(merge_base_sha.to_string())
+        }
+    }
+
+    fn review_target_value(review_target: ReviewTargetRequest) -> Value {
+        match review_target {
+            ReviewTargetRequest::NativeBaseBranch { branch } => {
+                json!({ "type": "baseBranch", "branch": branch })
+            }
+            ReviewTargetRequest::Custom { instructions } => {
+                json!({ "type": "custom", "instructions": instructions })
+            }
+        }
     }
 
     fn env_vars(&self) -> Vec<String> {
@@ -1388,19 +1531,12 @@ fi
             .start_app_server_container(script, &account.auth_host_path, Vec::new(), browser_mcp)
             .await?;
         let repo_path = "/work/repo";
-        let instructions = self.review_instructions(ctx);
-        let base_branch = ctx
-            .mr
-            .target_branch
-            .as_deref()
-            .filter(|value| !value.is_empty());
-        let review_target = if let Some(branch) = base_branch {
-            json!({ "type": "baseBranch", "branch": branch })
-        } else {
-            json!({ "type": "custom", "instructions": instructions.clone() })
-        };
 
         let review_result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
+            let review_target = Self::review_target_value(
+                self.resolve_review_target_request(ctx, &container_id, repo_path)
+                    .await,
+            );
             client.initialize().await?;
             client.initialized().await?;
             let thread_response = client
@@ -1410,7 +1546,6 @@ fi
                         "cwd": repo_path,
                         "approvalPolicy": "never",
                         "sandbox": self.sandbox_mode_value(),
-                        "baseInstructions": instructions,
                     }),
                 )
                 .await?;
@@ -3164,6 +3299,85 @@ mod tests {
         }
     }
 
+    fn review_context_with_target_branch(target_branch: Option<&str>) -> ReviewContext {
+        ReviewContext {
+            repo: "group/repo".to_string(),
+            project_path: "group/repo".to_string(),
+            mr: MergeRequest {
+                iid: 11,
+                title: Some("Title".to_string()),
+                web_url: Some(
+                    "https://gitlab.example.com/group/repo/-/merge_requests/11".to_string(),
+                ),
+                created_at: None,
+                updated_at: None,
+                sha: Some("abc123".to_string()),
+                source_branch: Some("feature".to_string()),
+                target_branch: target_branch.map(ToOwned::to_owned),
+                author: None,
+                source_project_id: None,
+                target_project_id: None,
+                diff_refs: None,
+            },
+            head_sha: "abc123".to_string(),
+        }
+    }
+
+    #[test]
+    fn review_target_request_uses_native_base_branch_without_extra_instructions() {
+        let ctx = review_context_with_target_branch(Some("main"));
+        let request = DockerCodexRunner::review_target_request(&ctx, Some("mergebase"), None);
+        assert_eq!(
+            request,
+            ReviewTargetRequest::NativeBaseBranch {
+                branch: "main".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn review_target_request_uses_synced_custom_prompt_with_extra_instructions() {
+        let ctx = review_context_with_target_branch(Some("main"));
+        let request = DockerCodexRunner::review_target_request(
+            &ctx,
+            Some("mergebase"),
+            Some("Check performance-sensitive paths."),
+        );
+        match request {
+            ReviewTargetRequest::NativeBaseBranch { .. } => {
+                panic!("expected custom review target request")
+            }
+            ReviewTargetRequest::Custom { instructions } => {
+                assert!(
+                    instructions.contains("merge base commit for this comparison is mergebase")
+                );
+                assert!(instructions.contains("Additional review instructions:"));
+                assert!(instructions.contains("Check performance-sensitive paths."));
+            }
+        }
+    }
+
+    #[test]
+    fn review_target_request_falls_back_when_target_branch_missing() {
+        let ctx = review_context_with_target_branch(None);
+        let request = DockerCodexRunner::review_target_request(
+            &ctx,
+            None,
+            Some("Check browser regressions."),
+        );
+        match request {
+            ReviewTargetRequest::NativeBaseBranch { .. } => {
+                panic!("expected custom review target request")
+            }
+            ReviewTargetRequest::Custom { instructions } => {
+                assert!(instructions.contains("introduced by commit abc123 (\"Title\")"));
+                assert!(instructions.contains("did not provide target branch metadata"));
+                assert!(instructions.contains("Additional review instructions:"));
+                assert!(instructions.contains("Check browser regressions."));
+            }
+        }
+    }
+
     #[test]
     fn parse_usage_limit_reset_at_supports_rfc3339() {
         let now = Utc
@@ -3487,6 +3701,7 @@ mod tests {
                 mcp_server_overrides: McpServerOverridesConfig::default(),
                 reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
             },
+            review_additional_developer_instructions: None,
             git_base: Url::parse("https://gitlab.example.com").expect("url"),
             gitlab_token: "token".to_string(),
             log_all_json: false,

@@ -140,6 +140,8 @@ pub struct ReviewConfig {
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
+    pub additional_developer_instructions: Option<String>,
+    #[serde(default)]
     pub mention_commands: ReviewMentionCommandsConfig,
 }
 
@@ -575,6 +577,7 @@ docker:
     fn defaults_mention_commands_when_missing() {
         let yaml = base_config_yaml("");
         let config = load_from_yaml(&yaml);
+        assert_eq!(config.review.additional_developer_instructions, None);
         assert!(!config.review.mention_commands.enabled);
         assert_eq!(config.review.mention_commands.bot_username, None);
         assert_eq!(config.review.mention_commands.eyes_emoji, None);
@@ -647,6 +650,7 @@ review:
   comment_marker_prefix: "<!-- codex-review:sha="
   stale_in_progress_minutes: 60
   dry_run: false
+  additional_developer_instructions: "Check performance-sensitive paths."
   mention_commands:
     enabled: true
     bot_username: "botuser"
@@ -664,6 +668,10 @@ server:
   bind_addr: "127.0.0.1:0"
 "#;
         let config = load_from_yaml(yaml);
+        assert_eq!(
+            config.review.additional_developer_instructions.as_deref(),
+            Some("Check performance-sensitive paths.")
+        );
         assert!(config.review.mention_commands.enabled);
         assert_eq!(
             config.review.mention_commands.bot_username.as_deref(),

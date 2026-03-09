@@ -1154,6 +1154,7 @@ mod tests {
                 comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
                 stale_in_progress_minutes: 60,
                 dry_run: false,
+                additional_developer_instructions: None,
                 mention_commands: ReviewMentionCommandsConfig::default(),
             },
             codex: CodexConfig {

@@ -59,6 +59,12 @@ data:
       comment_marker_prefix: {{ .Values.config.review.commentMarkerPrefix | quote }}
       stale_in_progress_minutes: {{ .Values.config.review.staleInProgressMinutes }}
       dry_run: {{ .Values.config.review.dryRun }}
+{{- if .Values.config.review.additionalDeveloperInstructions }}
+      additional_developer_instructions: |-
+{{ .Values.config.review.additionalDeveloperInstructions | nindent 8 }}
+{{- else }}
+      additional_developer_instructions: null
+{{- end }}
       mention_commands:
         enabled: {{ .Values.config.review.mentionCommands.enabled }}
 {{- if .Values.config.review.mentionCommands.botUsername }}

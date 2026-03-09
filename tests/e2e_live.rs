@@ -54,6 +54,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
             stale_in_progress_minutes: 60,
             dry_run: true,
+            additional_developer_instructions: None,
             mention_commands: ReviewMentionCommandsConfig::default(),
         },
         codex: CodexConfig {
@@ -106,6 +107,10 @@ async fn e2e_live_dry_run() -> Result<()> {
             gitlab_token: config.gitlab.token.clone(),
             log_all_json: false,
             owner_id: review_owner_id,
+            review_additional_developer_instructions: config
+                .review
+                .additional_developer_instructions
+                .clone(),
         },
     )?;
     let service = ReviewService::new(

@@ -3,6 +3,8 @@ pub mod codex_runner;
 pub mod config;
 pub mod docker_utils;
 pub mod flow;
+mod generated_review_prompt_templates;
 pub mod gitlab;
 pub mod review;
+pub mod review_prompt_templates;
 pub mod state;
