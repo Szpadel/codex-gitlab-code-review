@@ -5,6 +5,7 @@ pub mod docker_utils;
 pub mod flow;
 mod generated_review_prompt_templates;
 pub mod gitlab;
+pub mod http;
 pub mod review;
 pub mod review_prompt_templates;
 pub mod state;

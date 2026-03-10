@@ -1,11 +1,14 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use std::fs::{self, OpenOptions};
 use std::path::Path;
+use tracing::warn;
 use uuid::Uuid;
 
 const AUTH_LIMIT_RESET_KEY_PREFIX: &str = "codex_auth_limit_reset_at::";
+const SCAN_STATUS_KEY: &str = "scan_status";
 
 pub struct ReviewStateStore {
     pool: SqlitePool,
@@ -16,14 +19,14 @@ pub struct ProjectCatalog {
     pub projects: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InProgressReview {
     pub repo: String,
     pub iid: u64,
     pub head_sha: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MentionCommandStateKey {
     pub repo: String,
     pub iid: u64,
@@ -31,10 +34,69 @@ pub struct MentionCommandStateKey {
     pub trigger_note_id: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InProgressMentionCommand {
     pub key: MentionCommandStateKey,
     pub head_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanState {
+    Idle,
+    Scanning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanMode {
+    Full,
+    Incremental,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanOutcome {
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedScanStatus {
+    pub state: ScanState,
+    pub mode: Option<ScanMode>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub outcome: Option<ScanOutcome>,
+    pub error: Option<String>,
+    pub next_scan_at: Option<String>,
+}
+
+impl Default for PersistedScanStatus {
+    fn default() -> Self {
+        Self {
+            state: ScanState::Idle,
+            mode: None,
+            started_at: None,
+            finished_at: None,
+            outcome: None,
+            error: None,
+            next_scan_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuthLimitResetEntry {
+    pub account_name: String,
+    pub reset_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectCatalogSummary {
+    pub cache_key: String,
+    pub fetched_at: i64,
+    pub project_count: usize,
 }
 
 impl ReviewStateStore {
@@ -394,16 +456,18 @@ impl ReviewStateStore {
             serde_json::to_string(projects).context("serialize catalog projects")?;
         sqlx::query(
             r#"
-            INSERT INTO project_catalog (cache_key, fetched_at, projects)
-            VALUES (?, ?, ?)
+            INSERT INTO project_catalog (cache_key, fetched_at, projects, project_count)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(cache_key) DO UPDATE SET
                 fetched_at = excluded.fetched_at,
-                projects = excluded.projects
+                projects = excluded.projects,
+                project_count = excluded.project_count
             "#,
         )
         .bind(key)
         .bind(now)
         .bind(projects_json)
+        .bind(projects.len() as i64)
         .execute(&self.pool)
         .await
         .context("upsert project catalog")?;
@@ -517,8 +581,139 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    pub async fn get_scan_status(&self) -> Result<PersistedScanStatus> {
+        let raw = self.get_service_state_value(SCAN_STATUS_KEY).await?;
+        match raw {
+            Some(raw) => match serde_json::from_str(&raw) {
+                Ok(scan) => Ok(scan),
+                Err(err) => {
+                    warn!(error = %err, "invalid persisted scan status; using default");
+                    Ok(PersistedScanStatus::default())
+                }
+            },
+            None => Ok(PersistedScanStatus::default()),
+        }
+    }
+
+    pub async fn set_scan_status(&self, status: &PersistedScanStatus) -> Result<()> {
+        let raw = serde_json::to_string(status).context("serialize scan status")?;
+        self.set_service_state_value(SCAN_STATUS_KEY, &raw).await
+    }
+
+    pub async fn clear_next_scan_at(&self) -> Result<()> {
+        let mut status = self.get_scan_status().await?;
+        status.next_scan_at = None;
+        self.set_scan_status(&status).await
+    }
+
+    pub async fn list_auth_limit_reset_entries(&self) -> Result<Vec<AuthLimitResetEntry>> {
+        let rows =
+            sqlx::query("SELECT key, value FROM service_state WHERE key LIKE ? ORDER BY key ASC")
+                .bind(format!("{AUTH_LIMIT_RESET_KEY_PREFIX}%"))
+                .fetch_all(&self.pool)
+                .await
+                .context("list auth limit reset entries")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let key: String = row.try_get("key").context("read auth limit reset key")?;
+                let reset_at: String = row
+                    .try_get("value")
+                    .context("read auth limit reset timestamp")?;
+                Ok(AuthLimitResetEntry {
+                    account_name: key
+                        .strip_prefix(AUTH_LIMIT_RESET_KEY_PREFIX)
+                        .unwrap_or(key.as_str())
+                        .to_string(),
+                    reset_at,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_project_catalog_summaries(&self) -> Result<Vec<ProjectCatalogSummary>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT cache_key, fetched_at, project_count
+            FROM project_catalog
+            ORDER BY cache_key ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list project catalogs")?;
+
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cache_key: String = row.try_get("cache_key").context("read cache_key")?;
+            let fetched_at: i64 = row.try_get("fetched_at").context("read fetched_at")?;
+            let project_count_raw: Option<i64> =
+                row.try_get("project_count").context("read project_count")?;
+            let project_count = match project_count_raw {
+                Some(project_count) => {
+                    usize::try_from(project_count).context("convert project_count")?
+                }
+                None => self.load_legacy_project_catalog_count(&cache_key).await?,
+            };
+            summaries.push(ProjectCatalogSummary {
+                cache_key,
+                fetched_at,
+                project_count,
+            });
+        }
+        Ok(summaries)
+    }
+
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    async fn get_service_state_value(&self, key: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .with_context(|| format!("load service_state value for key {key}"))?;
+        row.map(|row| row.try_get("value").context("read service_state value"))
+            .transpose()
+    }
+
+    async fn set_service_state_value(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO service_state (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value
+            "#,
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("upsert service_state value for key {key}"))?;
+        Ok(())
+    }
+
+    async fn load_legacy_project_catalog_count(&self, key: &str) -> Result<usize> {
+        let row = sqlx::query("SELECT projects FROM project_catalog WHERE cache_key = ?")
+            .bind(key)
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| format!("load legacy project catalog for key {key}"))?;
+        let projects_json: String = row.try_get("projects").context("read projects")?;
+        let projects: Vec<String> = serde_json::from_str(&projects_json)
+            .context("deserialize catalog projects for legacy count")?;
+        let project_count = projects.len();
+        sqlx::query(
+            "UPDATE project_catalog SET project_count = ? WHERE cache_key = ? AND project_count IS NULL",
+        )
+        .bind(project_count as i64)
+        .bind(key)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("backfill legacy project count for key {key}"))?;
+        Ok(project_count)
     }
 }
 
@@ -1042,6 +1237,120 @@ mod tests {
             .await?;
         let after_newer_write = store.get_auth_limit_reset_at(account).await?;
         assert_eq!(after_newer_write, Some("2026-03-02T13:30:00Z".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_status_roundtrip_and_clear_next_scan() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+
+        let initial = store.get_scan_status().await?;
+        assert_eq!(initial.state, ScanState::Idle);
+        assert_eq!(initial.mode, None);
+        assert_eq!(initial.started_at, None);
+        assert_eq!(initial.finished_at, None);
+        assert_eq!(initial.outcome, None);
+        assert_eq!(initial.error, None);
+        assert_eq!(initial.next_scan_at, None);
+
+        store
+            .set_scan_status(&PersistedScanStatus {
+                state: ScanState::Scanning,
+                mode: Some(ScanMode::Full),
+                started_at: Some("2026-03-10T10:00:00Z".to_string()),
+                finished_at: None,
+                outcome: None,
+                error: None,
+                next_scan_at: Some("2026-03-10T10:10:00Z".to_string()),
+            })
+            .await?;
+
+        let running = store.get_scan_status().await?;
+        assert_eq!(running.state, ScanState::Scanning);
+        assert_eq!(running.mode, Some(ScanMode::Full));
+        assert_eq!(running.started_at, Some("2026-03-10T10:00:00Z".to_string()));
+        assert_eq!(running.finished_at, None);
+        assert_eq!(running.outcome, None);
+        assert_eq!(running.error, None);
+        assert_eq!(
+            running.next_scan_at,
+            Some("2026-03-10T10:10:00Z".to_string())
+        );
+
+        store.clear_next_scan_at().await?;
+        let cleared = store.get_scan_status().await?;
+        assert_eq!(cleared.next_scan_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auth_limit_reset_listing_returns_sorted_accounts() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        store
+            .set_auth_limit_reset_at("backup-2", "2026-03-10T12:30:00Z")
+            .await?;
+        store
+            .set_auth_limit_reset_at("primary", "2026-03-10T11:00:00Z")
+            .await?;
+
+        let entries = store.list_auth_limit_reset_entries().await?;
+        assert_eq!(
+            entries,
+            vec![
+                AuthLimitResetEntry {
+                    account_name: "backup-2".to_string(),
+                    reset_at: "2026-03-10T12:30:00Z".to_string(),
+                },
+                AuthLimitResetEntry {
+                    account_name: "primary".to_string(),
+                    reset_at: "2026-03-10T11:00:00Z".to_string(),
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_catalog_summary_lists_project_counts() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        store
+            .save_project_catalog(
+                "all",
+                &[
+                    "group/a".to_string(),
+                    "group/b".to_string(),
+                    "group/c".to_string(),
+                ],
+            )
+            .await?;
+
+        let summaries = store.list_project_catalog_summaries().await?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].cache_key, "all".to_string());
+        assert_eq!(summaries[0].project_count, 3);
+        assert!(summaries[0].fetched_at > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn project_catalog_summary_falls_back_for_legacy_rows_without_count() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        sqlx::query(
+            r#"
+            INSERT INTO project_catalog (cache_key, fetched_at, projects, project_count)
+            VALUES (?, ?, ?, NULL)
+            "#,
+        )
+        .bind("legacy")
+        .bind(123i64)
+        .bind("[\"group/a\",\"group/b\"]")
+        .execute(store.pool())
+        .await?;
+
+        let summaries = store.list_project_catalog_summaries().await?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].cache_key, "legacy".to_string());
+        assert_eq!(summaries[0].project_count, 2);
         Ok(())
     }
 }

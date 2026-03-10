@@ -153,3 +153,4 @@ data:
       path: "/data/state.sqlite"
     server:
       bind_addr: {{ .Values.config.server.bindAddr | quote }}
+      status_ui_enabled: {{ .Values.config.server.statusUiEnabled }}

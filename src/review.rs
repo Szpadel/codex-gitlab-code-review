@@ -22,6 +22,12 @@ enum ScanMode {
     Incremental,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanRunStatus {
+    Completed,
+    Interrupted,
+}
+
 #[derive(Default)]
 struct ScanCounters {
     total_mrs: usize,
@@ -84,11 +90,11 @@ impl ReviewService {
         }
     }
 
-    pub async fn scan_once(&self) -> Result<()> {
+    pub async fn scan_once(&self) -> Result<ScanRunStatus> {
         self.scan(ScanMode::Full).await
     }
 
-    pub async fn scan_once_incremental(&self) -> Result<()> {
+    pub async fn scan_once_incremental(&self) -> Result<ScanRunStatus> {
         self.scan(ScanMode::Incremental).await
     }
 
@@ -146,10 +152,10 @@ impl ReviewService {
         Ok(blocks_review)
     }
 
-    async fn scan(&self, mode: ScanMode) -> Result<()> {
+    async fn scan(&self, mode: ScanMode) -> Result<ScanRunStatus> {
         if self.shutdown_requested() {
             info!("scan skipped: shutdown requested");
-            return Ok(());
+            return Ok(ScanRunStatus::Interrupted);
         }
         match mode {
             ScanMode::Full => info!("starting scan"),
@@ -159,13 +165,15 @@ impl ReviewService {
         let repos = self.resolve_repos(mode).await?;
         if repos.is_empty() {
             info!("no gitlab repositories configured");
-            return Ok(());
+            return Ok(ScanRunStatus::Completed);
         }
         let mut tasks = Vec::new();
         let mut counters = ScanCounters::default();
+        let mut interrupted = false;
         for repo in &repos {
             if self.shutdown_requested() {
                 info!("stopping scan early: shutdown requested");
+                interrupted = true;
                 break;
             }
             let activity_marker = self.load_latest_mr_activity_marker(repo).await;
@@ -202,6 +210,7 @@ impl ReviewService {
                         .await?;
                 }
             } else {
+                interrupted = true;
                 debug!(
                     repo = repo.as_str(),
                     "skip: not advancing activity marker because scan was interrupted"
@@ -242,7 +251,11 @@ impl ReviewService {
                 );
             }
         }
-        Ok(())
+        Ok(if interrupted {
+            ScanRunStatus::Interrupted
+        } else {
+            ScanRunStatus::Completed
+        })
     }
 
     async fn load_latest_mr_activity_marker(&self, repo: &str) -> Option<String> {
@@ -1178,6 +1191,7 @@ mod tests {
             },
             server: ServerConfig {
                 bind_addr: "127.0.0.1:0".to_string(),
+                status_ui_enabled: false,
             },
         }
     }
@@ -2079,6 +2093,48 @@ mod tests {
 
         assert_eq!(*runner.calls.lock().unwrap(), 0);
         assert_eq!(gitlab.calls.lock().unwrap().len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_once_reports_interrupted_when_shutdown_requested_before_start() -> Result<()> {
+        let config = test_config();
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let service = ReviewService::new(
+            config,
+            Arc::new(FakeGitLab {
+                bot_user,
+                mrs: Mutex::new(Vec::new()),
+                awards: Mutex::new(HashMap::new()),
+                notes: Mutex::new(HashMap::new()),
+                discussions: Mutex::new(HashMap::new()),
+                users: Mutex::new(HashMap::new()),
+                projects: Mutex::new(HashMap::new()),
+                all_projects: Mutex::new(Vec::new()),
+                group_projects: Mutex::new(HashMap::new()),
+                calls: Mutex::new(Vec::new()),
+                list_open_calls: Mutex::new(0),
+                list_projects_calls: Mutex::new(0),
+                list_group_projects_calls: Mutex::new(0),
+                delete_award_fails: false,
+            }),
+            Arc::new(ReviewStateStore::new(":memory:").await?),
+            Arc::new(FakeRunner {
+                result: Mutex::new(None),
+                calls: Mutex::new(0),
+            }),
+            1,
+            default_created_after(),
+        );
+        service.request_shutdown();
+
+        let status = service.scan_once().await?;
+
+        assert_eq!(status, ScanRunStatus::Interrupted);
         Ok(())
     }
 

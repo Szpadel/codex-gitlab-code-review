@@ -290,6 +290,8 @@ pub struct DatabaseConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerConfig {
     pub bind_addr: String,
+    #[serde(default)]
+    pub status_ui_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

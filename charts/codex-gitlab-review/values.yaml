@@ -6,6 +6,17 @@ image:
 service:
   port: 8080
 
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: "codex-gitlab-review.local"
+      paths:
+        - path: "/"
+          pathType: Prefix
+  tls: []
+
 resources: {}
 
 serviceAccount:
@@ -94,6 +105,9 @@ config:
     host: "unix:///var/run/docker.sock"
   server:
     bindAddr: "0.0.0.0:8080"
+    # Keep this independent from ingress.enabled.
+    # If false, ingress can still route to /healthz but the status UI/API stays disabled.
+    statusUiEnabled: false
 
 gitlab:
   baseUrl: "https://gitlab.example.com"

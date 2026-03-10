@@ -4,3 +4,15 @@ Built-in proxy and egress-firewall chart support has been removed.
 Any supplied `proxy.*` or `networkPolicy.*` values are ignored by this release.
 Configure restricted egress outside this chart if you still require it.
 {{- end }}
+{{- if .Values.ingress.enabled }}
+
+Ingress:
+{{- range .Values.ingress.hosts }}
+  - http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+
+Note:
+`ingress.enabled` only exposes the Service. It does not enable the status UI/API.
+Set `config.server.statusUiEnabled=true` if you want `/`, `/status`, and `/api/status`
+to exist behind your ingress/proxy. `/healthz` remains available regardless.
+{{- end }}

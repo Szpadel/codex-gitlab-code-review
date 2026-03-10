@@ -2,18 +2,20 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use cron::Schedule;
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use codex_gitlab_code_review::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
 use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
 use codex_gitlab_code_review::config::Config;
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
-use codex_gitlab_code_review::review::ReviewService;
-use codex_gitlab_code_review::state::ReviewStateStore;
+use codex_gitlab_code_review::http::{StatusService, run_http_server};
+use codex_gitlab_code_review::review::{ReviewService, ScanRunStatus};
+use codex_gitlab_code_review::state::{ReviewStateStore, ScanMode, ScanOutcome};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Codex GitLab review service")]
@@ -207,27 +209,43 @@ async fn main() -> Result<()> {
     let service = Arc::new(ReviewService::new(
         config.clone(),
         Arc::new(gitlab_client),
-        state,
+        Arc::clone(&state),
         Arc::new(runner),
         bot_user_id,
         created_after,
     ));
 
-    tokio::spawn(run_health_server(config.server.bind_addr.clone()));
+    let status_service = Arc::new(StatusService::new(
+        config.clone(),
+        Arc::clone(&state),
+        run_once,
+    ));
 
     if let Err(err) = service.recover_in_progress_reviews().await {
         warn!(error = %err, "startup recovery of interrupted reviews failed");
     }
+    if let Err(err) = status_service.recover_startup_status().await {
+        warn!(error = %err, "failed to reconcile startup scan status");
+    }
+    tokio::spawn(run_http_server(
+        config.server.bind_addr.clone(),
+        Arc::clone(&status_service),
+    ));
 
     if run_once {
         info!("running single scan");
-        service.scan_once().await?;
+        if let Err(err) = status_service.clear_next_scan_at().await {
+            warn!(error = %err, "failed to clear next scheduled scan status");
+        }
+        run_tracked_scan(status_service.as_ref(), ScanMode::Full, service.scan_once()).await?;
         info!("single scan complete");
         return Ok(());
     }
 
     info!("starting scan loop");
-    if let Err(err) = service.scan_once().await {
+    if let Err(err) =
+        run_tracked_scan(status_service.as_ref(), ScanMode::Full, service.scan_once()).await
+    {
         warn!(error = %err, "initial scan failed");
     }
 
@@ -241,8 +259,16 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let scheduled_service = Arc::clone(&service);
+    let scheduled_status_service = Arc::clone(&status_service);
     let mut scheduled_loop = tokio::spawn(async move {
-        run_schedule_loop(scheduled_service.as_ref(), schedule, tz, shutdown_rx).await
+        run_schedule_loop(
+            scheduled_service.as_ref(),
+            scheduled_status_service.as_ref(),
+            schedule,
+            tz,
+            shutdown_rx,
+        )
+        .await
     });
 
     let shutdown_signal = wait_for_shutdown_signal();
@@ -272,23 +298,6 @@ async fn main() -> Result<()> {
     match scheduled_loop.await {
         Ok(result) => result,
         Err(err) => Err(err.into()),
-    }
-}
-
-async fn run_health_server(bind_addr: String) {
-    use axum::{Router, routing::get};
-    use tokio::net::TcpListener;
-
-    let app = Router::new().route("/healthz", get(|| async { "OK" }));
-    match TcpListener::bind(&bind_addr).await {
-        Ok(listener) => {
-            if let Err(err) = axum::serve(listener, app).await {
-                error!(error = %err, "health server failed");
-            }
-        }
-        Err(err) => {
-            error!(error = %err, "failed to bind health server");
-        }
     }
 }
 
@@ -335,12 +344,16 @@ fn env_flag(name: &str) -> bool {
 
 async fn run_schedule_loop(
     service: &ReviewService,
+    status_service: &StatusService,
     schedule: Schedule,
     tz: chrono_tz::Tz,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
         if *shutdown_rx.borrow() {
+            if let Err(err) = status_service.clear_next_scan_at().await {
+                warn!(error = %err, "failed to clear next scheduled scan status");
+            }
             info!("stopping schedule loop: shutdown requested");
             return Ok(());
         }
@@ -349,6 +362,12 @@ async fn run_schedule_loop(
         let next = upcoming
             .next()
             .ok_or_else(|| anyhow::anyhow!("cron has no future times"))?;
+        if let Err(err) = status_service
+            .set_next_scan_at(Some(next.with_timezone(&Utc)))
+            .await
+        {
+            warn!(error = %err, "failed to persist next scheduled scan status");
+        }
         let delay = (next - now)
             .to_std()
             .unwrap_or_else(|_| Duration::from_secs(0));
@@ -358,6 +377,9 @@ async fn run_schedule_loop(
             _ = &mut sleep => {}
             changed = shutdown_rx.changed() => match changed {
                 Ok(()) if *shutdown_rx.borrow() => {
+                    if let Err(err) = status_service.clear_next_scan_at().await {
+                        warn!(error = %err, "failed to clear next scheduled scan status");
+                    }
                     info!("stopping schedule loop: shutdown requested");
                     return Ok(());
                 }
@@ -366,13 +388,71 @@ async fn run_schedule_loop(
             },
         }
         if *shutdown_rx.borrow() {
+            if let Err(err) = status_service.clear_next_scan_at().await {
+                warn!(error = %err, "failed to clear next scheduled scan status");
+            }
             info!("stopping schedule loop: shutdown requested");
             return Ok(());
         }
-        if let Err(err) = service.scan_once_incremental().await {
+        if let Err(err) = run_tracked_scan(
+            status_service,
+            ScanMode::Incremental,
+            service.scan_once_incremental(),
+        )
+        .await
+        {
             warn!(error = %err, "scheduled scan failed");
         }
     }
+}
+
+async fn run_tracked_scan<F>(status_service: &StatusService, mode: ScanMode, scan: F) -> Result<()>
+where
+    F: Future<Output = Result<ScanRunStatus>>,
+{
+    if let Err(err) = status_service.mark_scan_started(mode).await {
+        warn!(error = %err, ?mode, "failed to persist scan start status");
+    }
+    let result = scan.await;
+    match &result {
+        Ok(ScanRunStatus::Interrupted) => {
+            if let Err(status_err) = status_service
+                .mark_scan_finished(
+                    mode,
+                    ScanOutcome::Failure,
+                    Some("scan interrupted by shutdown".to_string()),
+                )
+                .await
+            {
+                warn!(
+                    error = %status_err,
+                    ?mode,
+                    "failed to persist interrupted scan status"
+                );
+            }
+        }
+        Ok(ScanRunStatus::Completed) => {
+            if let Err(err) = status_service
+                .mark_scan_finished(mode, ScanOutcome::Success, None)
+                .await
+            {
+                warn!(error = %err, ?mode, "failed to persist successful scan status");
+            }
+        }
+        Err(err) => {
+            if let Err(status_err) = status_service
+                .mark_scan_finished(mode, ScanOutcome::Failure, Some(err.to_string()))
+                .await
+            {
+                warn!(
+                    error = %status_err,
+                    ?mode,
+                    "failed to persist failed scan status"
+                );
+            }
+        }
+    }
+    result.map(|_| ())
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {
@@ -390,5 +470,98 @@ async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await.context("listen for Ctrl+C")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_gitlab_code_review::config::{
+        BrowserMcpConfig, CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
+        McpServerOverridesConfig, ReasoningEffortOverridesConfig, ReviewConfig,
+        ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
+    };
+    use sqlx::Executor;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn tracked_scan_runs_even_when_status_state_is_malformed() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state
+            .pool()
+            .execute(sqlx::query(
+                "INSERT INTO service_state (key, value) VALUES ('scan_status', 'not-json')",
+            ))
+            .await?;
+        let status_service = StatusService::new(test_config(), state, false);
+        let executed = Arc::new(AtomicBool::new(false));
+        let executed_flag = Arc::clone(&executed);
+
+        run_tracked_scan(&status_service, ScanMode::Full, async move {
+            executed_flag.store(true, Ordering::SeqCst);
+            Ok(ScanRunStatus::Completed)
+        })
+        .await?;
+
+        assert!(executed.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    fn test_config() -> Config {
+        Config {
+            gitlab: GitLabConfig {
+                base_url: "https://gitlab.example.com".to_string(),
+                token: String::new(),
+                bot_user_id: Some(1),
+                created_after: None,
+                targets: GitLabTargets {
+                    repos: TargetSelector::List(vec!["group/repo".to_string()]),
+                    groups: TargetSelector::List(vec![]),
+                    exclude_repos: vec![],
+                    exclude_groups: vec![],
+                    refresh_seconds: 3600,
+                },
+            },
+            schedule: ScheduleConfig {
+                cron: "0 */10 * * * *".to_string(),
+                timezone: Some("UTC".to_string()),
+            },
+            review: ReviewConfig {
+                max_concurrent: 2,
+                eyes_emoji: "eyes".to_string(),
+                thumbs_emoji: "thumbsup".to_string(),
+                comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
+                stale_in_progress_minutes: 120,
+                dry_run: true,
+                additional_developer_instructions: None,
+                mention_commands: ReviewMentionCommandsConfig {
+                    enabled: false,
+                    bot_username: None,
+                    eyes_emoji: None,
+                    additional_developer_instructions: None,
+                },
+            },
+            codex: CodexConfig {
+                image: "ghcr.io/openai/codex-universal:latest".to_string(),
+                timeout_seconds: 1800,
+                auth_host_path: "/tmp/codex".to_string(),
+                auth_mount_path: "/root/.codex".to_string(),
+                exec_sandbox: "danger-full-access".to_string(),
+                fallback_auth_accounts: vec![],
+                usage_limit_fallback_cooldown_seconds: 3600,
+                deps: Default::default(),
+                browser_mcp: BrowserMcpConfig::default(),
+                mcp_server_overrides: McpServerOverridesConfig::default(),
+                reasoning_effort: ReasoningEffortOverridesConfig::default(),
+            },
+            docker: DockerConfig::default(),
+            database: DatabaseConfig {
+                path: ":memory:".to_string(),
+            },
+            server: ServerConfig {
+                bind_addr: "127.0.0.1:0".to_string(),
+                status_ui_enabled: false,
+            },
+        }
     }
 }

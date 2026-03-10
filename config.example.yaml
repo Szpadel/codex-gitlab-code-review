@@ -153,3 +153,6 @@ database:
 server:
   # Required. Health server bind address.
   bind_addr: "0.0.0.0:8080"
+  # Optional. Enable the status HTML/JSON endpoints on the same listener.
+  # Keep this false unless the listener is reachable only through an authenticated proxy.
+  status_ui_enabled: false
