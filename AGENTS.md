@@ -23,6 +23,9 @@ This service scans configured GitLab projects/groups for open merge requests, ru
 - Use standard Rust naming: `snake_case` for modules/functions, `CamelCase` for types, `SCREAMING_SNAKE_CASE` for constants.
 - Prefer small, focused functions and attach context to errors via `anyhow::Context`.
 
+## UI And Design Guidance
+- For UI, layout, styling, and design-system work, follow `STYLE_GUIDE.md` as the source of truth for the intended visual language and interaction patterns.
+
 ## Testing Guidelines
 - Unit tests live alongside modules under `src/` using `#[cfg(test)]`.
 - Live E2E test `tests/e2e_live.rs` only runs when `E2E_LIVE=1`.
