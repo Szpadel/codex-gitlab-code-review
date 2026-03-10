@@ -521,6 +521,7 @@ impl DockerCodexRunner {
             configured_reasoning_effort(self.codex.reasoning_effort.review.as_deref());
         Ok(Self::build_command_script(
             &clone_url,
+            &ctx.repo,
             ctx.head_sha.as_str(),
             &self.codex.auth_mount_path,
             ctx.mr
@@ -588,6 +589,7 @@ impl DockerCodexRunner {
         let clone_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
         let head_sha_q = shell_quote(&ctx.head_sha);
         let auth_mount_path_q = shell_quote(auth_mount_path);
+        let git_url_rewrite_script = git_url_rewrite_script(clone_url, &ctx.repo);
         let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
         let browser_wait_script = browser_wait_script(app_server.browser_mcp);
         let app_server_exec_cmd = codex_app_server_exec_command(
@@ -614,6 +616,7 @@ run_git() {{
     fi
   fi
 }}
+{git_url_rewrite_script}
 run_git clone git clone --depth 1 --recurse-submodules "{clone_url_dq}" "$repo_dir"
 cd "$repo_dir"
 run_git fetch git fetch --depth 1 origin {head_sha_q}
@@ -651,6 +654,7 @@ fi
             clone_url_dq = clone_url_dq,
             head_sha_q = head_sha_q,
             auth_mount_path_q = auth_mount_path_q,
+            git_url_rewrite_script = git_url_rewrite_script,
             browser_prereq_script = browser_prereq_script,
             browser_wait_script = browser_wait_script,
             app_server_exec_cmd = app_server_exec_cmd,
@@ -659,6 +663,7 @@ fi
 
     fn build_command_script(
         clone_url: &str,
+        repo: &str,
         head_sha: &str,
         auth_mount_path: &str,
         target_branch: Option<&str>,
@@ -775,6 +780,7 @@ export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
         } else {
             ""
         };
+        let git_url_rewrite_script = git_url_rewrite_script(clone_url, repo);
         let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
         let browser_wait_script = browser_wait_script(app_server.browser_mcp);
         let app_server_exec_cmd = codex_app_server_exec_command(
@@ -800,6 +806,7 @@ run_git() {{
     fi
   fi
 }}
+{git_url_rewrite_script}
 run_git clone git clone --depth 1 --recurse-submodules "{clone_url}" repo
 cd repo
 run_git fetch git fetch --depth 1 origin "{head_sha}"
@@ -835,6 +842,7 @@ fi
             auth_mount_path = auth_mount_path,
             target_branch_script = target_branch_script,
             deps_prefetch_script = deps_prefetch_script,
+            git_url_rewrite_script = git_url_rewrite_script,
             browser_prereq_script = browser_prereq_script,
             browser_wait_script = browser_wait_script,
             app_server_exec_cmd = app_server_exec_cmd
@@ -3125,6 +3133,68 @@ fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
+fn git_url_rewrite_script(clone_url: &str, repo: &str) -> String {
+    let Some((scheme, rest)) = clone_url.split_once("://") else {
+        return String::new();
+    };
+    let Some((authority, path_with_slash)) = rest.split_once('/') else {
+        return String::new();
+    };
+
+    let sanitized_clone_url = clone_url.replace("${GITLAB_TOKEN}", "token");
+    let Ok(parsed_clone_url) = Url::parse(&sanitized_clone_url) else {
+        return String::new();
+    };
+    let Some(host) = parsed_clone_url.host_str() else {
+        return String::new();
+    };
+    let host_endpoint = authority
+        .rsplit_once('@')
+        .map(|(_, value)| value)
+        .unwrap_or(authority);
+
+    let path = format!("/{}", path_with_slash);
+    let repo_suffix = format!("/{}.git", repo);
+    let base_path = path
+        .strip_suffix(&repo_suffix)
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let base_url = if base_path.is_empty() {
+        format!("{scheme}://{authority}/")
+    } else {
+        format!("{scheme}://{authority}{base_path}/")
+    };
+
+    let mut rewrites = vec![
+        (format!("url.{base_url}.insteadOf"), format!("git@{host}:")),
+        (
+            format!("url.{base_url}.insteadOf"),
+            format!("ssh://git@{host_endpoint}/"),
+        ),
+    ];
+
+    if !base_path.is_empty() {
+        let base_path = base_path.trim_start_matches('/');
+        rewrites.push((
+            format!("url.{base_url}.insteadOf"),
+            format!("git@{host}:{base_path}/"),
+        ));
+        rewrites.push((
+            format!("url.{base_url}.insteadOf"),
+            format!("ssh://git@{host_endpoint}/{base_path}/"),
+        ));
+    }
+
+    let mut script = format!("export GIT_CONFIG_COUNT=\"{}\"\n", rewrites.len());
+    for (index, (key, value)) in rewrites.into_iter().enumerate() {
+        let key = key.replace('\\', "\\\\").replace('"', "\\\"");
+        let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+        script.push_str(&format!("export GIT_CONFIG_KEY_{index}=\"{key}\"\n"));
+        script.push_str(&format!("export GIT_CONFIG_VALUE_{index}=\"{value}\"\n"));
+    }
+    script
+}
+
 fn escape_toml_basic_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -4115,6 +4185,7 @@ mod tests {
     fn build_command_script_sets_writable_codex_home() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "repo",
             "abc",
             "/root/.codex",
             None,
@@ -4133,6 +4204,7 @@ mod tests {
     fn build_command_script_fetches_target_branch() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "repo",
             "abc",
             "/root/.codex",
             Some("main"),
@@ -4152,6 +4224,7 @@ mod tests {
     fn build_command_script_updates_submodules() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "repo",
             "abc",
             "/root/.codex",
             None,
@@ -4164,12 +4237,44 @@ mod tests {
         );
         assert!(script.contains("git clone --depth 1 --recurse-submodules"));
         assert!(script.contains("git submodule update --init --recursive"));
+        assert!(script.contains("export GIT_CONFIG_KEY_0=\"url.https://example.com/.insteadOf\""));
+        assert!(script.contains("export GIT_CONFIG_VALUE_0=\"git@example.com:\""));
+    }
+
+    #[test]
+    fn git_url_rewrite_script_prefers_relative_url_root_when_present() {
+        let script = git_url_rewrite_script(
+            "https://oauth2:${GITLAB_TOKEN}@example.com/gitlab/group/repo.git",
+            "group/repo",
+        );
+
+        assert!(script.contains("export GIT_CONFIG_COUNT=\"4\""));
+        assert!(script.contains(
+            "export GIT_CONFIG_KEY_0=\"url.https://oauth2:${GITLAB_TOKEN}@example.com/gitlab/.insteadOf\""
+        ));
+        assert!(script.contains("export GIT_CONFIG_VALUE_0=\"git@example.com:\""));
+        assert!(script.contains("export GIT_CONFIG_VALUE_2=\"git@example.com:gitlab/\""));
+        assert!(script.contains("export GIT_CONFIG_VALUE_3=\"ssh://git@example.com/gitlab/\""));
+    }
+
+    #[test]
+    fn git_url_rewrite_script_preserves_explicit_host_port_for_ssh_urls() {
+        let script = git_url_rewrite_script(
+            "https://oauth2:${GITLAB_TOKEN}@example.com:8443/group/repo.git",
+            "group/repo",
+        );
+
+        assert!(script.contains(
+            "export GIT_CONFIG_KEY_1=\"url.https://oauth2:${GITLAB_TOKEN}@example.com:8443/.insteadOf\""
+        ));
+        assert!(script.contains("export GIT_CONFIG_VALUE_1=\"ssh://git@example.com:8443/\""));
     }
 
     #[test]
     fn build_command_script_includes_prefetch_when_enabled() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "repo",
             "abc",
             "/root/.codex",
             None,
@@ -4189,6 +4294,7 @@ mod tests {
         let overrides = BTreeMap::from([("github".to_string(), false)]);
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "repo",
             "abc",
             "/root/.codex",
             None,
@@ -4206,6 +4312,7 @@ mod tests {
     fn build_command_script_includes_reasoning_effort_override() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "repo",
             "abc",
             "/root/.codex",
             None,
@@ -4223,6 +4330,7 @@ mod tests {
     fn build_command_script_waits_for_browser_when_enabled() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "repo",
             "abc",
             "/root/.codex",
             None,
@@ -4308,6 +4416,10 @@ mod tests {
         assert!(
             script.contains("git clone --depth 1 --recurse-submodules \"https://oauth2:${GITLAB_TOKEN}@example.com/repo.git\"")
         );
+        assert!(script.contains(
+            "export GIT_CONFIG_KEY_0=\"url.https://oauth2:${GITLAB_TOKEN}@example.com/.insteadOf\""
+        ));
+        assert!(script.contains("export GIT_CONFIG_VALUE_0=\"git@example.com:\""));
         assert!(!script.contains("rm -rf"));
         assert!(script.contains("git remote set-url --push origin \"no_push://disabled\""));
         assert!(script.contains("exec codex app-server"));
