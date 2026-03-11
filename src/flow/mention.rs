@@ -1,6 +1,7 @@
 use crate::codex_runner::{MentionCommandContext, MentionCommandResult, MentionCommandStatus};
 use crate::flow::{FlowShared, MergeRequestFlow};
 use crate::gitlab::{DiscussionNote, GitLabApi, GitLabUser, MergeRequest, MergeRequestDiscussion};
+use crate::state::{NewRunHistory, RunHistoryFinish, RunHistoryKind};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -426,6 +427,41 @@ impl MentionFlow {
                 outcome.skipped_processed += 1;
                 continue;
             }
+            let trigger_author_name = trigger
+                .trigger_note
+                .author
+                .name
+                .clone()
+                .or_else(|| trigger.trigger_note.author.username.clone());
+            let run_history_id = match self
+                .shared
+                .state
+                .start_run_history(NewRunHistory {
+                    kind: RunHistoryKind::Mention,
+                    repo: repo.to_string(),
+                    iid: mr.iid,
+                    head_sha: head_sha.to_string(),
+                    discussion_id: Some(trigger.discussion_id.clone()),
+                    trigger_note_id: Some(trigger_note_id),
+                    trigger_note_author_name: trigger_author_name,
+                    trigger_note_body: Some(trigger.trigger_note.body.clone()),
+                    command_repo: Some(command_repo.clone()),
+                })
+                .await
+            {
+                Ok(run_history_id) => run_history_id,
+                Err(err) => {
+                    self.release_mention_lock_after_history_failure(
+                        repo,
+                        mr.iid,
+                        &trigger.discussion_id,
+                        trigger_note_id,
+                        head_sha,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            };
             let source_branch_key = mr
                 .source_branch
                 .as_deref()
@@ -473,6 +509,19 @@ impl MentionFlow {
                             "cancelled",
                         )
                         .await;
+                    let _ = state
+                        .finish_run_history(
+                            run_history_id,
+                            RunHistoryFinish {
+                                result: "cancelled".to_string(),
+                                preview: Some(format!(
+                                    "Mention {} !{} note {}",
+                                    repo_name, mr_copy.iid, trigger_note_id
+                                )),
+                                ..RunHistoryFinish::default()
+                            },
+                        )
+                        .await;
                     return;
                 }
                 let effective_mr = match gitlab.get_mr(&repo_name, mr_copy.iid).await {
@@ -492,6 +541,22 @@ impl MentionFlow {
                 let effective_head_sha = effective_mr
                     .head_sha()
                     .unwrap_or_else(|| head_sha_copy.clone());
+                if effective_head_sha != head_sha_copy {
+                    if let Err(err) = state
+                        .update_run_history_head_sha(run_history_id, &effective_head_sha)
+                        .await
+                    {
+                        warn!(
+                            repo = repo_name.as_str(),
+                            iid = mr_copy.iid,
+                            discussion_id = discussion_id.as_str(),
+                            trigger_note_id,
+                            head_sha = effective_head_sha.as_str(),
+                            error = %err,
+                            "failed to refresh mention run history head sha"
+                        );
+                    }
+                }
                 let prompt = MentionFlow::build_mention_prompt(
                     &repo_name,
                     &effective_mr,
@@ -532,9 +597,10 @@ impl MentionFlow {
                     requester_email: requester.email.clone(),
                     additional_developer_instructions,
                     prompt,
+                    run_history_id: Some(run_history_id),
                 };
                 let outcome = codex.run_mention_command(command_context).await;
-                let (state_result, status_message) = match outcome {
+                let (state_result, status_message, run_history_finish) = match outcome {
                     Ok(MentionCommandResult {
                         status: MentionCommandStatus::Committed,
                         commit_sha,
@@ -545,7 +611,7 @@ impl MentionFlow {
                         } else {
                             reply_message
                         };
-                        if let Some(commit_sha) = commit_sha {
+                        if let Some(ref commit_sha) = commit_sha {
                             let short_sha: String = commit_sha.chars().take(7).collect();
                             let has_sha = message.contains(commit_sha.as_str())
                                 || (!short_sha.is_empty() && message.contains(short_sha.as_str()));
@@ -553,20 +619,45 @@ impl MentionFlow {
                                 message.push_str(&format!("\n\nCommit SHA: `{}`", commit_sha));
                             }
                         }
-                        ("committed", message)
+                        (
+                            "committed",
+                            message.clone(),
+                            RunHistoryFinish {
+                                result: "committed".to_string(),
+                                preview: Some(format!(
+                                    "Mention {} !{} note {}",
+                                    repo_name, mr_copy.iid, trigger_note_id
+                                )),
+                                summary: Some(message),
+                                commit_sha,
+                                ..RunHistoryFinish::default()
+                            },
+                        )
                     }
                     Ok(MentionCommandResult {
                         status: MentionCommandStatus::NoChanges,
                         reply_message,
                         ..
-                    }) => (
-                        "no_changes",
-                        if reply_message.trim().is_empty() {
+                    }) => {
+                        let message = if reply_message.trim().is_empty() {
                             "Mention command completed with no code changes.".to_string()
                         } else {
                             reply_message
-                        },
-                    ),
+                        };
+                        (
+                            "no_changes",
+                            message.clone(),
+                            RunHistoryFinish {
+                                result: "no_changes".to_string(),
+                                preview: Some(format!(
+                                    "Mention {} !{} note {}",
+                                    repo_name, mr_copy.iid, trigger_note_id
+                                )),
+                                summary: Some(message),
+                                ..RunHistoryFinish::default()
+                            },
+                        )
+                    }
                     Err(err) => {
                         let error_chain = format!("{err:#}");
                         warn!(
@@ -581,9 +672,31 @@ impl MentionFlow {
                         (
                             "error",
                             "Mention command failed. Check service logs for details.".to_string(),
+                            RunHistoryFinish {
+                                result: "error".to_string(),
+                                preview: Some(format!(
+                                    "Mention {} !{} note {}",
+                                    repo_name, mr_copy.iid, trigger_note_id
+                                )),
+                                error: Some(err.to_string()),
+                                ..RunHistoryFinish::default()
+                            },
                         )
                     }
                 };
+                if let Err(err) = state
+                    .finish_run_history(run_history_id, run_history_finish)
+                    .await
+                {
+                    warn!(
+                        repo = repo_name.as_str(),
+                        iid = mr_copy.iid,
+                        discussion_id = discussion_id.as_str(),
+                        trigger_note_id,
+                        error = %err,
+                        "failed to persist mention run history"
+                    );
+                }
                 let mut completion_note_posted = false;
                 for attempt in 1..=3 {
                     match gitlab
@@ -729,6 +842,32 @@ impl MentionFlow {
             }));
         }
         Ok(outcome)
+    }
+
+    async fn release_mention_lock_after_history_failure(
+        &self,
+        repo: &str,
+        iid: u64,
+        discussion_id: &str,
+        trigger_note_id: u64,
+        head_sha: &str,
+    ) {
+        if let Err(recovery_err) = self
+            .shared
+            .state
+            .finish_mention_command(repo, iid, discussion_id, trigger_note_id, head_sha, "error")
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                discussion_id = discussion_id,
+                trigger_note_id = trigger_note_id,
+                head_sha = head_sha,
+                error = %recovery_err,
+                "failed to release mention lock after run history creation error"
+            );
+        }
     }
 }
 

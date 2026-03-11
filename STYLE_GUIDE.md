@@ -301,6 +301,32 @@ Motion should support orientation, not decoration.
 - avoid theatrical entrances or constant micro-motion
 - ensure reduced-motion behavior is defined and respected
 
+## 15. Session Transcripts
+
+Session transcripts display the chronological record of interactions between users and agents. To maintain a scannable, calm aesthetic without overwhelming the user, the layout relies on progressive disclosure, clean structural lines, and distinct visual treatments for different types of content.
+
+Overall layout and structure:
+- represent the session as a vertical timeline or conversation thread
+- rely on padding, borders, and subtle background shifts to group related items, reserving strong shadows or borders for primary content
+- default to progressive disclosure: show high-level actions, summaries, and final answers immediately; collapse verbose details (such as long outputs or step-by-step reasoning) behind simple toggle elements (e.g., accordions or `details` blocks)
+
+Reasoning and internal thoughts:
+- present the agent's internal reasoning as distinct message blocks
+- use a distinct, subtle background color to separate reasoning from user input and final outputs (e.g., a soft purple or indigo like `#F5F3FF` surface with `#4C1D95` text)
+- keep reasoning text slightly de-emphasized compared to final answers, using the secondary body typography size (`13 / 18`) or an italicized treatment
+
+Terminal and command outputs:
+- display command execution and standard outputs as terminal-like snippets
+- use a dark background (e.g., `#0F172A`) to strongly differentiate terminal environments from the rest of the light-themed application shell
+- use the standard monospace font stack (`JetBrains Mono`, `SF Mono`, etc.)
+- include distinct visual cues for the prompt line (e.g., `$`, `>`) versus the output lines
+- apply a maximum height with internal scrolling for very long outputs to preserve page position and avoid breaking the primary layout flow
+
+Metadata and density:
+- keep metadata such as timestamps, execution duration, and exit codes logically grouped and clearly legible but de-emphasized (using secondary or tertiary text colors like `#475569` or `#64748B`)
+- display badges for the success/failure states of commands (e.g., `Exit Code: 0` using the success semantic palette, `Exit Code: 1` using the danger palette)
+
+
 ## 15. Design tokens
 
 Standardize tokens before introducing local values.

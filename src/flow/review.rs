@@ -2,7 +2,7 @@ use crate::codex_runner::{CodexResult, ReviewContext};
 use crate::config::Config;
 use crate::flow::{FlowShared, MergeRequestFlow};
 use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, Note};
-use crate::state::ReviewStateStore;
+use crate::state::{NewRunHistory, ReviewStateStore, RunHistoryFinish, RunHistoryKind};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -246,6 +246,29 @@ impl ReviewFlow {
             ReviewGateOutcome::Decision(decision) => return Ok(decision),
             ReviewGateOutcome::Ready => {}
         }
+        let run_history_id = match self
+            .shared
+            .state
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: repo.to_string(),
+                iid: mr.iid,
+                head_sha: head_sha.to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await
+        {
+            Ok(run_history_id) => run_history_id,
+            Err(err) => {
+                self.release_review_lock_after_history_failure(repo, mr.iid, head_sha)
+                    .await;
+                return Err(err);
+            }
+        };
         let permit = self.shared.semaphore.clone().acquire_owned().await?;
         let repo_name = repo.to_string();
         let review_context = ReviewRunContext {
@@ -260,7 +283,10 @@ impl ReviewFlow {
         let head_sha = head_sha.to_string();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
-            if let Err(err) = review_context.run(&repo_name, mr, &head_sha).await {
+            if let Err(err) = review_context
+                .run(&repo_name, mr, &head_sha, run_history_id)
+                .await
+            {
                 warn!(repo = repo_name.as_str(), error = %err, "review failed");
             }
         }));
@@ -277,6 +303,29 @@ impl ReviewFlow {
             ReviewGateOutcome::Decision(decision) => return Ok(decision),
             ReviewGateOutcome::Ready => {}
         }
+        let run_history_id = match self
+            .shared
+            .state
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: repo.to_string(),
+                iid: mr.iid,
+                head_sha: head_sha.to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await
+        {
+            Ok(run_history_id) => run_history_id,
+            Err(err) => {
+                self.release_review_lock_after_history_failure(repo, mr.iid, head_sha)
+                    .await;
+                return Err(err);
+            }
+        };
         let _permit = self.shared.semaphore.clone().acquire_owned().await?;
         let review_context = ReviewRunContext {
             config: self.shared.config.clone(),
@@ -287,8 +336,32 @@ impl ReviewFlow {
             bot_user_id: self.shared.bot_user_id,
             shutdown: Arc::clone(&self.shared.shutdown),
         };
-        review_context.run(repo, mr, head_sha).await?;
+        review_context
+            .run(repo, mr, head_sha, run_history_id)
+            .await?;
         Ok(ReviewScheduleOutcome::Scheduled)
+    }
+
+    async fn release_review_lock_after_history_failure(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+    ) {
+        if let Err(recovery_err) = self
+            .shared
+            .state
+            .finish_review(repo, iid, head_sha, "error")
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                head_sha = head_sha,
+                error = %recovery_err,
+                "failed to release review lock after run history creation error"
+            );
+        }
     }
 }
 
@@ -351,20 +424,37 @@ impl ReviewRunContext {
         iid: u64,
         head_sha: &str,
         retry_key: &RetryKey,
+        run_history_id: i64,
     ) -> Result<()> {
         self.remove_eyes_best_effort(repo, iid).await;
         self.retry_backoff.clear(retry_key);
         self.state
             .finish_review(repo, iid, head_sha, "cancelled")
             .await?;
+        self.state
+            .finish_run_history(
+                run_history_id,
+                RunHistoryFinish {
+                    result: "cancelled".to_string(),
+                    preview: Some(format!("Review {repo} !{iid}")),
+                    ..RunHistoryFinish::default()
+                },
+            )
+            .await?;
         info!(repo = repo, iid = iid, "review cancelled due to shutdown");
         Ok(())
     }
 
-    pub(crate) async fn run(&self, repo: &str, mr: MergeRequest, head_sha: &str) -> Result<()> {
+    pub(crate) async fn run(
+        &self,
+        repo: &str,
+        mr: MergeRequest,
+        head_sha: &str,
+        run_history_id: i64,
+    ) -> Result<()> {
         let retry_key = RetryKey::new(repo, mr.iid, head_sha);
         if self.shutdown_requested() {
-            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                 .await?;
             return Ok(());
         }
@@ -383,23 +473,24 @@ impl ReviewRunContext {
             project_path: repo.to_string(),
             mr: mr.clone(),
             head_sha: head_sha.to_string(),
+            run_history_id: Some(run_history_id),
         };
 
         if self.shutdown_requested() {
-            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                 .await?;
             return Ok(());
         }
 
         let result = self.codex.run_review(review_ctx).await;
         if self.shutdown_requested() {
-            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                 .await?;
             return Ok(());
         }
         self.remove_eyes_best_effort(repo, mr.iid).await;
         if self.shutdown_requested() {
-            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                 .await?;
             return Ok(());
         }
@@ -407,7 +498,7 @@ impl ReviewRunContext {
         match result {
             Ok(CodexResult::Pass { summary }) => {
                 if self.shutdown_requested() {
-                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                         .await?;
                     return Ok(());
                 }
@@ -422,6 +513,17 @@ impl ReviewRunContext {
                 self.state
                     .finish_review(repo, mr.iid, head_sha, "pass")
                     .await?;
+                self.state
+                    .finish_run_history(
+                        run_history_id,
+                        RunHistoryFinish {
+                            result: "pass".to_string(),
+                            preview: Some(format!("Review {repo} !{}", mr.iid)),
+                            summary: Some(summary.clone()),
+                            ..RunHistoryFinish::default()
+                        },
+                    )
+                    .await?;
                 info!(
                     repo = repo,
                     iid = mr.iid,
@@ -431,7 +533,7 @@ impl ReviewRunContext {
             }
             Ok(CodexResult::Comment { summary, body }) => {
                 if self.shutdown_requested() {
-                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                         .await?;
                     return Ok(());
                 }
@@ -447,6 +549,18 @@ impl ReviewRunContext {
                 self.retry_backoff.clear(&retry_key);
                 self.state
                     .finish_review(repo, mr.iid, head_sha, "comment")
+                    .await?;
+                self.state
+                    .finish_run_history(
+                        run_history_id,
+                        RunHistoryFinish {
+                            result: "comment".to_string(),
+                            preview: Some(format!("Review {repo} !{}", mr.iid)),
+                            summary: Some(summary.clone()),
+                            error: Some(body),
+                            ..RunHistoryFinish::default()
+                        },
+                    )
                     .await?;
                 info!(
                     repo = repo,
@@ -467,12 +581,23 @@ impl ReviewRunContext {
                     "review failed"
                 );
                 if self.shutdown_requested() {
-                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key)
+                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                         .await?;
                     return Ok(());
                 }
                 self.state
                     .finish_review(repo, mr.iid, head_sha, "error")
+                    .await?;
+                self.state
+                    .finish_run_history(
+                        run_history_id,
+                        RunHistoryFinish {
+                            result: "error".to_string(),
+                            preview: Some(format!("Review {repo} !{}", mr.iid)),
+                            error: Some(err.to_string()),
+                            ..RunHistoryFinish::default()
+                        },
+                    )
                     .await?;
             }
         }

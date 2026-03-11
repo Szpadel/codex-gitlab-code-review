@@ -1144,6 +1144,127 @@ mod tests {
         }
     }
 
+    struct RefreshedMentionGitLab {
+        inner: Arc<FakeGitLab>,
+        refreshed_mr: MergeRequest,
+    }
+
+    #[async_trait]
+    impl GitLabApi for RefreshedMentionGitLab {
+        async fn current_user(&self) -> Result<GitLabUser> {
+            self.inner.current_user().await
+        }
+
+        async fn list_projects(&self) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+            self.inner.list_projects().await
+        }
+
+        async fn list_group_projects(
+            &self,
+            group: &str,
+        ) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+            self.inner.list_group_projects(group).await
+        }
+
+        async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>> {
+            self.inner.list_open_mrs(project).await
+        }
+
+        async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>> {
+            self.inner.get_latest_open_mr_activity(project).await
+        }
+
+        async fn get_mr(&self, _project: &str, _iid: u64) -> Result<MergeRequest> {
+            Ok(self.refreshed_mr.clone())
+        }
+
+        async fn get_project(&self, project: &str) -> Result<crate::gitlab::GitLabProject> {
+            self.inner.get_project(project).await
+        }
+
+        async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>> {
+            self.inner.list_awards(project, iid).await
+        }
+
+        async fn add_award(&self, project: &str, iid: u64, name: &str) -> Result<()> {
+            self.inner.add_award(project, iid, name).await
+        }
+
+        async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()> {
+            self.inner.delete_award(project, iid, award_id).await
+        }
+
+        async fn list_notes(&self, project: &str, iid: u64) -> Result<Vec<Note>> {
+            self.inner.list_notes(project, iid).await
+        }
+
+        async fn create_note(&self, project: &str, iid: u64, body: &str) -> Result<()> {
+            self.inner.create_note(project, iid, body).await
+        }
+
+        async fn list_discussions(
+            &self,
+            project: &str,
+            iid: u64,
+        ) -> Result<Vec<MergeRequestDiscussion>> {
+            self.inner.list_discussions(project, iid).await
+        }
+
+        async fn create_discussion_note(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            body: &str,
+        ) -> Result<()> {
+            self.inner
+                .create_discussion_note(project, iid, discussion_id, body)
+                .await
+        }
+
+        async fn list_discussion_note_awards(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            note_id: u64,
+        ) -> Result<Vec<AwardEmoji>> {
+            self.inner
+                .list_discussion_note_awards(project, iid, discussion_id, note_id)
+                .await
+        }
+
+        async fn add_discussion_note_award(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            note_id: u64,
+            name: &str,
+        ) -> Result<()> {
+            self.inner
+                .add_discussion_note_award(project, iid, discussion_id, note_id, name)
+                .await
+        }
+
+        async fn delete_discussion_note_award(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            note_id: u64,
+            award_id: u64,
+        ) -> Result<()> {
+            self.inner
+                .delete_discussion_note_award(project, iid, discussion_id, note_id, award_id)
+                .await
+        }
+
+        async fn get_user(&self, user_id: u64) -> Result<GitLabUserDetail> {
+            self.inner.get_user(user_id).await
+        }
+    }
+
     fn test_config() -> Config {
         Config {
             gitlab: GitLabConfig {
@@ -1433,6 +1554,62 @@ mod tests {
 
         assert_eq!(*runner.calls.lock().unwrap(), 1);
         assert_eq!(gitlab.calls.lock().unwrap().len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_history_insert_failure_releases_review_lock() -> Result<()> {
+        let config = test_config();
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user,
+            mrs: Mutex::new(vec![mr(40, "sha40")]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(FakeRunner {
+            result: Mutex::new(None),
+            calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        sqlx::query("DROP TABLE run_history")
+            .execute(state.pool())
+            .await?;
+        let service = ReviewService::new(
+            config,
+            gitlab,
+            Arc::clone(&state),
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+
+        assert!(service.scan_once().await.is_err());
+        assert_eq!(*runner.calls.lock().unwrap(), 0);
+        assert!(state.list_in_progress_reviews().await?.is_empty());
+        let row = sqlx::query("SELECT status, result FROM review_state WHERE repo = ? AND iid = ?")
+            .bind("group/repo")
+            .bind(40i64)
+            .fetch_one(state.pool())
+            .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done");
+        assert_eq!(result.as_deref(), Some("error"));
         Ok(())
     }
 
@@ -2187,7 +2364,7 @@ mod tests {
         };
 
         review_context
-            .run("group/repo", mr(22, "sha22"), "sha22")
+            .run("group/repo", mr(22, "sha22"), "sha22", 0)
             .await?;
 
         assert_eq!(*runner.calls.lock().unwrap(), 1);
@@ -2280,7 +2457,7 @@ mod tests {
         };
 
         review_context
-            .run("group/repo", mr(23, "sha23"), "sha23")
+            .run("group/repo", mr(23, "sha23"), "sha23", 0)
             .await?;
 
         assert_eq!(*runner.calls.lock().unwrap(), 0);
@@ -2373,7 +2550,7 @@ mod tests {
         };
 
         review_context
-            .run("group/repo", mr(24, "sha24"), "sha24")
+            .run("group/repo", mr(24, "sha24"), "sha24", 0)
             .await?;
 
         assert_eq!(*runner.calls.lock().unwrap(), 1);
@@ -2595,6 +2772,218 @@ mod tests {
         let result: Option<String> = row.try_get("result")?;
         assert_eq!(status, "done");
         assert_eq!(result, Some("committed".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mention_history_insert_failure_releases_mention_lock() -> Result<()> {
+        let mut config = test_config();
+        config.review.mention_commands.enabled = true;
+        config.review.mention_commands.bot_username = Some("botuser".to_string());
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let requester = GitLabUser {
+            id: 7,
+            username: Some("alice".to_string()),
+            name: Some("Alice".to_string()),
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(vec![mr(41, "sha41")]),
+            awards: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 41),
+                vec![AwardEmoji {
+                    id: 411,
+                    name: "thumbsup".to_string(),
+                    user: bot_user,
+                }],
+            )])),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 41),
+                vec![MergeRequestDiscussion {
+                    id: "discussion-1".to_string(),
+                    notes: vec![
+                        DiscussionNote {
+                            id: 910,
+                            body: "initial review comment".to_string(),
+                            author: GitLabUser {
+                                id: 1,
+                                username: Some("botuser".to_string()),
+                                name: Some("Bot User".to_string()),
+                            },
+                            system: false,
+                            in_reply_to_id: None,
+                            created_at: None,
+                        },
+                        DiscussionNote {
+                            id: 911,
+                            body: "@botuser please implement change".to_string(),
+                            author: requester,
+                            system: false,
+                            in_reply_to_id: Some(910),
+                            created_at: None,
+                        },
+                    ],
+                }],
+            )])),
+            users: Mutex::new(HashMap::from([(
+                7,
+                GitLabUserDetail {
+                    id: 7,
+                    username: Some("alice".to_string()),
+                    name: Some("Alice".to_string()),
+                    public_email: Some("alice@example.com".to_string()),
+                },
+            )])),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(MentionRunner {
+            mention_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        sqlx::query("DROP TABLE run_history")
+            .execute(state.pool())
+            .await?;
+        let service = ReviewService::new(
+            config,
+            gitlab,
+            Arc::clone(&state),
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+
+        assert!(service.scan_once().await.is_err());
+        assert_eq!(*runner.mention_calls.lock().unwrap(), 0);
+        assert!(state.list_in_progress_mention_commands().await?.is_empty());
+        let row = sqlx::query(
+            "SELECT status, result FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
+        )
+        .bind("group/repo")
+        .bind(41i64)
+        .bind("discussion-1")
+        .bind(911i64)
+        .fetch_one(state.pool())
+        .await?;
+        let status: String = row.try_get("status")?;
+        let result: Option<String> = row.try_get("result")?;
+        assert_eq!(status, "done");
+        assert_eq!(result.as_deref(), Some("error"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mention_run_history_uses_refreshed_mr_sha() -> Result<()> {
+        let mut config = test_config();
+        config.review.mention_commands.enabled = true;
+        config.review.mention_commands.bot_username = Some("botuser".to_string());
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let requester = GitLabUser {
+            id: 7,
+            username: Some("alice".to_string()),
+            name: Some("Alice".to_string()),
+        };
+        let inner_gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(vec![mr(42, "sha-old")]),
+            awards: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 42),
+                vec![AwardEmoji {
+                    id: 421,
+                    name: "thumbsup".to_string(),
+                    user: bot_user,
+                }],
+            )])),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 42),
+                vec![MergeRequestDiscussion {
+                    id: "discussion-1".to_string(),
+                    notes: vec![
+                        DiscussionNote {
+                            id: 920,
+                            body: "initial review comment".to_string(),
+                            author: GitLabUser {
+                                id: 1,
+                                username: Some("botuser".to_string()),
+                                name: Some("Bot User".to_string()),
+                            },
+                            system: false,
+                            in_reply_to_id: None,
+                            created_at: None,
+                        },
+                        DiscussionNote {
+                            id: 921,
+                            body: "@botuser please implement change".to_string(),
+                            author: requester,
+                            system: false,
+                            in_reply_to_id: Some(920),
+                            created_at: None,
+                        },
+                    ],
+                }],
+            )])),
+            users: Mutex::new(HashMap::from([(
+                7,
+                GitLabUserDetail {
+                    id: 7,
+                    username: Some("alice".to_string()),
+                    name: Some("Alice".to_string()),
+                    public_email: Some("alice@example.com".to_string()),
+                },
+            )])),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let gitlab = Arc::new(RefreshedMentionGitLab {
+            inner: Arc::clone(&inner_gitlab),
+            refreshed_mr: mr(42, "sha-new"),
+        });
+        let runner = Arc::new(MentionRunner {
+            mention_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let service = ReviewService::new(
+            config,
+            gitlab,
+            Arc::clone(&state),
+            runner,
+            1,
+            default_created_after(),
+        );
+
+        service.scan_once().await?;
+
+        let row = sqlx::query(
+            "SELECT head_sha FROM run_history WHERE repo = ? AND iid = ? ORDER BY started_at DESC, id DESC LIMIT 1",
+        )
+        .bind("group/repo")
+        .bind(42i64)
+        .fetch_one(state.pool())
+        .await?;
+        let head_sha: String = row.try_get("head_sha")?;
+        assert_eq!(head_sha, "sha-new");
         Ok(())
     }
 

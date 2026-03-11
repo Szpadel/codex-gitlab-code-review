@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use codex_gitlab_code_review::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
 use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
 use codex_gitlab_code_review::config::Config;
+use codex_gitlab_code_review::demo_history::seed_example_history;
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::http::{StatusService, run_http_server};
 use codex_gitlab_code_review::review::{ReviewService, ScanRunStatus};
@@ -37,6 +38,8 @@ struct Cli {
 enum Command {
     /// Manage Codex authentication.
     Auth(AuthCommand),
+    /// Developer-only utilities.
+    Dev(DevCommand),
 }
 
 #[derive(Parser, Debug)]
@@ -53,6 +56,22 @@ enum AuthSubcommand {
     Status,
 }
 
+#[derive(Parser, Debug)]
+struct DevCommand {
+    #[command(subcommand)]
+    action: DevSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum DevSubcommand {
+    /// Append synthetic review and mention history for validating the web UI.
+    SeedExampleHistory {
+        /// Required acknowledgement that this mutates the configured database.path.
+        #[arg(long)]
+        yes_append_to_configured_state: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -66,14 +85,48 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let mut config = Config::load()?;
-    if let Some(Command::Auth(auth_cmd)) = cli.command {
-        let runner = AuthRunner::new(config.docker.clone(), config.codex.clone())?;
-        let action = match auth_cmd.action {
-            AuthSubcommand::Login => RunnerAuthAction::Login,
-            AuthSubcommand::Status => RunnerAuthAction::Status,
-        };
-        runner.run(action, cli.debug).await?;
-        return Ok(());
+    if let Some(command) = cli.command {
+        match command {
+            Command::Auth(auth_cmd) => {
+                let runner = AuthRunner::new(config.docker.clone(), config.codex.clone())?;
+                let action = match auth_cmd.action {
+                    AuthSubcommand::Login => RunnerAuthAction::Login,
+                    AuthSubcommand::Status => RunnerAuthAction::Status,
+                };
+                runner.run(action, cli.debug).await?;
+                return Ok(());
+            }
+            Command::Dev(dev_cmd) => match dev_cmd.action {
+                DevSubcommand::SeedExampleHistory {
+                    yes_append_to_configured_state,
+                } => {
+                    if !yes_append_to_configured_state {
+                        anyhow::bail!(
+                            "refusing to append demo data into configured runtime state; rerun with --yes-append-to-configured-state"
+                        );
+                    }
+                    let report = seed_example_history(&config).await?;
+                    println!(
+                        "Seeded {} demo run(s) into {}.",
+                        report.runs.len(),
+                        report.database_path
+                    );
+                    for run in report.runs {
+                        println!(
+                            "- run {}: {:?} {} !{} [{}] -> {} | {}",
+                            run.run_id,
+                            run.kind,
+                            run.repo,
+                            run.iid,
+                            run.result,
+                            run.history_path,
+                            run.mr_history_path
+                        );
+                    }
+                    return Ok(());
+                }
+            },
+        }
     }
     let run_once = cli.once || env_flag("RUN_ONCE");
     let dry_run_override = cli.dry_run || env_flag("DRY_RUN");
@@ -190,7 +243,7 @@ async fn main() -> Result<()> {
         "using merge request created_after cutoff"
     );
     let review_owner_id = state.get_or_create_review_owner_id().await?;
-    let runner = DockerCodexRunner::new(
+    let runner = Arc::new(DockerCodexRunner::new(
         config.docker.clone(),
         config.codex.clone(),
         git_base,
@@ -204,13 +257,13 @@ async fn main() -> Result<()> {
                 .additional_developer_instructions
                 .clone(),
         },
-    )?;
+    )?);
 
     let service = Arc::new(ReviewService::new(
         config.clone(),
         Arc::new(gitlab_client),
         Arc::clone(&state),
-        Arc::new(runner),
+        runner.clone(),
         bot_user_id,
         created_after,
     ));
@@ -219,6 +272,7 @@ async fn main() -> Result<()> {
         config.clone(),
         Arc::clone(&state),
         run_once,
+        Some(runner),
     ));
 
     if let Err(err) = service.recover_in_progress_reviews().await {
@@ -293,6 +347,9 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(true);
     if let Err(err) = service.recover_in_progress_reviews().await {
         warn!(error = %err, "shutdown recovery of interrupted reviews failed");
+    }
+    if let Err(err) = status_service.reconcile_interrupted_run_history().await {
+        warn!(error = %err, "shutdown reconciliation of run history failed");
     }
 
     match scheduled_loop.await {
@@ -493,7 +550,7 @@ mod tests {
                 "INSERT INTO service_state (key, value) VALUES ('scan_status', 'not-json')",
             ))
             .await?;
-        let status_service = StatusService::new(test_config(), state, false);
+        let status_service = StatusService::new(test_config(), state, false, None);
         let executed = Arc::new(AtomicBool::new(false));
         let executed_flag = Arc::clone(&executed);
 

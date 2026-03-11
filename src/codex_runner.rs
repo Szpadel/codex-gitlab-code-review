@@ -8,7 +8,7 @@ use crate::review_prompt_templates::{
     build_commit_review_prompt, upstream_review_prompt_source_commit,
     upstream_review_prompt_source_path,
 };
-use crate::state::ReviewStateStore;
+use crate::state::{NewRunHistoryEvent, ReviewStateStore, RunHistorySessionUpdate};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use bollard::Docker;
@@ -19,12 +19,13 @@ use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, ListContainersOptionsBuilder,
     LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
 };
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +41,7 @@ pub struct ReviewContext {
     pub project_path: String,
     pub mr: MergeRequest,
     pub head_sha: String,
+    pub run_history_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +56,7 @@ pub struct MentionCommandContext {
     pub requester_email: String,
     pub additional_developer_instructions: Option<String>,
     pub prompt: String,
+    pub run_history_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +259,10 @@ pub trait CodexRunner: Send + Sync {
     async fn stop_active_reviews(&self) -> Result<()> {
         Ok(())
     }
+
+    async fn read_thread(&self, _account_name: &str, _thread_id: &str) -> Result<Value> {
+        bail!("thread history is not implemented by this runner")
+    }
 }
 
 pub struct DockerCodexRunner {
@@ -279,6 +286,64 @@ pub struct RunnerRuntimeOptions {
 }
 
 impl DockerCodexRunner {
+    async fn update_run_history_session(
+        &self,
+        run_history_id: Option<i64>,
+        update: RunHistorySessionUpdate,
+    ) {
+        let Some(run_history_id) = run_history_id else {
+            return;
+        };
+        if let Err(err) = self
+            .state
+            .update_run_history_session(run_history_id, update)
+            .await
+        {
+            warn!(
+                run_history_id,
+                error = %err,
+                "failed to update run history session metadata"
+            );
+        }
+    }
+
+    async fn append_run_history_events(
+        &self,
+        run_history_id: Option<i64>,
+        events: &[NewRunHistoryEvent],
+    ) {
+        let Some(run_history_id) = run_history_id else {
+            return;
+        };
+        if events.is_empty() {
+            return;
+        }
+        if let Err(err) = self
+            .state
+            .append_run_history_events(run_history_id, events)
+            .await
+        {
+            warn!(
+                run_history_id,
+                error = %err,
+                "failed to append run history events"
+            );
+            // Sticky on purpose: a failed batch means this run's persisted transcript may have
+            // permanent gaps because we do not replay already-consumed notifications.
+            if let Err(mark_err) = self
+                .state
+                .mark_run_history_events_incomplete(run_history_id)
+                .await
+            {
+                warn!(
+                    run_history_id,
+                    error = %mark_err,
+                    "failed to mark run history events incomplete"
+                );
+            }
+        }
+    }
+
     pub fn new(
         docker_cfg: DockerConfig,
         codex: CodexConfig,
@@ -852,6 +917,34 @@ fi
     fn app_server_cmd(script: String) -> Vec<String> {
         // The codex-universal entrypoint runs `bash --login "$@"`, so pass only bash flags + script.
         vec!["-lc".to_string(), script]
+    }
+
+    fn build_history_reader_script(auth_mount_path: &str) -> String {
+        format!(
+            r#"set -eu
+mkdir -p "{auth_mount_path}"
+export CODEX_HOME="{auth_mount_path}"
+if ! command -v codex >/dev/null 2>&1; then
+  echo "codex-runner: codex not found, installing"
+  if command -v npm >/dev/null 2>&1; then
+    if [ "${{CODEX_RUNNER_DEBUG:-}}" = "1" ]; then
+      npm install -g @openai/codex
+    else
+      if ! npm install -g @openai/codex >/tmp/codex-install.log 2>&1; then
+        echo "codex-runner-error: codex install failed"
+        tail -n 50 /tmp/codex-install.log | sed 's/^/codex-runner-error: /'
+        exit 1
+      fi
+    fi
+  else
+    echo "codex-runner-error: npm not found; provide a base image with node/npm or preinstall codex"
+    exit 1
+  fi
+fi
+exec codex app-server --listen stdio://
+"#,
+            auth_mount_path = auth_mount_path
+        )
     }
 
     fn normalize_image_reference(image: &str) -> String {
@@ -1524,6 +1617,12 @@ fi
         Ok(id)
     }
 
+    fn auth_account_by_name(&self, account_name: &str) -> Option<&AuthAccount> {
+        self.auth_accounts
+            .iter()
+            .find(|account| account.name == account_name)
+    }
+
     async fn run_app_server_review_with_account(
         &self,
         ctx: &ReviewContext,
@@ -1539,6 +1638,14 @@ fi
             .start_app_server_container(script, &account.auth_host_path, Vec::new(), browser_mcp)
             .await?;
         let repo_path = "/work/repo";
+        self.update_run_history_session(
+            ctx.run_history_id,
+            RunHistorySessionUpdate {
+                auth_account_name: Some(account.name.clone()),
+                ..RunHistorySessionUpdate::default()
+            },
+        )
+        .await;
 
         let review_result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
             let review_target = Self::review_target_value(
@@ -1554,6 +1661,7 @@ fi
                         "cwd": repo_path,
                         "approvalPolicy": "never",
                         "sandbox": self.sandbox_mode_value(),
+                        "persistExtendedHistory": true,
                     }),
                 )
                 .await?;
@@ -1563,6 +1671,15 @@ fi
                 .and_then(|id| id.as_str())
                 .ok_or_else(|| anyhow!("thread/start missing thread id"))?
                 .to_string();
+            self.update_run_history_session(
+                ctx.run_history_id,
+                RunHistorySessionUpdate {
+                    thread_id: Some(thread_id.clone()),
+                    auth_account_name: Some(account.name.clone()),
+                    ..RunHistorySessionUpdate::default()
+                },
+            )
+            .await;
             let review_response = client
                 .request(
                     "review/start",
@@ -1584,7 +1701,22 @@ fi
                 .and_then(|id| id.as_str())
                 .unwrap_or(thread_id.as_str())
                 .to_string();
-            client.stream_review(&review_thread_id, &turn_id).await
+            self.update_run_history_session(
+                ctx.run_history_id,
+                RunHistorySessionUpdate {
+                    thread_id: Some(thread_id.clone()),
+                    turn_id: Some(turn_id.clone()),
+                    review_thread_id: Some(review_thread_id.clone()),
+                    auth_account_name: Some(account.name.clone()),
+                },
+            )
+            .await;
+            client
+                .stream_review(&review_thread_id, &turn_id, |events| async move {
+                    self.append_run_history_events(ctx.run_history_id, &events)
+                        .await;
+                })
+                .await
         })
         .await;
 
@@ -1716,6 +1848,14 @@ fi
         } = self
             .start_app_server_container(script, &account.auth_host_path, Vec::new(), browser_mcp)
             .await?;
+        self.update_run_history_session(
+            ctx.run_history_id,
+            RunHistorySessionUpdate {
+                auth_account_name: Some(account.name.clone()),
+                ..RunHistorySessionUpdate::default()
+            },
+        )
+        .await;
 
         let mention_result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
             client.initialize().await?;
@@ -1728,6 +1868,7 @@ fi
                         "approvalPolicy": "never",
                         "sandbox": sandbox_mode,
                         "developerInstructions": Self::mention_developer_instructions(ctx),
+                        "persistExtendedHistory": true,
                     }),
                 )
                 .await?;
@@ -1737,6 +1878,15 @@ fi
                 .and_then(|id| id.as_str())
                 .ok_or_else(|| anyhow!("thread/start missing thread id"))?
                 .to_string();
+            self.update_run_history_session(
+                ctx.run_history_id,
+                RunHistorySessionUpdate {
+                    thread_id: Some(thread_id.clone()),
+                    auth_account_name: Some(account.name.clone()),
+                    ..RunHistorySessionUpdate::default()
+                },
+            )
+            .await;
 
             self.exec_container_command(
                 &container_id,
@@ -1804,7 +1954,22 @@ fi
                 .and_then(|id| id.as_str())
                 .ok_or_else(|| anyhow!("turn/start missing turn id"))?
                 .to_string();
-            let mut reply_message = client.stream_turn_message(&thread_id, &turn_id).await?;
+            self.update_run_history_session(
+                ctx.run_history_id,
+                RunHistorySessionUpdate {
+                    thread_id: Some(thread_id.clone()),
+                    turn_id: Some(turn_id.clone()),
+                    auth_account_name: Some(account.name.clone()),
+                    ..RunHistorySessionUpdate::default()
+                },
+            )
+            .await;
+            let mut reply_message = client
+                .stream_turn_message(&thread_id, &turn_id, |events| async move {
+                    self.append_run_history_events(ctx.run_history_id, &events)
+                        .await;
+                })
+                .await?;
             if reply_message.trim().is_empty() {
                 reply_message = "Mention command completed.".to_string();
             }
@@ -2027,6 +2192,45 @@ fi
             auth_fallback_errors.join(" | ")
         );
     }
+
+    async fn read_thread_with_account(
+        &self,
+        account: &AuthAccount,
+        thread_id: &str,
+    ) -> Result<Value> {
+        let script = Self::build_history_reader_script(&self.codex.auth_mount_path);
+        let StartedAppServer {
+            container_id,
+            browser_container_id,
+            mut client,
+        } = self
+            .start_app_server_container(script, &account.auth_host_path, Vec::new(), None)
+            .await?;
+
+        let result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
+            client.initialize().await?;
+            client.initialized().await?;
+            client
+                .request(
+                    "thread/read",
+                    json!({
+                        "threadId": thread_id,
+                        "includeTurns": true,
+                    }),
+                )
+                .await
+        })
+        .await;
+
+        self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
+            .await;
+
+        match result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(anyhow!("codex thread/read timed out")),
+        }
+    }
 }
 
 #[async_trait]
@@ -2069,6 +2273,13 @@ impl CodexRunner for DockerCodexRunner {
         self.stop_active_review_containers_best_effort().await;
         Ok(())
     }
+
+    async fn read_thread(&self, account_name: &str, thread_id: &str) -> Result<Value> {
+        let account = self
+            .auth_account_by_name(account_name)
+            .ok_or_else(|| anyhow!("unknown codex auth account: {account_name}"))?;
+        self.read_thread_with_account(account, thread_id).await
+    }
 }
 
 struct AppServerClient {
@@ -2077,6 +2288,8 @@ struct AppServerClient {
     buffer: Vec<u8>,
     pending_notifications: VecDeque<Value>,
     reasoning_buffers: HashMap<String, ReasoningBuffer>,
+    agent_message_buffers: HashMap<String, String>,
+    command_output_buffers: HashMap<String, String>,
     recent_runner_errors: VecDeque<String>,
     log_all_json: bool,
 }
@@ -2093,6 +2306,44 @@ enum TurnStreamNotificationOutcome {
     TurnCompleted,
 }
 
+#[derive(Default)]
+struct TurnHistoryCapture {
+    next_sequence: i64,
+    events: Vec<NewRunHistoryEvent>,
+}
+
+impl TurnHistoryCapture {
+    fn push(&mut self, turn_id: Option<&str>, event_type: &str, payload: Value) {
+        self.next_sequence += 1;
+        let payload = annotate_event_payload(payload);
+        self.events.push(NewRunHistoryEvent {
+            sequence: self.next_sequence,
+            turn_id: turn_id.map(ToOwned::to_owned),
+            event_type: event_type.to_string(),
+            payload,
+        });
+    }
+
+    fn take_pending(&mut self) -> Vec<NewRunHistoryEvent> {
+        self.next_sequence = 0;
+        std::mem::take(&mut self.events)
+    }
+}
+
+fn annotate_event_payload(mut payload: Value) -> Value {
+    if let Some(object) = payload.as_object_mut()
+        && !object.contains_key("createdAt")
+        && !object.contains_key("created_at")
+        && !object.contains_key("timestamp")
+    {
+        object.insert(
+            "createdAt".to_string(),
+            Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
+        );
+    }
+    payload
+}
+
 impl AppServerClient {
     fn new(attach: bollard::container::AttachContainerResults, log_all_json: bool) -> Self {
         Self {
@@ -2101,6 +2352,8 @@ impl AppServerClient {
             buffer: Vec::new(),
             pending_notifications: VecDeque::new(),
             reasoning_buffers: HashMap::new(),
+            agent_message_buffers: HashMap::new(),
+            command_output_buffers: HashMap::new(),
             recent_runner_errors: VecDeque::new(),
             log_all_json,
         }
@@ -2111,10 +2364,13 @@ impl AppServerClient {
             .request(
                 "initialize",
                 json!({
-                    "clientInfo": {
-                        "name": "codex-gitlab-review",
-                        "title": "Codex GitLab Review Service",
-                        "version": env!("CARGO_PKG_VERSION"),
+                "clientInfo": {
+                    "name": "codex-gitlab-review",
+                    "title": "Codex GitLab Review Service",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": {
+                        "experimentalApi": true,
                     }
                 }),
             )
@@ -2127,10 +2383,23 @@ impl AppServerClient {
         self.send_json(&json!({ "method": "initialized" })).await
     }
 
-    async fn stream_review(&mut self, thread_id: &str, turn_id: &str) -> Result<String> {
+    async fn stream_review<F, Fut>(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        mut persist_events: F,
+    ) -> Result<String>
+    where
+        F: FnMut(Vec<NewRunHistoryEvent>) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let mut review_text = None;
+        let mut history_capture = TurnHistoryCapture::default();
         loop {
-            let message = self.next_notification().await?;
+            let message = match self.next_notification().await {
+                Ok(message) => message,
+                Err(err) => break Err(err),
+            };
             let method = message
                 .get("method")
                 .and_then(|value| value.as_str())
@@ -2140,11 +2409,12 @@ impl AppServerClient {
                 continue;
             }
 
-            let outcome = self.handle_turn_notification(
+            let outcome = match self.handle_turn_notification(
                 method,
                 params,
                 thread_id,
                 turn_id,
+                &mut history_capture,
                 |_, _| {},
                 |item| {
                     if let Some(review) = item.get("review").and_then(|value| value.as_str())
@@ -2154,20 +2424,44 @@ impl AppServerClient {
                         review_text = Some(review.to_string());
                     }
                 },
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let pending_events = history_capture.take_pending();
+                    if !pending_events.is_empty() {
+                        persist_events(pending_events).await;
+                    }
+                    break Err(err);
+                }
+            };
+            let pending_events = history_capture.take_pending();
+            if !pending_events.is_empty() {
+                persist_events(pending_events).await;
+            }
             if outcome == TurnStreamNotificationOutcome::TurnCompleted {
-                break;
+                break review_text.ok_or_else(|| anyhow!("codex review missing review text"));
             }
         }
-
-        review_text.ok_or_else(|| anyhow!("codex review missing review text"))
     }
 
-    async fn stream_turn_message(&mut self, thread_id: &str, turn_id: &str) -> Result<String> {
+    async fn stream_turn_message<F, Fut>(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        mut persist_events: F,
+    ) -> Result<String>
+    where
+        F: FnMut(Vec<NewRunHistoryEvent>) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let final_message = RefCell::new(None);
         let message_deltas: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+        let mut history_capture = TurnHistoryCapture::default();
         loop {
-            let message = self.next_notification().await?;
+            let message = match self.next_notification().await {
+                Ok(message) => message,
+                Err(err) => break Err(err),
+            };
             let method = message
                 .get("method")
                 .and_then(|value| value.as_str())
@@ -2177,11 +2471,12 @@ impl AppServerClient {
                 continue;
             }
 
-            let outcome = self.handle_turn_notification(
+            let outcome = match self.handle_turn_notification(
                 method,
                 params,
                 thread_id,
                 turn_id,
+                &mut history_capture,
                 |item_id, delta| {
                     if item_id != "<unknown>" {
                         message_deltas
@@ -2214,21 +2509,33 @@ impl AppServerClient {
                         }
                     }
                 },
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let pending_events = history_capture.take_pending();
+                    if !pending_events.is_empty() {
+                        persist_events(pending_events).await;
+                    }
+                    break Err(err);
+                }
+            };
+            let pending_events = history_capture.take_pending();
+            if !pending_events.is_empty() {
+                persist_events(pending_events).await;
+            }
             if outcome == TurnStreamNotificationOutcome::TurnCompleted {
-                break;
+                break if let Some(message) = final_message.into_inner() {
+                    Ok(message)
+                } else {
+                    let fallback = message_deltas
+                        .into_inner()
+                        .into_values()
+                        .find(|value| !value.trim().is_empty())
+                        .unwrap_or_default();
+                    Ok(fallback)
+                };
             }
         }
-
-        if let Some(message) = final_message.into_inner() {
-            return Ok(message);
-        }
-        let fallback = message_deltas
-            .into_inner()
-            .into_values()
-            .find(|value| !value.trim().is_empty())
-            .unwrap_or_default();
-        Ok(fallback)
     }
 
     fn handle_turn_notification<FDelta, FCompleted>(
@@ -2237,6 +2544,7 @@ impl AppServerClient {
         params: Option<&Value>,
         thread_id: &str,
         turn_id: &str,
+        history_capture: &mut TurnHistoryCapture,
         mut on_agent_message_delta: FDelta,
         mut on_item_completed: FCompleted,
     ) -> Result<TurnStreamNotificationOutcome>
@@ -2246,6 +2554,11 @@ impl AppServerClient {
     {
         match method {
             "turn/started" => {
+                history_capture.push(
+                    Some(turn_id_from_params(params).unwrap_or(turn_id)),
+                    "turn_started",
+                    json!({}),
+                );
                 info!(thread_id, turn_id, "codex turn started");
             }
             "item/agentMessage/delta" => {
@@ -2257,6 +2570,12 @@ impl AppServerClient {
                         .and_then(|value| value.get("itemId"))
                         .and_then(|value| value.as_str())
                         .unwrap_or("<unknown>");
+                    if item_id != "<unknown>" {
+                        self.agent_message_buffers
+                            .entry(item_id.to_string())
+                            .or_default()
+                            .push_str(delta);
+                    }
                     on_agent_message_delta(item_id, delta);
                 }
             }
@@ -2269,6 +2588,12 @@ impl AppServerClient {
                         .and_then(|value| value.get("itemId"))
                         .and_then(|value| value.as_str())
                         .unwrap_or("<unknown>");
+                    if item_id != "<unknown>" {
+                        self.command_output_buffers
+                            .entry(item_id.to_string())
+                            .or_default()
+                            .push_str(delta);
+                    }
                     info!(item_id, kind = "command", output = %delta, "codex command output");
                 }
             }
@@ -2362,28 +2687,60 @@ impl AppServerClient {
                 if let Some(item) = params.and_then(|value| value.get("item"))
                     && let Some(item_type) = item.get("type").and_then(|value| value.as_str())
                 {
+                    let event_turn_id = turn_id_from_params(params).unwrap_or(turn_id);
+                    let mut completed_item = item.clone();
                     if item_type == "reasoning" {
                         if let Some(item_id) = item.get("id").and_then(|value| value.as_str())
                             && let Some(buffer) = self.reasoning_buffers.remove(item_id)
                         {
-                            let reasoning = if !buffer.summary.trim().is_empty() {
-                                buffer.summary
-                            } else {
-                                buffer.text
+                            let summary = buffer.summary.trim().to_string();
+                            let text = buffer.text.trim().to_string();
+                            completed_item = enrich_reasoning_item(
+                                item,
+                                item_id,
+                                summary.as_str(),
+                                text.as_str(),
+                            );
+                            let reasoning_log = match (summary.is_empty(), text.is_empty()) {
+                                (false, false) => format!("{summary}\n\n{text}"),
+                                (false, true) => summary.clone(),
+                                (true, false) => text.clone(),
+                                (true, true) => String::new(),
                             };
-                            if !reasoning.trim().is_empty() {
+                            if !reasoning_log.trim().is_empty() {
                                 info!(
                                     item_id,
-                                    reasoning = reasoning.as_str(),
+                                    reasoning = reasoning_log.as_str(),
                                     "codex reasoning completed"
                                 );
                             }
+                        }
+                    } else if matches!(item_type, "agentMessage" | "AgentMessage") {
+                        let item_id = item
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("<unknown>");
+                        let buffered_message = (item_id != "<unknown>")
+                            .then(|| self.agent_message_buffers.remove(item_id))
+                            .flatten();
+                        let extracted = extract_agent_message_text(item).or(buffered_message);
+                        if let Some(message) = extracted
+                            && !message.trim().is_empty()
+                        {
+                            completed_item = enrich_agent_message_item(item, message.as_str());
                         }
                     } else if item_type == "commandExecution" {
                         let item_id = item
                             .get("id")
                             .and_then(|value| value.as_str())
                             .unwrap_or("<unknown>");
+                        if let Some(output) = (item_id != "<unknown>")
+                            .then(|| self.command_output_buffers.remove(item_id))
+                            .flatten()
+                            && !output.is_empty()
+                        {
+                            completed_item = enrich_command_execution_item(item, output.as_str());
+                        }
                         let command = item
                             .get("command")
                             .and_then(|value| value.as_str())
@@ -2405,7 +2762,12 @@ impl AppServerClient {
                     } else {
                         info!(item_type, "codex item completed");
                     }
-                    on_item_completed(item);
+                    history_capture.push(
+                        Some(event_turn_id),
+                        "item_completed",
+                        completed_item.clone(),
+                    );
+                    on_item_completed(&completed_item);
                 }
             }
             "turn/completed" => {
@@ -2414,6 +2776,11 @@ impl AppServerClient {
                     .and_then(|value| value.get("status"))
                     .and_then(|value| value.as_str())
                     .unwrap_or("unknown");
+                history_capture.push(
+                    Some(turn_id_from_params(params).unwrap_or(turn_id)),
+                    "turn_completed",
+                    json!({ "status": status }),
+                );
                 info!(status, "codex turn completed");
                 if status == "failed" {
                     let error_message = params
@@ -2637,6 +3004,80 @@ fn matches_thread_turn(params: Option<&Value>, thread_id: &str, turn_id: &str) -
         .map(|value| value == turn_id)
         .unwrap_or(true);
     thread_matches && turn_matches
+}
+
+fn turn_id_from_params(params: Option<&Value>) -> Option<&str> {
+    params
+        .and_then(|value| value.get("turnId"))
+        .and_then(|value| value.as_str())
+}
+
+fn enrich_reasoning_item(item: &Value, item_id: &str, summary: &str, text: &str) -> Value {
+    let mut enriched = item.clone();
+    let Some(object) = enriched.as_object_mut() else {
+        return enriched;
+    };
+    let summary_fallback = if !summary.trim().is_empty() {
+        summary
+    } else {
+        text
+    };
+    let content_fallback = if !text.trim().is_empty() {
+        text
+    } else {
+        summary
+    };
+    if object
+        .get("summary")
+        .and_then(|value| value.as_array())
+        .is_none_or(|value| value.is_empty())
+    {
+        object.insert("summary".to_string(), json!([summary_fallback]));
+    }
+    if object
+        .get("content")
+        .and_then(|value| value.as_array())
+        .is_none_or(|value| value.is_empty())
+    {
+        object.insert("content".to_string(), json!([content_fallback]));
+    }
+    if object.get("id").and_then(|value| value.as_str()).is_none() {
+        object.insert("id".to_string(), Value::String(item_id.to_string()));
+    }
+    enriched
+}
+
+fn enrich_agent_message_item(item: &Value, text: &str) -> Value {
+    let mut enriched = item.clone();
+    let Some(object) = enriched.as_object_mut() else {
+        return enriched;
+    };
+    if object
+        .get("text")
+        .and_then(|value| value.as_str())
+        .is_none_or(str::is_empty)
+    {
+        object.insert("text".to_string(), Value::String(text.to_string()));
+    }
+    enriched
+}
+
+fn enrich_command_execution_item(item: &Value, output: &str) -> Value {
+    let mut enriched = item.clone();
+    let Some(object) = enriched.as_object_mut() else {
+        return enriched;
+    };
+    if object
+        .get("aggregatedOutput")
+        .and_then(|value| value.as_str())
+        .is_none_or(str::is_empty)
+    {
+        object.insert(
+            "aggregatedOutput".to_string(),
+            Value::String(output.to_string()),
+        );
+    }
+    enriched
 }
 
 fn extract_agent_message_text(item: &Value) -> Option<String> {
@@ -3325,8 +3766,23 @@ fn codex_app_server_exec_command(
 mod tests {
     use super::*;
     use crate::config::{DepsConfig, FallbackAuthAccountConfig, McpServerOverridesConfig};
+    use anyhow::Context;
     use chrono::TimeZone;
     use std::collections::BTreeMap;
+
+    fn empty_app_server_client() -> AppServerClient {
+        AppServerClient {
+            input: Box::pin(tokio::io::sink()),
+            output: Box::pin(futures::stream::empty()),
+            buffer: Vec::new(),
+            pending_notifications: VecDeque::new(),
+            reasoning_buffers: HashMap::new(),
+            agent_message_buffers: HashMap::new(),
+            command_output_buffers: HashMap::new(),
+            recent_runner_errors: VecDeque::new(),
+            log_all_json: false,
+        }
+    }
 
     #[test]
     fn parse_review_output_json_pass() -> Result<()> {
@@ -3369,6 +3825,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn handle_turn_notification_enriches_agent_message_from_deltas() -> Result<()> {
+        let mut client = empty_app_server_client();
+        let mut capture = TurnHistoryCapture::default();
+        client.handle_turn_notification(
+            "item/agentMessage/delta",
+            Some(&json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "delta": "Reply from deltas"
+            })),
+            "thread-1",
+            "turn-1",
+            &mut capture,
+            |_, _| {},
+            |_| {},
+        )?;
+
+        let mut completed = None;
+        client.handle_turn_notification(
+            "item/completed",
+            Some(&json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "AgentMessage",
+                    "phase": "final"
+                }
+            })),
+            "thread-1",
+            "turn-1",
+            &mut capture,
+            |_, _| {},
+            |item| completed = Some(item.clone()),
+        )?;
+
+        let completed = completed.context("completed agent message")?;
+        assert_eq!(completed["text"], "Reply from deltas");
+        let events = capture.take_pending();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].payload["createdAt"].is_string());
+        assert_eq!(events[0].payload["text"], "Reply from deltas");
+        Ok(())
+    }
+
+    #[test]
+    fn handle_turn_notification_enriches_command_output_from_deltas() -> Result<()> {
+        let mut client = empty_app_server_client();
+        let mut capture = TurnHistoryCapture::default();
+        client.handle_turn_notification(
+            "item/commandExecution/outputDelta",
+            Some(&json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "cmd-1",
+                "delta": "line one\nline two"
+            })),
+            "thread-1",
+            "turn-1",
+            &mut capture,
+            |_, _| {},
+            |_| {},
+        )?;
+
+        let mut completed = None;
+        client.handle_turn_notification(
+            "item/completed",
+            Some(&json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "cmd-1",
+                    "type": "commandExecution",
+                    "command": "cargo test",
+                    "status": "completed"
+                }
+            })),
+            "thread-1",
+            "turn-1",
+            &mut capture,
+            |_, _| {},
+            |item| completed = Some(item.clone()),
+        )?;
+
+        let completed = completed.context("completed command")?;
+        assert_eq!(completed["aggregatedOutput"], "line one\nline two");
+        let events = capture.take_pending();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].payload["createdAt"].is_string());
+        assert_eq!(events[0].payload["aggregatedOutput"], "line one\nline two");
+        Ok(())
+    }
+
     fn review_context_with_target_branch(target_branch: Option<&str>) -> ReviewContext {
         ReviewContext {
             repo: "group/repo".to_string(),
@@ -3390,6 +3941,7 @@ mod tests {
                 diff_refs: None,
             },
             head_sha: "abc123".to_string(),
+            run_history_id: None,
         }
     }
 
@@ -4402,6 +4954,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            run_history_id: None,
         };
         let script = DockerCodexRunner::build_mention_command_script(
             &ctx,
@@ -4455,6 +5008,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            run_history_id: None,
         };
         let overrides = BTreeMap::from([("playwright".to_string(), true)]);
         let script = DockerCodexRunner::build_mention_command_script(
@@ -4498,6 +5052,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            run_history_id: None,
         };
         let script = DockerCodexRunner::build_mention_command_script(
             &ctx,
@@ -4540,6 +5095,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            run_history_id: None,
         };
         let script = DockerCodexRunner::build_mention_command_script(
             &ctx,
@@ -4592,6 +5148,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            run_history_id: None,
         };
         let instructions = DockerCodexRunner::mention_developer_instructions(&ctx);
         assert!(instructions.contains("create at least one commit before you finish"));
@@ -4632,6 +5189,7 @@ mod tests {
                 "  Prefer minimal diffs and include tests.  ".to_string(),
             ),
             prompt: "Do the change".to_string(),
+            run_history_id: None,
         };
         let instructions = DockerCodexRunner::mention_developer_instructions(&ctx);
         assert!(instructions.contains("Additional instructions:"));

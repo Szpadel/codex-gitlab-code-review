@@ -1,6 +1,7 @@
 pub mod auth_cli;
 pub mod codex_runner;
 pub mod config;
+pub mod demo_history;
 pub mod docker_utils;
 pub mod flow;
 mod generated_review_prompt_templates;

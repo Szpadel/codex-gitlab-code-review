@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
+use serde_json::Value;
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 use tracing::warn;
@@ -17,6 +18,104 @@ pub struct ReviewStateStore {
 pub struct ProjectCatalog {
     pub fetched_at: i64,
     pub projects: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunHistoryKind {
+    Review,
+    Mention,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRunHistory {
+    pub kind: RunHistoryKind,
+    pub repo: String,
+    pub iid: u64,
+    pub head_sha: String,
+    pub discussion_id: Option<String>,
+    pub trigger_note_id: Option<u64>,
+    pub trigger_note_author_name: Option<String>,
+    pub trigger_note_body: Option<String>,
+    pub command_repo: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunHistoryFinish {
+    pub result: String,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub review_thread_id: Option<String>,
+    pub preview: Option<String>,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub auth_account_name: Option<String>,
+    pub commit_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunHistorySessionUpdate {
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub review_thread_id: Option<String>,
+    pub auth_account_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunHistoryRecord {
+    pub id: i64,
+    pub kind: RunHistoryKind,
+    pub repo: String,
+    pub iid: u64,
+    pub head_sha: String,
+    pub status: String,
+    pub result: Option<String>,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub updated_at: i64,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub review_thread_id: Option<String>,
+    pub preview: Option<String>,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub auth_account_name: Option<String>,
+    pub discussion_id: Option<String>,
+    pub trigger_note_id: Option<u64>,
+    pub trigger_note_author_name: Option<String>,
+    pub trigger_note_body: Option<String>,
+    pub command_repo: Option<String>,
+    pub commit_sha: Option<String>,
+    pub events_persisted_cleanly: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunHistoryListQuery {
+    pub repo: Option<String>,
+    pub iid: Option<u64>,
+    pub kind: Option<RunHistoryKind>,
+    pub result: Option<String>,
+    pub search: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRunHistoryEvent {
+    pub sequence: i64,
+    pub turn_id: Option<String>,
+    pub event_type: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunHistoryEventRecord {
+    pub id: i64,
+    pub run_history_id: i64,
+    pub sequence: i64,
+    pub turn_id: Option<String>,
+    pub event_type: String,
+    pub payload: Value,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -264,6 +363,28 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    pub async fn reconcile_interrupted_run_history(&self, reason: &str) -> Result<u64> {
+        let now = Utc::now().timestamp();
+        let result = sqlx::query(
+            r#"
+            UPDATE run_history
+            SET status = 'done',
+                result = 'cancelled',
+                finished_at = COALESCE(finished_at, ?),
+                updated_at = ?,
+                error = COALESCE(error, ?)
+            WHERE status = 'in_progress'
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .context("reconcile interrupted run history")?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn begin_mention_command(
         &self,
         repo: &str,
@@ -387,6 +508,340 @@ impl ReviewStateStore {
                 })
             })
             .collect()
+    }
+
+    pub async fn start_run_history(&self, new_run: NewRunHistory) -> Result<i64> {
+        let now = Utc::now().timestamp();
+        let result = sqlx::query(
+            r#"
+            INSERT INTO run_history (
+                kind,
+                repo,
+                iid,
+                head_sha,
+                status,
+                started_at,
+                updated_at,
+                discussion_id,
+                trigger_note_id,
+                trigger_note_author_name,
+                trigger_note_body,
+                command_repo
+            )
+            VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(run_history_kind_label(new_run.kind))
+        .bind(new_run.repo)
+        .bind(new_run.iid as i64)
+        .bind(new_run.head_sha)
+        .bind(now)
+        .bind(now)
+        .bind(new_run.discussion_id)
+        .bind(new_run.trigger_note_id.map(|value| value as i64))
+        .bind(new_run.trigger_note_author_name)
+        .bind(new_run.trigger_note_body)
+        .bind(new_run.command_repo)
+        .execute(&self.pool)
+        .await
+        .context("insert run history")?;
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn update_run_history_session(
+        &self,
+        run_id: i64,
+        update: RunHistorySessionUpdate,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE run_history
+            SET thread_id = COALESCE(?, thread_id),
+                turn_id = COALESCE(?, turn_id),
+                review_thread_id = COALESCE(?, review_thread_id),
+                auth_account_name = COALESCE(?, auth_account_name),
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(update.thread_id)
+        .bind(update.turn_id)
+        .bind(update.review_thread_id)
+        .bind(update.auth_account_name)
+        .bind(Utc::now().timestamp())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .context("update run history session metadata")?;
+        Ok(())
+    }
+
+    pub async fn update_run_history_head_sha(&self, run_id: i64, head_sha: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE run_history
+            SET head_sha = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(head_sha)
+        .bind(Utc::now().timestamp())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .context("update run history head sha")?;
+        Ok(())
+    }
+
+    pub async fn finish_run_history(&self, run_id: i64, finish: RunHistoryFinish) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            r#"
+            UPDATE run_history
+            SET status = 'done',
+                result = ?,
+                finished_at = ?,
+                updated_at = ?,
+                thread_id = COALESCE(?, thread_id),
+                turn_id = COALESCE(?, turn_id),
+                review_thread_id = COALESCE(?, review_thread_id),
+                preview = ?,
+                summary = ?,
+                error = ?,
+                auth_account_name = COALESCE(?, auth_account_name),
+                commit_sha = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(finish.result)
+        .bind(now)
+        .bind(now)
+        .bind(finish.thread_id)
+        .bind(finish.turn_id)
+        .bind(finish.review_thread_id)
+        .bind(finish.preview)
+        .bind(finish.summary)
+        .bind(finish.error)
+        .bind(finish.auth_account_name)
+        .bind(finish.commit_sha)
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .context("finish run history")?;
+        Ok(())
+    }
+
+    pub async fn mark_run_history_events_incomplete(&self, run_id: i64) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE run_history
+            SET events_persisted_cleanly = 0,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(Utc::now().timestamp())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .context("mark run history events incomplete")?;
+        Ok(())
+    }
+
+    pub async fn append_run_history_events(
+        &self,
+        run_history_id: i64,
+        events: &[NewRunHistoryEvent],
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let created_at = Utc::now().timestamp();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("start sqlite transaction for run history events")?;
+        let sequence_offset = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COALESCE(MAX(sequence), 0)
+            FROM run_history_event
+            WHERE run_history_id = ?
+            "#,
+        )
+        .bind(run_history_id)
+        .fetch_one(&mut *tx)
+        .await
+        .context("load current run history event sequence")?;
+        for event in events {
+            let payload_json =
+                serde_json::to_string(&event.payload).context("serialize run history payload")?;
+            sqlx::query(
+                r#"
+                INSERT INTO run_history_event (
+                    run_history_id,
+                    sequence,
+                    turn_id,
+                    event_type,
+                    payload_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(run_history_id)
+            .bind(sequence_offset + event.sequence)
+            .bind(event.turn_id.as_deref())
+            .bind(event.event_type.as_str())
+            .bind(payload_json)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await
+            .context("insert run history event")?;
+        }
+        tx.commit()
+            .await
+            .context("commit sqlite transaction for run history events")?;
+        Ok(())
+    }
+
+    pub async fn list_run_history_events(
+        &self,
+        run_history_id: i64,
+    ) -> Result<Vec<RunHistoryEventRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, run_history_id, sequence, turn_id, event_type, payload_json, created_at
+            FROM run_history_event
+            WHERE run_history_id = ?
+            ORDER BY sequence ASC, id ASC
+            "#,
+        )
+        .bind(run_history_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("list run history events")?;
+        rows.into_iter().map(map_run_history_event_row).collect()
+    }
+
+    pub async fn list_run_history_for_mr(
+        &self,
+        repo: &str,
+        iid: u64,
+    ) -> Result<Vec<RunHistoryRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
+                   thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
+                   discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
+                   command_repo, commit_sha, events_persisted_cleanly
+            FROM run_history
+            WHERE repo = ? AND iid = ?
+            ORDER BY started_at DESC, id DESC
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("list run history for MR")?;
+        rows.into_iter().map(map_run_history_row).collect()
+    }
+
+    pub async fn get_run_history(&self, run_id: i64) -> Result<Option<RunHistoryRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
+                   thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
+                   discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
+                   command_repo, commit_sha, events_persisted_cleanly
+            FROM run_history
+            WHERE id = ?
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("get run history")?;
+        row.map(map_run_history_row).transpose()
+    }
+
+    pub async fn list_run_history(
+        &self,
+        query: &RunHistoryListQuery,
+    ) -> Result<Vec<RunHistoryRecord>> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
+                   thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
+                   discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
+                   command_repo, commit_sha, events_persisted_cleanly
+            FROM run_history
+            "#,
+        );
+
+        let mut has_where = false;
+        let mut push_where = |builder: &mut QueryBuilder<Sqlite>| {
+            if !has_where {
+                builder.push(" WHERE ");
+                has_where = true;
+            } else {
+                builder.push(" AND ");
+            }
+        };
+
+        if let Some(repo) = query.repo.as_deref() {
+            push_where(&mut builder);
+            builder.push("repo = ").push_bind(repo);
+        }
+        if let Some(iid) = query.iid {
+            push_where(&mut builder);
+            builder.push("iid = ").push_bind(iid as i64);
+        }
+        if let Some(kind) = query.kind {
+            push_where(&mut builder);
+            builder
+                .push("kind = ")
+                .push_bind(run_history_kind_label(kind));
+        }
+        if let Some(result) = query.result.as_deref() {
+            push_where(&mut builder);
+            builder.push("result = ").push_bind(result);
+        }
+        if let Some(search) = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let pattern = format!("%{search}%");
+            push_where(&mut builder);
+            builder.push("(");
+            builder.push("repo LIKE ").push_bind(pattern.clone());
+            builder.push(" OR summary LIKE ").push_bind(pattern.clone());
+            builder.push(" OR preview LIKE ").push_bind(pattern.clone());
+            builder.push(" OR error LIKE ").push_bind(pattern.clone());
+            builder
+                .push(" OR trigger_note_body LIKE ")
+                .push_bind(pattern);
+            builder.push(")");
+        }
+
+        let limit = if query.limit == 0 {
+            50
+        } else {
+            query.limit.min(500)
+        };
+        builder
+            .push(" ORDER BY started_at DESC, id DESC LIMIT ")
+            .push_bind(limit as i64);
+
+        let rows = builder
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .context("list run history")?;
+        rows.into_iter().map(map_run_history_row).collect()
     }
 
     pub async fn get_project_last_mr_activity(&self, repo: &str) -> Result<Option<String>> {
@@ -719,6 +1174,113 @@ impl ReviewStateStore {
 
 fn auth_limit_reset_key(account_name: &str) -> String {
     format!("{AUTH_LIMIT_RESET_KEY_PREFIX}{account_name}")
+}
+
+fn run_history_kind_label(kind: RunHistoryKind) -> &'static str {
+    match kind {
+        RunHistoryKind::Review => "review",
+        RunHistoryKind::Mention => "mention",
+    }
+}
+
+fn parse_run_history_kind(value: &str) -> Result<RunHistoryKind> {
+    match value {
+        "review" => Ok(RunHistoryKind::Review),
+        "mention" => Ok(RunHistoryKind::Mention),
+        other => bail!("unknown run_history kind: {other}"),
+    }
+}
+
+fn map_run_history_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord> {
+    let iid_raw: i64 = row.try_get("iid").context("read run history iid")?;
+    let trigger_note_id_raw: Option<i64> = row
+        .try_get("trigger_note_id")
+        .context("read run history trigger note id")?;
+    Ok(RunHistoryRecord {
+        id: row.try_get("id").context("read run history id")?,
+        kind: parse_run_history_kind(
+            row.try_get::<String, _>("kind")
+                .context("read run history kind")?
+                .as_str(),
+        )?,
+        repo: row.try_get("repo").context("read run history repo")?,
+        iid: u64::try_from(iid_raw).context("convert run history iid to u64")?,
+        head_sha: row
+            .try_get("head_sha")
+            .context("read run history head sha")?,
+        status: row.try_get("status").context("read run history status")?,
+        result: row.try_get("result").context("read run history result")?,
+        started_at: row
+            .try_get("started_at")
+            .context("read run history started_at")?,
+        finished_at: row
+            .try_get("finished_at")
+            .context("read run history finished_at")?,
+        updated_at: row
+            .try_get("updated_at")
+            .context("read run history updated_at")?,
+        thread_id: row
+            .try_get("thread_id")
+            .context("read run history thread_id")?,
+        turn_id: row.try_get("turn_id").context("read run history turn_id")?,
+        review_thread_id: row
+            .try_get("review_thread_id")
+            .context("read run history review_thread_id")?,
+        preview: row.try_get("preview").context("read run history preview")?,
+        summary: row.try_get("summary").context("read run history summary")?,
+        error: row.try_get("error").context("read run history error")?,
+        auth_account_name: row
+            .try_get("auth_account_name")
+            .context("read run history auth account")?,
+        discussion_id: row
+            .try_get("discussion_id")
+            .context("read run history discussion id")?,
+        trigger_note_id: trigger_note_id_raw
+            .map(|value| u64::try_from(value).context("convert trigger_note_id to u64"))
+            .transpose()?,
+        trigger_note_author_name: row
+            .try_get("trigger_note_author_name")
+            .context("read run history trigger note author")?,
+        trigger_note_body: row
+            .try_get("trigger_note_body")
+            .context("read run history trigger note body")?,
+        command_repo: row
+            .try_get("command_repo")
+            .context("read run history command repo")?,
+        commit_sha: row
+            .try_get("commit_sha")
+            .context("read run history commit sha")?,
+        events_persisted_cleanly: row
+            .try_get::<i64, _>("events_persisted_cleanly")
+            .context("read run history events_persisted_cleanly")?
+            != 0,
+    })
+}
+
+fn map_run_history_event_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryEventRecord> {
+    let payload_json: String = row
+        .try_get("payload_json")
+        .context("read run history event payload_json")?;
+    Ok(RunHistoryEventRecord {
+        id: row.try_get("id").context("read run history event id")?,
+        run_history_id: row
+            .try_get("run_history_id")
+            .context("read run history event run_history_id")?,
+        sequence: row
+            .try_get("sequence")
+            .context("read run history event sequence")?,
+        turn_id: row
+            .try_get("turn_id")
+            .context("read run history event turn_id")?,
+        event_type: row
+            .try_get("event_type")
+            .context("read run history event event_type")?,
+        payload: serde_json::from_str(&payload_json)
+            .context("deserialize run history event payload_json")?,
+        created_at: row
+            .try_get("created_at")
+            .context("read run history event created_at")?,
+    })
 }
 
 fn sqlite_url(path: &str) -> String {
@@ -1351,6 +1913,384 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].cache_key, "legacy".to_string());
         assert_eq!(summaries[0].project_count, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_history_is_append_only_for_same_mr() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+
+        let first_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 42,
+                head_sha: "sha1".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .finish_run_history(
+                first_id,
+                RunHistoryFinish {
+                    result: "comment".to_string(),
+                    thread_id: Some("thread-1".to_string()),
+                    turn_id: Some("turn-1".to_string()),
+                    review_thread_id: Some("thread-1".to_string()),
+                    preview: Some("Review group/repo !42".to_string()),
+                    summary: Some("needs fixes".to_string()),
+                    error: None,
+                    auth_account_name: Some("primary".to_string()),
+                    commit_sha: None,
+                },
+            )
+            .await?;
+
+        let second_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 42,
+                head_sha: "sha2".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+
+        assert_ne!(first_id, second_id);
+
+        let records = store.list_run_history_for_mr("group/repo", 42).await?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].id, second_id);
+        assert_eq!(records[0].head_sha, "sha2".to_string());
+        assert_eq!(records[1].id, first_id);
+        assert_eq!(records[1].result.as_deref(), Some("comment"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_history_preserves_mention_trigger_metadata() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+
+        let run_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Mention,
+                repo: "group/repo".to_string(),
+                iid: 7,
+                head_sha: "sha-mention".to_string(),
+                discussion_id: Some("discussion-9".to_string()),
+                trigger_note_id: Some(123),
+                trigger_note_author_name: Some("Reviewer".to_string()),
+                trigger_note_body: Some("@codex please rename this".to_string()),
+                command_repo: Some("fork/repo".to_string()),
+            })
+            .await?;
+        store
+            .finish_run_history(
+                run_id,
+                RunHistoryFinish {
+                    result: "committed".to_string(),
+                    thread_id: Some("thread-mention".to_string()),
+                    turn_id: Some("turn-mention".to_string()),
+                    review_thread_id: None,
+                    preview: Some("note:123 author:reviewer".to_string()),
+                    summary: Some("renamed method".to_string()),
+                    error: None,
+                    auth_account_name: Some("backup".to_string()),
+                    commit_sha: Some("abc1234".to_string()),
+                },
+            )
+            .await?;
+
+        let record = store
+            .get_run_history(run_id)
+            .await?
+            .expect("run history record should exist");
+        assert_eq!(record.kind, RunHistoryKind::Mention);
+        assert_eq!(record.discussion_id.as_deref(), Some("discussion-9"));
+        assert_eq!(record.trigger_note_id, Some(123));
+        assert_eq!(record.trigger_note_author_name.as_deref(), Some("Reviewer"));
+        assert_eq!(
+            record.trigger_note_body.as_deref(),
+            Some("@codex please rename this")
+        );
+        assert_eq!(record.command_repo.as_deref(), Some("fork/repo"));
+        assert_eq!(record.commit_sha.as_deref(), Some("abc1234"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_history_filters_by_mr() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let first = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 11,
+                head_sha: "sha-a".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        let _other = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/other".to_string(),
+                iid: 11,
+                head_sha: "sha-b".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .finish_run_history(
+                first,
+                RunHistoryFinish {
+                    result: "pass".to_string(),
+                    thread_id: Some("thread-a".to_string()),
+                    turn_id: Some("turn-a".to_string()),
+                    review_thread_id: Some("thread-a".to_string()),
+                    preview: Some("Review group/repo !11".to_string()),
+                    summary: Some("looks good".to_string()),
+                    error: None,
+                    auth_account_name: Some("primary".to_string()),
+                    commit_sha: None,
+                },
+            )
+            .await?;
+
+        let records = store.list_run_history_for_mr("group/repo", 11).await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].repo, "group/repo".to_string());
+        assert_eq!(records[0].iid, 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_interrupted_run_history_marks_in_progress_rows_cancelled() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let interrupted_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Mention,
+                repo: "group/repo".to_string(),
+                iid: 12,
+                head_sha: "sha-interrupted".to_string(),
+                discussion_id: Some("discussion-1".to_string()),
+                trigger_note_id: Some(9),
+                trigger_note_author_name: Some("reviewer".to_string()),
+                trigger_note_body: Some("@codex fix this".to_string()),
+                command_repo: Some("group/repo".to_string()),
+            })
+            .await?;
+        let finished_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 12,
+                head_sha: "sha-finished".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .finish_run_history(
+                finished_id,
+                RunHistoryFinish {
+                    result: "pass".to_string(),
+                    preview: Some("Review group/repo !12".to_string()),
+                    summary: Some("looks good".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let affected = store
+            .reconcile_interrupted_run_history("run interrupted by service restart")
+            .await?;
+        assert_eq!(affected, 1);
+
+        let interrupted = store
+            .get_run_history(interrupted_id)
+            .await?
+            .expect("interrupted run should exist");
+        assert_eq!(interrupted.status, "done".to_string());
+        assert_eq!(interrupted.result.as_deref(), Some("cancelled"));
+        assert_eq!(
+            interrupted.error.as_deref(),
+            Some("run interrupted by service restart")
+        );
+        assert!(interrupted.finished_at.is_some());
+
+        let finished = store
+            .get_run_history(finished_id)
+            .await?
+            .expect("finished run should exist");
+        assert_eq!(finished.result.as_deref(), Some("pass"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_history_events_roundtrip_in_sequence_order() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let run_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 99,
+                head_sha: "sha-seq".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .append_run_history_events(
+                run_id,
+                &[
+                    NewRunHistoryEvent {
+                        sequence: 2,
+                        turn_id: Some("turn-1".to_string()),
+                        event_type: "item_completed".to_string(),
+                        payload: serde_json::json!({"type": "agentMessage", "text": "done"}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 1,
+                        turn_id: Some("turn-1".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({}),
+                    },
+                ],
+            )
+            .await?;
+
+        let events = store.list_run_history_events(run_id).await?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[0].event_type, "turn_started");
+        assert_eq!(events[1].sequence, 2);
+        assert_eq!(events[1].event_type, "item_completed");
+        assert_eq!(events[1].payload["text"], "done");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_history_events_offset_sequence_across_append_batches() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let run_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 100,
+                head_sha: "sha-batches".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .append_run_history_events(
+                run_id,
+                &[NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-a".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: serde_json::json!({}),
+                }],
+            )
+            .await?;
+        store
+            .append_run_history_events(
+                run_id,
+                &[
+                    NewRunHistoryEvent {
+                        sequence: 1,
+                        turn_id: Some("turn-b".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 2,
+                        turn_id: Some("turn-b".to_string()),
+                        event_type: "turn_completed".to_string(),
+                        payload: serde_json::json!({"status": "completed"}),
+                    },
+                ],
+            )
+            .await?;
+
+        let events = store.list_run_history_events(run_id).await?;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[0].turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(events[1].sequence, 2);
+        assert_eq!(events[1].turn_id.as_deref(), Some("turn-b"));
+        assert_eq!(events[2].sequence, 3);
+        assert_eq!(events[2].turn_id.as_deref(), Some("turn-b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_run_history_events_incomplete_updates_flag() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let run_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 101,
+                head_sha: "sha-flag".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .finish_run_history(
+                run_id,
+                RunHistoryFinish {
+                    result: "commented".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(
+            store
+                .get_run_history(run_id)
+                .await?
+                .context("run history row")?
+                .events_persisted_cleanly
+        );
+
+        store.mark_run_history_events_incomplete(run_id).await?;
+
+        assert!(
+            !store
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after mark")?
+                .events_persisted_cleanly
+        );
         Ok(())
     }
 }
