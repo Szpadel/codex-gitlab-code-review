@@ -241,9 +241,7 @@ impl GitLabClient {
             .send()
             .await
             .with_context(|| format!("gitlab GET {}", url))?;
-        ensure_success(response)
-            .await
-            .with_context(|| format!("gitlab GET {} response", url))
+        ensure_success(response, "GET", url).await
     }
 
     async fn post_empty(&self, url: &str) -> Result<()> {
@@ -253,9 +251,7 @@ impl GitLabClient {
             .send()
             .await
             .with_context(|| format!("gitlab POST {}", url))?;
-        ensure_success_empty(response)
-            .await
-            .with_context(|| format!("gitlab POST {} response", url))
+        ensure_success_empty(response, "POST", url).await
     }
 
     async fn delete_empty(&self, url: &str) -> Result<()> {
@@ -265,9 +261,7 @@ impl GitLabClient {
             .send()
             .await
             .with_context(|| format!("gitlab DELETE {}", url))?;
-        ensure_success_empty(response)
-            .await
-            .with_context(|| format!("gitlab DELETE {} response", url))
+        ensure_success_empty(response, "DELETE", url).await
     }
 
     async fn post_note(&self, url: &str, body: &str) -> Result<()> {
@@ -278,9 +272,7 @@ impl GitLabClient {
             .send()
             .await
             .with_context(|| format!("gitlab POST {}", url))?;
-        ensure_success::<serde_json::Value>(response)
-            .await
-            .with_context(|| format!("gitlab POST {} response", url))?;
+        ensure_success::<serde_json::Value>(response, "POST", url).await?;
         Ok(())
     }
 
@@ -312,9 +304,7 @@ impl GitLabClient {
                         Some(val.to_string())
                     }
                 });
-            let mut page_items: Vec<T> = ensure_success(response)
-                .await
-                .with_context(|| format!("gitlab GET {} response", url.as_str()))?;
+            let mut page_items: Vec<T> = ensure_success(response, "GET", url.as_str()).await?;
             items.append(&mut page_items);
             match next_page {
                 Some(next) => {
@@ -561,31 +551,64 @@ impl GitLabApi for GitLabClient {
     }
 }
 
-async fn ensure_success<T: for<'de> Deserialize<'de>>(response: Response) -> Result<T> {
+const GITLAB_ERROR_BODY_LIMIT: usize = 512;
+
+async fn ensure_success<T: for<'de> Deserialize<'de>>(
+    response: Response,
+    method: &str,
+    url: &str,
+) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "gitlab api error: status={} body={} ",
-            status,
-            text
-        ));
+        return Err(anyhow!(format_gitlab_http_error(
+            method, url, status, &text
+        )));
     }
-    let value = response.json::<T>().await?;
+    let value = response
+        .json::<T>()
+        .await
+        .with_context(|| format!("gitlab {method} {url} response"))?;
     Ok(value)
 }
 
-async fn ensure_success_empty(response: Response) -> Result<()> {
+async fn ensure_success_empty(response: Response, method: &str, url: &str) -> Result<()> {
     let status = response.status();
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "gitlab api error: status={} body={} ",
-            status,
-            text
-        ));
+        return Err(anyhow!(format_gitlab_http_error(
+            method, url, status, &text
+        )));
     }
     Ok(())
+}
+
+fn format_gitlab_http_error(
+    method: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> String {
+    format!(
+        "gitlab {method} {url} response: status={status} body={}",
+        format_gitlab_error_body(body)
+    )
+}
+
+fn format_gitlab_error_body(body: &str) -> String {
+    if body.is_empty() {
+        return "<empty>".to_string();
+    }
+    let sanitized = body.replace(char::is_whitespace, " ");
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        return "<whitespace>".to_string();
+    }
+    if sanitized.chars().count() <= GITLAB_ERROR_BODY_LIMIT {
+        return sanitized.to_string();
+    }
+    let truncated: String = sanitized.chars().take(GITLAB_ERROR_BODY_LIMIT).collect();
+    format!("{truncated}...")
 }
 
 fn should_fallback_to_merge_request_note_awards(err: &anyhow::Error) -> bool {
@@ -699,6 +722,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_latest_open_mr_activity_error_is_self_contained() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+            .and(query_param("state", "opened"))
+            .and(query_param("scope", "all"))
+            .and(query_param("order_by", "updated_at"))
+            .and(query_param("sort", "desc"))
+            .and(query_param("per_page", "1"))
+            .respond_with(
+                ResponseTemplate::new(502)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string("upstream proxy failure"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let err = client
+            .get_latest_open_mr_activity("group/repo")
+            .await
+            .expect_err("request should fail");
+        let message = err.to_string();
+        assert!(message.contains("gitlab GET"));
+        assert!(message.contains("/projects/group%2Frepo/merge_requests?state=opened"));
+        assert!(message.contains("status=502 Bad Gateway"));
+        assert!(message.contains("body=upstream proxy failure"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_latest_open_mr_activity_json_decode_error_keeps_request_context() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+            .and(query_param("state", "opened"))
+            .and(query_param("scope", "all"))
+            .and(query_param("order_by", "updated_at"))
+            .and(query_param("sort", "desc"))
+            .and(query_param("per_page", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .set_body_string("<html>proxy splash</html>"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let err = client
+            .get_latest_open_mr_activity("group/repo")
+            .await
+            .expect_err("request should fail");
+        let message = err.to_string();
+        assert!(message.contains("gitlab GET"));
+        assert!(message.contains("/projects/group%2Frepo/merge_requests?state=opened"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn list_projects_paginates() -> Result<()> {
         let server = MockServer::start().await;
         let page1 = ResponseTemplate::new(200)
@@ -736,6 +819,32 @@ mod tests {
         assert_eq!(projects.len(), 2);
         assert_eq!(projects[0].path_with_namespace, "group/repo");
         assert_eq!(projects[1].path_with_namespace, "group/other");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_note_error_is_self_contained() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests/7/notes"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"message":"forbidden"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let err = client
+            .create_note("group/repo", 7, "hello")
+            .await
+            .expect_err("request should fail");
+        let message = err.to_string();
+        assert!(message.contains("gitlab POST"));
+        assert!(message.contains("/projects/group%2Frepo/merge_requests/7/notes"));
+        assert!(message.contains("status=403 Forbidden"));
+        assert!(message.contains(r#"body={"message":"forbidden"}"#));
         Ok(())
     }
 
