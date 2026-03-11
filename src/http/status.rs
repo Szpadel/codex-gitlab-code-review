@@ -745,33 +745,45 @@ fn join_agent_message_content(value: Option<&Value>) -> String {
 }
 
 fn join_reasoning_content(item: &Value) -> String {
-    let summary = item
-        .get("summary")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-    let content = item
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
+    const ENCRYPTED_REASONING_PLACEHOLDER: &str =
+        "Reasoning is unavailable because Codex returned only encrypted history for this step.";
+    let summary = join_reasoning_entries(item.get("summary"));
+    let content = join_reasoning_entries(item.get("content"));
     match (summary.is_empty(), content.is_empty()) {
         (false, false) => format!("{summary}\n\n{content}"),
         (false, true) => summary,
         (true, false) => content,
-        (true, true) => String::new(),
+        (true, true) => item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|_| ENCRYPTED_REASONING_PLACEHOLDER.to_string())
+            .unwrap_or_default(),
+    }
+}
+
+fn join_reasoning_entries(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(reasoning_entry_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn reasoning_entry_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(_) => value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| Some(compact_json(value))),
+        _ => None,
     }
 }
 
@@ -787,6 +799,45 @@ fn tool_call_preview(item: &Value) -> Option<String> {
         .map(single_line_preview)
         .or_else(|| item.get("result").map(single_line_preview))
         .or_else(|| item.get("error").map(single_line_preview))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn join_reasoning_content_extracts_typed_summary_and_content_entries() {
+        let item = json!({
+            "type": "reasoning",
+            "summary": [
+                { "type": "summary_text", "text": "Typed reasoning summary" }
+            ],
+            "content": [
+                { "type": "reasoning_text", "text": "Typed reasoning detail." }
+            ]
+        });
+
+        assert_eq!(
+            join_reasoning_content(&item),
+            "Typed reasoning summary\n\nTyped reasoning detail."
+        );
+    }
+
+    #[test]
+    fn join_reasoning_content_returns_placeholder_for_encrypted_only_reasoning() {
+        let item = json!({
+            "type": "reasoning",
+            "summary": [],
+            "content": null,
+            "encrypted_content": "opaque-reasoning-blob"
+        });
+
+        assert_eq!(
+            join_reasoning_content(&item),
+            "Reasoning is unavailable because Codex returned only encrypted history for this step."
+        );
+    }
 }
 
 fn combine_detail_sections(sections: &[(&str, Option<&Value>)]) -> Option<String> {

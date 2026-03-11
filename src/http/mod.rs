@@ -769,6 +769,33 @@ mod tests {
                     turn_id: Some("turn-1".to_string()),
                     event_type: "item_completed".to_string(),
                     payload: json!({
+                        "createdAt": "2026-03-11T12:54:06Z",
+                        "type": "reasoning",
+                        "summary": [
+                            { "type": "summary_text", "text": "Typed reasoning summary" }
+                        ],
+                        "content": [
+                            { "type": "reasoning_text", "text": "Typed reasoning detail." }
+                        ]
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 5,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "createdAt": "2026-03-11T12:54:07Z",
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": null,
+                        "encrypted_content": "opaque-reasoning-blob"
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 6,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
                         "type": "commandExecution",
                         "command": "cargo test",
                         "cwd": "/workdir",
@@ -779,7 +806,7 @@ mod tests {
                     }),
                 },
                 NewRunHistoryEvent {
-                    sequence: 5,
+                    sequence: 7,
                     turn_id: Some("turn-1".to_string()),
                     event_type: "item_completed".to_string(),
                     payload: json!({
@@ -793,7 +820,7 @@ mod tests {
                     }),
                 },
                 NewRunHistoryEvent {
-                    sequence: 6,
+                    sequence: 8,
                     turn_id: Some("turn-1".to_string()),
                     event_type: "item_completed".to_string(),
                     payload: json!({
@@ -805,7 +832,7 @@ mod tests {
                     }),
                 },
                 NewRunHistoryEvent {
-                    sequence: 7,
+                    sequence: 9,
                     turn_id: Some("turn-1".to_string()),
                     event_type: "item_completed".to_string(),
                     payload: json!({
@@ -815,7 +842,7 @@ mod tests {
                     }),
                 },
                 NewRunHistoryEvent {
-                    sequence: 8,
+                    sequence: 10,
                     turn_id: Some("turn-1".to_string()),
                     event_type: "item_completed".to_string(),
                     payload: json!({
@@ -830,7 +857,7 @@ mod tests {
                     }),
                 },
                 NewRunHistoryEvent {
-                    sequence: 9,
+                    sequence: 11,
                     turn_id: Some("turn-1".to_string()),
                     event_type: "item_completed".to_string(),
                     payload: json!({
@@ -840,7 +867,7 @@ mod tests {
                     }),
                 },
                 NewRunHistoryEvent {
-                    sequence: 10,
+                    sequence: 12,
                     turn_id: Some("turn-1".to_string()),
                     event_type: "turn_completed".to_string(),
                     payload: json!({"status": "completed"}),
@@ -887,6 +914,13 @@ mod tests {
         assert!(body.contains("diff-stats-add\">+4</span>"));
         assert!(body.contains("diff-stats-remove\">-3</span>"));
         assert!(body.contains("Reasoning"));
+        assert!(body.contains("Need to inspect CI output"));
+        assert!(body.contains("The failure looks deterministic."));
+        assert!(body.contains("Typed reasoning summary"));
+        assert!(body.contains("Typed reasoning detail."));
+        assert!(body.contains(
+            "Reasoning is unavailable because Codex returned only encrypted history for this step."
+        ));
         assert!(body.contains("cargo test"));
         assert!(body.contains("gitlab:get_merge_request"));
         assert!(body.contains("Arguments"));
