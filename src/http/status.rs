@@ -1,16 +1,34 @@
+use super::transcript::{
+    thread_snapshot_from_events, thread_snapshot_is_complete,
+    thread_snapshot_only_target_turn_is_incomplete,
+};
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
     ProjectCatalogSummary, ReviewStateStore, RunHistoryEventRecord, RunHistoryKind,
     RunHistoryListQuery, RunHistoryRecord, ScanMode, ScanOutcome, ScanState,
+    TranscriptBackfillState, merge_rewritten_turn_events,
+};
+use crate::transcript_backfill::{
+    SessionHistoryBackfillSource, TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR,
+    TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR, TranscriptBackfillSource,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::warn;
+
+pub use super::transcript::{ThreadItemSnapshot, ThreadSnapshot};
+
+const TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR: &str =
+    "matching Codex session history was not found";
+const TRANSCRIPT_BACKFILL_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
+const TRANSCRIPT_BACKFILL_MISSING_HISTORY_RETRY_WINDOW: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StatusSnapshot {
@@ -56,7 +74,10 @@ pub struct StatusScanSnapshot {
 pub struct StatusService {
     config: StatusConfig,
     state: Arc<ReviewStateStore>,
-    runner: Option<Arc<dyn CodexRunner>>,
+    default_transcript_backfill_source: Option<Arc<dyn TranscriptBackfillSource>>,
+    account_transcript_backfill_sources: HashMap<String, Arc<dyn TranscriptBackfillSource>>,
+    active_backfills: Arc<Mutex<HashSet<i64>>>,
+    backfill_retry_after: Arc<Mutex<HashMap<i64, Instant>>>,
 }
 
 #[derive(Clone)]
@@ -82,8 +103,21 @@ impl StatusService {
         config: Config,
         state: Arc<ReviewStateStore>,
         run_once: bool,
-        runner: Option<Arc<dyn CodexRunner>>,
+        // Status-page reads stay on persisted events plus local session history.
+        // Do not reintroduce synchronous Codex thread reads on the HTTP path.
+        _runner: Option<Arc<dyn CodexRunner>>,
     ) -> Self {
+        let default_transcript_backfill_source = Arc::new(SessionHistoryBackfillSource::new(
+            primary_session_history_path(
+                &config.codex.auth_host_path,
+                &config.codex.auth_mount_path,
+                config.codex.session_history_path.as_deref(),
+            ),
+        )) as Arc<dyn TranscriptBackfillSource>;
+        let account_transcript_backfill_sources = build_account_transcript_backfill_sources(
+            &config,
+            Arc::clone(&default_transcript_backfill_source),
+        );
         Self {
             config: StatusConfig {
                 gitlab_base_url: config.gitlab.base_url,
@@ -105,8 +139,23 @@ impl StatusService {
                 group_targets_all: config.gitlab.targets.groups.is_all(),
             },
             state,
-            runner,
+            default_transcript_backfill_source: Some(default_transcript_backfill_source),
+            account_transcript_backfill_sources,
+            active_backfills: Arc::new(Mutex::new(HashSet::new())),
+            backfill_retry_after: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_transcript_backfill_source(
+        mut self,
+        transcript_backfill_source: Arc<dyn TranscriptBackfillSource>,
+    ) -> Self {
+        self.account_transcript_backfill_sources.insert(
+            "primary".to_string(),
+            Arc::clone(&transcript_backfill_source),
+        );
+        self.default_transcript_backfill_source = Some(transcript_backfill_source);
+        self
     }
 
     pub(crate) fn status_ui_enabled(&self) -> bool {
@@ -240,78 +289,509 @@ impl StatusService {
             .list_run_history_for_mr(&run.repo, run.iid)
             .await?;
         let events = self.state.list_run_history_events(run.id).await?;
-        let thread_from_events = thread_snapshot_from_events(&run, &events);
-        let live_thread = if run.events_persisted_cleanly
-            && thread_from_events
-                .as_ref()
-                .is_some_and(thread_snapshot_is_complete)
-        {
-            None
-        } else {
-            self.load_thread_snapshot(&run, thread_from_events.is_none())
-                .await?
-        };
-        let thread = if !run.events_persisted_cleanly {
-            live_thread.or(thread_from_events)
-        } else {
-            match (thread_from_events, live_thread) {
-                (Some(persisted), Some(live)) => {
-                    if thread_snapshot_is_richer(&live, &persisted) {
-                        Some(live)
-                    } else if thread_snapshot_is_complete(&persisted) {
-                        Some(persisted)
-                    } else {
-                        Some(live)
-                    }
-                }
-                (Some(persisted), None) => Some(persisted),
-                (None, Some(live)) => Some(live),
-                (None, None) => None,
-            }
-        };
+        let thread = thread_snapshot_from_events(&run, &events);
+        let transcript_backfill = self
+            .resolve_transcript_backfill(&run, thread.as_ref())
+            .await?;
         Ok(Some(RunDetailSnapshot {
             generated_at: Utc::now().to_rfc3339(),
             run,
             related_runs,
             thread,
+            transcript_backfill,
         }))
     }
 
-    async fn load_thread_snapshot(
+    async fn resolve_transcript_backfill(
         &self,
         run: &RunHistoryRecord,
-        warn_on_error: bool,
-    ) -> Result<Option<ThreadSnapshot>> {
-        let Some(runner) = self.runner.as_ref() else {
+        thread: Option<&ThreadSnapshot>,
+    ) -> Result<Option<TranscriptBackfillSnapshot>> {
+        if run.status != "done" {
             return Ok(None);
-        };
-        let Some(account_name) = run.auth_account_name.as_deref() else {
+        }
+        if !transcript_needs_backfill(run, thread) {
             return Ok(None);
+        }
+
+        let mut state = run.transcript_backfill_state;
+        let mut error = run.transcript_backfill_error.clone();
+        let has_transcript_backfill_source = self.transcript_backfill_source_for_run(run).is_some();
+        let should_retry_missing_history = state == TranscriptBackfillState::Failed
+            && error
+                .as_deref()
+                .is_some_and(|error| should_retry_transcript_backfill_error(run, error));
+        let cooldown_elapsed = self.backfill_retry_due(run.id).await;
+        if (matches!(
+            state,
+            TranscriptBackfillState::NotRequested | TranscriptBackfillState::InProgress
+        ) || (should_retry_missing_history && cooldown_elapsed))
+            && has_transcript_backfill_source
+            && (run.review_thread_id.is_some() || run.thread_id.is_some())
+            && !self.active_backfills.lock().await.contains(&run.id)
+        {
+            self.schedule_transcript_backfill(run.clone()).await?;
+            state = TranscriptBackfillState::InProgress;
+            error = None;
+        }
+
+        Ok(Some(TranscriptBackfillSnapshot { state, error }))
+    }
+
+    async fn schedule_transcript_backfill(&self, run: RunHistoryRecord) -> Result<()> {
+        let Some(source) = self.transcript_backfill_source_for_run(&run) else {
+            return Ok(());
         };
-        let thread_id = run.review_thread_id.as_deref().or(run.thread_id.as_deref());
-        let Some(thread_id) = thread_id else {
-            return Ok(None);
-        };
-        let response = match runner.read_thread(account_name, thread_id).await {
-            Ok(response) => response,
-            Err(err) => {
-                if warn_on_error {
+
+        {
+            let mut active = self.active_backfills.lock().await;
+            if !active.insert(run.id) {
+                return Ok(());
+            }
+        }
+        self.backfill_retry_after.lock().await.remove(&run.id);
+
+        if let Err(err) = self
+            .state
+            .update_run_history_transcript_backfill(
+                run.id,
+                TranscriptBackfillState::InProgress,
+                None,
+            )
+            .await
+        {
+            self.active_backfills.lock().await.remove(&run.id);
+            return Err(err);
+        }
+
+        let state = Arc::clone(&self.state);
+        let active_backfills = Arc::clone(&self.active_backfills);
+        let backfill_retry_after = Arc::clone(&self.backfill_retry_after);
+        tokio::spawn(async move {
+            let outcome = run_transcript_backfill(state.as_ref(), source.as_ref(), &run).await;
+            match outcome {
+                Ok(()) => {
+                    backfill_retry_after.lock().await.remove(&run.id);
+                }
+                Err(err) => {
                     warn!(
                         run_id = run.id,
                         repo = %run.repo,
                         iid = run.iid,
-                        thread_id,
                         error = %err,
-                        "failed to load thread history for run"
+                        "transcript backfill failed"
                     );
+                    let error_text = err.to_string();
+                    if is_retryable_transcript_backfill_error(&error_text) {
+                        backfill_retry_after
+                            .lock()
+                            .await
+                            .insert(run.id, Instant::now() + TRANSCRIPT_BACKFILL_RETRY_COOLDOWN);
+                    } else {
+                        backfill_retry_after.lock().await.remove(&run.id);
+                    }
+                    if let Err(update_err) = state
+                        .update_run_history_transcript_backfill(
+                            run.id,
+                            TranscriptBackfillState::Failed,
+                            Some(error_text.as_str()),
+                        )
+                        .await
+                    {
+                        warn!(
+                            run_id = run.id,
+                            error = %update_err,
+                            "failed to persist transcript backfill error"
+                        );
+                    }
                 }
-                return Ok(None);
             }
-        };
-        let Some(thread) = response.get("thread") else {
-            return Ok(None);
-        };
-        Ok(Some(parse_thread_snapshot(thread)))
+            active_backfills.lock().await.remove(&run.id);
+        });
+
+        Ok(())
+    }
+
+    fn transcript_backfill_source_for_run(
+        &self,
+        run: &RunHistoryRecord,
+    ) -> Option<Arc<dyn TranscriptBackfillSource>> {
+        run.auth_account_name
+            .as_deref()
+            .and_then(|account_name| {
+                self.account_transcript_backfill_sources
+                    .get(account_name)
+                    .cloned()
+            })
+            .or_else(|| self.default_transcript_backfill_source.as_ref().cloned())
+    }
+
+    async fn backfill_retry_due(&self, run_id: i64) -> bool {
+        let mut retry_after = self.backfill_retry_after.lock().await;
+        match retry_after.get(&run_id).copied() {
+            Some(deadline) if Instant::now() < deadline => false,
+            Some(_) => {
+                retry_after.remove(&run_id);
+                true
+            }
+            None => true,
+        }
+    }
+}
+
+async fn run_transcript_backfill(
+    state: &ReviewStateStore,
+    source: &dyn TranscriptBackfillSource,
+    run: &RunHistoryRecord,
+) -> Result<()> {
+    let Some(thread_id) = run.thread_id.as_deref().or(run.review_thread_id.as_deref()) else {
+        state
+            .update_run_history_transcript_backfill(
+                run.id,
+                TranscriptBackfillState::Failed,
+                Some("run is missing Codex thread metadata"),
+            )
+            .await?;
+        return Ok(());
+    };
+
+    let persisted_events = state.list_run_history_events(run.id).await?;
+    let turn_scoped_events =
+        load_validated_transcript_backfill_events(source, run, thread_id, run.turn_id.as_deref())
+            .await?;
+    let mut candidate_events = match (run.turn_id.as_deref(), turn_scoped_events) {
+        (Some(turn_id), Some(events)) => {
+            merge_rewritten_turn_events(persisted_events.clone(), turn_id, &events)?
+        }
+        (Some(_), None) => Vec::new(),
+        (None, Some(events)) => events,
+        (None, None) => anyhow::bail!(TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR),
+    };
+    let mut rebuilt_thread = (!candidate_events.is_empty())
+        .then(|| thread_snapshot_from_events(run, &ephemeral_run_history_events(&candidate_events)))
+        .flatten();
+    let persisted_turn_ids = persisted_turn_ids(&persisted_events);
+    if run.turn_id.as_deref().is_some()
+        && (candidate_events.is_empty()
+            || (!rebuilt_thread
+                .as_ref()
+                .is_some_and(thread_snapshot_is_complete)
+                && !run.turn_id.as_deref().is_some_and(|turn_id| {
+                    rebuilt_thread.as_ref().is_some_and(|thread| {
+                        thread_snapshot_only_target_turn_is_incomplete(thread, turn_id)
+                    })
+                })))
+    {
+        if let Some(full_thread_events) = source.load_events(thread_id, None).await? {
+            let filtered_full_thread_events =
+                filter_events_to_turn_ids(&full_thread_events, &persisted_turn_ids);
+            let filtered_thread = thread_snapshot_from_events(
+                run,
+                &ephemeral_run_history_events(&filtered_full_thread_events),
+            );
+            if !filtered_full_thread_events.is_empty()
+                && persisted_turn_ids_are_covered(&persisted_turn_ids, &filtered_full_thread_events)
+                && filtered_thread
+                    .as_ref()
+                    .is_some_and(thread_snapshot_is_complete)
+            {
+                rebuilt_thread = filtered_thread;
+                candidate_events = filtered_full_thread_events;
+            }
+        }
+    }
+    if candidate_events.is_empty() {
+        anyhow::bail!(TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR);
+    }
+    if !rebuilt_thread
+        .as_ref()
+        .is_some_and(thread_snapshot_is_complete)
+    {
+        state.mark_run_history_events_incomplete(run.id).await?;
+        if run.turn_id.as_deref().is_some_and(|turn_id| {
+            rebuilt_thread.as_ref().is_some_and(|thread| {
+                thread_snapshot_only_target_turn_is_incomplete(thread, turn_id)
+            })
+        }) {
+            anyhow::bail!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR);
+        }
+        state
+            .update_run_history_transcript_backfill(
+                run.id,
+                TranscriptBackfillState::Failed,
+                Some("transcript remains incomplete after local session-history backfill"),
+            )
+            .await?;
+        return Ok(());
+    }
+    state
+        .replace_run_history_events(run.id, &candidate_events)
+        .await?;
+    state
+        .mark_run_history_transcript_backfill_complete(run.id)
+        .await?;
+    Ok(())
+}
+
+async fn load_validated_transcript_backfill_events(
+    source: &dyn TranscriptBackfillSource,
+    run: &RunHistoryRecord,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> Result<Option<Vec<crate::state::NewRunHistoryEvent>>> {
+    let Some(events) = source.load_events(thread_id, turn_id).await? else {
+        return Ok(None);
+    };
+    let source_thread = thread_snapshot_from_events(run, &ephemeral_run_history_events(&events));
+    if !source_thread
+        .as_ref()
+        .is_some_and(thread_snapshot_is_complete)
+    {
+        anyhow::bail!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR);
+    }
+    Ok(Some(events))
+}
+
+fn transcript_needs_backfill(run: &RunHistoryRecord, thread: Option<&ThreadSnapshot>) -> bool {
+    !run.events_persisted_cleanly || !thread.is_some_and(thread_snapshot_is_complete)
+}
+
+fn should_retry_transcript_backfill_error(run: &RunHistoryRecord, error: &str) -> bool {
+    if error == TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR
+        || error == TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR
+    {
+        return missing_history_retry_window_open(run, Utc::now().timestamp());
+    }
+    is_retryable_transcript_backfill_error(error)
+}
+
+fn missing_history_retry_window_open(run: &RunHistoryRecord, now: i64) -> bool {
+    let reference = run.finished_at.unwrap_or(run.updated_at);
+    let retry_window = i64::try_from(TRANSCRIPT_BACKFILL_MISSING_HISTORY_RETRY_WINDOW.as_secs())
+        .unwrap_or(i64::MAX);
+    now.saturating_sub(reference) <= retry_window
+}
+
+fn persisted_turn_ids(persisted_events: &[RunHistoryEventRecord]) -> HashSet<String> {
+    persisted_events
+        .iter()
+        .filter_map(|event| event.turn_id.clone())
+        .collect()
+}
+
+fn filter_events_to_turn_ids(
+    events: &[crate::state::NewRunHistoryEvent],
+    turn_ids: &HashSet<String>,
+) -> Vec<crate::state::NewRunHistoryEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            event
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn_id| turn_ids.contains(turn_id))
+        })
+        .enumerate()
+        .map(|(index, event)| crate::state::NewRunHistoryEvent {
+            sequence: i64::try_from(index + 1).expect("filtered event sequence"),
+            turn_id: event.turn_id.clone(),
+            event_type: event.event_type.clone(),
+            payload: event.payload.clone(),
+        })
+        .collect()
+}
+
+fn persisted_turn_ids_are_covered(
+    persisted_turn_ids: &HashSet<String>,
+    full_thread_events: &[crate::state::NewRunHistoryEvent],
+) -> bool {
+    let full_thread_turn_ids = full_thread_events
+        .iter()
+        .filter_map(|event| event.turn_id.as_deref())
+        .collect::<HashSet<_>>();
+    persisted_turn_ids
+        .iter()
+        .all(|turn_id| full_thread_turn_ids.contains(turn_id.as_str()))
+}
+
+fn build_account_transcript_backfill_sources(
+    config: &Config,
+    default_source: Arc<dyn TranscriptBackfillSource>,
+) -> HashMap<String, Arc<dyn TranscriptBackfillSource>> {
+    let configured_session_history_path = config.codex.session_history_path.as_deref();
+    let primary_session_history_path = primary_session_history_path(
+        &config.codex.auth_host_path,
+        &config.codex.auth_mount_path,
+        configured_session_history_path,
+    );
+
+    let mut sources = HashMap::new();
+    sources.insert("primary".to_string(), default_source);
+    for account in &config.codex.fallback_auth_accounts {
+        let session_history_path = fallback_session_history_path(
+            &config.codex.auth_host_path,
+            &config.codex.auth_mount_path,
+            &primary_session_history_path,
+            &account.auth_host_path,
+        );
+        sources.insert(
+            account.name.clone(),
+            Arc::new(SessionHistoryBackfillSource::new(session_history_path))
+                as Arc<dyn TranscriptBackfillSource>,
+        );
+    }
+    sources
+}
+
+fn primary_session_history_path(
+    auth_host_path: &str,
+    _auth_mount_path: &str,
+    configured_session_history_path: Option<&str>,
+) -> String {
+    configured_session_history_path.map_or_else(
+        || format!("{}/sessions", auth_host_path.trim_end_matches('/')),
+        ToString::to_string,
+    )
+}
+
+fn fallback_session_history_path(
+    primary_auth_host_path: &str,
+    primary_auth_mount_path: &str,
+    primary_session_history_path: &str,
+    fallback_auth_host_path: &str,
+) -> String {
+    let fallback_auth_host_path = fallback_auth_host_path.trim_end_matches('/');
+    primary_session_history_path
+        .strip_prefix(primary_auth_host_path.trim_end_matches('/'))
+        .or_else(|| {
+            primary_session_history_path.strip_prefix(primary_auth_mount_path.trim_end_matches('/'))
+        })
+        .map(|suffix| format!("{fallback_auth_host_path}{suffix}"))
+        .unwrap_or_else(|| format!("{fallback_auth_host_path}/sessions"))
+}
+
+fn is_retryable_transcript_backfill_error(error: &str) -> bool {
+    error == TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR
+        || error == TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR
+        || error == TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR
+}
+
+fn ephemeral_run_history_events(
+    events: &[crate::state::NewRunHistoryEvent],
+) -> Vec<RunHistoryEventRecord> {
+    events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| RunHistoryEventRecord {
+            id: i64::try_from(index + 1).expect("ephemeral run history event id"),
+            run_history_id: 0,
+            sequence: event.sequence,
+            turn_id: event.turn_id.clone(),
+            event_type: event.event_type.clone(),
+            payload: event.payload.clone(),
+            created_at: 0,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        fallback_session_history_path, missing_history_retry_window_open,
+        primary_session_history_path,
+    };
+    use crate::state::{RunHistoryKind, RunHistoryRecord, TranscriptBackfillState};
+
+    #[test]
+    fn primary_session_history_defaults_to_auth_host_sessions_dir() {
+        assert_eq!(
+            primary_session_history_path("/srv/codex-auth", "/root/.codex", None),
+            "/srv/codex-auth/sessions"
+        );
+        assert_eq!(
+            primary_session_history_path("/srv/codex-auth/", "/root/.codex", None),
+            "/srv/codex-auth/sessions"
+        );
+    }
+
+    #[test]
+    fn fallback_session_history_preserves_primary_suffix() {
+        assert_eq!(
+            fallback_session_history_path(
+                "/srv/codex-auth",
+                "/root/.codex",
+                "/srv/codex-auth/sessions/archive",
+                "/srv/fallback-account",
+            ),
+            "/srv/fallback-account/sessions/archive"
+        );
+    }
+
+    #[test]
+    fn fallback_session_history_defaults_to_fallback_auth_sessions_dir_for_custom_primary_path() {
+        assert_eq!(
+            fallback_session_history_path(
+                "/srv/codex-auth",
+                "/root/.codex",
+                "/custom/transcripts/archive",
+                "/srv/fallback-account",
+            ),
+            "/srv/fallback-account/sessions"
+        );
+    }
+
+    #[test]
+    fn primary_session_history_preserves_explicit_custom_root() {
+        assert_eq!(
+            primary_session_history_path(
+                "/srv/codex-auth",
+                "/root/.codex",
+                Some("/var/lib/codex-history"),
+            ),
+            "/var/lib/codex-history"
+        );
+    }
+
+    #[test]
+    fn missing_history_and_unavailable_source_retry_only_for_recent_runs() {
+        let recent_run = sample_run_history_record(1_000);
+        let stale_run = sample_run_history_record(0);
+
+        assert!(missing_history_retry_window_open(&recent_run, 1_100));
+        assert!(!missing_history_retry_window_open(&stale_run, 1_000));
+    }
+
+    fn sample_run_history_record(updated_at: i64) -> RunHistoryRecord {
+        RunHistoryRecord {
+            id: 1,
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 1,
+            head_sha: "sha".to_string(),
+            status: "done".to_string(),
+            result: Some("commented".to_string()),
+            started_at: updated_at,
+            finished_at: Some(updated_at),
+            updated_at,
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            review_thread_id: None,
+            preview: Some("Preview".to_string()),
+            summary: None,
+            error: None,
+            auth_account_name: None,
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+            commit_sha: None,
+            events_persisted_cleanly: false,
+            transcript_backfill_state: TranscriptBackfillState::Failed,
+            transcript_backfill_error: Some(
+                "matching Codex session history was not found".to_string(),
+            ),
+        }
     }
 }
 
@@ -346,31 +826,13 @@ pub struct RunDetailSnapshot {
     pub run: RunHistoryRecord,
     pub related_runs: Vec<RunHistoryRecord>,
     pub thread: Option<ThreadSnapshot>,
+    pub transcript_backfill: Option<TranscriptBackfillSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ThreadSnapshot {
-    pub id: String,
-    pub preview: String,
-    pub status: String,
-    pub turns: Vec<TurnSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct TurnSnapshot {
-    pub id: String,
-    pub status: String,
-    pub items: Vec<ThreadItemSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ThreadItemSnapshot {
-    pub item_type: String,
-    pub title: String,
-    pub preview: Option<String>,
-    pub body: Option<String>,
-    pub meta: Vec<(String, String)>,
-    pub timestamp: Option<String>,
+pub struct TranscriptBackfillSnapshot {
+    pub state: TranscriptBackfillState,
+    pub error: Option<String>,
 }
 
 fn scan_into_snapshot(scan: PersistedScanStatus) -> StatusScanSnapshot {
@@ -392,622 +854,4 @@ fn scan_into_snapshot(scan: PersistedScanStatus) -> StatusScanSnapshot {
         error: scan.error,
         next_scan_at: scan.next_scan_at,
     }
-}
-
-fn parse_thread_snapshot(thread: &Value) -> ThreadSnapshot {
-    ThreadSnapshot {
-        id: json_string(thread.get("id")).unwrap_or_else(|| "<unknown>".to_string()),
-        preview: json_string(thread.get("preview")).unwrap_or_default(),
-        status: json_string(thread.get("status")).unwrap_or_else(|| "unknown".to_string()),
-        turns: thread
-            .get("turns")
-            .and_then(Value::as_array)
-            .map(|turns| turns.iter().map(parse_turn_snapshot).collect())
-            .unwrap_or_default(),
-    }
-}
-
-fn thread_snapshot_from_events(
-    run: &RunHistoryRecord,
-    events: &[RunHistoryEventRecord],
-) -> Option<ThreadSnapshot> {
-    if events.is_empty() {
-        return None;
-    }
-    let mut turns = Vec::<TurnSnapshot>::new();
-    for event in events {
-        let turn_id = event.turn_id.as_deref().unwrap_or("<unknown>");
-        let turn = if let Some(existing) = turns.iter_mut().find(|entry| entry.id == turn_id) {
-            existing
-        } else {
-            turns.push(TurnSnapshot {
-                id: turn_id.to_string(),
-                status: "in_progress".to_string(),
-                items: Vec::new(),
-            });
-            turns.last_mut().expect("turn inserted")
-        };
-        match event.event_type.as_str() {
-            "turn_started" => {}
-            // Per-item timestamps must come from the item payload itself. The row-level
-            // created_at is the append-batch write time and can be shared across multiple
-            // events, so rendering it as an exact item timestamp would be misleading.
-            "item_completed" => turn.items.push(parse_thread_item_snapshot(
-                &event.payload,
-                extract_item_timestamp(&event.payload),
-            )),
-            "turn_completed" => {
-                turn.status = json_string(event.payload.get("status"))
-                    .unwrap_or_else(|| "unknown".to_string());
-            }
-            _ => {}
-        }
-    }
-    let status = turns
-        .last()
-        .map(|turn| turn.status.clone())
-        .unwrap_or_else(|| "unknown".to_string());
-    Some(ThreadSnapshot {
-        id: run
-            .review_thread_id
-            .clone()
-            .or_else(|| run.thread_id.clone())
-            .unwrap_or_else(|| format!("run-{}", run.id)),
-        preview: run.preview.clone().unwrap_or_default(),
-        status,
-        turns,
-    })
-}
-
-fn thread_snapshot_is_complete(thread: &ThreadSnapshot) -> bool {
-    !thread.turns.is_empty()
-        && !thread.turns.iter().any(|turn| {
-            matches!(turn.status.as_str(), "in_progress" | "unknown")
-                || turn.items.is_empty()
-                || turn
-                    .items
-                    .iter()
-                    .any(|item| !thread_item_is_self_contained(item))
-        })
-}
-
-fn thread_snapshot_is_richer(candidate: &ThreadSnapshot, baseline: &ThreadSnapshot) -> bool {
-    if candidate.turns.len() > baseline.turns.len() {
-        return true;
-    }
-    candidate
-        .turns
-        .iter()
-        .zip(baseline.turns.iter())
-        .any(|(candidate_turn, baseline_turn)| {
-            candidate_turn.items.len() > baseline_turn.items.len()
-        })
-}
-
-fn thread_item_is_self_contained(item: &ThreadItemSnapshot) -> bool {
-    match item.item_type.as_str() {
-        "agentMessage" | "AgentMessage" => {
-            item.body.as_deref().is_some_and(|body| !body.is_empty())
-        }
-        "commandExecution" => item.body.as_deref().is_some_and(|body| !body.is_empty()),
-        "reasoning" => item.body.as_deref().is_some_and(|body| !body.is_empty()),
-        _ => true,
-    }
-}
-
-fn parse_turn_snapshot(turn: &Value) -> TurnSnapshot {
-    TurnSnapshot {
-        id: json_string(turn.get("id")).unwrap_or_else(|| "<unknown>".to_string()),
-        status: json_string(turn.get("status")).unwrap_or_else(|| "unknown".to_string()),
-        items: turn
-            .get("items")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| parse_thread_item_snapshot(item, extract_item_timestamp(item)))
-                    .collect()
-            })
-            .unwrap_or_default(),
-    }
-}
-
-fn parse_thread_item_snapshot(
-    item: &serde_json::Value,
-    timestamp: Option<String>,
-) -> ThreadItemSnapshot {
-    let item_type = json_string(item.get("type")).unwrap_or_else(|| "unknown".to_string());
-    match item_type.as_str() {
-        "userMessage" => ThreadItemSnapshot {
-            item_type,
-            title: "User message".to_string(),
-            preview: None,
-            body: Some(join_user_content(item.get("content"))),
-            meta: Vec::new(),
-            timestamp,
-        },
-        "agentMessage" | "AgentMessage" => ThreadItemSnapshot {
-            item_type,
-            title: "Agent message".to_string(),
-            preview: None,
-            body: json_string(item.get("text")).or_else(|| {
-                let content = join_agent_message_content(item.get("content"));
-                (!content.is_empty()).then_some(content)
-            }),
-            meta: phase_meta(item),
-            timestamp,
-        },
-        "reasoning" => ThreadItemSnapshot {
-            item_type,
-            title: "Reasoning".to_string(),
-            preview: None,
-            body: Some(join_reasoning_content(item)),
-            meta: Vec::new(),
-            timestamp,
-        },
-        "commandExecution" => ThreadItemSnapshot {
-            item_type,
-            title: json_string(item.get("command")).unwrap_or_else(|| "Command".to_string()),
-            preview: None,
-            body: json_string(item.get("aggregatedOutput")),
-            meta: vec![
-                optional_meta("cwd", item.get("cwd")),
-                optional_meta("status", item.get("status")),
-                optional_meta("exit", item.get("exitCode")),
-                optional_meta("durationMs", item.get("durationMs")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
-            timestamp,
-        },
-        "mcpToolCall" => ThreadItemSnapshot {
-            item_type,
-            title: format!(
-                "{}:{}",
-                json_string(item.get("server")).unwrap_or_else(|| "mcp".to_string()),
-                json_string(item.get("tool")).unwrap_or_else(|| "tool".to_string())
-            ),
-            preview: tool_call_preview(item),
-            body: combine_detail_sections(&[
-                ("Arguments", tool_call_arguments(item)),
-                ("Result", item.get("result")),
-                ("Error", item.get("error")),
-            ]),
-            meta: vec![
-                optional_meta("status", item.get("status")),
-                optional_meta("durationMs", item.get("durationMs")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
-            timestamp,
-        },
-        "dynamicToolCall" => ThreadItemSnapshot {
-            item_type,
-            title: json_string(item.get("tool")).unwrap_or_else(|| "Dynamic tool".to_string()),
-            preview: item
-                .get("contentItems")
-                .map(single_line_preview)
-                .or_else(|| item.get("result").map(single_line_preview))
-                .or_else(|| item.get("error").map(single_line_preview)),
-            body: combine_detail_sections(&[
-                ("Input", item.get("contentItems")),
-                ("Result", item.get("result")),
-                ("Error", item.get("error")),
-            ]),
-            meta: vec![
-                optional_meta("status", item.get("status")),
-                optional_meta("durationMs", item.get("durationMs")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
-            timestamp,
-        },
-        "webSearch" => ThreadItemSnapshot {
-            item_type,
-            title: "Web search".to_string(),
-            preview: json_string(item.get("query"))
-                .or_else(|| item.get("action").map(single_line_preview)),
-            body: item
-                .get("action")
-                .map(compact_json)
-                .filter(|body| Some(body.as_str()) != json_string(item.get("query")).as_deref()),
-            meta: Vec::new(),
-            timestamp,
-        },
-        "fileChange" => {
-            let summary = file_change_preview_and_body(item.get("changes"));
-            ThreadItemSnapshot {
-                item_type,
-                title: "File change".to_string(),
-                preview: summary.preview,
-                body: summary.body,
-                meta: vec![
-                    optional_meta("status", item.get("status")),
-                    Some(("bodyFormat".to_string(), summary.body_format.to_string())),
-                    Some(("addedLines".to_string(), summary.added_lines.to_string())),
-                    Some((
-                        "removedLines".to_string(),
-                        summary.removed_lines.to_string(),
-                    )),
-                ]
-                .into_iter()
-                .flatten()
-                .collect(),
-                timestamp,
-            }
-        }
-        "enteredReviewMode" | "exitedReviewMode" => ThreadItemSnapshot {
-            item_type: item_type.clone(),
-            title: if item_type == "enteredReviewMode" {
-                "Entered review mode".to_string()
-            } else {
-                "Exited review mode".to_string()
-            },
-            preview: None,
-            body: json_string(item.get("review")),
-            meta: Vec::new(),
-            timestamp,
-        },
-        "contextCompaction" => ThreadItemSnapshot {
-            item_type,
-            title: "Context compaction".to_string(),
-            preview: None,
-            body: None,
-            meta: Vec::new(),
-            timestamp,
-        },
-        _ => ThreadItemSnapshot {
-            item_type,
-            title: "Event".to_string(),
-            preview: None,
-            body: Some(compact_json(item)),
-            meta: Vec::new(),
-            timestamp,
-        },
-    }
-}
-
-fn extract_item_timestamp(item: &Value) -> Option<String> {
-    let value = item
-        .get("createdAt")
-        .or_else(|| item.get("created_at"))
-        .or_else(|| item.get("timestamp"))?;
-    match value {
-        Value::Number(number) => number.as_i64().map(format_history_timestamp).or_else(|| {
-            number
-                .as_u64()
-                .map(|value| format_history_timestamp(value as i64))
-        }),
-        Value::String(text) => format_history_timestamp_text(text).or_else(|| Some(text.clone())),
-        _ => None,
-    }
-}
-
-fn format_history_timestamp(timestamp: i64) -> String {
-    DateTime::<Utc>::from_timestamp(normalize_unix_timestamp(timestamp), 0)
-        .map(|value| value.format("%-I:%M %p UTC").to_string())
-        .unwrap_or_else(|| timestamp.to_string())
-}
-
-fn normalize_unix_timestamp(timestamp: i64) -> i64 {
-    if timestamp.unsigned_abs() >= 1_000_000_000_000 {
-        timestamp / 1_000
-    } else {
-        timestamp
-    }
-}
-
-fn format_history_timestamp_text(timestamp: &str) -> Option<String> {
-    DateTime::parse_from_rfc3339(timestamp).ok().map(|value| {
-        value
-            .with_timezone(&Utc)
-            .format("%-I:%M %p UTC")
-            .to_string()
-    })
-}
-
-fn join_user_content(value: Option<&Value>) -> String {
-    value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    if item.get("type").and_then(Value::as_str) == Some("text") {
-                        json_string(item.get("text"))
-                    } else {
-                        Some(compact_json(item))
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        })
-        .unwrap_or_default()
-}
-
-fn join_agent_message_content(value: Option<&Value>) -> String {
-    value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| match item.get("type").and_then(Value::as_str) {
-                    Some("Text") => json_string(item.get("text")),
-                    _ => Some(compact_json(item)),
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        })
-        .unwrap_or_default()
-}
-
-fn join_reasoning_content(item: &Value) -> String {
-    const ENCRYPTED_REASONING_PLACEHOLDER: &str =
-        "Reasoning is unavailable because Codex returned only encrypted history for this step.";
-    let summary = join_reasoning_entries(item.get("summary"));
-    let content = join_reasoning_entries(item.get("content"));
-    match (summary.is_empty(), content.is_empty()) {
-        (false, false) => format!("{summary}\n\n{content}"),
-        (false, true) => summary,
-        (true, false) => content,
-        (true, true) => item
-            .get("encrypted_content")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(|_| ENCRYPTED_REASONING_PLACEHOLDER.to_string())
-            .unwrap_or_default(),
-    }
-}
-
-fn join_reasoning_entries(value: Option<&Value>) -> String {
-    value
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(reasoning_entry_text)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
-}
-
-fn reasoning_entry_text(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Object(_) => value
-            .get("text")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .or_else(|| Some(compact_json(value))),
-        _ => None,
-    }
-}
-
-fn tool_call_arguments(item: &Value) -> Option<&Value> {
-    item.get("arguments")
-        .or_else(|| item.get("args"))
-        .or_else(|| item.get("input"))
-        .or_else(|| item.get("params"))
-}
-
-fn tool_call_preview(item: &Value) -> Option<String> {
-    tool_call_arguments(item)
-        .map(single_line_preview)
-        .or_else(|| item.get("result").map(single_line_preview))
-        .or_else(|| item.get("error").map(single_line_preview))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn join_reasoning_content_extracts_typed_summary_and_content_entries() {
-        let item = json!({
-            "type": "reasoning",
-            "summary": [
-                { "type": "summary_text", "text": "Typed reasoning summary" }
-            ],
-            "content": [
-                { "type": "reasoning_text", "text": "Typed reasoning detail." }
-            ]
-        });
-
-        assert_eq!(
-            join_reasoning_content(&item),
-            "Typed reasoning summary\n\nTyped reasoning detail."
-        );
-    }
-
-    #[test]
-    fn join_reasoning_content_returns_placeholder_for_encrypted_only_reasoning() {
-        let item = json!({
-            "type": "reasoning",
-            "summary": [],
-            "content": null,
-            "encrypted_content": "opaque-reasoning-blob"
-        });
-
-        assert_eq!(
-            join_reasoning_content(&item),
-            "Reasoning is unavailable because Codex returned only encrypted history for this step."
-        );
-    }
-}
-
-fn combine_detail_sections(sections: &[(&str, Option<&Value>)]) -> Option<String> {
-    let rendered = sections
-        .iter()
-        .filter_map(|(label, value)| value.map(|value| format!("{label}\n{}", compact_json(value))))
-        .collect::<Vec<_>>();
-    (!rendered.is_empty()).then(|| rendered.join("\n\n"))
-}
-
-fn single_line_preview(value: &Value) -> String {
-    let compact = compact_json(value)
-        .replace('\n', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    truncate_preview(&compact, 140)
-}
-
-fn truncate_preview(value: &str, max_chars: usize) -> String {
-    let mut output = String::new();
-    for (index, ch) in value.chars().enumerate() {
-        if index >= max_chars {
-            output.push('…');
-            break;
-        }
-        output.push(ch);
-    }
-    output
-}
-
-struct FileChangeSummary {
-    preview: Option<String>,
-    body: Option<String>,
-    body_format: &'static str,
-    added_lines: usize,
-    removed_lines: usize,
-}
-
-fn file_change_preview_and_body(changes: Option<&Value>) -> FileChangeSummary {
-    #[derive(Serialize)]
-    struct FileChangeBodySection {
-        kind: &'static str,
-        path: String,
-        body: String,
-    }
-
-    let Some(changes) = changes.and_then(Value::as_object) else {
-        return FileChangeSummary {
-            preview: None,
-            body: None,
-            body_format: "payload",
-            added_lines: 0,
-            removed_lines: 0,
-        };
-    };
-    let preview = match changes.len() {
-        0 => None,
-        1 => changes.keys().next().cloned(),
-        count => Some(format!("{count} files changed")),
-    };
-    let sections = changes
-        .iter()
-        .map(|(path, value)| {
-            if let Some(diff) = value.get("unified_diff").and_then(Value::as_str) {
-                FileChangeBodySection {
-                    kind: "diff",
-                    path: path.clone(),
-                    body: format!("diff --git a/{path} b/{path}\n{diff}"),
-                }
-            } else {
-                FileChangeBodySection {
-                    kind: "payload",
-                    path: path.clone(),
-                    body: compact_json(value),
-                }
-            }
-        })
-        .collect::<Vec<_>>();
-    let (added_lines, removed_lines) = sections
-        .iter()
-        .filter(|section| section.kind == "diff")
-        .map(|section| unified_diff_stats(&section.body))
-        .fold(
-            (0usize, 0usize),
-            |(added_acc, removed_acc), (added, removed)| (added_acc + added, removed_acc + removed),
-        );
-    let has_diff = sections.iter().any(|section| section.kind == "diff");
-    let has_payload = sections.iter().any(|section| section.kind == "payload");
-    let (body, body_format) = if has_diff && has_payload {
-        (serde_json::to_string(&sections).ok(), "mixed")
-    } else if has_diff {
-        (
-            Some(
-                sections
-                    .into_iter()
-                    .map(|section| section.body)
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            ),
-            "diff",
-        )
-    } else {
-        (
-            Some(
-                sections
-                    .into_iter()
-                    .map(|section| format!("{}\n{}", section.path, section.body))
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            ),
-            "payload",
-        )
-    };
-    FileChangeSummary {
-        preview,
-        body: body.filter(|body| !body.is_empty()),
-        body_format,
-        added_lines,
-        removed_lines,
-    }
-}
-
-fn unified_diff_stats(diff: &str) -> (usize, usize) {
-    diff.lines()
-        .fold((0usize, 0usize), |(added, removed), line| {
-            if line.starts_with('+') && !is_unified_diff_header(line) {
-                (added + 1, removed)
-            } else if line.starts_with('-') && !is_unified_diff_header(line) {
-                (added, removed + 1)
-            } else {
-                (added, removed)
-            }
-        })
-}
-
-fn is_unified_diff_header(line: &str) -> bool {
-    if line.starts_with("diff --git ") || line.starts_with("@@") {
-        return true;
-    }
-    let Some(path) = line
-        .strip_prefix("+++ ")
-        .or_else(|| line.strip_prefix("--- "))
-    else {
-        return false;
-    };
-    let path = path.trim();
-    path == "/dev/null" || path.starts_with("a/") || path.starts_with("b/")
-}
-
-fn phase_meta(item: &Value) -> Vec<(String, String)> {
-    optional_meta("phase", item.get("phase"))
-        .into_iter()
-        .collect()
-}
-
-fn optional_meta(label: &str, value: Option<&Value>) -> Option<(String, String)> {
-    json_string(value).map(|value| (label.to_string(), value))
-}
-
-fn json_string(value: Option<&Value>) -> Option<String> {
-    match value {
-        Some(Value::String(text)) => Some(text.clone()),
-        Some(Value::Number(number)) => Some(number.to_string()),
-        Some(Value::Bool(value)) => Some(value.to_string()),
-        Some(Value::Null) | None => None,
-        Some(other) => Some(compact_json(other)),
-    }
-}
-
-fn compact_json(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }

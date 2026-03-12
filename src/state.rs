@@ -27,6 +27,15 @@ pub enum RunHistoryKind {
     Mention,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptBackfillState {
+    NotRequested,
+    InProgress,
+    Complete,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewRunHistory {
     pub kind: RunHistoryKind,
@@ -87,6 +96,8 @@ pub struct RunHistoryRecord {
     pub command_repo: Option<String>,
     pub commit_sha: Option<String>,
     pub events_persisted_cleanly: bool,
+    pub transcript_backfill_state: TranscriptBackfillState,
+    pub transcript_backfill_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -705,6 +716,132 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    pub async fn replace_run_history_events(
+        &self,
+        run_history_id: i64,
+        events: &[NewRunHistoryEvent],
+    ) -> Result<()> {
+        let created_at = Utc::now().timestamp();
+        let rewritten_events = events.to_vec();
+        self.replace_run_history_events_inner(run_history_id, rewritten_events, created_at)
+            .await
+    }
+
+    pub async fn replace_run_history_events_for_turn(
+        &self,
+        run_history_id: i64,
+        turn_id: &str,
+        events: &[NewRunHistoryEvent],
+    ) -> Result<()> {
+        let created_at = Utc::now().timestamp();
+        let existing_events = self.list_run_history_events(run_history_id).await?;
+        let rewritten_events = merge_rewritten_turn_events(existing_events, turn_id, events)
+            .with_context(|| format!("merge rewritten run history events for turn {turn_id}"))?;
+        self.replace_run_history_events_inner(run_history_id, rewritten_events, created_at)
+            .await
+    }
+
+    async fn replace_run_history_events_inner(
+        &self,
+        run_history_id: i64,
+        events: Vec<NewRunHistoryEvent>,
+        created_at: i64,
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("start sqlite transaction for run history event rewrite")?;
+        sqlx::query("DELETE FROM run_history_event WHERE run_history_id = ?")
+            .bind(run_history_id)
+            .execute(&mut *tx)
+            .await
+            .context("delete previous run history events")?;
+        for event in events {
+            let payload_json =
+                serde_json::to_string(&event.payload).context("serialize run history payload")?;
+            sqlx::query(
+                r#"
+                INSERT INTO run_history_event (
+                    run_history_id,
+                    sequence,
+                    turn_id,
+                    event_type,
+                    payload_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(run_history_id)
+            .bind(event.sequence)
+            .bind(event.turn_id.as_deref())
+            .bind(event.event_type.as_str())
+            .bind(payload_json)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await
+            .context("insert rewritten run history event")?;
+        }
+        sqlx::query("UPDATE run_history SET updated_at = ? WHERE id = ?")
+            .bind(created_at)
+            .bind(run_history_id)
+            .execute(&mut *tx)
+            .await
+            .context("update run history timestamp after event rewrite")?;
+        tx.commit()
+            .await
+            .context("commit sqlite transaction for run history event rewrite")?;
+        Ok(())
+    }
+
+    pub async fn mark_run_history_transcript_backfill_complete(&self, run_id: i64) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE run_history
+            SET events_persisted_cleanly = 1,
+                transcript_backfill_state = ?,
+                transcript_backfill_error = NULL,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(transcript_backfill_state_label(
+            TranscriptBackfillState::Complete,
+        ))
+        .bind(Utc::now().timestamp())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .context("mark run history transcript backfill complete")?;
+        Ok(())
+    }
+
+    pub async fn update_run_history_transcript_backfill(
+        &self,
+        run_id: i64,
+        state: TranscriptBackfillState,
+        error: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE run_history
+            SET transcript_backfill_state = ?,
+                transcript_backfill_error = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(transcript_backfill_state_label(state))
+        .bind(error)
+        .bind(Utc::now().timestamp())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .context("update run history transcript backfill state")?;
+        Ok(())
+    }
+
     pub async fn list_run_history_events(
         &self,
         run_history_id: i64,
@@ -734,7 +871,8 @@ impl ReviewStateStore {
             SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
-                   command_repo, commit_sha, events_persisted_cleanly
+                   command_repo, commit_sha, events_persisted_cleanly,
+                   transcript_backfill_state, transcript_backfill_error
             FROM run_history
             WHERE repo = ? AND iid = ?
             ORDER BY started_at DESC, id DESC
@@ -754,7 +892,8 @@ impl ReviewStateStore {
             SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
-                   command_repo, commit_sha, events_persisted_cleanly
+                   command_repo, commit_sha, events_persisted_cleanly,
+                   transcript_backfill_state, transcript_backfill_error
             FROM run_history
             WHERE id = ?
             "#,
@@ -775,7 +914,8 @@ impl ReviewStateStore {
             SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
-                   command_repo, commit_sha, events_persisted_cleanly
+                   command_repo, commit_sha, events_persisted_cleanly,
+                   transcript_backfill_state, transcript_backfill_error
             FROM run_history
             "#,
         );
@@ -1191,6 +1331,25 @@ fn parse_run_history_kind(value: &str) -> Result<RunHistoryKind> {
     }
 }
 
+fn transcript_backfill_state_label(state: TranscriptBackfillState) -> &'static str {
+    match state {
+        TranscriptBackfillState::NotRequested => "not_requested",
+        TranscriptBackfillState::InProgress => "in_progress",
+        TranscriptBackfillState::Complete => "complete",
+        TranscriptBackfillState::Failed => "failed",
+    }
+}
+
+fn parse_transcript_backfill_state(value: &str) -> Result<TranscriptBackfillState> {
+    match value {
+        "not_requested" => Ok(TranscriptBackfillState::NotRequested),
+        "in_progress" => Ok(TranscriptBackfillState::InProgress),
+        "complete" => Ok(TranscriptBackfillState::Complete),
+        "failed" => Ok(TranscriptBackfillState::Failed),
+        other => bail!("unknown transcript_backfill state: {other}"),
+    }
+}
+
 fn map_run_history_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord> {
     let iid_raw: i64 = row.try_get("iid").context("read run history iid")?;
     let trigger_note_id_raw: Option<i64> = row
@@ -1254,6 +1413,14 @@ fn map_run_history_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord>
             .try_get::<i64, _>("events_persisted_cleanly")
             .context("read run history events_persisted_cleanly")?
             != 0,
+        transcript_backfill_state: parse_transcript_backfill_state(
+            row.try_get::<String, _>("transcript_backfill_state")
+                .context("read run history transcript_backfill_state")?
+                .as_str(),
+        )?,
+        transcript_backfill_error: row
+            .try_get("transcript_backfill_error")
+            .context("read run history transcript_backfill_error")?,
     })
 }
 
@@ -1291,6 +1458,64 @@ fn sqlite_url(path: &str) -> String {
     } else {
         format!("sqlite://{}", path)
     }
+}
+
+pub(crate) fn merge_rewritten_turn_events(
+    existing_events: Vec<RunHistoryEventRecord>,
+    turn_id: &str,
+    rewritten_events: &[NewRunHistoryEvent],
+) -> Result<Vec<NewRunHistoryEvent>> {
+    let mut existing_events = existing_events;
+    existing_events.sort_by_key(|event| (event.sequence, event.id));
+
+    let target_sequences = existing_events
+        .iter()
+        .filter(|event| event.turn_id.as_deref() == Some(turn_id))
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+
+    let first_target_sequence = target_sequences.first().copied().unwrap_or_else(|| {
+        existing_events
+            .last()
+            .map(|event| event.sequence + 1)
+            .unwrap_or(1)
+    });
+    let last_target_sequence = target_sequences
+        .last()
+        .copied()
+        .unwrap_or(first_target_sequence - 1);
+    let delta = rewritten_events.len() as i64 - target_sequences.len() as i64;
+
+    let mut merged_events = Vec::new();
+    for event in existing_events {
+        if event.turn_id.as_deref() == Some(turn_id) {
+            continue;
+        }
+        let shifted_sequence = if event.sequence > last_target_sequence {
+            event.sequence + delta
+        } else {
+            event.sequence
+        };
+        merged_events.push(NewRunHistoryEvent {
+            sequence: shifted_sequence,
+            turn_id: event.turn_id,
+            event_type: event.event_type,
+            payload: event.payload,
+        });
+    }
+
+    merged_events.extend(rewritten_events.iter().map(|event| NewRunHistoryEvent {
+        sequence: first_target_sequence + event.sequence - 1,
+        turn_id: event.turn_id.clone(),
+        event_type: event.event_type.clone(),
+        payload: event.payload.clone(),
+    }));
+
+    merged_events.sort_by_key(|event| event.sequence);
+    for (index, event) in merged_events.iter_mut().enumerate() {
+        event.sequence = i64::try_from(index + 1).context("convert merged event index")?;
+    }
+    Ok(merged_events)
 }
 
 #[cfg(test)]
@@ -2291,6 +2516,246 @@ mod tests {
                 .context("run history row after mark")?
                 .events_persisted_cleanly
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transcript_backfill_state_and_event_rewrite_roundtrip() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let run_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 102,
+                head_sha: "sha-backfill".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .finish_run_history(
+                run_id,
+                RunHistoryFinish {
+                    result: "commented".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        store
+            .append_run_history_events(
+                run_id,
+                &[
+                    NewRunHistoryEvent {
+                        sequence: 1,
+                        turn_id: Some("turn-a".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 2,
+                        turn_id: Some("turn-a".to_string()),
+                        event_type: "item_completed".to_string(),
+                        payload: serde_json::json!({
+                            "type": "reasoning",
+                            "summary": [],
+                            "content": []
+                        }),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 3,
+                        turn_id: Some("turn-a".to_string()),
+                        event_type: "turn_completed".to_string(),
+                        payload: serde_json::json!({"status": "completed"}),
+                    },
+                ],
+            )
+            .await?;
+
+        store
+            .update_run_history_transcript_backfill(
+                run_id,
+                TranscriptBackfillState::InProgress,
+                None,
+            )
+            .await?;
+        let in_progress = store
+            .get_run_history(run_id)
+            .await?
+            .context("run history row after in-progress update")?;
+        assert_eq!(
+            in_progress.transcript_backfill_state,
+            TranscriptBackfillState::InProgress
+        );
+        assert_eq!(in_progress.transcript_backfill_error, None);
+
+        store
+            .replace_run_history_events(
+                run_id,
+                &[
+                    NewRunHistoryEvent {
+                        sequence: 1,
+                        turn_id: Some("turn-a".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 2,
+                        turn_id: Some("turn-a".to_string()),
+                        event_type: "item_completed".to_string(),
+                        payload: serde_json::json!({
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "Recovered summary"}],
+                            "content": [{"type": "reasoning_text", "text": "Recovered detail"}]
+                        }),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 3,
+                        turn_id: Some("turn-a".to_string()),
+                        event_type: "turn_completed".to_string(),
+                        payload: serde_json::json!({"status": "completed"}),
+                    },
+                ],
+            )
+            .await?;
+        store
+            .mark_run_history_transcript_backfill_complete(run_id)
+            .await?;
+
+        let run = store
+            .get_run_history(run_id)
+            .await?
+            .context("run history row after rewrite")?;
+        assert_eq!(
+            run.transcript_backfill_state,
+            TranscriptBackfillState::Complete
+        );
+        assert_eq!(run.transcript_backfill_error, None);
+        assert!(run.events_persisted_cleanly);
+
+        let events = store.list_run_history_events(run_id).await?;
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[1].payload["summary"][0]["text"],
+            serde_json::json!("Recovered summary")
+        );
+        assert_eq!(
+            events[1].payload["content"][0]["text"],
+            serde_json::json!("Recovered detail")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_run_history_events_for_turn_preserves_other_turns() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let run_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 103,
+                head_sha: "sha-turn-rewrite".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .finish_run_history(
+                run_id,
+                RunHistoryFinish {
+                    result: "commented".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        store
+            .append_run_history_events(
+                run_id,
+                &[
+                    NewRunHistoryEvent {
+                        sequence: 1,
+                        turn_id: Some("turn-a".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({"label": "turn-a-start"}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 2,
+                        turn_id: Some("turn-a".to_string()),
+                        event_type: "turn_completed".to_string(),
+                        payload: serde_json::json!({"label": "turn-a-end"}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 3,
+                        turn_id: Some("turn-b".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({"label": "turn-b-start"}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 4,
+                        turn_id: Some("turn-b".to_string()),
+                        event_type: "turn_completed".to_string(),
+                        payload: serde_json::json!({"label": "turn-b-end"}),
+                    },
+                ],
+            )
+            .await?;
+
+        store
+            .update_run_history_transcript_backfill(
+                run_id,
+                TranscriptBackfillState::InProgress,
+                None,
+            )
+            .await?;
+        store
+            .replace_run_history_events_for_turn(
+                run_id,
+                "turn-b",
+                &[
+                    NewRunHistoryEvent {
+                        sequence: 1,
+                        turn_id: Some("turn-b".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({"label": "turn-b-new-start"}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 2,
+                        turn_id: Some("turn-b".to_string()),
+                        event_type: "item_completed".to_string(),
+                        payload: serde_json::json!({"label": "turn-b-item"}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 3,
+                        turn_id: Some("turn-b".to_string()),
+                        event_type: "turn_completed".to_string(),
+                        payload: serde_json::json!({"label": "turn-b-new-end"}),
+                    },
+                ],
+            )
+            .await?;
+
+        let events = store.list_run_history_events(run_id).await?;
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[0].turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(events[0].payload["label"], "turn-a-start");
+        assert_eq!(events[1].sequence, 2);
+        assert_eq!(events[1].turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(events[1].payload["label"], "turn-a-end");
+        assert_eq!(events[2].sequence, 3);
+        assert_eq!(events[2].turn_id.as_deref(), Some("turn-b"));
+        assert_eq!(events[2].payload["label"], "turn-b-new-start");
+        assert_eq!(events[3].sequence, 4);
+        assert_eq!(events[3].turn_id.as_deref(), Some("turn-b"));
+        assert_eq!(events[3].payload["label"], "turn-b-item");
+        assert_eq!(events[4].sequence, 5);
+        assert_eq!(events[4].turn_id.as_deref(), Some("turn-b"));
+        assert_eq!(events[4].payload["label"], "turn-b-new-end");
         Ok(())
     }
 }

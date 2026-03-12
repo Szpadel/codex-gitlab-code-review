@@ -603,6 +603,7 @@ mod tests {
                 timeout_seconds: 1800,
                 auth_host_path: "/tmp/codex".to_string(),
                 auth_mount_path: "/root/.codex".to_string(),
+                session_history_path: None,
                 exec_sandbox: "danger-full-access".to_string(),
                 fallback_auth_accounts: vec![],
                 usage_limit_fallback_cooldown_seconds: 3600,

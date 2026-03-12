@@ -164,6 +164,8 @@ pub struct CodexConfig {
     #[serde(default)]
     pub auth_host_path: String,
     pub auth_mount_path: String,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub session_history_path: Option<String>,
     pub exec_sandbox: String,
     #[serde(default)]
     pub fallback_auth_accounts: Vec<FallbackAuthAccountConfig>,
@@ -327,6 +329,17 @@ impl Config {
         validate_reasoning_effort_overrides(&config.codex)?;
         Ok(config)
     }
+}
+
+fn empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }))
 }
 
 fn legacy_proxy_config_present(cfg: &config::Config) -> bool {

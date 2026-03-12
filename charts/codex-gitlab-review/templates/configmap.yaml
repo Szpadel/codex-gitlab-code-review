@@ -88,6 +88,7 @@ data:
       timeout_seconds: {{ .Values.config.codex.timeoutSeconds }}
       auth_host_path: {{ default .Values.config.codex.authMountPath .Values.config.codex.authHostPath | quote }}
       auth_mount_path: {{ .Values.config.codex.authMountPath | quote }}
+      session_history_path: {{ default (printf "%s/sessions" .Values.config.codex.authMountPath) .Values.config.codex.sessionHistoryPath | quote }}
 {{- if .Values.config.codex.fallbackAuthAccounts }}
       fallback_auth_accounts:
 {{- range .Values.config.codex.fallbackAuthAccounts }}

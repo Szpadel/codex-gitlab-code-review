@@ -76,6 +76,8 @@ codex:
   auth_host_path: "/root/.codex"
   # Required. Container path to mount auth/config from host (read-only).
   auth_mount_path: "/root/.codex"
+  # Optional. Host path containing Codex JSONL session history used for async transcript backfill.
+  session_history_path: "/root/.codex/sessions"
   # Optional. Additional Codex auth accounts in priority order (highest priority first).
   # Primary auth_host_path is always preferred when available again.
   fallback_auth_accounts:

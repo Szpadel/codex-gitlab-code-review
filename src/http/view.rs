@@ -1,6 +1,6 @@
 use super::status::{
     HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, StatusSnapshot, ThreadItemSnapshot,
-    ThreadSnapshot,
+    ThreadSnapshot, TranscriptBackfillSnapshot,
 };
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, ProjectCatalogSummary,
@@ -136,7 +136,10 @@ pub(super) fn render_run_detail_page(snapshot: &RunDetailSnapshot) -> String {
         render_run_metadata(run),
         render_related_runs(&snapshot.related_runs, run.id),
         render_trigger_card(run),
-        render_thread_card(snapshot.thread.as_ref()),
+        render_thread_card(
+            snapshot.thread.as_ref(),
+            snapshot.transcript_backfill.as_ref(),
+        ),
     );
     render_shell("Run Detail", NavItem::History, body)
 }
@@ -438,9 +441,15 @@ fn render_trigger_card(run: &RunHistoryRecord) -> String {
     )
 }
 
-fn render_thread_card(thread: Option<&ThreadSnapshot>) -> String {
+fn render_thread_card(
+    thread: Option<&ThreadSnapshot>,
+    transcript_backfill: Option<&TranscriptBackfillSnapshot>,
+) -> String {
+    let backfill_notice = render_transcript_backfill_notice(transcript_backfill);
     let Some(thread) = thread else {
-        return "<section class=\"card transcript-panel\"><div class=\"transcript-header\"><div><h2>Session transcript</h2><p class=\"muted\">Persisted session detail is not available for this run.</p></div></div><div class=\"thread-empty\"><p class=\"empty\">Codex thread detail is unavailable for this run.</p></div></section>".to_string();
+        return format!(
+            "<section class=\"card transcript-panel\"><div class=\"transcript-header\"><div><h2>Session transcript</h2><p class=\"muted\">Persisted session detail is not available for this run.</p></div></div>{backfill_notice}<div class=\"thread-empty\"><p class=\"empty\">Codex thread detail is unavailable for this run.</p></div></section>"
+        );
     };
     let multiple_turns = thread.turns.len() > 1;
     let items = thread
@@ -465,12 +474,13 @@ fn render_thread_card(thread: Option<&ThreadSnapshot>) -> String {
          <span class=\"meta-chip\"><span class=\"meta-chip-label\">Thread</span><code>{}</code></span>\
          <span class=\"status-pill status-{}\">{}</span>\
          {}\
-         </div></div>\
+         </div></div>{}\
          <div class=\"transcript-stream\">{}</div></section>",
         escape_html(&thread.id),
         status_class(&thread.status),
         escape_html(&thread.status),
         render_optional_preview_chip(&thread.preview),
+        backfill_notice,
         if items.is_empty() {
             "<div class=\"thread-empty\"><p class=\"empty\">No persisted items.</p></div>"
                 .to_string()
@@ -478,6 +488,30 @@ fn render_thread_card(thread: Option<&ThreadSnapshot>) -> String {
             items
         }
     )
+}
+
+fn render_transcript_backfill_notice(
+    transcript_backfill: Option<&TranscriptBackfillSnapshot>,
+) -> String {
+    let Some(transcript_backfill) = transcript_backfill else {
+        return String::new();
+    };
+    match transcript_backfill.state {
+        crate::state::TranscriptBackfillState::InProgress => {
+            "<div class=\"thread-empty\"><p class=\"empty\">Transcript backfill is in progress.</p></div>"
+                .to_string()
+        }
+        crate::state::TranscriptBackfillState::Failed => format!(
+            "<div class=\"thread-empty\"><p class=\"empty\">Transcript backfill failed{}.</p></div>",
+            transcript_backfill
+                .error
+                .as_deref()
+                .map(|error| format!(": {}", escape_html(error)))
+                .unwrap_or_default()
+        ),
+        crate::state::TranscriptBackfillState::NotRequested
+        | crate::state::TranscriptBackfillState::Complete => String::new(),
+    }
 }
 
 fn render_thread_item(item: &ThreadItemSnapshot) -> String {

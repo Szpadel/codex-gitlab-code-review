@@ -62,6 +62,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             timeout_seconds: 1800,
             auth_host_path,
             auth_mount_path: "/root/.codex".to_string(),
+            session_history_path: None,
             exec_sandbox: "danger-full-access".to_string(),
             fallback_auth_accounts: Vec::new(),
             usage_limit_fallback_cooldown_seconds: 3600,

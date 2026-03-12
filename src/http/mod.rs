@@ -1,4 +1,5 @@
 mod status;
+mod transcript;
 mod view;
 
 use axum::{
@@ -206,14 +207,18 @@ mod tests {
     use crate::state::{
         NewRunHistory, NewRunHistoryEvent, PersistedScanStatus, ReviewStateStore, RunHistoryFinish,
         RunHistoryKind, RunHistorySessionUpdate, ScanMode, ScanOutcome, ScanState,
+        TranscriptBackfillState,
     };
-    use anyhow::Result;
+    use crate::transcript_backfill::{
+        TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR, TranscriptBackfillSource,
+    };
+    use anyhow::{Context, Result};
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use reqwest::StatusCode;
     use serde_json::{Value, json};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use tokio::time::{Duration, sleep};
 
     #[tokio::test]
@@ -1409,7 +1414,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_detail_page_falls_back_to_thread_reader_for_legacy_runs() -> Result<()> {
+    async fn run_detail_page_shows_unavailable_transcript_for_legacy_runs() -> Result<()> {
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         let run_id = insert_run_history(
             &state,
@@ -1466,13 +1471,13 @@ mod tests {
         let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await?;
-        assert!(body.contains("Legacy history still renders."));
-        assert!(!body.contains("Codex thread detail is unavailable for this run."));
+        assert!(body.contains("Codex thread detail is unavailable for this run."));
+        assert!(!body.contains("Legacy history still renders."));
         Ok(())
     }
 
     #[tokio::test]
-    async fn run_detail_prefers_thread_reader_when_event_history_is_partial() -> Result<()> {
+    async fn run_detail_keeps_partial_persisted_history_without_thread_reader() -> Result<()> {
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         let run_id = insert_run_history(
             &state,
@@ -1550,9 +1555,9 @@ mod tests {
         let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await?;
-        assert!(body.contains("Complete live thread history."));
-        assert!(body.contains("Follow-up turn from live replay."));
-        assert!(!body.contains("Codex thread detail is unavailable for this run."));
+        assert!(body.contains("No persisted items."));
+        assert!(!body.contains("Complete live thread history."));
+        assert!(!body.contains("Follow-up turn from live replay."));
         Ok(())
     }
 
@@ -1726,8 +1731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_detail_uses_live_thread_when_event_persistence_is_marked_incomplete() -> Result<()>
-    {
+    async fn run_detail_keeps_incomplete_persisted_history_without_thread_reader() -> Result<()> {
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         let run_id = insert_run_history(
             &state,
@@ -1804,13 +1808,13 @@ mod tests {
         let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await?;
-        assert!(body.contains("Recovered from live replay."));
+        assert!(body.contains("No persisted items."));
+        assert!(!body.contains("Recovered from live replay."));
         Ok(())
     }
 
     #[tokio::test]
-    async fn run_detail_uses_live_thread_when_completed_persisted_turn_has_no_items() -> Result<()>
-    {
+    async fn run_detail_keeps_completed_turn_without_items_without_thread_reader() -> Result<()> {
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         let run_id = insert_run_history(
             &state,
@@ -1886,12 +1890,13 @@ mod tests {
         let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await?;
-        assert!(body.contains("Recovered delta-only reply."));
+        assert!(body.contains("No persisted items."));
+        assert!(!body.contains("Recovered delta-only reply."));
         Ok(())
     }
 
     #[tokio::test]
-    async fn run_detail_uses_live_thread_when_persisted_command_has_no_body() -> Result<()> {
+    async fn run_detail_keeps_command_without_body_without_thread_reader() -> Result<()> {
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         let run_id = insert_run_history(
             &state,
@@ -1978,7 +1983,8 @@ mod tests {
         let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await?;
-        assert!(body.contains("Recovered command output"));
+        assert!(body.contains("cargo test"));
+        assert!(!body.contains("Recovered command output"));
         Ok(())
     }
 
@@ -2004,6 +2010,1527 @@ mod tests {
                 }
             }))
         }
+    }
+
+    #[derive(Clone)]
+    struct StaticTranscriptBackfillSource {
+        events: Vec<NewRunHistoryEvent>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TranscriptBackfillSource for StaticTranscriptBackfillSource {
+        async fn load_events(
+            &self,
+            _thread_id: &str,
+            _turn_id: Option<&str>,
+        ) -> Result<Option<Vec<NewRunHistoryEvent>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(self.events.clone()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct SequencedTranscriptBackfillSource {
+        responses: Arc<Mutex<Vec<Option<Vec<NewRunHistoryEvent>>>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TranscriptBackfillSource for SequencedTranscriptBackfillSource {
+        async fn load_events(
+            &self,
+            _thread_id: &str,
+            _turn_id: Option<&str>,
+        ) -> Result<Option<Vec<NewRunHistoryEvent>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut responses = self
+                .responses
+                .lock()
+                .expect("sequenced transcript responses mutex");
+            if responses.len() > 1 {
+                Ok(responses.remove(0))
+            } else {
+                Ok(responses.first().cloned().unwrap_or(None))
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturingTranscriptBackfillSource {
+        events: Vec<NewRunHistoryEvent>,
+        calls: Arc<AtomicUsize>,
+        seen_thread_id: Arc<Mutex<Option<String>>>,
+        seen_turn_id: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl TranscriptBackfillSource for CapturingTranscriptBackfillSource {
+        async fn load_events(
+            &self,
+            thread_id: &str,
+            turn_id: Option<&str>,
+        ) -> Result<Option<Vec<NewRunHistoryEvent>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .seen_thread_id
+                .lock()
+                .expect("capturing transcript thread id mutex") = Some(thread_id.to_string());
+            *self
+                .seen_turn_id
+                .lock()
+                .expect("capturing transcript turn id mutex") = turn_id.map(ToOwned::to_owned);
+            Ok(Some(self.events.clone()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct TurnScopedFallbackTranscriptBackfillSource {
+        turn_events: Option<Vec<NewRunHistoryEvent>>,
+        full_thread_events: Vec<NewRunHistoryEvent>,
+        seen_turn_ids: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl TranscriptBackfillSource for TurnScopedFallbackTranscriptBackfillSource {
+        async fn load_events(
+            &self,
+            _thread_id: &str,
+            turn_id: Option<&str>,
+        ) -> Result<Option<Vec<NewRunHistoryEvent>>> {
+            self.seen_turn_ids
+                .lock()
+                .expect("turn-scoped fallback seen turn ids mutex")
+                .push(turn_id.map(ToOwned::to_owned));
+            Ok(match turn_id {
+                Some(_) => self.turn_events.clone(),
+                None => Some(self.full_thread_events.clone()),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct ErroringTranscriptBackfillSource {
+        error: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TranscriptBackfillSource for ErroringTranscriptBackfillSource {
+        async fn load_events(
+            &self,
+            _thread_id: &str,
+            _turn_id: Option<&str>,
+        ) -> Result<Option<Vec<NewRunHistoryEvent>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!(self.error);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history() -> Result<()>
+    {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = insert_run_history(
+            &state,
+            NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 18,
+                head_sha: "feed222".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            RunHistorySessionUpdate {
+                thread_id: Some("thread-backfill".to_string()),
+                turn_id: Some("turn-backfill".to_string()),
+                review_thread_id: None,
+                auth_account_name: Some("primary".to_string()),
+            },
+            RunHistoryFinish {
+                result: "commented".to_string(),
+                preview: Some("Review group/repo !18".to_string()),
+                summary: Some("Queue background transcript backfill".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_run_history_events(
+            &state,
+            run_id,
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-backfill".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-backfill".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 3,
+                    turn_id: Some("turn-backfill".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+            ],
+        )
+        .await?;
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let runner = Arc::new(CountingThreadReaderRunner {
+            read_calls: Arc::clone(&read_calls),
+        });
+        let backfill_calls = Arc::new(AtomicUsize::new(0));
+        let backfill_source = Arc::new(StaticTranscriptBackfillSource {
+            events: vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-backfill".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-backfill".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "Recovered summary"}],
+                        "content": [{"type": "reasoning_text", "text": "Recovered detail"}]
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 3,
+                    turn_id: Some("turn-backfill".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+            ],
+            calls: Arc::clone(&backfill_calls),
+        });
+        let status_service = Arc::new(
+            StatusService::new(test_config(), Arc::clone(&state), false, Some(runner))
+                .with_transcript_backfill_source(backfill_source),
+        );
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+        assert_eq!(read_calls.load(Ordering::SeqCst), 0);
+
+        for _ in 0..20 {
+            if state
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after async backfill")?
+                .transcript_backfill_state
+                == TranscriptBackfillState::Complete
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Recovered summary"));
+        assert!(body.contains("Recovered detail"));
+        assert!(!body.contains("Transcript backfill is in progress"));
+        assert_eq!(read_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backfill_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = state
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 19,
+                head_sha: "feed333".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        state
+            .update_run_history_session(
+                run_id,
+                RunHistorySessionUpdate {
+                    thread_id: Some("thread-active".to_string()),
+                    turn_id: Some("turn-active".to_string()),
+                    review_thread_id: None,
+                    auth_account_name: Some("primary".to_string()),
+                },
+            )
+            .await?;
+        insert_run_history_events(
+            &state,
+            run_id,
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-active".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-active".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+            ],
+        )
+        .await?;
+        let backfill_calls = Arc::new(AtomicUsize::new(0));
+        let status_service = Arc::new(
+            StatusService::new(test_config(), Arc::clone(&state), false, None)
+                .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
+                    events: Vec::new(),
+                    calls: Arc::clone(&backfill_calls),
+                })),
+        );
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(!body.contains("Transcript backfill is in progress"));
+        sleep(Duration::from_millis(20)).await;
+        assert_eq!(backfill_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = insert_run_history(
+            &state,
+            NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 20,
+                head_sha: "feed444".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            RunHistorySessionUpdate {
+                thread_id: Some("thread-stale-backfill".to_string()),
+                turn_id: Some("turn-stale-backfill".to_string()),
+                review_thread_id: None,
+                auth_account_name: Some("primary".to_string()),
+            },
+            RunHistoryFinish {
+                result: "commented".to_string(),
+                preview: Some("Review group/repo !20".to_string()),
+                summary: Some("Retry stale transcript backfill".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_run_history_events(
+            &state,
+            run_id,
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-stale-backfill".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-stale-backfill".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 3,
+                    turn_id: Some("turn-stale-backfill".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+            ],
+        )
+        .await?;
+        state
+            .update_run_history_transcript_backfill(
+                run_id,
+                TranscriptBackfillState::InProgress,
+                None,
+            )
+            .await?;
+        let backfill_calls = Arc::new(AtomicUsize::new(0));
+        let status_service = Arc::new(
+            StatusService::new(test_config(), Arc::clone(&state), false, None)
+                .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
+                    events: vec![
+                        NewRunHistoryEvent {
+                            sequence: 1,
+                            turn_id: Some("turn-stale-backfill".to_string()),
+                            event_type: "turn_started".to_string(),
+                            payload: json!({}),
+                        },
+                        NewRunHistoryEvent {
+                            sequence: 2,
+                            turn_id: Some("turn-stale-backfill".to_string()),
+                            event_type: "item_completed".to_string(),
+                            payload: json!({
+                                "type": "reasoning",
+                                "summary": [{"type": "summary_text", "text": "Recovered after restart"}],
+                                "content": [{"type": "reasoning_text", "text": "Backfill retried successfully"}]
+                            }),
+                        },
+                        NewRunHistoryEvent {
+                            sequence: 3,
+                            turn_id: Some("turn-stale-backfill".to_string()),
+                            event_type: "turn_completed".to_string(),
+                            payload: json!({"status": "completed"}),
+                        },
+                    ],
+                    calls: Arc::clone(&backfill_calls),
+                })),
+        );
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+
+        for _ in 0..20 {
+            if state
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after retry")?
+                .transcript_backfill_state
+                == TranscriptBackfillState::Complete
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Recovered after restart"));
+        assert!(body.contains("Backfill retried successfully"));
+        assert_eq!(backfill_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_detail_retries_after_transient_missing_session_history() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = insert_run_history(
+            &state,
+            NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 21,
+                head_sha: "feed555".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            RunHistorySessionUpdate {
+                thread_id: Some("thread-transient".to_string()),
+                turn_id: Some("turn-transient".to_string()),
+                review_thread_id: None,
+                auth_account_name: Some("primary".to_string()),
+            },
+            RunHistoryFinish {
+                result: "commented".to_string(),
+                preview: Some("Review group/repo !21".to_string()),
+                summary: Some("Retry after transient session-history miss".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_run_history_events(
+            &state,
+            run_id,
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-transient".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-transient".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 3,
+                    turn_id: Some("turn-transient".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+            ],
+        )
+        .await?;
+        let backfill_calls = Arc::new(AtomicUsize::new(0));
+        let backfill_source = Arc::new(SequencedTranscriptBackfillSource {
+            responses: Arc::new(Mutex::new(vec![
+                None,
+                None,
+                Some(vec![
+                    NewRunHistoryEvent {
+                        sequence: 1,
+                        turn_id: Some("turn-transient".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: json!({}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 2,
+                        turn_id: Some("turn-transient".to_string()),
+                        event_type: "item_completed".to_string(),
+                        payload: json!({
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "Recovered after missing file"}],
+                            "content": [{"type": "reasoning_text", "text": "Second attempt found session history"}]
+                        }),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 3,
+                        turn_id: Some("turn-transient".to_string()),
+                        event_type: "turn_completed".to_string(),
+                        payload: json!({"status": "completed"}),
+                    },
+                ]),
+            ])),
+            calls: Arc::clone(&backfill_calls),
+        });
+        let status_service = Arc::new(
+            StatusService::new(test_config(), Arc::clone(&state), false, None)
+                .with_transcript_backfill_source(backfill_source),
+        );
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+
+        for _ in 0..20 {
+            if backfill_calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        for _ in 0..20 {
+            if state
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after transient miss")?
+                .transcript_backfill_state
+                == TranscriptBackfillState::Failed
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let run = state
+            .get_run_history(run_id)
+            .await?
+            .context("run history row after transient miss")?;
+        assert_eq!(
+            run.transcript_backfill_state,
+            TranscriptBackfillState::Failed
+        );
+        assert_eq!(
+            run.transcript_backfill_error.as_deref(),
+            Some("matching Codex session history was not found")
+        );
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill failed"));
+
+        sleep(Duration::from_millis(1100)).await;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+
+        for _ in 0..20 {
+            if state
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after retry success")?
+                .transcript_backfill_state
+                == TranscriptBackfillState::Complete
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Recovered after missing file"));
+        assert!(body.contains("Second attempt found session history"));
+        assert_eq!(backfill_calls.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = insert_run_history(
+            &state,
+            NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 24,
+                head_sha: "feed888".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            RunHistorySessionUpdate {
+                thread_id: Some("thread-partial-file".to_string()),
+                turn_id: Some("turn-partial-file".to_string()),
+                review_thread_id: None,
+                auth_account_name: Some("primary".to_string()),
+            },
+            RunHistoryFinish {
+                result: "commented".to_string(),
+                preview: Some("Review group/repo !24".to_string()),
+                summary: Some("Retry partial session-history file after cooldown".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_run_history_events(
+            &state,
+            run_id,
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-partial-file".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-partial-file".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 3,
+                    turn_id: Some("turn-partial-file".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+            ],
+        )
+        .await?;
+        let backfill_calls = Arc::new(AtomicUsize::new(0));
+        let backfill_source = Arc::new(SequencedTranscriptBackfillSource {
+            responses: Arc::new(Mutex::new(vec![
+                Some(vec![
+                    NewRunHistoryEvent {
+                        sequence: 1,
+                        turn_id: Some("turn-partial-file".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: json!({}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 2,
+                        turn_id: Some("turn-partial-file".to_string()),
+                        event_type: "item_completed".to_string(),
+                        payload: json!({
+                            "type": "reasoning",
+                            "summary": [],
+                            "content": []
+                        }),
+                    },
+                ]),
+                Some(vec![
+                    NewRunHistoryEvent {
+                        sequence: 1,
+                        turn_id: Some("turn-partial-file".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: json!({}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 2,
+                        turn_id: Some("turn-partial-file".to_string()),
+                        event_type: "item_completed".to_string(),
+                        payload: json!({
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": "Recovered after partial write"}],
+                            "content": [{"type": "reasoning_text", "text": "Second parse saw the finished turn"}]
+                        }),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 3,
+                        turn_id: Some("turn-partial-file".to_string()),
+                        event_type: "turn_completed".to_string(),
+                        payload: json!({"status": "completed"}),
+                    },
+                ]),
+            ])),
+            calls: Arc::clone(&backfill_calls),
+        });
+        let status_service = Arc::new(
+            StatusService::new(test_config(), Arc::clone(&state), false, None)
+                .with_transcript_backfill_source(backfill_source),
+        );
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+
+        for _ in 0..20 {
+            if state
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after partial file attempt")?
+                .transcript_backfill_state
+                == TranscriptBackfillState::Failed
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill failed"));
+
+        sleep(Duration::from_millis(1100)).await;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+
+        for _ in 0..20 {
+            if state
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after partial file retry")?
+                .transcript_backfill_state
+                == TranscriptBackfillState::Complete
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Recovered after partial write"));
+        assert!(body.contains("Second parse saw the finished turn"));
+        assert_eq!(backfill_calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = insert_run_history(
+            &state,
+            NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 22,
+                head_sha: "feed666".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            RunHistorySessionUpdate {
+                thread_id: Some("thread-partial".to_string()),
+                turn_id: Some("turn-new".to_string()),
+                review_thread_id: None,
+                auth_account_name: Some("primary".to_string()),
+            },
+            RunHistoryFinish {
+                result: "commented".to_string(),
+                preview: Some("Review group/repo !22".to_string()),
+                summary: Some("Do not mark partial multi-turn transcript complete".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_run_history_events(
+            &state,
+            run_id,
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-old".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-old".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 3,
+                    turn_id: Some("turn-old".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 4,
+                    turn_id: Some("turn-new".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 5,
+                    turn_id: Some("turn-new".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 6,
+                    turn_id: Some("turn-new".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+            ],
+        )
+        .await?;
+        let backfill_calls = Arc::new(AtomicUsize::new(0));
+        let status_service = Arc::new(
+            StatusService::new(test_config(), Arc::clone(&state), false, None)
+                .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
+                    events: vec![
+                        NewRunHistoryEvent {
+                            sequence: 1,
+                            turn_id: Some("turn-new".to_string()),
+                            event_type: "turn_started".to_string(),
+                            payload: json!({}),
+                        },
+                        NewRunHistoryEvent {
+                            sequence: 2,
+                            turn_id: Some("turn-new".to_string()),
+                            event_type: "item_completed".to_string(),
+                            payload: json!({
+                                "type": "reasoning",
+                                "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
+                                "content": [{"type": "reasoning_text", "text": "Older turn still missing"}]
+                            }),
+                        },
+                        NewRunHistoryEvent {
+                            sequence: 3,
+                            turn_id: Some("turn-new".to_string()),
+                            event_type: "turn_completed".to_string(),
+                            payload: json!({"status": "completed"}),
+                        },
+                    ],
+                    calls: Arc::clone(&backfill_calls),
+                })),
+        );
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+
+        for _ in 0..20 {
+            let run = state
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after partial multi-turn backfill")?;
+            if run.transcript_backfill_state == TranscriptBackfillState::Failed {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let run = state
+            .get_run_history(run_id)
+            .await?
+            .context("run history row after failed partial backfill")?;
+        assert_eq!(
+            run.transcript_backfill_state,
+            TranscriptBackfillState::Failed
+        );
+        assert!(!run.events_persisted_cleanly);
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(!body.contains("Recovered current turn"));
+        assert!(body.contains("Transcript backfill failed"));
+        assert_eq!(backfill_calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = insert_run_history(
+            &state,
+            NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 23,
+                head_sha: "feed777".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            RunHistorySessionUpdate {
+                thread_id: Some("thread-full-fallback".to_string()),
+                turn_id: Some("turn-new".to_string()),
+                review_thread_id: None,
+                auth_account_name: Some("primary".to_string()),
+            },
+            RunHistoryFinish {
+                result: "commented".to_string(),
+                preview: Some("Review group/repo !23".to_string()),
+                summary: Some("Recover older turns from the full local thread".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_run_history_events(
+            &state,
+            run_id,
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-old".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-old".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 3,
+                    turn_id: Some("turn-old".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 4,
+                    turn_id: Some("turn-new".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 5,
+                    turn_id: Some("turn-new".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 6,
+                    turn_id: Some("turn-new".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+            ],
+        )
+        .await?;
+        let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+        let status_service = Arc::new(
+            StatusService::new(test_config(), Arc::clone(&state), false, None)
+                .with_transcript_backfill_source(Arc::new(
+                    TurnScopedFallbackTranscriptBackfillSource {
+                        turn_events: Some(vec![
+                            NewRunHistoryEvent {
+                                sequence: 1,
+                                turn_id: Some("turn-new".to_string()),
+                                event_type: "turn_started".to_string(),
+                                payload: json!({}),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 2,
+                                turn_id: Some("turn-new".to_string()),
+                                event_type: "item_completed".to_string(),
+                                payload: json!({
+                                    "type": "reasoning",
+                                    "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
+                                    "content": [{"type": "reasoning_text", "text": "Current turn detail"}]
+                                }),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 3,
+                                turn_id: Some("turn-new".to_string()),
+                                event_type: "turn_completed".to_string(),
+                                payload: json!({"status": "completed"}),
+                            },
+                        ]),
+                        full_thread_events: vec![
+                            NewRunHistoryEvent {
+                                sequence: 1,
+                                turn_id: Some("turn-old".to_string()),
+                                event_type: "turn_started".to_string(),
+                                payload: json!({}),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 2,
+                                turn_id: Some("turn-old".to_string()),
+                                event_type: "item_completed".to_string(),
+                                payload: json!({
+                                    "type": "reasoning",
+                                    "summary": [{"type": "summary_text", "text": "Recovered older turn"}],
+                                    "content": [{"type": "reasoning_text", "text": "Older turn detail"}]
+                                }),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 3,
+                                turn_id: Some("turn-old".to_string()),
+                                event_type: "turn_completed".to_string(),
+                                payload: json!({"status": "completed"}),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 4,
+                                turn_id: Some("turn-new".to_string()),
+                                event_type: "turn_started".to_string(),
+                                payload: json!({}),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 5,
+                                turn_id: Some("turn-new".to_string()),
+                                event_type: "item_completed".to_string(),
+                                payload: json!({
+                                    "type": "reasoning",
+                                    "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
+                                    "content": [{"type": "reasoning_text", "text": "Current turn detail"}]
+                                }),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 6,
+                                turn_id: Some("turn-new".to_string()),
+                                event_type: "turn_completed".to_string(),
+                                payload: json!({"status": "completed"}),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 7,
+                                turn_id: Some("turn-later".to_string()),
+                                event_type: "turn_started".to_string(),
+                                payload: json!({}),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 8,
+                                turn_id: Some("turn-later".to_string()),
+                                event_type: "item_completed".to_string(),
+                                payload: json!({
+                                    "type": "agentMessage",
+                                    "text": "Later turn should be ignored"
+                                }),
+                            },
+                        ],
+                        seen_turn_ids: Arc::clone(&seen_turn_ids),
+                    },
+                )),
+        );
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+
+        for _ in 0..20 {
+            let run = state
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after full-thread fallback backfill")?;
+            if run.transcript_backfill_state == TranscriptBackfillState::Complete {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Recovered older turn"));
+        assert!(body.contains("Older turn detail"));
+        assert!(body.contains("Recovered current turn"));
+        assert!(body.contains("Current turn detail"));
+        assert_eq!(
+            *seen_turn_ids
+                .lock()
+                .expect("turn-scoped fallback seen turn ids mutex"),
+            vec![Some("turn-new".to_string()), None]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missing()
+    -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = insert_run_history(
+            &state,
+            NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 26,
+                head_sha: "feedabc".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            RunHistorySessionUpdate {
+                thread_id: Some("thread-missing-turn".to_string()),
+                turn_id: Some("turn-new".to_string()),
+                review_thread_id: None,
+                auth_account_name: Some("primary".to_string()),
+            },
+            RunHistoryFinish {
+                result: "commented".to_string(),
+                preview: Some("Review group/repo !26".to_string()),
+                summary: Some(
+                    "Fallback to whole-thread session history when turn lookup is missing"
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_run_history_events(
+            &state,
+            run_id,
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-old".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-old".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 3,
+                    turn_id: Some("turn-old".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 4,
+                    turn_id: Some("turn-new".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 5,
+                    turn_id: Some("turn-new".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 6,
+                    turn_id: Some("turn-new".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+            ],
+        )
+        .await?;
+        let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+        let status_service = Arc::new(
+            StatusService::new(test_config(), Arc::clone(&state), false, None)
+                .with_transcript_backfill_source(Arc::new(
+                    TurnScopedFallbackTranscriptBackfillSource {
+                        turn_events: None,
+                        full_thread_events: vec![
+                            NewRunHistoryEvent {
+                                sequence: 1,
+                                turn_id: Some("turn-old".to_string()),
+                                event_type: "turn_started".to_string(),
+                                payload: json!({}),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 2,
+                                turn_id: Some("turn-old".to_string()),
+                                event_type: "item_completed".to_string(),
+                                payload: json!({
+                                    "type": "reasoning",
+                                    "summary": [{"type": "summary_text", "text": "Recovered older turn"}],
+                                    "content": [{"type": "reasoning_text", "text": "Older turn detail"}]
+                                }),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 3,
+                                turn_id: Some("turn-old".to_string()),
+                                event_type: "turn_completed".to_string(),
+                                payload: json!({"status": "completed"}),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 4,
+                                turn_id: Some("turn-new".to_string()),
+                                event_type: "turn_started".to_string(),
+                                payload: json!({}),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 5,
+                                turn_id: Some("turn-new".to_string()),
+                                event_type: "item_completed".to_string(),
+                                payload: json!({
+                                    "type": "reasoning",
+                                    "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
+                                    "content": [{"type": "reasoning_text", "text": "Current turn detail"}]
+                                }),
+                            },
+                            NewRunHistoryEvent {
+                                sequence: 6,
+                                turn_id: Some("turn-new".to_string()),
+                                event_type: "turn_completed".to_string(),
+                                payload: json!({"status": "completed"}),
+                            },
+                        ],
+                        seen_turn_ids: Arc::clone(&seen_turn_ids),
+                    },
+                )),
+        );
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .text()
+                .await?
+                .contains("Transcript backfill is in progress")
+        );
+
+        for _ in 0..20 {
+            let run = state
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after missing turn fallback backfill")?;
+            if run.transcript_backfill_state == TranscriptBackfillState::Complete {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Recovered older turn"));
+        assert!(body.contains("Recovered current turn"));
+        assert!(!body.contains("Later turn should be ignored"));
+        assert_eq!(
+            *seen_turn_ids
+                .lock()
+                .expect("turn-scoped fallback seen turn ids mutex"),
+            vec![Some("turn-new".to_string()), None]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_detail_backfill_uses_base_thread_id_when_review_thread_differs() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = insert_run_history(
+            &state,
+            NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 25,
+                head_sha: "feed999".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            RunHistorySessionUpdate {
+                thread_id: Some("thread-base".to_string()),
+                turn_id: Some("turn-review".to_string()),
+                review_thread_id: Some("thread-review".to_string()),
+                auth_account_name: Some("primary".to_string()),
+            },
+            RunHistoryFinish {
+                result: "commented".to_string(),
+                preview: Some("Review group/repo !25".to_string()),
+                summary: Some("Backfill should read base thread history".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_run_history_events(
+            &state,
+            run_id,
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-review".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-review".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+                NewRunHistoryEvent {
+                    sequence: 3,
+                    turn_id: Some("turn-review".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                },
+            ],
+        )
+        .await?;
+        let backfill_calls = Arc::new(AtomicUsize::new(0));
+        let seen_thread_id = Arc::new(Mutex::new(None));
+        let seen_turn_id = Arc::new(Mutex::new(None));
+        let status_service = Arc::new(
+            StatusService::new(test_config(), Arc::clone(&state), false, None)
+                .with_transcript_backfill_source(Arc::new(CapturingTranscriptBackfillSource {
+                    events: vec![
+                        NewRunHistoryEvent {
+                            sequence: 1,
+                            turn_id: Some("turn-review".to_string()),
+                            event_type: "turn_started".to_string(),
+                            payload: json!({}),
+                        },
+                        NewRunHistoryEvent {
+                            sequence: 2,
+                            turn_id: Some("turn-review".to_string()),
+                            event_type: "item_completed".to_string(),
+                            payload: json!({
+                                "type": "reasoning",
+                                "summary": [{"type": "summary_text", "text": "Recovered"}],
+                                "content": [{"type": "reasoning_text", "text": "Base thread history used"}]
+                            }),
+                        },
+                        NewRunHistoryEvent {
+                            sequence: 3,
+                            turn_id: Some("turn-review".to_string()),
+                            event_type: "turn_completed".to_string(),
+                            payload: json!({"status": "completed"}),
+                        },
+                    ],
+                    calls: Arc::clone(&backfill_calls),
+                    seen_thread_id: Arc::clone(&seen_thread_id),
+                    seen_turn_id: Arc::clone(&seen_turn_id),
+                })),
+        );
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+
+        for _ in 0..20 {
+            if backfill_calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            seen_thread_id
+                .lock()
+                .expect("captured thread id mutex")
+                .as_deref(),
+            Some("thread-base")
+        );
+        assert_eq!(
+            seen_turn_id
+                .lock()
+                .expect("captured turn id mutex")
+                .as_deref(),
+            Some("turn-review")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_detail_retries_when_session_history_directory_appears_later() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = insert_run_history(
+            &state,
+            NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 23,
+                head_sha: "feed777".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            RunHistorySessionUpdate {
+                thread_id: Some("thread-unavailable".to_string()),
+                turn_id: Some("turn-unavailable".to_string()),
+                review_thread_id: None,
+                auth_account_name: Some("primary".to_string()),
+            },
+            RunHistoryFinish {
+                result: "commented".to_string(),
+                preview: Some("Review group/repo !23".to_string()),
+                summary: Some("Do not retry unavailable local session history".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        insert_run_history_events(
+            &state,
+            run_id,
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-unavailable".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-unavailable".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": []
+                    }),
+                },
+            ],
+        )
+        .await?;
+        let backfill_calls = Arc::new(AtomicUsize::new(0));
+        let status_service = Arc::new(
+            StatusService::new(test_config(), Arc::clone(&state), false, None)
+                .with_transcript_backfill_source(Arc::new(ErroringTranscriptBackfillSource {
+                    error: TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR,
+                    calls: Arc::clone(&backfill_calls),
+                })),
+        );
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+
+        for _ in 0..20 {
+            if state
+                .get_run_history(run_id)
+                .await?
+                .context("run history row after unavailable backfill source")?
+                .transcript_backfill_state
+                == TranscriptBackfillState::Failed
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        sleep(Duration::from_millis(1100)).await;
+        let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Transcript backfill is in progress"));
+        assert_eq!(backfill_calls.load(Ordering::SeqCst), 2);
+        Ok(())
     }
 
     fn test_config() -> Config {
@@ -2045,6 +3572,7 @@ mod tests {
                 timeout_seconds: 1800,
                 auth_host_path: "/tmp/codex".to_string(),
                 auth_mount_path: "/root/.codex".to_string(),
+                session_history_path: None,
                 exec_sandbox: "danger-full-access".to_string(),
                 fallback_auth_accounts: vec![],
                 usage_limit_fallback_cooldown_seconds: 3600,

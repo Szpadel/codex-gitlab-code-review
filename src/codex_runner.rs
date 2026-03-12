@@ -4261,6 +4261,7 @@ mod tests {
             timeout_seconds: 300,
             auth_host_path: "/root/.codex-primary".to_string(),
             auth_mount_path: "/root/.codex".to_string(),
+            session_history_path: None,
             exec_sandbox: "danger-full-access".to_string(),
             fallback_auth_accounts: vec![
                 FallbackAuthAccountConfig {
@@ -4315,6 +4316,7 @@ mod tests {
                 timeout_seconds: 300,
                 auth_host_path: "/root/.codex".to_string(),
                 auth_mount_path: "/root/.codex".to_string(),
+                session_history_path: None,
                 exec_sandbox: "danger-full-access".to_string(),
                 fallback_auth_accounts: Vec::new(),
                 usage_limit_fallback_cooldown_seconds: 3600,

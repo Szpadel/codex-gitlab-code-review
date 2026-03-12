@@ -58,6 +58,10 @@ config:
     # Must be writable to persist refreshed auth.json credentials.
     authHostPath: ""
     authMountPath: "/root/.codex"
+    # Leave empty to default to <authMountPath>/sessions inside the review pod.
+    # When set outside the mounted auth directories, the chart mounts the primary
+    # auth sessions subtree at this path for async transcript backfill.
+    sessionHistoryPath: ""
     # Optional fallback auth accounts in descending priority order.
     # Every account should use a distinct host path so each auth.json is isolated.
     fallbackAuthAccounts: []

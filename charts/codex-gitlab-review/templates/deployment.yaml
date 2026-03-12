@@ -1,6 +1,7 @@
 {{- $primaryAuthSubPath := "codex-auth" -}}
 {{- $primaryAuthHostPath := default .Values.config.codex.authMountPath .Values.config.codex.authHostPath -}}
 {{- $authMountPath := .Values.config.codex.authMountPath -}}
+{{- $sessionHistoryPath := default (printf "%s/sessions" $authMountPath) .Values.config.codex.sessionHistoryPath -}}
 {{- $authAccountMounts := list (dict "hostPath" $primaryAuthHostPath "subPath" $primaryAuthSubPath) -}}
 {{- $allAuthHostPaths := list $primaryAuthHostPath -}}
 {{- range $index, $account := .Values.config.codex.fallbackAuthAccounts -}}
@@ -11,6 +12,14 @@
 {{- $containerAuthMounts := $authAccountMounts -}}
 {{- if and (ne $primaryAuthHostPath $authMountPath) (not (has $authMountPath $allAuthHostPaths)) -}}
 {{- $containerAuthMounts = append $containerAuthMounts (dict "hostPath" $authMountPath "subPath" $primaryAuthSubPath) -}}
+{{- end -}}
+{{- $sessionHistoryPathState := dict "covered" false -}}
+{{- range $mount := $containerAuthMounts -}}
+{{- $mountPath := trimSuffix "/" $mount.hostPath -}}
+{{- $normalizedSessionHistoryPath := trimSuffix "/" $sessionHistoryPath -}}
+{{- if or (eq $normalizedSessionHistoryPath $mountPath) (hasPrefix (printf "%s/" $mountPath) $normalizedSessionHistoryPath) -}}
+{{- $_ := set $sessionHistoryPathState "covered" true -}}
+{{- end -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -52,6 +61,7 @@ spec:
 {{- range $authAccountMounts }}
                 auth_dir="/mnt/data/{{ .subPath }}"
                 mkdir -p "$auth_dir"
+                mkdir -p "${auth_dir}/sessions"
                 if [ -f "/seed-config/config.toml" ]; then
                   cp "/seed-config/config.toml" "${auth_dir}/config.toml"
                   chmod 0600 "${auth_dir}/config.toml"
@@ -88,6 +98,11 @@ spec:
             - name: data
               mountPath: {{ .hostPath }}
               subPath: {{ .subPath }}
+{{- end }}
+{{- if not ($sessionHistoryPathState.covered) }}
+            - name: data
+              mountPath: {{ $sessionHistoryPath }}
+              subPath: {{ printf "%s/sessions" $primaryAuthSubPath }}
 {{- end }}
             - name: docker-socket
               mountPath: /var/run
