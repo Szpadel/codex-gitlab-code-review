@@ -614,14 +614,16 @@ impl DockerCodexRunner {
         repo_path: &str,
         branch: &str,
     ) -> Option<String> {
-        let command = vec![
-            "git".to_string(),
-            "merge-base".to_string(),
-            "HEAD".to_string(),
-            branch.to_string(),
-        ];
         let output = match self
-            .exec_container_command(container_id, command, Some(repo_path))
+            .exec_container_git_command(
+                container_id,
+                &[
+                    "merge-base".to_string(),
+                    "HEAD".to_string(),
+                    branch.to_string(),
+                ],
+                Some(repo_path),
+            )
             .await
         {
             Ok(output) => output,
@@ -1365,6 +1367,16 @@ exec codex app-server --listen stdio://
         Ok(output)
     }
 
+    async fn exec_container_git_command(
+        &self,
+        container_id: &str,
+        git_args: &[String],
+        cwd: Option<&str>,
+    ) -> Result<ContainerExecOutput> {
+        self.exec_container_command(container_id, auxiliary_git_exec_command(git_args), cwd)
+            .await
+    }
+
     fn is_managed_container_name(name: &str) -> bool {
         let name = name.trim_start_matches('/');
         name.starts_with(REVIEW_CONTAINER_NAME_PREFIX)
@@ -1992,10 +2004,9 @@ exec codex app-server --listen stdio://
             )
             .await;
 
-            self.exec_container_command(
+            self.exec_container_git_command(
                 &container_id,
-                vec![
-                    "git".to_string(),
+                &[
                     "config".to_string(),
                     "user.name".to_string(),
                     ctx.requester_name.clone(),
@@ -2003,10 +2014,9 @@ exec codex app-server --listen stdio://
                 Some(repo_dir),
             )
             .await?;
-            self.exec_container_command(
+            self.exec_container_git_command(
                 &container_id,
-                vec![
-                    "git".to_string(),
+                &[
                     "config".to_string(),
                     "user.email".to_string(),
                     ctx.requester_email.clone(),
@@ -2014,10 +2024,9 @@ exec codex app-server --listen stdio://
                 Some(repo_dir),
             )
             .await?;
-            self.exec_container_command(
+            self.exec_container_git_command(
                 &container_id,
-                vec![
-                    "git".to_string(),
+                &[
                     "remote".to_string(),
                     "set-url".to_string(),
                     "--push".to_string(),
@@ -2028,13 +2037,9 @@ exec codex app-server --listen stdio://
             )
             .await?;
             let before_sha = self
-                .exec_container_command(
+                .exec_container_git_command(
                     &container_id,
-                    vec![
-                        "git".to_string(),
-                        "rev-parse".to_string(),
-                        "HEAD".to_string(),
-                    ],
+                    &["rev-parse".to_string(), "HEAD".to_string()],
                     Some(repo_dir),
                 )
                 .await?
@@ -2079,13 +2084,9 @@ exec codex app-server --listen stdio://
             }
 
             let after_sha = self
-                .exec_container_command(
+                .exec_container_git_command(
                     &container_id,
-                    vec![
-                        "git".to_string(),
-                        "rev-parse".to_string(),
-                        "HEAD".to_string(),
-                    ],
+                    &["rev-parse".to_string(), "HEAD".to_string()],
                     Some(repo_dir),
                 )
                 .await?
@@ -2100,10 +2101,9 @@ exec codex app-server --listen stdio://
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| anyhow!("merge request source branch is missing"))?;
                 if let Err(err) = self
-                    .exec_container_command(
+                    .exec_container_git_command(
                         &container_id,
-                        vec![
-                            "git".to_string(),
+                        &[
                             "merge-base".to_string(),
                             "--is-ancestor".to_string(),
                             before_sha.clone(),
@@ -2116,10 +2116,9 @@ exec codex app-server --listen stdio://
                     bail!("mention command moved HEAD outside MR ancestry: {err}");
                 }
                 let commit_count_output = self
-                    .exec_container_command(
+                    .exec_container_git_command(
                         &container_id,
-                        vec![
-                            "git".to_string(),
+                        &[
                             "rev-list".to_string(),
                             "--count".to_string(),
                             format!("{before_sha}..{after_sha}"),
@@ -2140,21 +2139,15 @@ exec codex app-server --listen stdio://
                 if commit_count == 0 {
                     bail!("mention command moved HEAD without producing new commits");
                 }
-                let push_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
                 self.exec_container_command(
                     &container_id,
-                    vec![
-                        "bash".to_string(),
-                        "-lc".to_string(),
-                        format!("git remote set-url --push origin \"{push_url_dq}\""),
-                    ],
+                    restore_push_remote_url_exec_command(&clone_url),
                     Some(repo_dir),
                 )
                 .await?;
-                self.exec_container_command(
+                self.exec_container_git_command(
                     &container_id,
-                    vec![
-                        "git".to_string(),
+                    &[
                         "push".to_string(),
                         "origin".to_string(),
                         format!("HEAD:{source_branch}"),
@@ -2165,13 +2158,9 @@ exec codex app-server --listen stdio://
                 (MentionCommandStatus::Committed, Some(after_sha))
             } else {
                 let worktree_state = self
-                    .exec_container_command(
+                    .exec_container_git_command(
                         &container_id,
-                        vec![
-                            "git".to_string(),
-                            "status".to_string(),
-                            "--porcelain".to_string(),
-                        ],
+                        &["status".to_string(), "--porcelain".to_string()],
                         Some(repo_dir),
                     )
                     .await?;
@@ -3587,6 +3576,24 @@ fn format_command_for_log(command: &[String]) -> String {
         .join(" ")
 }
 
+fn auxiliary_git_exec_command(git_args: &[String]) -> Vec<String> {
+    let git_command = std::iter::once("git".to_string())
+        .chain(git_args.iter().cloned())
+        .map(|value| shell_quote(&value))
+        .collect::<Vec<_>>()
+        .join(" ");
+    vec!["bash".to_string(), "-lc".to_string(), git_command]
+}
+
+fn restore_push_remote_url_exec_command(push_url: &str) -> Vec<String> {
+    let push_url_dq = push_url.replace('\\', "\\\\").replace('"', "\\\"");
+    vec![
+        "bash".to_string(),
+        "-lc".to_string(),
+        format!("git remote set-url --push origin \"{push_url_dq}\""),
+    ]
+}
+
 fn browser_container_cmd(
     image: &str,
     configured_entrypoint: &[String],
@@ -4566,6 +4573,69 @@ mod tests {
         assert!(text.contains("docker exec command failed with exit code 1"));
         assert!(text.contains("'git' 'status'"));
         assert!(text.contains("/work/repo"));
+    }
+
+    #[test]
+    fn auxiliary_git_exec_command_wraps_git_in_login_shell() {
+        let command = auxiliary_git_exec_command(&["status".to_string()]);
+        assert_eq!(
+            command,
+            vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "'git' 'status'".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn auxiliary_git_exec_command_quotes_arguments() {
+        let command = auxiliary_git_exec_command(&[
+            "config".to_string(),
+            "user.name".to_string(),
+            "O'Brian Example".to_string(),
+        ]);
+        assert_eq!(
+            command,
+            vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "'git' 'config' 'user.name' 'O'\"'\"'Brian Example'".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn auxiliary_git_exec_command_wraps_merge_base_flags_and_shas() {
+        let command = auxiliary_git_exec_command(&[
+            "merge-base".to_string(),
+            "--is-ancestor".to_string(),
+            "before123".to_string(),
+            "after456".to_string(),
+        ]);
+        assert_eq!(
+            command,
+            vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "'git' 'merge-base' '--is-ancestor' 'before123' 'after456'".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_push_remote_url_exec_command_preserves_gitlab_token_expansion() {
+        let command = restore_push_remote_url_exec_command(
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git",
+        );
+        assert_eq!(
+            command,
+            vec![
+                "bash".to_string(),
+                "-lc".to_string(),
+                "git remote set-url --push origin \"https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git\"".to_string(),
+            ]
+        );
     }
 
     #[test]
