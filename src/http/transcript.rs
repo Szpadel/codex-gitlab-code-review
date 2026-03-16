@@ -79,14 +79,10 @@ pub fn thread_snapshot_from_events(
 
 pub fn thread_snapshot_is_complete(thread: &ThreadSnapshot) -> bool {
     !thread.turns.is_empty()
-        && !thread.turns.iter().any(|turn| {
-            matches!(turn.status.as_str(), "in_progress" | "unknown")
-                || turn.items.is_empty()
-                || turn
-                    .items
-                    .iter()
-                    .any(|item| !thread_item_is_self_contained(item))
-        })
+        && !thread
+            .turns
+            .iter()
+            .any(|turn| !turn_snapshot_is_complete(turn))
 }
 
 pub fn thread_snapshot_only_target_turn_is_incomplete(
@@ -96,14 +92,7 @@ pub fn thread_snapshot_only_target_turn_is_incomplete(
     let incomplete_turns = thread
         .turns
         .iter()
-        .filter(|turn| {
-            matches!(turn.status.as_str(), "in_progress" | "unknown")
-                || turn.items.is_empty()
-                || turn
-                    .items
-                    .iter()
-                    .any(|item| !thread_item_is_self_contained(item))
-        })
+        .filter(|turn| !turn_snapshot_is_complete(turn))
         .map(|turn| turn.id.as_str())
         .collect::<Vec<_>>();
     !incomplete_turns.is_empty()
@@ -123,6 +112,28 @@ fn thread_item_is_self_contained(item: &ThreadItemSnapshot) -> bool {
         "reasoning" => item.body.as_deref().is_some_and(|body| !body.is_empty()),
         _ => true,
     }
+}
+
+fn turn_snapshot_is_complete(turn: &TurnSnapshot) -> bool {
+    if matches!(turn.status.as_str(), "in_progress" | "unknown") || turn.items.is_empty() {
+        return false;
+    }
+    let has_renderable_non_reasoning_item = turn
+        .items
+        .iter()
+        .any(|item| reasoning_fallback_supports_completeness(item));
+    turn.items.iter().all(|item| {
+        thread_item_is_self_contained(item)
+            || (item.item_type == "reasoning" && has_renderable_non_reasoning_item)
+    })
+}
+
+fn reasoning_fallback_supports_completeness(item: &ThreadItemSnapshot) -> bool {
+    thread_item_is_self_contained(item)
+        && matches!(
+            item.item_type.as_str(),
+            "agentMessage" | "AgentMessage" | "exitedReviewMode"
+        )
 }
 
 fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> ThreadItemSnapshot {
@@ -690,5 +701,267 @@ mod tests {
         )
         .expect("thread snapshot");
         assert!(thread_snapshot_is_complete(&thread));
+    }
+
+    #[test]
+    fn thread_snapshot_treats_empty_reasoning_as_complete_when_turn_is_otherwise_renderable() {
+        let run = RunHistoryRecord {
+            id: 1,
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 1,
+            head_sha: "sha".to_string(),
+            status: "done".to_string(),
+            result: Some("commented".to_string()),
+            started_at: 0,
+            finished_at: Some(0),
+            updated_at: 0,
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            review_thread_id: None,
+            preview: Some("Preview".to_string()),
+            summary: None,
+            error: None,
+            auth_account_name: None,
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+            commit_sha: None,
+            events_persisted_cleanly: false,
+            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
+            transcript_backfill_error: None,
+        };
+        let thread = thread_snapshot_from_events(
+            &run,
+            &[
+                crate::state::RunHistoryEventRecord {
+                    id: 1,
+                    run_history_id: 1,
+                    sequence: 1,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 2,
+                    run_history_id: 1,
+                    sequence: 2,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": null
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 3,
+                    run_history_id: 1,
+                    sequence: 3,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "commandExecution",
+                        "command": "git diff",
+                        "aggregatedOutput": "diff output",
+                        "status": "completed"
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 4,
+                    run_history_id: 1,
+                    sequence: 4,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "agentMessage",
+                        "text": "All clear."
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 5,
+                    run_history_id: 1,
+                    sequence: 5,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                    created_at: 0,
+                },
+            ],
+        )
+        .expect("thread snapshot");
+        assert!(thread_snapshot_is_complete(&thread));
+    }
+
+    #[test]
+    fn thread_snapshot_does_not_treat_user_message_as_reasoning_fallback() {
+        let run = RunHistoryRecord {
+            id: 1,
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 1,
+            head_sha: "sha".to_string(),
+            status: "done".to_string(),
+            result: Some("commented".to_string()),
+            started_at: 0,
+            finished_at: Some(0),
+            updated_at: 0,
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            review_thread_id: None,
+            preview: Some("Preview".to_string()),
+            summary: None,
+            error: None,
+            auth_account_name: None,
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+            commit_sha: None,
+            events_persisted_cleanly: false,
+            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
+            transcript_backfill_error: None,
+        };
+        let thread = thread_snapshot_from_events(
+            &run,
+            &[
+                crate::state::RunHistoryEventRecord {
+                    id: 1,
+                    run_history_id: 1,
+                    sequence: 1,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 2,
+                    run_history_id: 1,
+                    sequence: 2,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": null
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 3,
+                    run_history_id: 1,
+                    sequence: 3,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "userMessage",
+                        "content": [{ "type": "text", "text": "Please review this." }]
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 4,
+                    run_history_id: 1,
+                    sequence: 4,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                    created_at: 0,
+                },
+            ],
+        )
+        .expect("thread snapshot");
+        assert!(!thread_snapshot_is_complete(&thread));
+    }
+
+    #[test]
+    fn thread_snapshot_does_not_treat_tool_output_as_reasoning_fallback() {
+        let run = RunHistoryRecord {
+            id: 1,
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 1,
+            head_sha: "sha".to_string(),
+            status: "done".to_string(),
+            result: Some("commented".to_string()),
+            started_at: 0,
+            finished_at: Some(0),
+            updated_at: 0,
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            review_thread_id: None,
+            preview: Some("Preview".to_string()),
+            summary: None,
+            error: None,
+            auth_account_name: None,
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+            commit_sha: None,
+            events_persisted_cleanly: false,
+            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
+            transcript_backfill_error: None,
+        };
+        let thread = thread_snapshot_from_events(
+            &run,
+            &[
+                crate::state::RunHistoryEventRecord {
+                    id: 1,
+                    run_history_id: 1,
+                    sequence: 1,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 2,
+                    run_history_id: 1,
+                    sequence: 2,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": null
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 3,
+                    run_history_id: 1,
+                    sequence: 3,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "commandExecution",
+                        "command": "git diff",
+                        "aggregatedOutput": "diff output",
+                        "status": "completed"
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 4,
+                    run_history_id: 1,
+                    sequence: 4,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                    created_at: 0,
+                },
+            ],
+        )
+        .expect("thread snapshot");
+        assert!(!thread_snapshot_is_complete(&thread));
     }
 }
