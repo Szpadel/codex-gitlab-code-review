@@ -1,5 +1,5 @@
+use super::timestamp::UiTimestamp;
 use crate::state::{RunHistoryEventRecord, RunHistoryRecord};
-use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -26,6 +26,8 @@ pub struct ThreadItemSnapshot {
     pub body: Option<String>,
     pub meta: Vec<(String, String)>,
     pub timestamp: Option<String>,
+    #[serde(skip)]
+    pub(crate) ui_timestamp: Option<UiTimestamp>,
 }
 
 pub fn thread_snapshot_from_events(
@@ -136,8 +138,9 @@ fn reasoning_fallback_supports_completeness(item: &ThreadItemSnapshot) -> bool {
         )
 }
 
-fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> ThreadItemSnapshot {
+fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> ThreadItemSnapshot {
     let item_type = json_string(item.get("type")).unwrap_or_else(|| "unknown".to_string());
+    let timestamp_text = timestamp.as_ref().map(|value| value.fallback_text.clone());
     match item_type.as_str() {
         "userMessage" => ThreadItemSnapshot {
             item_type,
@@ -145,7 +148,8 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
             preview: None,
             body: Some(join_user_content(item.get("content"))),
             meta: Vec::new(),
-            timestamp,
+            timestamp: timestamp_text,
+            ui_timestamp: timestamp,
         },
         "agentMessage" | "AgentMessage" => ThreadItemSnapshot {
             item_type,
@@ -156,7 +160,8 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
                 (!content.is_empty()).then_some(content)
             }),
             meta: phase_meta(item),
-            timestamp,
+            timestamp: timestamp_text,
+            ui_timestamp: timestamp,
         },
         "reasoning" => ThreadItemSnapshot {
             item_type,
@@ -164,7 +169,8 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
             preview: None,
             body: Some(join_reasoning_content(item)),
             meta: Vec::new(),
-            timestamp,
+            timestamp: timestamp_text,
+            ui_timestamp: timestamp,
         },
         "commandExecution" => ThreadItemSnapshot {
             item_type,
@@ -180,7 +186,8 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
             .into_iter()
             .flatten()
             .collect(),
-            timestamp,
+            timestamp: timestamp_text,
+            ui_timestamp: timestamp,
         },
         "mcpToolCall" => ThreadItemSnapshot {
             item_type,
@@ -202,7 +209,8 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
             .into_iter()
             .flatten()
             .collect(),
-            timestamp,
+            timestamp: timestamp_text,
+            ui_timestamp: timestamp,
         },
         "dynamicToolCall" => ThreadItemSnapshot {
             item_type,
@@ -224,7 +232,8 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
             .into_iter()
             .flatten()
             .collect(),
-            timestamp,
+            timestamp: timestamp_text,
+            ui_timestamp: timestamp,
         },
         "webSearch" => ThreadItemSnapshot {
             item_type,
@@ -236,7 +245,8 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
                 .map(compact_json)
                 .filter(|body| Some(body.as_str()) != json_string(item.get("query")).as_deref()),
             meta: Vec::new(),
-            timestamp,
+            timestamp: timestamp_text,
+            ui_timestamp: timestamp,
         },
         "fileChange" => {
             let summary = file_change_preview_and_body(item.get("changes"));
@@ -257,7 +267,8 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
                 .into_iter()
                 .flatten()
                 .collect(),
-                timestamp,
+                timestamp: timestamp_text,
+                ui_timestamp: timestamp,
             }
         }
         "enteredReviewMode" | "exitedReviewMode" => ThreadItemSnapshot {
@@ -270,7 +281,8 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
             preview: None,
             body: json_string(item.get("review")),
             meta: Vec::new(),
-            timestamp,
+            timestamp: timestamp_text,
+            ui_timestamp: timestamp,
         },
         "contextCompaction" => ThreadItemSnapshot {
             item_type,
@@ -278,7 +290,8 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
             preview: None,
             body: None,
             meta: Vec::new(),
-            timestamp,
+            timestamp: timestamp_text,
+            ui_timestamp: timestamp,
         },
         _ => ThreadItemSnapshot {
             item_type,
@@ -286,48 +299,18 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<String>) -> Thread
             preview: None,
             body: Some(compact_json(item)),
             meta: Vec::new(),
-            timestamp,
+            timestamp: timestamp_text,
+            ui_timestamp: timestamp,
         },
     }
 }
 
-fn extract_item_timestamp(item: &Value) -> Option<String> {
+fn extract_item_timestamp(item: &Value) -> Option<UiTimestamp> {
     let value = item
         .get("createdAt")
         .or_else(|| item.get("created_at"))
         .or_else(|| item.get("timestamp"))?;
-    match value {
-        Value::Number(number) => number.as_i64().map(format_history_timestamp).or_else(|| {
-            number
-                .as_u64()
-                .map(|value| format_history_timestamp(value as i64))
-        }),
-        Value::String(text) => format_history_timestamp_text(text).or_else(|| Some(text.clone())),
-        _ => None,
-    }
-}
-
-fn format_history_timestamp(timestamp: i64) -> String {
-    DateTime::<Utc>::from_timestamp(normalize_unix_timestamp(timestamp), 0)
-        .map(|value| value.format("%-I:%M %p UTC").to_string())
-        .unwrap_or_else(|| timestamp.to_string())
-}
-
-fn normalize_unix_timestamp(timestamp: i64) -> i64 {
-    if timestamp.unsigned_abs() >= 1_000_000_000_000 {
-        timestamp / 1_000
-    } else {
-        timestamp
-    }
-}
-
-fn format_history_timestamp_text(timestamp: &str) -> Option<String> {
-    DateTime::parse_from_rfc3339(timestamp).ok().map(|value| {
-        value
-            .with_timezone(&Utc)
-            .format("%-I:%M %p UTC")
-            .to_string()
-    })
+    UiTimestamp::from_history_value(value)
 }
 
 fn join_user_content(value: Option<&Value>) -> String {

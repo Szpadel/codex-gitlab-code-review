@@ -1,4 +1,5 @@
 mod status;
+mod timestamp;
 mod transcript;
 mod view;
 
@@ -294,6 +295,11 @@ mod tests {
         assert!(body.contains("Auth fallback cooldowns"));
         assert!(body.contains("group/&lt;repo&gt;"));
         assert!(body.contains("primary&lt;script&gt;"));
+        assert!(body.contains("class=\"localized-timestamp\""));
+        assert!(body.contains("datetime=\"2026-03-10T11:59:00Z\""));
+        assert!(body.contains("datetime=\"2026-03-10T12:00:00Z\""));
+        assert!(body.contains("Mar 10, 2026, 11:59 AM UTC"));
+        assert!(body.contains("Mar 10, 2026, 12:00 PM UTC"));
         assert!(!body.contains("primary<script>"));
         Ok(())
     }
@@ -534,6 +540,37 @@ mod tests {
     #[tokio::test]
     async fn history_page_renders_field_based_filters_layout() -> Result<()> {
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let run_id = insert_run_history(
+            &state,
+            NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 7,
+                head_sha: "abc777".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            RunHistorySessionUpdate::default(),
+            RunHistoryFinish {
+                result: "commented".to_string(),
+                preview: Some("Review group/repo !7".to_string()),
+                summary: Some("Posted findings".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let started_at = DateTime::parse_from_rfc3339("2026-03-10T12:00:00Z")?
+            .with_timezone(&Utc)
+            .timestamp();
+        sqlx::query("UPDATE run_history SET started_at = ?, updated_at = ? WHERE id = ?")
+            .bind(started_at)
+            .bind(started_at)
+            .bind(run_id)
+            .execute(state.pool())
+            .await?;
         let status_service = Arc::new(StatusService::new(
             test_config(),
             Arc::clone(&state),
@@ -543,7 +580,7 @@ mod tests {
         let address = spawn_test_server(app_router(status_service)).await?;
 
         let response = reqwest::get(format!(
-            "http://{address}/history?repo=group%2Frepo&iid=7&kind=mention&q=note"
+            "http://{address}/history?repo=group%2Frepo&iid=7&kind=review&q=findings"
         ))
         .await?;
         assert_eq!(response.status(), StatusCode::OK);
@@ -553,6 +590,9 @@ mod tests {
         assert!(body.contains("class=\"filter-actions\""));
         assert!(body.contains("name=\"repo\" value=\"group/repo\""));
         assert!(body.contains("name=\"iid\" value=\"7\""));
+        assert!(body.contains("class=\"localized-timestamp\""));
+        assert!(body.contains("data-timestamp=\"2026-03-10T12:00:00Z\""));
+        assert!(body.contains("Mar 10, 2026, 12:00 PM UTC"));
         Ok(())
     }
 
@@ -739,6 +779,21 @@ mod tests {
             },
         )
         .await?;
+        let started_at = DateTime::parse_from_rfc3339("2026-03-11T12:00:00Z")?
+            .with_timezone(&Utc)
+            .timestamp();
+        let finished_at = DateTime::parse_from_rfc3339("2026-03-11T12:05:00Z")?
+            .with_timezone(&Utc)
+            .timestamp();
+        sqlx::query(
+            "UPDATE run_history SET started_at = ?, finished_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(started_at)
+        .bind(finished_at)
+        .bind(finished_at)
+        .bind(run_id)
+        .execute(state.pool())
+        .await?;
         insert_run_history_events(
             &state,
             run_id,
@@ -900,7 +955,9 @@ mod tests {
         assert!(body.contains("transcript-stream"));
         assert!(body.contains("message-entry"));
         assert!(body.contains("message-timestamp"));
-        assert!(body.contains("12:54 PM UTC"));
+        assert!(body.contains("class=\"localized-timestamp message-timestamp\""));
+        assert!(body.contains("data-timestamp=\"2026-03-11T12:54:00Z\""));
+        assert!(body.contains("Mar 11, 2026, 12:54 PM UTC"));
         assert!(body.contains("reasoning-entry"));
         assert!(body.contains("terminal-entry"));
         assert!(body.contains("mcp-entry"));
@@ -977,6 +1034,21 @@ mod tests {
             },
         )
         .await?;
+        let started_at = DateTime::parse_from_rfc3339("2026-03-11T12:00:00Z")?
+            .with_timezone(&Utc)
+            .timestamp();
+        let finished_at = DateTime::parse_from_rfc3339("2026-03-11T12:05:00Z")?
+            .with_timezone(&Utc)
+            .timestamp();
+        sqlx::query(
+            "UPDATE run_history SET started_at = ?, finished_at = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(started_at)
+        .bind(finished_at)
+        .bind(finished_at)
+        .bind(run_id)
+        .execute(state.pool())
+        .await?;
         insert_run_history_events(
             &state,
             run_id,
@@ -1008,6 +1080,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await?;
         assert!(body.contains("meta-chip-label\">Thread</span><code>thread-review</code>"));
+        assert!(body.contains("data-timestamp=\"2026-03-11T12:00:00Z\""));
+        assert!(body.contains("data-timestamp=\"2026-03-11T12:05:00Z\""));
         Ok(())
     }
 
@@ -1175,7 +1249,8 @@ mod tests {
         let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.text().await?;
-        assert!(body.contains("12:54 PM UTC"));
+        assert!(body.contains("data-timestamp=\"2026-03-11T12:54:00Z\""));
+        assert!(body.contains("Mar 11, 2026, 12:54 PM UTC"));
         assert!(!body.contains("1773233640000"));
         Ok(())
     }

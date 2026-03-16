@@ -2,6 +2,7 @@ use super::status::{
     HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, StatusSnapshot, ThreadItemSnapshot,
     ThreadSnapshot, TranscriptBackfillSnapshot,
 };
+use super::timestamp::{self, UiTimestamp};
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, ProjectCatalogSummary,
     RunHistoryKind, RunHistoryRecord,
@@ -12,71 +13,74 @@ pub(super) fn render_status_page(snapshot: &StatusSnapshot) -> String {
     let scan = &snapshot.scan;
     let config = &snapshot.config;
     let scan_summary = vec![
-        ("State".to_string(), scan.scan_state.clone()),
+        ("State".to_string(), escape_html(&scan.scan_state)),
         (
             "Mode".to_string(),
-            scan.mode.clone().unwrap_or_else(|| "-".to_string()),
+            escape_html(scan.mode.as_deref().unwrap_or("-")),
         ),
         (
             "Started".to_string(),
-            scan.started_at.clone().unwrap_or_else(|| "-".to_string()),
+            render_rfc3339_timestamp(scan.started_at.as_deref()),
         ),
         (
             "Finished".to_string(),
-            scan.finished_at.clone().unwrap_or_else(|| "-".to_string()),
+            render_rfc3339_timestamp(scan.finished_at.as_deref()),
         ),
         (
             "Outcome".to_string(),
-            scan.outcome.clone().unwrap_or_else(|| "-".to_string()),
+            escape_html(scan.outcome.as_deref().unwrap_or("-")),
         ),
         (
             "Error".to_string(),
-            scan.error.clone().unwrap_or_else(|| "-".to_string()),
+            escape_html(scan.error.as_deref().unwrap_or("-")),
         ),
         (
             "Next scan".to_string(),
-            scan.next_scan_at.clone().unwrap_or_else(|| "-".to_string()),
+            render_rfc3339_timestamp(scan.next_scan_at.as_deref()),
         ),
     ];
     let config_summary = vec![
-        ("GitLab".to_string(), config.gitlab_base_url.clone()),
-        ("Bind".to_string(), config.bind_addr.clone()),
+        ("GitLab".to_string(), escape_html(&config.gitlab_base_url)),
+        ("Bind".to_string(), escape_html(&config.bind_addr)),
         (
             "Run once".to_string(),
-            bool_label(config.run_once).to_string(),
+            escape_html(bool_label(config.run_once)),
         ),
         (
             "Dry run".to_string(),
-            bool_label(config.dry_run).to_string(),
+            escape_html(bool_label(config.dry_run)),
         ),
         (
             "Mention commands".to_string(),
-            bool_label(config.mention_commands_enabled).to_string(),
+            escape_html(bool_label(config.mention_commands_enabled)),
         ),
         (
             "Browser MCP".to_string(),
-            bool_label(config.browser_mcp_enabled).to_string(),
+            escape_html(bool_label(config.browser_mcp_enabled)),
         ),
         (
             "Max concurrent".to_string(),
-            config.max_concurrent.to_string(),
+            escape_html(&config.max_concurrent.to_string()),
         ),
-        ("Cron".to_string(), config.schedule_cron.clone()),
-        ("Timezone".to_string(), config.schedule_timezone.clone()),
+        ("Cron".to_string(), escape_html(&config.schedule_cron)),
+        (
+            "Timezone".to_string(),
+            escape_html(&config.schedule_timezone),
+        ),
         (
             "Created after".to_string(),
-            config
-                .created_after
-                .clone()
-                .unwrap_or_else(|| "-".to_string()),
+            render_rfc3339_timestamp(config.created_after.as_deref()),
         ),
         (
             "Repo targets".to_string(),
-            target_label(config.repo_targets_all, config.repo_targets),
+            escape_html(&target_label(config.repo_targets_all, config.repo_targets)),
         ),
         (
             "Group targets".to_string(),
-            target_label(config.group_targets_all, config.group_targets),
+            escape_html(&target_label(
+                config.group_targets_all,
+                config.group_targets,
+            )),
         ),
     ];
     let body = format!(
@@ -86,7 +90,7 @@ pub(super) fn render_status_page(snapshot: &StatusSnapshot) -> String {
          <article class=\"card\"><h2>Configuration</h2><dl>{}</dl></article>\
          </section>\
          {}{}{}{}",
-        escape_html(&snapshot.generated_at),
+        render_rfc3339_timestamp(Some(&snapshot.generated_at)),
         render_definition_list(&scan_summary),
         render_definition_list(&config_summary),
         render_reviews_section(&snapshot.in_progress_reviews),
@@ -218,7 +222,7 @@ fn render_auth_section(entries: &[AuthLimitResetEntry]) -> String {
                     format!(
                         "<tr><td>{}</td><td>{}</td></tr>",
                         escape_html(&entry.account_name),
-                        escape_html(&entry.reset_at)
+                        render_rfc3339_timestamp(Some(&entry.reset_at))
                     )
                 })
                 .collect::<Vec<_>>()
@@ -243,7 +247,7 @@ fn render_catalog_section(catalogs: &[ProjectCatalogSummary]) -> String {
                         "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
                         escape_html(&catalog.cache_key),
                         catalog.project_count,
-                        catalog.fetched_at
+                        render_unix_timestamp(catalog.fetched_at)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -328,7 +332,7 @@ fn render_run_row(run: &RunHistoryRecord) -> String {
         mr_history_href(&run.repo, run.iid),
         run.iid,
         escape_html(run.result.as_deref().unwrap_or(&run.status)),
-        run.started_at,
+        render_unix_timestamp(run.started_at),
         run.id,
         escape_html(
             run.preview
@@ -341,46 +345,44 @@ fn render_run_row(run: &RunHistoryRecord) -> String {
 
 fn render_run_metadata(run: &RunHistoryRecord) -> String {
     let items = vec![
-        ("Kind".to_string(), run_kind_label(run.kind).to_string()),
-        ("Repo".to_string(), run.repo.clone()),
-        ("MR".to_string(), format!("!{}", run.iid)),
-        ("Head SHA".to_string(), run.head_sha.clone()),
-        ("Status".to_string(), run.status.clone()),
+        ("Kind".to_string(), escape_html(run_kind_label(run.kind))),
+        ("Repo".to_string(), escape_html(&run.repo)),
+        ("MR".to_string(), escape_html(&format!("!{}", run.iid))),
+        ("Head SHA".to_string(), escape_html(&run.head_sha)),
+        ("Status".to_string(), escape_html(&run.status)),
         (
             "Result".to_string(),
-            run.result.clone().unwrap_or_else(|| "-".to_string()),
+            escape_html(run.result.as_deref().unwrap_or("-")),
         ),
-        ("Started".to_string(), run.started_at.to_string()),
+        ("Started".to_string(), render_unix_timestamp(run.started_at)),
         (
             "Finished".to_string(),
-            run.finished_at
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_string()),
+            render_optional_unix_timestamp(run.finished_at),
         ),
         (
             "Account".to_string(),
-            run.auth_account_name
-                .clone()
-                .unwrap_or_else(|| "-".to_string()),
+            escape_html(run.auth_account_name.as_deref().unwrap_or("-")),
         ),
         (
             "Thread".to_string(),
-            run.review_thread_id
-                .clone()
-                .or_else(|| run.thread_id.clone())
-                .unwrap_or_else(|| "-".to_string()),
+            escape_html(
+                run.review_thread_id
+                    .as_deref()
+                    .or(run.thread_id.as_deref())
+                    .unwrap_or("-"),
+            ),
         ),
         (
             "Turn".to_string(),
-            run.turn_id.clone().unwrap_or_else(|| "-".to_string()),
+            escape_html(run.turn_id.as_deref().unwrap_or("-")),
         ),
         (
             "Command repo".to_string(),
-            run.command_repo.clone().unwrap_or_else(|| "-".to_string()),
+            escape_html(run.command_repo.as_deref().unwrap_or("-")),
         ),
         (
             "Commit SHA".to_string(),
-            run.commit_sha.clone().unwrap_or_else(|| "-".to_string()),
+            escape_html(run.commit_sha.as_deref().unwrap_or("-")),
         ),
     ];
     format!("<dl>{}</dl>", render_definition_list(&items))
@@ -394,9 +396,9 @@ fn render_related_runs(runs: &[RunHistoryRecord], current_id: i64) -> String {
             format!(
                 "<li><a href=\"/history/{}\">{} {} {}</a></li>",
                 run.id,
-                run_kind_label(run.kind),
-                run.result.as_deref().unwrap_or(&run.status),
-                run.started_at
+                escape_html(run_kind_label(run.kind)),
+                escape_html(run.result.as_deref().unwrap_or(&run.status)),
+                render_unix_timestamp(run.started_at)
             )
         })
         .collect::<Vec<_>>();
@@ -418,19 +420,19 @@ fn render_trigger_card(run: &RunHistoryRecord) -> String {
         render_definition_list(&[
             (
                 "Discussion".to_string(),
-                run.discussion_id.clone().unwrap_or_else(|| "-".to_string()),
+                escape_html(run.discussion_id.as_deref().unwrap_or("-")),
             ),
             (
                 "Trigger note".to_string(),
-                run.trigger_note_id
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
+                escape_html(
+                    &run.trigger_note_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
             ),
             (
                 "Author".to_string(),
-                run.trigger_note_author_name
-                    .clone()
-                    .unwrap_or_else(|| "-".to_string()),
+                escape_html(run.trigger_note_author_name.as_deref().unwrap_or("-")),
             ),
         ]),
         escape_html(
@@ -898,13 +900,16 @@ fn render_meta_pills(meta: &[(String, String)]) -> String {
 }
 
 fn render_entry_timestamp(item: &ThreadItemSnapshot) -> String {
-    item.timestamp
-        .as_deref()
-        .map(|timestamp| {
-            format!(
-                "<span class=\"message-timestamp\">{}</span>",
-                escape_html(timestamp)
-            )
+    item.ui_timestamp
+        .as_ref()
+        .map(|timestamp| timestamp::render(timestamp, &["message-timestamp"]))
+        .or_else(|| {
+            item.timestamp.as_deref().map(|timestamp| {
+                format!(
+                    "<span class=\"message-timestamp\">{}</span>",
+                    escape_html(timestamp)
+                )
+            })
         })
         .unwrap_or_default()
 }
@@ -1150,7 +1155,7 @@ fn render_definition_list(items: &[(String, String)]) -> String {
             format!(
                 "<div class=\"pair\"><dt>{}</dt><dd>{}</dd></div>",
                 escape_html(label),
-                escape_html(value)
+                value
             )
         })
         .collect::<Vec<_>>()
@@ -1161,16 +1166,39 @@ fn render_shell(title: &str, active: NavItem, content: String) -> String {
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>Codex GitLab Review {}</title><style>{}</style></head><body>\
+         <title>Codex GitLab Review {}</title><style>{}{}</style></head><body>\
          <div class=\"layout\">\
          <aside class=\"sidebar\"><div class=\"brand\">Codex GitLab Review</div>{}</aside>\
          <main class=\"content\">{}</main>\
-         </div></body></html>",
+         </div>{}</body></html>",
         escape_html(title),
         page_style(),
+        timestamp::style_fragment(),
         render_nav(active),
-        content
+        content,
+        timestamp::script_tag(),
     )
+}
+
+fn render_rfc3339_timestamp(timestamp: Option<&str>) -> String {
+    match timestamp {
+        Some(value) => UiTimestamp::from_rfc3339_text(value)
+            .map(|timestamp| timestamp::render(&timestamp, &[]))
+            .unwrap_or_else(|| escape_html(value)),
+        None => "-".to_string(),
+    }
+}
+
+fn render_unix_timestamp(timestamp: i64) -> String {
+    UiTimestamp::from_unix_timestamp(timestamp)
+        .map(|timestamp| timestamp::render(&timestamp, &[]))
+        .unwrap_or_else(|| escape_html(&timestamp.to_string()))
+}
+
+fn render_optional_unix_timestamp(timestamp: Option<i64>) -> String {
+    timestamp
+        .map(render_unix_timestamp)
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn render_nav(active: NavItem) -> String {
