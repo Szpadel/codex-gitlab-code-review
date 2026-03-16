@@ -183,7 +183,7 @@ impl HistoryQueryParams {
 }
 
 fn decode_repo_key(repo_key: &str) -> anyhow::Result<String> {
-    if repo_key.len() % 2 != 0 {
+    if !repo_key.len().is_multiple_of(2) {
         anyhow::bail!("invalid repo key");
     }
     let mut bytes = Vec::with_capacity(repo_key.len() / 2);

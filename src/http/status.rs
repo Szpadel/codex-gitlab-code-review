@@ -538,137 +538,137 @@ async fn run_transcript_backfill(
         && target_turn_missing_in_persisted
         && run.turn_id.is_some()
         && had_any_original_persisted_events;
-    if run.turn_id.as_deref().is_some()
+    let only_target_turn_is_incomplete = run.turn_id.as_deref().is_some_and(|turn_id| {
+        rebuilt_thread
+            .as_ref()
+            .is_some_and(|thread| thread_snapshot_only_target_turn_is_incomplete(thread, turn_id))
+    });
+    let needs_full_thread_rebuild = run.turn_id.as_deref().is_some()
         && (candidate_events.is_empty()
             || target_turn_missing_in_persisted
             || needs_review_wrapper_missing_target_recovery
             || (!rebuilt_thread
                 .as_ref()
                 .is_some_and(thread_snapshot_is_complete)
-                && !run.turn_id.as_deref().is_some_and(|turn_id| {
-                    rebuilt_thread.as_ref().is_some_and(|thread| {
-                        thread_snapshot_only_target_turn_is_incomplete(thread, turn_id)
-                    })
-                })))
+                && !only_target_turn_is_incomplete));
+    if needs_full_thread_rebuild
+        && let Some(full_thread_events) = source.load_events(thread_id, None).await?
     {
-        if let Some(full_thread_events) = source.load_events(thread_id, None).await? {
-            let persisted_events_for_full_thread = sanitize_persisted_events_for_backfill(
-                persisted_events.clone(),
-                run.turn_id.as_deref(),
-                Some(&full_thread_events),
-            );
-            let persisted_turn_ids_in_full_thread =
-                persisted_turn_ids(&persisted_events_for_full_thread);
-            let filtered_turn_ids = if persisted_turn_ids_in_full_thread.is_empty() {
-                run.turn_id
-                    .as_deref()
-                    .map(|turn_id| HashSet::from([turn_id.to_string()]))
-                    .unwrap_or_else(|| turn_ids_from_new_events(&full_thread_events))
-            } else if needs_review_wrapper_missing_target_recovery
-                || (target_turn_missing_in_persisted && run.turn_id.is_some())
-            {
-                persisted_turn_ids_with_target_turn_id(
-                    &persisted_turn_ids_in_full_thread,
-                    run.turn_id.as_deref().expect("turn id checked above"),
-                )
+        let persisted_events_for_full_thread = sanitize_persisted_events_for_backfill(
+            persisted_events.clone(),
+            run.turn_id.as_deref(),
+            Some(&full_thread_events),
+        );
+        let persisted_turn_ids_in_full_thread =
+            persisted_turn_ids(&persisted_events_for_full_thread);
+        let filtered_turn_ids = if persisted_turn_ids_in_full_thread.is_empty() {
+            run.turn_id
+                .as_deref()
+                .map(|turn_id| HashSet::from([turn_id.to_string()]))
+                .unwrap_or_else(|| turn_ids_from_new_events(&full_thread_events))
+        } else if needs_review_wrapper_missing_target_recovery
+            || (target_turn_missing_in_persisted && run.turn_id.is_some())
+        {
+            persisted_turn_ids_with_target_turn_id(
+                &persisted_turn_ids_in_full_thread,
+                run.turn_id.as_deref().expect("turn id checked above"),
+            )
+        } else {
+            persisted_turn_ids_in_full_thread.clone()
+        };
+        let filtered_full_thread_events =
+            if persisted_turn_id_set.is_empty() && run.turn_id.is_none() {
+                full_thread_events.clone()
             } else {
-                persisted_turn_ids_in_full_thread.clone()
+                filter_events_to_turn_ids(&full_thread_events, &filtered_turn_ids)
             };
-            let filtered_full_thread_events =
-                if persisted_turn_id_set.is_empty() && run.turn_id.is_none() {
-                    full_thread_events.clone()
-                } else {
-                    filter_events_to_turn_ids(&full_thread_events, &filtered_turn_ids)
-                };
-            let filtered_full_thread_has_missing_review_child_history =
-                events_have_missing_review_child_history(&filtered_full_thread_events);
-            let filtered_full_thread_can_fall_back =
-                !filtered_full_thread_has_missing_review_child_history
-                    || missing_review_child_history_has_renderable_fallback(
-                        &filtered_full_thread_events,
-                    );
-            let allow_target_only_recovery_despite_unrelated_missing_child_history =
-                target_turn_missing_in_persisted
-                    && run.turn_id.is_some()
-                    && filtered_full_thread_has_missing_review_child_history
-                    && (!allow_missing_review_child_history || !filtered_full_thread_can_fall_back);
-            if filtered_full_thread_has_missing_review_child_history
-                && !allow_missing_review_child_history
-                && !allow_target_only_recovery_despite_unrelated_missing_child_history
-            {
+        let filtered_full_thread_has_missing_review_child_history =
+            events_have_missing_review_child_history(&filtered_full_thread_events);
+        let filtered_full_thread_can_fall_back =
+            !filtered_full_thread_has_missing_review_child_history
+                || missing_review_child_history_has_renderable_fallback(
+                    &filtered_full_thread_events,
+                );
+        let allow_target_only_recovery_despite_unrelated_missing_child_history =
+            target_turn_missing_in_persisted
+                && run.turn_id.is_some()
+                && filtered_full_thread_has_missing_review_child_history
+                && (!allow_missing_review_child_history || !filtered_full_thread_can_fall_back);
+        if filtered_full_thread_has_missing_review_child_history
+            && !allow_missing_review_child_history
+            && !allow_target_only_recovery_despite_unrelated_missing_child_history
+        {
+            anyhow::bail!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR);
+        }
+        if filtered_full_thread_has_missing_review_child_history
+            && allow_missing_review_child_history
+            && !filtered_full_thread_can_fall_back
+            && !allow_target_only_recovery_despite_unrelated_missing_child_history
+        {
+            anyhow::bail!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR);
+        }
+        let filtered_full_thread_events =
+            strip_missing_review_child_history_markers(filtered_full_thread_events);
+        let filtered_thread = thread_snapshot_from_events(
+            run,
+            &ephemeral_run_history_events(&filtered_full_thread_events),
+        );
+        let should_accept_filtered_full_thread = !(filtered_full_thread_events.is_empty()
+            || (allow_target_only_recovery_despite_unrelated_missing_child_history
+                && filtered_full_thread_has_missing_review_child_history));
+        if should_accept_filtered_full_thread
+            && persisted_turn_ids_are_covered(&filtered_turn_ids, &filtered_full_thread_events)
+            && filtered_thread
+                .as_ref()
+                .is_some_and(thread_snapshot_is_complete)
+        {
+            rebuilt_thread = filtered_thread;
+            candidate_events = filtered_full_thread_events;
+        } else if target_turn_missing_in_persisted && run.turn_id.is_some() {
+            let target_only_turn_ids = HashSet::from([run
+                .turn_id
+                .as_deref()
+                .expect("turn id checked above")
+                .to_string()]);
+            let target_only_full_thread_events =
+                filter_events_to_turn_ids(&full_thread_events, &target_only_turn_ids);
+            let target_only_has_missing_review_child_history =
+                events_have_missing_review_child_history(&target_only_full_thread_events);
+            if target_only_has_missing_review_child_history && !allow_missing_review_child_history {
                 anyhow::bail!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR);
             }
-            if filtered_full_thread_has_missing_review_child_history
+            if target_only_has_missing_review_child_history
                 && allow_missing_review_child_history
-                && !filtered_full_thread_can_fall_back
-                && !allow_target_only_recovery_despite_unrelated_missing_child_history
+                && !missing_review_child_history_has_renderable_fallback(
+                    &target_only_full_thread_events,
+                )
             {
                 anyhow::bail!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR);
             }
-            let filtered_full_thread_events =
-                strip_missing_review_child_history_markers(filtered_full_thread_events);
-            let filtered_thread = thread_snapshot_from_events(
+            let target_only_full_thread_events =
+                strip_missing_review_child_history_markers(target_only_full_thread_events);
+            let target_only_thread = thread_snapshot_from_events(
                 run,
-                &ephemeral_run_history_events(&filtered_full_thread_events),
+                &ephemeral_run_history_events(&target_only_full_thread_events),
             );
-            if !filtered_full_thread_events.is_empty()
-                && !(allow_target_only_recovery_despite_unrelated_missing_child_history
-                    && filtered_full_thread_has_missing_review_child_history)
-                && persisted_turn_ids_are_covered(&filtered_turn_ids, &filtered_full_thread_events)
-                && filtered_thread
+            if !target_only_full_thread_events.is_empty()
+                && persisted_turn_ids_are_covered(
+                    &target_only_turn_ids,
+                    &target_only_full_thread_events,
+                )
+                && target_only_thread
                     .as_ref()
                     .is_some_and(thread_snapshot_is_complete)
             {
-                rebuilt_thread = filtered_thread;
-                candidate_events = filtered_full_thread_events;
-            } else if target_turn_missing_in_persisted && run.turn_id.is_some() {
-                let target_only_turn_ids = HashSet::from([run
-                    .turn_id
-                    .as_deref()
-                    .expect("turn id checked above")
-                    .to_string()]);
-                let target_only_full_thread_events =
-                    filter_events_to_turn_ids(&full_thread_events, &target_only_turn_ids);
-                let target_only_has_missing_review_child_history =
-                    events_have_missing_review_child_history(&target_only_full_thread_events);
-                if target_only_has_missing_review_child_history
-                    && !allow_missing_review_child_history
-                {
-                    anyhow::bail!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR);
-                }
-                if target_only_has_missing_review_child_history
-                    && allow_missing_review_child_history
-                    && !missing_review_child_history_has_renderable_fallback(
-                        &target_only_full_thread_events,
-                    )
-                {
-                    anyhow::bail!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR);
-                }
-                let target_only_full_thread_events =
-                    strip_missing_review_child_history_markers(target_only_full_thread_events);
-                let target_only_thread = thread_snapshot_from_events(
+                candidate_events = merge_recovered_target_turn_events(
+                    persisted_events.clone(),
+                    run.turn_id.as_deref().expect("turn id checked above"),
+                    &target_only_full_thread_events,
+                )?;
+                rebuilt_thread = thread_snapshot_from_events(
                     run,
-                    &ephemeral_run_history_events(&target_only_full_thread_events),
+                    &ephemeral_run_history_events(&candidate_events),
                 );
-                if !target_only_full_thread_events.is_empty()
-                    && persisted_turn_ids_are_covered(
-                        &target_only_turn_ids,
-                        &target_only_full_thread_events,
-                    )
-                    && target_only_thread
-                        .as_ref()
-                        .is_some_and(thread_snapshot_is_complete)
-                {
-                    candidate_events = merge_recovered_target_turn_events(
-                        persisted_events.clone(),
-                        run.turn_id.as_deref().expect("turn id checked above"),
-                        &target_only_full_thread_events,
-                    )?;
-                    rebuilt_thread = thread_snapshot_from_events(
-                        run,
-                        &ephemeral_run_history_events(&candidate_events),
-                    );
-                }
             }
         }
     }

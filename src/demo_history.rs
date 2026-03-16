@@ -77,10 +77,7 @@ async fn seed_example_history_with_store(
     let mut runs = Vec::new();
     let seed_specs = demo_run_specs();
     for spec in seed_specs {
-        let transcript = match spec.transcript {
-            Some(kind) => Some(seed_transcript(kind)),
-            None => None,
-        };
+        let transcript = spec.transcript.map(seed_transcript);
         let run_id = state
             .start_run_history(NewRunHistory {
                 kind: spec.kind,

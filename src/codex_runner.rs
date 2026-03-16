@@ -108,6 +108,12 @@ struct StartedAppServer {
     client: AppServerClient,
 }
 
+struct TurnNotificationContext<'a> {
+    thread_id: &'a str,
+    turn_id: &'a str,
+    history_capture: &'a mut TurnHistoryCapture,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BrowserLaunchConfig {
     image: String,
@@ -2520,9 +2526,11 @@ impl AppServerClient {
             let outcome = match self.handle_turn_notification(
                 method,
                 params,
-                thread_id,
-                turn_id,
-                &mut history_capture,
+                TurnNotificationContext {
+                    thread_id,
+                    turn_id,
+                    history_capture: &mut history_capture,
+                },
                 |_, _| {},
                 |item| {
                     if let Some(review) = item.get("review").and_then(|value| value.as_str())
@@ -2582,9 +2590,11 @@ impl AppServerClient {
             let outcome = match self.handle_turn_notification(
                 method,
                 params,
-                thread_id,
-                turn_id,
-                &mut history_capture,
+                TurnNotificationContext {
+                    thread_id,
+                    turn_id,
+                    history_capture: &mut history_capture,
+                },
                 |item_id, delta| {
                     if item_id != "<unknown>" {
                         message_deltas
@@ -2650,9 +2660,7 @@ impl AppServerClient {
         &mut self,
         method: &str,
         params: Option<&Value>,
-        thread_id: &str,
-        turn_id: &str,
-        history_capture: &mut TurnHistoryCapture,
+        context: TurnNotificationContext<'_>,
         mut on_agent_message_delta: FDelta,
         mut on_item_completed: FCompleted,
     ) -> Result<TurnStreamNotificationOutcome>
@@ -2660,6 +2668,11 @@ impl AppServerClient {
         FDelta: FnMut(&str, &str),
         FCompleted: FnMut(&Value),
     {
+        let TurnNotificationContext {
+            thread_id,
+            turn_id,
+            history_capture,
+        } = context;
         match method {
             "turn/started" => {
                 history_capture.push(
@@ -3961,9 +3974,11 @@ mod tests {
                 "itemId": "item-1",
                 "delta": "Reply from deltas"
             })),
-            "thread-1",
-            "turn-1",
-            &mut capture,
+            TurnNotificationContext {
+                thread_id: "thread-1",
+                turn_id: "turn-1",
+                history_capture: &mut capture,
+            },
             |_, _| {},
             |_| {},
         )?;
@@ -3980,9 +3995,11 @@ mod tests {
                     "phase": "final"
                 }
             })),
-            "thread-1",
-            "turn-1",
-            &mut capture,
+            TurnNotificationContext {
+                thread_id: "thread-1",
+                turn_id: "turn-1",
+                history_capture: &mut capture,
+            },
             |_, _| {},
             |item| completed = Some(item.clone()),
         )?;
@@ -4008,9 +4025,11 @@ mod tests {
                 "itemId": "cmd-1",
                 "delta": "line one\nline two"
             })),
-            "thread-1",
-            "turn-1",
-            &mut capture,
+            TurnNotificationContext {
+                thread_id: "thread-1",
+                turn_id: "turn-1",
+                history_capture: &mut capture,
+            },
             |_, _| {},
             |_| {},
         )?;
@@ -4028,9 +4047,11 @@ mod tests {
                     "status": "completed"
                 }
             })),
-            "thread-1",
-            "turn-1",
-            &mut capture,
+            TurnNotificationContext {
+                thread_id: "thread-1",
+                turn_id: "turn-1",
+                history_capture: &mut capture,
+            },
             |_, _| {},
             |item| completed = Some(item.clone()),
         )?;

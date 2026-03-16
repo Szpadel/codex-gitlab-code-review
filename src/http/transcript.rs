@@ -123,7 +123,7 @@ fn turn_snapshot_is_complete(turn: &TurnSnapshot) -> bool {
     let has_renderable_non_reasoning_item = turn
         .items
         .iter()
-        .any(|item| reasoning_fallback_supports_completeness(item));
+        .any(reasoning_fallback_supports_completeness);
     turn.items.iter().all(|item| {
         thread_item_is_self_contained(item)
             || (item.item_type == "reasoning" && has_renderable_non_reasoning_item)

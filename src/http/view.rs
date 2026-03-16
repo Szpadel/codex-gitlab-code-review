@@ -557,9 +557,12 @@ fn render_message_entry(role: &str, role_class: &str, item: &ThreadItemSnapshot)
 
 fn render_mcp_entry(item: &ThreadItemSnapshot) -> String {
     render_expandable_entry(
-        "mcp-entry",
-        "tool-summary",
-        "MCP tool",
+        ExpandableEntryOptions {
+            entry_class: "mcp-entry",
+            summary_class: "tool-summary",
+            kicker: "MCP tool",
+            open: false,
+        },
         format!(
             "<span class=\"entry-title\">{}</span>",
             escape_html(&item.title)
@@ -579,15 +582,17 @@ fn render_mcp_entry(item: &ThreadItemSnapshot) -> String {
                 )
             })
             .unwrap_or_default(),
-        false,
     )
 }
 
 fn render_dynamic_tool_entry(item: &ThreadItemSnapshot) -> String {
     render_expandable_entry(
-        "dynamic-tool-entry",
-        "tool-summary",
-        "Dynamic tool",
+        ExpandableEntryOptions {
+            entry_class: "dynamic-tool-entry",
+            summary_class: "tool-summary",
+            kicker: "Dynamic tool",
+            open: false,
+        },
         format!(
             "<span class=\"entry-title\">{}</span>",
             escape_html(&item.title)
@@ -605,7 +610,6 @@ fn render_dynamic_tool_entry(item: &ThreadItemSnapshot) -> String {
                 )
             })
             .unwrap_or_default(),
-        false,
     )
 }
 
@@ -613,9 +617,12 @@ fn render_reasoning_entry(item: &ThreadItemSnapshot) -> String {
     let (summary, detail) = split_reasoning_content(item.body.as_deref());
     let open = detail.is_none();
     render_expandable_entry(
-        "reasoning-entry",
-        "reasoning-summary",
-        "Reasoning",
+        ExpandableEntryOptions {
+            entry_class: "reasoning-entry",
+            summary_class: "reasoning-summary",
+            kicker: "Reasoning",
+            open,
+        },
         format!(
             "<span class=\"entry-title reasoning-summary-text\">{}</span>",
             escape_html(summary.as_deref().unwrap_or(&item.title))
@@ -625,16 +632,18 @@ fn render_reasoning_entry(item: &ThreadItemSnapshot) -> String {
         detail
             .map(|body| format!("<div class=\"reasoning-body\">{}</div>", escape_html(&body)))
             .unwrap_or_default(),
-        open,
     )
 }
 
 fn render_web_search_entry(item: &ThreadItemSnapshot) -> String {
     if let Some(body) = item.body.as_deref() {
         return render_expandable_entry(
-            "web-search-entry",
-            "web-search-summary",
-            "Web search",
+            ExpandableEntryOptions {
+                entry_class: "web-search-entry",
+                summary_class: "web-search-summary",
+                kicker: "Web search",
+                open: false,
+            },
             format!(
                 "<span class=\"entry-title\">{}</span>",
                 escape_html(item.preview.as_deref().unwrap_or(&item.title))
@@ -645,7 +654,6 @@ fn render_web_search_entry(item: &ThreadItemSnapshot) -> String {
                 "<pre class=\"activity-body compact-activity-body\">{}</pre>",
                 escape_html(body)
             ),
-            false,
         );
     }
     render_static_entry(
@@ -739,9 +747,12 @@ fn render_file_change_entry(item: &ThreadItemSnapshot) -> String {
         .cloned()
         .collect::<Vec<_>>();
     render_expandable_entry(
-        "file-change-entry",
-        "file-change-summary",
-        "File change",
+        ExpandableEntryOptions {
+            entry_class: "file-change-entry",
+            summary_class: "file-change-summary",
+            kicker: "File change",
+            open: false,
+        },
         format!(
             "<span class=\"entry-title\">{}</span>",
             escape_html(item.preview.as_deref().unwrap_or(&item.title))
@@ -755,7 +766,6 @@ fn render_file_change_entry(item: &ThreadItemSnapshot) -> String {
             render_entry_timestamp(item)
         ),
         render_file_change_body(item),
-        false,
     )
 }
 
@@ -804,15 +814,19 @@ fn render_static_entry(
     )
 }
 
+struct ExpandableEntryOptions<'a> {
+    entry_class: &'a str,
+    summary_class: &'a str,
+    kicker: &'a str,
+    open: bool,
+}
+
 fn render_expandable_entry(
-    entry_class: &str,
-    summary_class: &str,
-    kicker: &str,
+    options: ExpandableEntryOptions<'_>,
     title_html: String,
     preview_html: Option<String>,
     meta_html: String,
     body_html: String,
-    open: bool,
 ) -> String {
     format!(
         "<details class=\"transcript-entry {}\"{}>\
@@ -820,10 +834,15 @@ fn render_expandable_entry(
          </summary>\
          {}\
          </details>",
-        entry_class,
-        if open { " open" } else { "" },
-        summary_class,
-        render_entry_header_content(kicker, &title_html, preview_html.as_deref(), &meta_html),
+        options.entry_class,
+        if options.open { " open" } else { "" },
+        options.summary_class,
+        render_entry_header_content(
+            options.kicker,
+            &title_html,
+            preview_html.as_deref(),
+            &meta_html,
+        ),
         body_html
     )
 }

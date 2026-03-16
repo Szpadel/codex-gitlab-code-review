@@ -410,17 +410,16 @@ fn parse_session_file_details(
                     Some("exited_review_mode") => {
                         if let Some(item) =
                             normalize_review_mode_event(payload, timestamp, "exitedReviewMode")
+                            && in_review_wrapper
                         {
-                            if in_review_wrapper {
-                                pending_review_wrapper_items.push(item);
-                            }
+                            pending_review_wrapper_items.push(item);
                         }
                     }
                     Some("agent_message") => {
-                        if let Some(item) = normalize_agent_message_event(payload, timestamp) {
-                            if in_review_wrapper {
-                                pending_review_wrapper_items.push(item);
-                            }
+                        if let Some(item) = normalize_agent_message_event(payload, timestamp)
+                            && in_review_wrapper
+                        {
+                            pending_review_wrapper_items.push(item);
                         }
                     }
                     _ => {}
@@ -768,7 +767,7 @@ fn filter_review_subagent_events(
                 .as_deref()
                 .is_some_and(|turn_id| child_turn_ids.contains(&turn_id))
         })
-        .filter(|event| review_subagent_event_is_renderable(event))
+        .filter(review_subagent_event_is_renderable)
         .map(|mut event| {
             event.turn_id = Some(parent_turn_id.to_string());
             event
@@ -887,8 +886,7 @@ fn ensure_parent_turn_shape(
         .collect::<Vec<_>>();
     let turn_completed = items
         .iter()
-        .filter(|event| event.event_type == "turn_completed")
-        .next_back()
+        .rfind(|event| event.event_type == "turn_completed")
         .cloned();
     items.retain(|event| event.event_type == "item_completed");
     if items.is_empty() && turn_completed.is_none() {

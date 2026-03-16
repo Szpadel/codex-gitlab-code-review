@@ -541,21 +541,20 @@ impl MentionFlow {
                 let effective_head_sha = effective_mr
                     .head_sha()
                     .unwrap_or_else(|| head_sha_copy.clone());
-                if effective_head_sha != head_sha_copy {
-                    if let Err(err) = state
+                if effective_head_sha != head_sha_copy
+                    && let Err(err) = state
                         .update_run_history_head_sha(run_history_id, &effective_head_sha)
                         .await
-                    {
-                        warn!(
-                            repo = repo_name.as_str(),
-                            iid = mr_copy.iid,
-                            discussion_id = discussion_id.as_str(),
-                            trigger_note_id,
-                            head_sha = effective_head_sha.as_str(),
-                            error = %err,
-                            "failed to refresh mention run history head sha"
-                        );
-                    }
+                {
+                    warn!(
+                        repo = repo_name.as_str(),
+                        iid = mr_copy.iid,
+                        discussion_id = discussion_id.as_str(),
+                        trigger_note_id,
+                        head_sha = effective_head_sha.as_str(),
+                        error = %err,
+                        "failed to refresh mention run history head sha"
+                    );
                 }
                 let prompt = MentionFlow::build_mention_prompt(
                     &repo_name,
