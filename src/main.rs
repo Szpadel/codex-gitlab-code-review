@@ -7,6 +7,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use codex_gitlab_code_review::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
@@ -243,6 +244,7 @@ async fn main() -> Result<()> {
         "using merge request created_after cutoff"
     );
     let review_owner_id = state.get_or_create_review_owner_id().await?;
+    let mention_commands_active = mention_commands_active(&config);
     let runner = Arc::new(DockerCodexRunner::new(
         config.docker.clone(),
         config.codex.clone(),
@@ -252,12 +254,14 @@ async fn main() -> Result<()> {
             gitlab_token: config.gitlab.token.clone(),
             log_all_json: cli.debug,
             owner_id: review_owner_id,
+            mention_commands_active,
             review_additional_developer_instructions: config
                 .review
                 .additional_developer_instructions
                 .clone(),
         },
     )?);
+    spawn_startup_warmup(runner.clone());
 
     let service = Arc::new(ReviewService::new(
         config.clone(),
@@ -399,6 +403,28 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn mention_commands_active(config: &Config) -> bool {
+    config.review.mention_commands.enabled
+        && !config.review.dry_run
+        && config
+            .review
+            .mention_commands
+            .bot_username
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn spawn_startup_warmup(
+    runner: Arc<dyn codex_gitlab_code_review::codex_runner::CodexRunner>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(err) = runner.warm_up_images().await {
+            warn!(error = %err, "startup docker image warm-up failed");
+        }
+    })
+}
+
 async fn run_schedule_loop(
     service: &ReviewService,
     status_service: &StatusService,
@@ -533,12 +559,18 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
+    use async_trait::async_trait;
+    use codex_gitlab_code_review::codex_runner::{
+        CodexResult, MentionCommandContext, MentionCommandResult, ReviewContext,
+    };
     use codex_gitlab_code_review::config::{
         BrowserMcpConfig, CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
         McpServerOverridesConfig, ReasoningEffortOverridesConfig, ReasoningSummaryOverridesConfig,
         ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
     };
     use sqlx::Executor;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
@@ -562,6 +594,81 @@ mod tests {
 
         assert!(executed.load(Ordering::SeqCst));
         Ok(())
+    }
+
+    struct WarmupRunner {
+        calls: Mutex<u32>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl codex_gitlab_code_review::codex_runner::CodexRunner for WarmupRunner {
+        async fn warm_up_images(&self) -> Result<()> {
+            *self.calls.lock().unwrap() += 1;
+            if self.fail {
+                Err(anyhow!("warmup failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+            unreachable!("run_review should not be called")
+        }
+
+        async fn run_mention_command(
+            &self,
+            _ctx: MentionCommandContext,
+        ) -> Result<MentionCommandResult> {
+            unreachable!("run_mention_command should not be called")
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_warmup_runs_runner_once() {
+        let runner = Arc::new(WarmupRunner {
+            calls: Mutex::new(0),
+            fail: false,
+        });
+
+        spawn_startup_warmup(runner.clone())
+            .await
+            .expect("task finished");
+
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_warmup_is_best_effort_on_failure() {
+        let runner = Arc::new(WarmupRunner {
+            calls: Mutex::new(0),
+            fail: true,
+        });
+
+        spawn_startup_warmup(runner.clone())
+            .await
+            .expect("task finished");
+
+        assert_eq!(*runner.calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn mention_commands_active_requires_runtime_usable_state() {
+        let mut config = test_config();
+        config.review.dry_run = false;
+        config.review.mention_commands.enabled = true;
+        config.review.mention_commands.bot_username = Some("bot".to_string());
+        assert!(mention_commands_active(&config));
+
+        config.review.dry_run = true;
+        assert!(!mention_commands_active(&config));
+
+        config.review.dry_run = false;
+        config.review.mention_commands.bot_username = None;
+        assert!(!mention_commands_active(&config));
+
+        config.review.mention_commands.bot_username = Some("   ".to_string());
+        assert!(!mention_commands_active(&config));
     }
 
     fn test_config() -> Config {

@@ -20,14 +20,15 @@ use bollard::query_parameters::{
     LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
 };
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt, future::BoxFuture, future::Shared};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::time::{Instant, sleep, timeout};
@@ -248,6 +249,10 @@ enum AuthFailureKind {
 
 #[async_trait]
 pub trait CodexRunner: Send + Sync {
+    async fn warm_up_images(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn run_review(&self, ctx: ReviewContext) -> Result<CodexResult>;
 
     async fn run_mention_command(
@@ -269,6 +274,7 @@ pub trait CodexRunner: Send + Sync {
 pub struct DockerCodexRunner {
     docker: Docker,
     codex: CodexConfig,
+    mention_commands_active: bool,
     review_additional_developer_instructions: Option<String>,
     git_base: Url,
     gitlab_token: String,
@@ -276,6 +282,14 @@ pub struct DockerCodexRunner {
     owner_id: String,
     state: Arc<ReviewStateStore>,
     auth_accounts: Vec<AuthAccount>,
+    image_pulls: Mutex<HashMap<String, InFlightImagePull>>,
+    next_image_pull_id: AtomicU64,
+}
+
+#[derive(Clone)]
+struct InFlightImagePull {
+    id: u64,
+    future: Shared<BoxFuture<'static, std::result::Result<(), Arc<String>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +297,7 @@ pub struct RunnerRuntimeOptions {
     pub gitlab_token: String,
     pub log_all_json: bool,
     pub owner_id: String,
+    pub mention_commands_active: bool,
     pub review_additional_developer_instructions: Option<String>,
 }
 
@@ -357,6 +372,7 @@ impl DockerCodexRunner {
         Ok(Self {
             docker,
             codex,
+            mention_commands_active: runtime.mention_commands_active,
             review_additional_developer_instructions: runtime
                 .review_additional_developer_instructions,
             git_base,
@@ -365,6 +381,8 @@ impl DockerCodexRunner {
             owner_id: runtime.owner_id,
             state,
             auth_accounts,
+            image_pulls: Mutex::new(HashMap::new()),
+            next_image_pull_id: AtomicU64::new(1),
         })
     }
 
@@ -387,6 +405,77 @@ impl DockerCodexRunner {
                 }),
         );
         accounts
+    }
+
+    fn warm_up_image_refs(&self) -> Vec<String> {
+        let mut images = vec![Self::normalize_image_reference(&self.codex.image)];
+        if self.browser_mcp_enabled_for_any_mode() {
+            let browser_image =
+                Self::normalize_image_reference(&self.codex.browser_mcp.browser_image);
+            if !images.contains(&browser_image) {
+                images.push(browser_image);
+            }
+        }
+        images
+    }
+
+    fn browser_mcp_enabled_for_any_mode(&self) -> bool {
+        effective_browser_mcp(self.browser_mcp(), &self.codex.mcp_server_overrides.review).is_some()
+            || (self.mention_commands_active
+                && effective_browser_mcp(
+                    self.browser_mcp(),
+                    &self.codex.mcp_server_overrides.mention,
+                )
+                .is_some())
+    }
+
+    async fn ensure_image_available(&self, image: &str) -> Result<()> {
+        let image = Self::normalize_image_reference(image);
+        let in_flight = {
+            let mut image_pulls = self
+                .image_pulls
+                .lock()
+                .expect("image pull map lock poisoned");
+            if let Some(in_flight) = image_pulls.get(&image) {
+                in_flight.clone()
+            } else {
+                let pull_id = self.next_image_pull_id.fetch_add(1, Ordering::Relaxed);
+                let docker = self.docker.clone();
+                let image_for_pull = image.clone();
+                let future = async move {
+                    ensure_image(&docker, &image_for_pull)
+                        .await
+                        .map_err(|err| Arc::new(format!("{err:#}")))
+                }
+                .boxed()
+                .shared();
+                let in_flight = InFlightImagePull {
+                    id: pull_id,
+                    future,
+                };
+                image_pulls.insert(image.clone(), in_flight.clone());
+                in_flight
+            }
+        };
+
+        let result = in_flight.future.await;
+        {
+            let mut image_pulls = self
+                .image_pulls
+                .lock()
+                .expect("image pull map lock poisoned");
+            if image_pulls
+                .get(&image)
+                .is_some_and(|current| current.id == in_flight.id)
+            {
+                image_pulls.remove(&image);
+            }
+        }
+        if let Err(err) = result {
+            return Err(anyhow!(err.as_ref().clone()));
+        }
+
+        Ok(())
     }
 
     fn clone_url(&self, repo: &str) -> Result<String> {
@@ -1457,7 +1546,7 @@ exec codex app-server --listen stdio://
         browser_mcp: Option<&BrowserMcpConfig>,
     ) -> Result<StartedAppServer> {
         let image_ref = Self::normalize_image_reference(&self.codex.image);
-        ensure_image(&self.docker, &image_ref).await?;
+        self.ensure_image_available(&image_ref).await?;
         let browser_container_id = if let Some(browser_mcp) = browser_mcp {
             Some(self.start_browser_container(browser_mcp).await?)
         } else {
@@ -1558,7 +1647,7 @@ exec codex app-server --listen stdio://
     async fn start_browser_container(&self, browser_mcp: &BrowserMcpConfig) -> Result<String> {
         let launch = BrowserLaunchConfig::from_browser_mcp(browser_mcp);
         let image_ref = launch.image.clone();
-        ensure_image(&self.docker, &image_ref).await?;
+        self.ensure_image_available(&image_ref).await?;
         let name = format!("{}{}", BROWSER_CONTAINER_NAME_PREFIX, Uuid::new_v4());
         let entrypoint_display = launch.entrypoint_display();
         let cmd_display = launch.cmd_display();
@@ -2244,6 +2333,16 @@ exec codex app-server --listen stdio://
 
 #[async_trait]
 impl CodexRunner for DockerCodexRunner {
+    async fn warm_up_images(&self) -> Result<()> {
+        let images = self.warm_up_image_refs();
+        info!(images = ?images, "warming up docker images");
+        for image in &images {
+            self.ensure_image_available(image).await?;
+            info!(image = image.as_str(), "docker image warm-up complete");
+        }
+        Ok(())
+    }
+
     async fn run_review(&self, ctx: ReviewContext) -> Result<CodexResult> {
         info!(
             repo = ctx.repo.as_str(),
@@ -4352,6 +4451,7 @@ mod tests {
                 reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
                 reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
             },
+            mention_commands_active: false,
             review_additional_developer_instructions: None,
             git_base: Url::parse("https://gitlab.example.com").expect("url"),
             gitlab_token: "token".to_string(),
@@ -4363,6 +4463,8 @@ mod tests {
                     .expect("state"),
             ),
             auth_accounts: Vec::new(),
+            image_pulls: Mutex::new(HashMap::new()),
+            next_image_pull_id: AtomicU64::new(1),
         };
 
         let env = runner.env_vars();
@@ -5364,6 +5466,167 @@ mod tests {
             DockerCodexRunner::normalize_image_reference(image),
             "localhost:5000/codex-universal:canary"
         );
+    }
+
+    #[test]
+    fn warm_up_image_refs_only_include_codex_image_when_browser_mcp_disabled() {
+        let runner = test_runner_with_codex(CodexConfig {
+            image: "ghcr.io/openai/codex-universal".to_string(),
+            browser_mcp: BrowserMcpConfig {
+                enabled: false,
+                ..BrowserMcpConfig::default()
+            },
+            ..test_codex_config()
+        });
+
+        assert_eq!(
+            runner.warm_up_image_refs(),
+            vec!["ghcr.io/openai/codex-universal:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn warm_up_image_refs_include_browser_image_when_any_mode_keeps_browser_enabled() {
+        let runner = test_runner_with_codex_and_mentions(
+            CodexConfig {
+                image: "ghcr.io/openai/codex-universal".to_string(),
+                browser_mcp: BrowserMcpConfig {
+                    enabled: true,
+                    server_name: "chrome-devtools".to_string(),
+                    browser_image: "chromedp/headless-shell".to_string(),
+                    ..BrowserMcpConfig::default()
+                },
+                mcp_server_overrides: McpServerOverridesConfig {
+                    review: BTreeMap::from([("chrome-devtools".to_string(), false)]),
+                    mention: BTreeMap::new(),
+                },
+                ..test_codex_config()
+            },
+            true,
+        );
+
+        assert_eq!(
+            runner.warm_up_image_refs(),
+            vec![
+                "ghcr.io/openai/codex-universal:latest".to_string(),
+                "chromedp/headless-shell:latest".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn warm_up_image_refs_skip_browser_image_when_mentions_are_disabled() {
+        let runner = test_runner_with_codex(CodexConfig {
+            image: "ghcr.io/openai/codex-universal".to_string(),
+            browser_mcp: BrowserMcpConfig {
+                enabled: true,
+                server_name: "chrome-devtools".to_string(),
+                browser_image: "chromedp/headless-shell".to_string(),
+                ..BrowserMcpConfig::default()
+            },
+            mcp_server_overrides: McpServerOverridesConfig {
+                review: BTreeMap::from([("chrome-devtools".to_string(), false)]),
+                mention: BTreeMap::new(),
+            },
+            ..test_codex_config()
+        });
+
+        assert_eq!(
+            runner.warm_up_image_refs(),
+            vec!["ghcr.io/openai/codex-universal:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn warm_up_image_refs_skip_browser_image_when_all_modes_disable_browser() {
+        let runner = test_runner_with_codex(CodexConfig {
+            image: "ghcr.io/openai/codex-universal".to_string(),
+            browser_mcp: BrowserMcpConfig {
+                enabled: true,
+                server_name: "chrome-devtools".to_string(),
+                browser_image: "chromedp/headless-shell".to_string(),
+                ..BrowserMcpConfig::default()
+            },
+            mcp_server_overrides: McpServerOverridesConfig {
+                review: BTreeMap::from([("chrome-devtools".to_string(), false)]),
+                mention: BTreeMap::from([("chrome-devtools".to_string(), false)]),
+            },
+            ..test_codex_config()
+        });
+
+        assert_eq!(
+            runner.warm_up_image_refs(),
+            vec!["ghcr.io/openai/codex-universal:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn warm_up_image_refs_deduplicate_identical_codex_and_browser_images() {
+        let runner = test_runner_with_codex(CodexConfig {
+            image: "ghcr.io/openai/codex-universal".to_string(),
+            browser_mcp: BrowserMcpConfig {
+                enabled: true,
+                server_name: "chrome-devtools".to_string(),
+                browser_image: "ghcr.io/openai/codex-universal:latest".to_string(),
+                ..BrowserMcpConfig::default()
+            },
+            ..test_codex_config()
+        });
+
+        assert_eq!(
+            runner.warm_up_image_refs(),
+            vec!["ghcr.io/openai/codex-universal:latest".to_string()]
+        );
+    }
+
+    fn test_codex_config() -> CodexConfig {
+        CodexConfig {
+            image: "ghcr.io/openai/codex-universal:latest".to_string(),
+            timeout_seconds: 300,
+            auth_host_path: "/root/.codex".to_string(),
+            auth_mount_path: "/root/.codex".to_string(),
+            session_history_path: None,
+            exec_sandbox: "danger-full-access".to_string(),
+            fallback_auth_accounts: Vec::new(),
+            usage_limit_fallback_cooldown_seconds: 3600,
+            deps: DepsConfig { enabled: false },
+            browser_mcp: BrowserMcpConfig::default(),
+            mcp_server_overrides: McpServerOverridesConfig::default(),
+            reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+            reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
+        }
+    }
+
+    fn test_runner_with_codex(codex: CodexConfig) -> DockerCodexRunner {
+        test_runner_with_codex_and_mentions(codex, false)
+    }
+
+    fn test_runner_with_codex_and_mentions(
+        codex: CodexConfig,
+        mention_commands_active: bool,
+    ) -> DockerCodexRunner {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        DockerCodexRunner {
+            docker: connect_docker(&DockerConfig {
+                host: "tcp://127.0.0.1:2375".to_string(),
+            })
+            .expect("docker client"),
+            codex,
+            mention_commands_active,
+            review_additional_developer_instructions: None,
+            git_base: Url::parse("https://gitlab.example.com").expect("url"),
+            gitlab_token: "token".to_string(),
+            log_all_json: false,
+            owner_id: "owner-id".to_string(),
+            state: Arc::new(
+                runtime
+                    .block_on(ReviewStateStore::new(":memory:"))
+                    .expect("state"),
+            ),
+            auth_accounts: Vec::new(),
+            image_pulls: Mutex::new(HashMap::new()),
+            next_image_pull_id: AtomicU64::new(1),
+        }
     }
 
     #[test]

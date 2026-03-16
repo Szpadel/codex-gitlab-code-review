@@ -111,6 +111,15 @@ async fn e2e_live_dry_run() -> Result<()> {
             gitlab_token: config.gitlab.token.clone(),
             log_all_json: false,
             owner_id: review_owner_id,
+            mention_commands_active: config.review.mention_commands.enabled
+                && !config.review.dry_run
+                && config
+                    .review
+                    .mention_commands
+                    .bot_username
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty()),
             review_additional_developer_instructions: config
                 .review
                 .additional_developer_instructions
