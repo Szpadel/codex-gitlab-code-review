@@ -230,6 +230,7 @@ mod tests {
             browser_mcp: BrowserMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
             reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+            reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
         }
     }
 

@@ -1304,6 +1304,7 @@ mod tests {
                 browser_mcp: crate::config::BrowserMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
                 reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+                reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
             },
             docker: DockerConfig {
                 host: "tcp://localhost:2375".to_string(),

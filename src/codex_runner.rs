@@ -172,6 +172,7 @@ struct BrowserContainerDiagnostics {
 struct AppServerCommandOptions<'a> {
     browser_mcp: Option<&'a BrowserMcpConfig>,
     mcp_server_overrides: &'a BTreeMap<String, bool>,
+    reasoning_summary: Option<&'a str>,
     reasoning_effort: Option<&'a str>,
 }
 
@@ -582,6 +583,8 @@ impl DockerCodexRunner {
         browser_mcp: Option<&BrowserMcpConfig>,
     ) -> Result<String> {
         let clone_url = self.clone_url(&ctx.repo)?;
+        let reasoning_summary =
+            configured_reasoning_summary(self.codex.reasoning_summary.review.as_deref());
         let reasoning_effort =
             configured_reasoning_effort(self.codex.reasoning_effort.review.as_deref());
         Ok(Self::build_command_script(
@@ -597,6 +600,7 @@ impl DockerCodexRunner {
             AppServerCommandOptions {
                 browser_mcp,
                 mcp_server_overrides: &self.codex.mcp_server_overrides.review,
+                reasoning_summary,
                 reasoning_effort,
             },
         ))
@@ -660,6 +664,7 @@ impl DockerCodexRunner {
         let app_server_exec_cmd = codex_app_server_exec_command(
             app_server.browser_mcp,
             app_server.mcp_server_overrides,
+            app_server.reasoning_summary,
             app_server.reasoning_effort,
         );
         format!(
@@ -851,6 +856,7 @@ export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
         let app_server_exec_cmd = codex_app_server_exec_command(
             app_server.browser_mcp,
             app_server.mcp_server_overrides,
+            app_server.reasoning_summary,
             app_server.reasoning_effort,
         );
         format!(
@@ -1829,6 +1835,8 @@ exec codex app-server --listen stdio://
         let clone_url = self.clone_url(&ctx.repo)?;
         let repo_dir = "/work/repo";
         let browser_mcp = self.effective_browser_mcp(&self.codex.mcp_server_overrides.mention);
+        let reasoning_summary =
+            configured_reasoning_summary(self.codex.reasoning_summary.mention.as_deref());
         let reasoning_effort =
             configured_reasoning_effort(self.codex.reasoning_effort.mention.as_deref());
         let script = Self::build_mention_command_script(
@@ -1838,6 +1846,7 @@ exec codex app-server --listen stdio://
             AppServerCommandOptions {
                 browser_mcp,
                 mcp_server_overrides: &self.codex.mcp_server_overrides.mention,
+                reasoning_summary,
                 reasoning_effort,
             },
         );
@@ -3706,16 +3715,32 @@ fn configured_reasoning_effort(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn configured_reasoning_summary(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 fn codex_app_server_exec_command(
     browser_mcp: Option<&BrowserMcpConfig>,
     mcp_server_overrides: &BTreeMap<String, bool>,
+    reasoning_summary: Option<&str>,
     reasoning_effort: Option<&str>,
 ) -> String {
-    if browser_mcp.is_none() && mcp_server_overrides.is_empty() && reasoning_effort.is_none() {
+    if browser_mcp.is_none()
+        && mcp_server_overrides.is_empty()
+        && reasoning_summary.is_none()
+        && reasoning_effort.is_none()
+    {
         return "exec codex app-server".to_string();
     }
 
     let mut cmd_parts = vec!["exec codex".to_string()];
+    if let Some(reasoning_summary) = reasoning_summary {
+        let override_value = format!(
+            "model_reasoning_summary={}",
+            toml_basic_string(reasoning_summary)
+        );
+        cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
+    }
     if let Some(reasoning_effort) = reasoning_effort {
         let override_value = format!(
             "model_reasoning_effort={}",
@@ -4278,6 +4303,7 @@ mod tests {
             browser_mcp: BrowserMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
             reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+            reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
         };
 
         let accounts = DockerCodexRunner::build_auth_accounts(&codex);
@@ -4324,6 +4350,7 @@ mod tests {
                 browser_mcp: BrowserMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
                 reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+                reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
             },
             review_additional_developer_instructions: None,
             git_base: Url::parse("https://gitlab.example.com").expect("url"),
@@ -4427,7 +4454,7 @@ mod tests {
     #[test]
     fn codex_app_server_exec_command_without_mcp_overrides_is_plain() {
         let overrides = BTreeMap::new();
-        let cmd = codex_app_server_exec_command(None, &overrides, None);
+        let cmd = codex_app_server_exec_command(None, &overrides, None, None);
         assert_eq!(cmd, "exec codex app-server");
     }
 
@@ -4435,7 +4462,7 @@ mod tests {
     fn codex_app_server_exec_command_renders_sorted_mcp_overrides() {
         let overrides =
             BTreeMap::from([("serena".to_string(), false), ("github".to_string(), true)]);
-        let cmd = codex_app_server_exec_command(None, &overrides, None);
+        let cmd = codex_app_server_exec_command(None, &overrides, None, None);
         assert_eq!(
             cmd,
             "exec codex -c 'mcp_servers.github.enabled=true' -c 'mcp_servers.serena.enabled=false' app-server"
@@ -4444,10 +4471,19 @@ mod tests {
 
     #[test]
     fn codex_app_server_exec_command_includes_reasoning_effort_override() {
-        let cmd = codex_app_server_exec_command(None, &BTreeMap::new(), Some("high"));
+        let cmd = codex_app_server_exec_command(None, &BTreeMap::new(), None, Some("high"));
         assert_eq!(
             cmd,
             "exec codex -c 'model_reasoning_effort=\"high\"' app-server"
+        );
+    }
+
+    #[test]
+    fn codex_app_server_exec_command_includes_reasoning_summary_override() {
+        let cmd = codex_app_server_exec_command(None, &BTreeMap::new(), Some("detailed"), None);
+        assert_eq!(
+            cmd,
+            "exec codex -c 'model_reasoning_summary=\"detailed\"' app-server"
         );
     }
 
@@ -4463,6 +4499,7 @@ mod tests {
                 ..BrowserMcpConfig::default()
             }),
             &BTreeMap::new(),
+            None,
             None,
         );
         assert!(cmd.contains("mcp_servers.chrome-devtools.command=\"npx\""));
@@ -4486,6 +4523,7 @@ mod tests {
             }),
             &BTreeMap::from([("chrome-devtools".to_string(), false)]),
             None,
+            None,
         );
         let expected_enable = "-c 'mcp_servers.chrome-devtools.enabled=true'";
         let expected_disable = "-c 'mcp_servers.chrome-devtools.enabled=false'";
@@ -4497,12 +4535,23 @@ mod tests {
     #[test]
     fn codex_app_server_exec_command_places_reasoning_effort_before_mcp_overrides() {
         let overrides = BTreeMap::from([("github".to_string(), false)]);
-        let cmd = codex_app_server_exec_command(None, &overrides, Some("medium"));
+        let cmd = codex_app_server_exec_command(None, &overrides, None, Some("medium"));
         let reasoning = "-c 'model_reasoning_effort=\"medium\"'";
         let mcp = "-c 'mcp_servers.github.enabled=false'";
         assert!(cmd.contains(reasoning));
         assert!(cmd.contains(mcp));
         assert!(cmd.find(reasoning) < cmd.find(mcp));
+    }
+
+    #[test]
+    fn codex_app_server_exec_command_places_reasoning_summary_before_effort() {
+        let cmd =
+            codex_app_server_exec_command(None, &BTreeMap::new(), Some("detailed"), Some("medium"));
+        let summary = "-c 'model_reasoning_summary=\"detailed\"'";
+        let effort = "-c 'model_reasoning_effort=\"medium\"'";
+        assert!(cmd.contains(summary));
+        assert!(cmd.contains(effort));
+        assert!(cmd.find(summary) < cmd.find(effort));
     }
 
     #[test]
@@ -4747,6 +4796,7 @@ mod tests {
             AppServerCommandOptions {
                 browser_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: None,
                 reasoning_effort: None,
             },
         );
@@ -4766,6 +4816,7 @@ mod tests {
             AppServerCommandOptions {
                 browser_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: None,
                 reasoning_effort: None,
             },
         );
@@ -4786,6 +4837,7 @@ mod tests {
             AppServerCommandOptions {
                 browser_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: None,
                 reasoning_effort: None,
             },
         );
@@ -4836,6 +4888,7 @@ mod tests {
             AppServerCommandOptions {
                 browser_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: None,
                 reasoning_effort: None,
             },
         );
@@ -4856,6 +4909,7 @@ mod tests {
             AppServerCommandOptions {
                 browser_mcp: None,
                 mcp_server_overrides: &overrides,
+                reasoning_summary: None,
                 reasoning_effort: None,
             },
         );
@@ -4874,10 +4928,30 @@ mod tests {
             AppServerCommandOptions {
                 browser_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: None,
                 reasoning_effort: Some("high"),
             },
         );
         assert!(script.contains("exec codex -c 'model_reasoning_effort=\"high\"' app-server"));
+    }
+
+    #[test]
+    fn build_command_script_includes_reasoning_summary_override() {
+        let script = DockerCodexRunner::build_command_script(
+            "https://example.com/repo.git",
+            "repo",
+            "abc",
+            "/root/.codex",
+            None,
+            false,
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: Some("detailed"),
+                reasoning_effort: None,
+            },
+        );
+        assert!(script.contains("exec codex -c 'model_reasoning_summary=\"detailed\"' app-server"));
     }
 
     #[test]
@@ -4899,6 +4973,7 @@ mod tests {
                     ..BrowserMcpConfig::default()
                 }),
                 mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: None,
                 reasoning_effort: None,
             },
         );
@@ -4965,6 +5040,7 @@ mod tests {
             AppServerCommandOptions {
                 browser_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: None,
                 reasoning_effort: None,
             },
         );
@@ -5020,6 +5096,7 @@ mod tests {
             AppServerCommandOptions {
                 browser_mcp: None,
                 mcp_server_overrides: &overrides,
+                reasoning_summary: None,
                 reasoning_effort: None,
             },
         );
@@ -5063,10 +5140,55 @@ mod tests {
             AppServerCommandOptions {
                 browser_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: None,
                 reasoning_effort: Some("low"),
             },
         );
         assert!(script.contains("exec codex -c 'model_reasoning_effort=\"low\"' app-server"));
+    }
+
+    #[test]
+    fn mention_command_script_includes_reasoning_summary_override() {
+        let ctx = MentionCommandContext {
+            repo: "group/repo".to_string(),
+            project_path: "group/repo".to_string(),
+            mr: MergeRequest {
+                iid: 11,
+                title: Some("Title".to_string()),
+                web_url: Some(
+                    "https://gitlab.example.com/group/repo/-/merge_requests/11".to_string(),
+                ),
+                created_at: None,
+                updated_at: None,
+                sha: Some("abc123".to_string()),
+                source_branch: None,
+                target_branch: Some("main".to_string()),
+                author: None,
+                source_project_id: None,
+                target_project_id: None,
+                diff_refs: None,
+            },
+            head_sha: "abc123".to_string(),
+            discussion_id: "discussion-1".to_string(),
+            trigger_note_id: 77,
+            requester_name: "Alice Example".to_string(),
+            requester_email: "alice@example.com".to_string(),
+            additional_developer_instructions: None,
+            prompt: "Do the change".to_string(),
+            run_history_id: None,
+        };
+        let script = DockerCodexRunner::build_mention_command_script(
+            &ctx,
+            "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "/root/.codex",
+            AppServerCommandOptions {
+                browser_mcp: None,
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: Some("detailed"),
+                reasoning_effort: None,
+            },
+        );
+        assert!(script.contains("exec codex -c 'model_reasoning_summary=\"detailed\"' app-server"));
     }
 
     #[test]
@@ -5113,6 +5235,7 @@ mod tests {
                     ..BrowserMcpConfig::default()
                 }),
                 mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: None,
                 reasoning_effort: None,
             },
         );

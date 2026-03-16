@@ -201,8 +201,9 @@ mod tests {
     use crate::codex_runner::{CodexResult, CodexRunner, ReviewContext};
     use crate::config::{
         BrowserMcpConfig, CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig,
-        GitLabTargets, McpServerOverridesConfig, ReasoningEffortOverridesConfig, ReviewConfig,
-        ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
+        GitLabTargets, McpServerOverridesConfig, ReasoningEffortOverridesConfig,
+        ReasoningSummaryOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
+        ServerConfig, TargetSelector,
     };
     use crate::state::{
         NewRunHistory, NewRunHistoryEvent, PersistedScanStatus, ReviewStateStore, RunHistoryFinish,
@@ -6400,6 +6401,7 @@ mod tests {
                 browser_mcp: BrowserMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
                 reasoning_effort: ReasoningEffortOverridesConfig::default(),
+                reasoning_summary: ReasoningSummaryOverridesConfig::default(),
             },
             docker: DockerConfig {
                 host: "unix:///var/run/docker.sock".to_string(),

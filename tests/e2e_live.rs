@@ -71,6 +71,8 @@ async fn e2e_live_dry_run() -> Result<()> {
             mcp_server_overrides: McpServerOverridesConfig::default(),
             reasoning_effort:
                 codex_gitlab_code_review::config::ReasoningEffortOverridesConfig::default(),
+            reasoning_summary:
+                codex_gitlab_code_review::config::ReasoningSummaryOverridesConfig::default(),
         },
         docker: DockerConfig { host: docker_host },
         database: DatabaseConfig {

@@ -535,8 +535,8 @@ mod tests {
     use super::*;
     use codex_gitlab_code_review::config::{
         BrowserMcpConfig, CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
-        McpServerOverridesConfig, ReasoningEffortOverridesConfig, ReviewConfig,
-        ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
+        McpServerOverridesConfig, ReasoningEffortOverridesConfig, ReasoningSummaryOverridesConfig,
+        ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
     };
     use sqlx::Executor;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -611,6 +611,7 @@ mod tests {
                 browser_mcp: BrowserMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
                 reasoning_effort: ReasoningEffortOverridesConfig::default(),
+                reasoning_summary: ReasoningSummaryOverridesConfig::default(),
             },
             docker: DockerConfig::default(),
             database: DatabaseConfig {

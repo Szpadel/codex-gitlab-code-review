@@ -104,6 +104,12 @@ config:
     reasoningEffort:
       review: null
       mention: null
+    # Per-mode reasoning summary overrides passed to Codex app-server.
+    # Defaults restore readable reasoning summaries even if upstream model defaults change.
+    # Supported values: none, auto, detailed.
+    reasoningSummary:
+      review: "detailed"
+      mention: "detailed"
     execSandbox: "danger-full-access"
   docker:
     host: "unix:///var/run/docker.sock"

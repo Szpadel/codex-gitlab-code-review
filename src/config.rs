@@ -7,6 +7,7 @@ use std::env;
 
 pub const BROWSER_MCP_REMOTE_DEBUGGING_PORT: u16 = 9222;
 const SUPPORTED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+const SUPPORTED_REASONING_SUMMARIES: &[&str] = &["none", "auto", "detailed"];
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -179,6 +180,8 @@ pub struct CodexConfig {
     pub mcp_server_overrides: McpServerOverridesConfig,
     #[serde(default)]
     pub reasoning_effort: ReasoningEffortOverridesConfig,
+    #[serde(default)]
+    pub reasoning_summary: ReasoningSummaryOverridesConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -214,6 +217,14 @@ pub struct ReasoningEffortOverridesConfig {
     #[serde(default)]
     pub review: Option<String>,
     #[serde(default)]
+    pub mention: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ReasoningSummaryOverridesConfig {
+    #[serde(default = "default_reasoning_summary_override")]
+    pub review: Option<String>,
+    #[serde(default = "default_reasoning_summary_override")]
     pub mention: Option<String>,
 }
 
@@ -261,6 +272,10 @@ fn default_browser_mcp_args() -> Vec<String> {
     vec!["-y".to_string(), "chrome-devtools-mcp@latest".to_string()]
 }
 
+fn default_reasoning_summary_override() -> Option<String> {
+    Some("detailed".to_string())
+}
+
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
@@ -280,6 +295,15 @@ impl Default for BrowserMcpConfig {
             browser_args: Vec::new(),
             mcp_command: default_browser_mcp_command(),
             mcp_args: default_browser_mcp_args(),
+        }
+    }
+}
+
+impl Default for ReasoningSummaryOverridesConfig {
+    fn default() -> Self {
+        Self {
+            review: default_reasoning_summary_override(),
+            mention: default_reasoning_summary_override(),
         }
     }
 }
@@ -327,6 +351,7 @@ impl Config {
         validate_browser_mcp(&config.codex)?;
         validate_mcp_server_overrides(&config.codex)?;
         validate_reasoning_effort_overrides(&config.codex)?;
+        validate_reasoning_summary_overrides(&config.codex)?;
         Ok(config)
     }
 }
@@ -481,6 +506,31 @@ fn validate_reasoning_effort_overrides(codex: &CodexConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_reasoning_summary_overrides(codex: &CodexConfig) -> Result<()> {
+    for (field, value) in [
+        ("review", codex.reasoning_summary.review.as_deref()),
+        ("mention", codex.reasoning_summary.mention.as_deref()),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        anyhow::ensure!(
+            !value.trim().is_empty(),
+            "codex.reasoning_summary.{field} must not be empty"
+        );
+        anyhow::ensure!(
+            value.chars().all(|ch| !ch.is_control()),
+            "codex.reasoning_summary.{field} must not contain control characters"
+        );
+        anyhow::ensure!(
+            SUPPORTED_REASONING_SUMMARIES.contains(&value),
+            "codex.reasoning_summary.{field} must be one of: {}",
+            SUPPORTED_REASONING_SUMMARIES.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn is_valid_mcp_server_name(name: &str) -> bool {
     // Codex CLI `-c key=value` overrides split nested config paths on `.`, so
     // names that require quoted TOML dotted-key segments cannot be targeted by
@@ -609,6 +659,14 @@ docker:
         assert!(config.codex.mcp_server_overrides.mention.is_empty());
         assert_eq!(config.codex.reasoning_effort.review, None);
         assert_eq!(config.codex.reasoning_effort.mention, None);
+        assert_eq!(
+            config.codex.reasoning_summary.review.as_deref(),
+            Some("detailed")
+        );
+        assert_eq!(
+            config.codex.reasoning_summary.mention.as_deref(),
+            Some("detailed")
+        );
         assert_eq!(config.codex.browser_mcp, BrowserMcpConfig::default());
     }
 
@@ -805,6 +863,51 @@ server:
         assert_eq!(
             config.codex.reasoning_effort.mention.as_deref(),
             Some("low")
+        );
+    }
+
+    #[test]
+    fn loads_reasoning_summary_overrides() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  reasoning_summary:
+    review: "detailed"
+    mention: "none"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let config = load_from_yaml(yaml);
+        assert_eq!(
+            config.codex.reasoning_summary.review.as_deref(),
+            Some("detailed")
+        );
+        assert_eq!(
+            config.codex.reasoning_summary.mention.as_deref(),
+            Some("none")
         );
     }
 
@@ -1199,6 +1302,86 @@ server:
         let msg = format!("{:#}", result.expect_err("error"));
         assert!(
             msg.contains("codex.reasoning_effort.mention must be one of: low, medium, high, xhigh")
+        );
+    }
+
+    #[test]
+    fn errors_on_empty_reasoning_summary_override() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  reasoning_summary:
+    review: "   "
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("codex.reasoning_summary.review must not be empty"));
+    }
+
+    #[test]
+    fn errors_on_unsupported_reasoning_summary_override() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  reasoning_summary:
+    mention: "verbose"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(
+            msg.contains("codex.reasoning_summary.mention must be one of: none, auto, detailed")
         );
     }
 

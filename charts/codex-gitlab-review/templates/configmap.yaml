@@ -147,6 +147,17 @@ data:
 {{- else }}
         mention: null
 {{- end }}
+      reasoning_summary:
+{{- if .Values.config.codex.reasoningSummary.review }}
+        review: {{ .Values.config.codex.reasoningSummary.review | quote }}
+{{- else }}
+        review: null
+{{- end }}
+{{- if .Values.config.codex.reasoningSummary.mention }}
+        mention: {{ .Values.config.codex.reasoningSummary.mention | quote }}
+{{- else }}
+        mention: null
+{{- end }}
       exec_sandbox: {{ .Values.config.codex.execSandbox | quote }}
     docker:
       host: {{ .Values.config.docker.host | quote }}

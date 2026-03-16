@@ -139,6 +139,14 @@ codex:
   reasoning_effort:
     review: "high"
     mention: "low"
+  # Optional. Per-mode reasoning summary overrides for Codex app-server sessions.
+  # Defaults restore readable reasoning summaries even if upstream model defaults change.
+  # Supported values: none, auto, detailed.
+  # Each entry becomes:
+  #   codex -c model_reasoning_summary="<value>" app-server
+  reasoning_summary:
+    review: "detailed"
+    mention: "detailed"
   # Optional. Prefetch dependency sources before running Codex (root-only detection).
   # Note: prefetch runs before Codex and counts toward timeout_seconds.
   deps:
