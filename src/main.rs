@@ -12,7 +12,9 @@ use tracing::{info, warn};
 
 use codex_gitlab_code_review::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
 use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
-use codex_gitlab_code_review::config::Config;
+use codex_gitlab_code_review::config::{
+    Config, gitlab_discovery_mcp_uses_cluster_service_advertise_url,
+};
 use codex_gitlab_code_review::demo_history::seed_example_history;
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
@@ -87,6 +89,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let mut config = Config::load()?;
+    if gitlab_discovery_mcp_uses_cluster_service_advertise_url(&config.codex) {
+        warn!(
+            advertise_url = config.codex.gitlab_discovery_mcp.advertise_url.as_str(),
+            "gitlab discovery MCP advertise_url uses cluster service DNS; Docker review containers may fail to reach it, so prefer a directly reachable pod IP or explicit routable address"
+        );
+    }
     if let Some(command) = cli.command {
         match command {
             Command::Auth(auth_cmd) => {

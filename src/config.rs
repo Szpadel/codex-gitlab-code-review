@@ -417,6 +417,10 @@ impl Config {
         if config.docker.host.trim().is_empty() {
             config.docker.host = default_docker_host();
         }
+        apply_gitlab_discovery_mcp_runtime_defaults(
+            &mut config,
+            env::var("POD_IP").ok().as_deref(),
+        )?;
         validate_codex_auth_accounts(&config.codex)?;
         validate_browser_mcp(&config.codex)?;
         validate_gitlab_discovery_mcp(&config.codex)?;
@@ -445,6 +449,56 @@ impl Config {
             overrides,
         )
     }
+}
+
+fn apply_gitlab_discovery_mcp_runtime_defaults(
+    config: &mut Config,
+    pod_ip: Option<&str>,
+) -> Result<()> {
+    if !config.codex.gitlab_discovery_mcp.enabled
+        || !config
+            .codex
+            .gitlab_discovery_mcp
+            .advertise_url
+            .trim()
+            .is_empty()
+    {
+        return Ok(());
+    }
+
+    let Some(pod_ip) = pod_ip.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let (bind_host, port) = parse_bind_addr(
+        "codex.gitlab_discovery_mcp.bind_addr",
+        &config.codex.gitlab_discovery_mcp.bind_addr,
+    )?;
+    anyhow::ensure!(
+        is_wildcard_host(&bind_host) || bind_host == pod_ip,
+        "codex.gitlab_discovery_mcp.advertise_url cannot default from POD_IP when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
+    );
+    let host = if pod_ip.contains(':') {
+        format!("[{pod_ip}]")
+    } else {
+        pod_ip.to_string()
+    };
+    config.codex.gitlab_discovery_mcp.advertise_url = format!("http://{host}:{port}/mcp");
+    Ok(())
+}
+
+pub fn gitlab_discovery_mcp_uses_cluster_service_advertise_url(codex: &CodexConfig) -> bool {
+    if !codex.gitlab_discovery_mcp.enabled {
+        return false;
+    }
+
+    let Ok(advertise_url) = Url::parse(&codex.gitlab_discovery_mcp.advertise_url) else {
+        return false;
+    };
+    let Some(host) = advertise_url.host_str() else {
+        return false;
+    };
+
+    host.ends_with(".svc.cluster.local") || host.ends_with(".cluster.local")
 }
 
 fn empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -713,7 +767,7 @@ fn parse_bind_addr(field: &str, value: &str) -> Result<(String, u16)> {
 }
 
 fn is_wildcard_host(host: &str) -> bool {
-    matches!(host, "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0")
+    matches!(host, "0.0.0.0" | "::" | "[::]" | "0:0:0:0:0:0:0:0")
 }
 
 fn validate_reasoning_effort_overrides(codex: &CodexConfig) -> Result<()> {
@@ -2134,5 +2188,247 @@ server:
         assert!(result.is_err());
         let msg = format!("{:#}", result.expect_err("error"));
         assert!(msg.contains("name 'primary' is reserved"));
+    }
+
+    #[test]
+    fn detects_cluster_service_advertise_urls() {
+        let config = load_from_yaml(
+            r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "0.0.0.0:8081"
+    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#,
+        );
+
+        assert!(gitlab_discovery_mcp_uses_cluster_service_advertise_url(
+            &config.codex
+        ));
+    }
+
+    #[test]
+    fn ignores_non_cluster_service_advertise_urls() {
+        let config = load_from_yaml(
+            r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "0.0.0.0:8081"
+    advertise_url: "http://10.42.0.15:8081/mcp"
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#,
+        );
+
+        assert!(!gitlab_discovery_mcp_uses_cluster_service_advertise_url(
+            &config.codex
+        ));
+    }
+
+    #[test]
+    fn fills_gitlab_discovery_advertise_url_from_pod_ip() {
+        let mut config = load_from_yaml(
+            r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "0.0.0.0:19091"
+    advertise_url: "http://10.42.0.15:19091/mcp"
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#,
+        );
+        config.codex.gitlab_discovery_mcp.advertise_url.clear();
+
+        apply_gitlab_discovery_mcp_runtime_defaults(&mut config, Some("10.42.0.15"))
+            .expect("pod IP default should be applied");
+
+        assert_eq!(
+            config.codex.gitlab_discovery_mcp.advertise_url,
+            "http://10.42.0.15:19091/mcp"
+        );
+    }
+
+    #[test]
+    fn fills_gitlab_discovery_advertise_url_from_ipv6_pod_ip() {
+        let mut config = load_from_yaml(
+            r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "[::]:8081"
+    advertise_url: "http://[fd00::123]:8081/mcp"
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#,
+        );
+        config.codex.gitlab_discovery_mcp.advertise_url.clear();
+
+        apply_gitlab_discovery_mcp_runtime_defaults(&mut config, Some("fd00::123"))
+            .expect("IPv6 pod IP default should be applied");
+
+        assert_eq!(
+            config.codex.gitlab_discovery_mcp.advertise_url,
+            "http://[fd00::123]:8081/mcp"
+        );
+    }
+
+    #[test]
+    fn rejects_pod_ip_default_for_non_wildcard_bind_host() {
+        let mut config = load_from_yaml(
+            r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "127.0.0.1:19091"
+    advertise_url: "http://127.0.0.1:19091/mcp"
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#,
+        );
+        config.codex.gitlab_discovery_mcp.advertise_url.clear();
+
+        let err = apply_gitlab_discovery_mcp_runtime_defaults(&mut config, Some("10.42.0.15"))
+            .expect_err("non-wildcard bind host should require an explicit advertise_url");
+
+        assert!(format!("{err:#}").contains("cannot default from POD_IP"));
     }
 }

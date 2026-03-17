@@ -22,10 +22,23 @@ tests:
           pattern: "(?m)^  gitlab_discovery_mcp:\\n    enabled: true$"
       - matchRegex:
           path: data["config.yaml"]
-          pattern: '(?m)^    advertise_url: "http://RELEASE-NAME-codex-gitlab-review.review-system.svc.cluster.local:8081/mcp"$'
+          pattern: "(?m)^    allow: \\[\\]$"
+  - it: leaves advertise_url empty in config so the service can derive it from POD_IP
+    template: templates/configmap.yaml
+    asserts:
       - matchRegex:
           path: data["config.yaml"]
-          pattern: "(?m)^    allow: \\[\\]$"
+          pattern: '(?m)^    advertise_url: ""$'
+  - it: exposes POD_IP to the service by default for runtime advertise URL derivation
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
   - it: exposes a dedicated MCP container port
     template: templates/deployment.yaml
     asserts:
@@ -51,9 +64,34 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: '(?m)^    bind_addr: "0.0.0.0:19091"$'
+  - it: syncs a custom bind_addr port into the rendered config
+    template: templates/configmap.yaml
+    set:
+      config.codex.gitlabDiscoveryMcp.bindAddr: "0.0.0.0:19091"
+    asserts:
       - matchRegex:
           path: data["config.yaml"]
-          pattern: '(?m)^    advertise_url: "http://RELEASE-NAME-codex-gitlab-review.review-system.svc.cluster.local:19091/mcp"$'
+          pattern: '(?m)^    bind_addr: "0.0.0.0:19091"$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    advertise_url: ""$'
+  - it: preserves an explicit advertiseUrl override in the rendered config
+    template: templates/configmap.yaml
+    set:
+      config.codex.gitlabDiscoveryMcp.advertiseUrl: "http://gitlab-discovery.example.internal:18081/mcp"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    advertise_url: "http://gitlab-discovery.example.internal:18081/mcp"$'
+  - it: skips POD_IP injection when advertiseUrl is explicit
+    template: templates/deployment.yaml
+    set:
+      config.codex.gitlabDiscoveryMcp.advertiseUrl: "http://gitlab-discovery.example.internal:18081/mcp"
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: POD_IP
   - it: syncs the deployment MCP port with a custom bind_addr port
     template: templates/deployment.yaml
     set:

@@ -3,6 +3,12 @@ use crate::state::{RunHistoryEventRecord, RunHistoryRecord};
 use serde::Serialize;
 use serde_json::Value;
 
+const GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID: &str = "gitlab-discovery-mcp-startup";
+
+pub(crate) fn is_auxiliary_transcript_turn_id(turn_id: &str) -> bool {
+    turn_id == GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ThreadSnapshot {
     pub id: String,
@@ -80,9 +86,13 @@ pub fn thread_snapshot_from_events(
 }
 
 pub fn thread_snapshot_is_complete(thread: &ThreadSnapshot) -> bool {
-    !thread.turns.is_empty()
-        && !thread
-            .turns
+    let relevant_turns = thread
+        .turns
+        .iter()
+        .filter(|turn| !turn_is_auxiliary_warning(turn))
+        .collect::<Vec<_>>();
+    !relevant_turns.is_empty()
+        && !relevant_turns
             .iter()
             .any(|turn| !turn_snapshot_is_complete(turn))
 }
@@ -94,6 +104,7 @@ pub fn thread_snapshot_only_target_turn_is_incomplete(
     let incomplete_turns = thread
         .turns
         .iter()
+        .filter(|turn| !turn_is_auxiliary_warning(turn))
         .filter(|turn| !turn_snapshot_is_complete(turn))
         .map(|turn| turn.id.as_str())
         .collect::<Vec<_>>();
@@ -128,6 +139,10 @@ fn turn_snapshot_is_complete(turn: &TurnSnapshot) -> bool {
         thread_item_is_self_contained(item)
             || (item.item_type == "reasoning" && has_renderable_non_reasoning_item)
     })
+}
+
+fn turn_is_auxiliary_warning(turn: &TurnSnapshot) -> bool {
+    is_auxiliary_transcript_turn_id(&turn.id)
 }
 
 fn reasoning_fallback_supports_completeness(item: &ThreadItemSnapshot) -> bool {
@@ -782,6 +797,196 @@ mod tests {
             ],
         )
         .expect("thread snapshot");
+        assert!(thread_snapshot_is_complete(&thread));
+    }
+
+    #[test]
+    fn thread_snapshot_renders_gitlab_discovery_startup_failure_turn() {
+        let run = RunHistoryRecord {
+            id: 1,
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 1,
+            head_sha: "sha".to_string(),
+            status: "done".to_string(),
+            result: Some("commented".to_string()),
+            started_at: 0,
+            finished_at: Some(0),
+            updated_at: 0,
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            review_thread_id: None,
+            preview: Some("Preview".to_string()),
+            summary: None,
+            error: None,
+            auth_account_name: None,
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+            commit_sha: None,
+            feature_flags: FeatureFlagSnapshot::default(),
+            events_persisted_cleanly: false,
+            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
+            transcript_backfill_error: None,
+        };
+        let thread = thread_snapshot_from_events(
+            &run,
+            &[
+                crate::state::RunHistoryEventRecord {
+                    id: 1,
+                    run_history_id: 1,
+                    sequence: 1,
+                    turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 2,
+                    run_history_id: 1,
+                    sequence: 2,
+                    turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "agentMessage",
+                        "phase": "system",
+                        "text": "GitLab discovery MCP startup warning: endpoint http://10.0.0.5:8081/mcp was unreachable. MCP tools may be unavailable in this run."
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 3,
+                    run_history_id: 1,
+                    sequence: 3,
+                    turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                    created_at: 0,
+                },
+            ],
+        )
+        .expect("thread snapshot");
+
+        assert_eq!(thread.turns.len(), 1);
+        assert_eq!(thread.turns[0].id, "gitlab-discovery-mcp-startup");
+        assert_eq!(thread.turns[0].status, "completed");
+        assert_eq!(thread.turns[0].items.len(), 1);
+        assert_eq!(thread.turns[0].items[0].item_type, "agentMessage");
+        assert_eq!(thread.turns[0].items[0].title, "Agent message");
+        assert_eq!(
+            thread.turns[0].items[0].body.as_deref(),
+            Some(
+                "GitLab discovery MCP startup warning: endpoint http://10.0.0.5:8081/mcp was unreachable. MCP tools may be unavailable in this run."
+            )
+        );
+        assert_eq!(
+            thread.turns[0].items[0].meta,
+            vec![("phase".to_string(), "system".to_string())]
+        );
+        assert!(!thread_snapshot_is_complete(&thread));
+    }
+
+    #[test]
+    fn thread_snapshot_ignores_gitlab_discovery_startup_warning_for_completeness() {
+        let run = RunHistoryRecord {
+            id: 1,
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 1,
+            head_sha: "sha".to_string(),
+            status: "done".to_string(),
+            result: Some("commented".to_string()),
+            started_at: 0,
+            finished_at: Some(0),
+            updated_at: 0,
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            review_thread_id: None,
+            preview: Some("Preview".to_string()),
+            summary: None,
+            error: None,
+            auth_account_name: None,
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+            commit_sha: None,
+            feature_flags: FeatureFlagSnapshot::default(),
+            events_persisted_cleanly: false,
+            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
+            transcript_backfill_error: None,
+        };
+        let thread = thread_snapshot_from_events(
+            &run,
+            &[
+                crate::state::RunHistoryEventRecord {
+                    id: 1,
+                    run_history_id: 1,
+                    sequence: 1,
+                    turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 2,
+                    run_history_id: 1,
+                    sequence: 2,
+                    turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "agentMessage",
+                        "phase": "system",
+                        "text": "GitLab discovery MCP startup warning"
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 3,
+                    run_history_id: 1,
+                    sequence: 3,
+                    turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 4,
+                    run_history_id: 1,
+                    sequence: 4,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 5,
+                    run_history_id: 1,
+                    sequence: 5,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "agentMessage",
+                        "text": "All clear."
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 6,
+                    run_history_id: 1,
+                    sequence: 6,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                    created_at: 0,
+                },
+            ],
+        )
+        .expect("thread snapshot");
+
         assert!(thread_snapshot_is_complete(&thread));
     }
 

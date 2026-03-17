@@ -104,10 +104,11 @@ config:
       enabled: true
       serverName: "gitlab-discovery"
       # Leave empty to default to 0.0.0.0:<service.mcpPort>.
-      # In the Helm chart this must stay a wildcard host so the Service can
-      # reach the pod listener.
       bindAddr: ""
-      # Leave empty to default to the in-cluster service FQDN and MCP port.
+      # Leave empty to let the service derive a pod-IP based advertise URL at
+      # startup from the Kubernetes POD_IP env var. This is the effective
+      # default because review containers are spawned by Docker and need a
+      # directly reachable pod address, not a Kubernetes Service DNS name.
       advertiseUrl: ""
       bearerTokenEnvVar: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
       cloneRoot: "/work/mcp"

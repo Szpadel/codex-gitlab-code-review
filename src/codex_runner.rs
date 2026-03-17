@@ -392,6 +392,40 @@ impl DockerCodexRunner {
         }
     }
 
+    async fn replace_run_history_events_for_turn(
+        &self,
+        run_history_id: Option<i64>,
+        turn_id: &str,
+        events: &[NewRunHistoryEvent],
+    ) {
+        let Some(run_history_id) = run_history_id else {
+            return;
+        };
+        if let Err(err) = self
+            .state
+            .replace_run_history_events_for_turn(run_history_id, turn_id, events)
+            .await
+        {
+            warn!(
+                run_history_id,
+                turn_id,
+                error = %err,
+                "failed to rewrite run history events for turn"
+            );
+            if let Err(mark_err) = self
+                .state
+                .mark_run_history_events_incomplete(run_history_id)
+                .await
+            {
+                warn!(
+                    run_history_id,
+                    error = %mark_err,
+                    "failed to mark run history events incomplete after turn rewrite error"
+                );
+            }
+        }
+    }
+
     pub fn new(
         docker_cfg: DockerConfig,
         codex: CodexConfig,
@@ -858,6 +892,127 @@ impl DockerCodexRunner {
                 },
             )
             .await;
+    }
+
+    async fn probe_gitlab_discovery_mcp_endpoint(
+        &self,
+        prepared: Option<&PreparedGitLabDiscoveryMcp>,
+        container_id: &str,
+        run_history_id: Option<i64>,
+    ) {
+        let Some(prepared) = prepared else {
+            return;
+        };
+        let Some(command) = gitlab_discovery_mcp_probe_exec_command(&prepared.runtime_config)
+        else {
+            let detail = "unsupported advertise_url scheme for startup probe";
+            warn!(
+                container_id,
+                url = prepared.runtime_config.advertise_url.as_str(),
+                detail,
+                "skipping gitlab discovery MCP reachability probe for unsupported advertise_url"
+            );
+            self.append_gitlab_discovery_mcp_startup_failure(
+                run_history_id,
+                prepared.runtime_config.advertise_url.as_str(),
+                detail,
+            )
+            .await;
+            return;
+        };
+
+        match self
+            .exec_container_command(container_id, command, None)
+            .await
+        {
+            Ok(output) => {
+                let first_line = output
+                    .stdout
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("");
+                if first_line.starts_with("OK ") {
+                    self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
+                        .await;
+                    debug!(
+                        container_id,
+                        url = prepared.runtime_config.advertise_url.as_str(),
+                        detail = first_line,
+                        "gitlab discovery MCP endpoint passed startup probe"
+                    );
+                } else if first_line.starts_with("SKIP ") {
+                    self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
+                        .await;
+                    warn!(
+                        container_id,
+                        url = prepared.runtime_config.advertise_url.as_str(),
+                        detail = first_line,
+                        "gitlab discovery MCP reachability probe skipped inside review container"
+                    );
+                } else {
+                    warn!(
+                        container_id,
+                        url = prepared.runtime_config.advertise_url.as_str(),
+                        detail = first_line,
+                        "gitlab discovery MCP endpoint failed startup probe"
+                    );
+                    if first_line.is_empty() {
+                        self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
+                            .await;
+                        warn!(
+                            container_id,
+                            url = prepared.runtime_config.advertise_url.as_str(),
+                            "gitlab discovery MCP startup probe returned no diagnostic output"
+                        );
+                    } else {
+                        self.append_gitlab_discovery_mcp_startup_failure(
+                            run_history_id,
+                            prepared.runtime_config.advertise_url.as_str(),
+                            first_line,
+                        )
+                        .await;
+                    }
+                }
+            }
+            Err(err) => {
+                self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
+                    .await;
+                warn!(
+                    container_id,
+                    url = prepared.runtime_config.advertise_url.as_str(),
+                    error = %err,
+                    "gitlab discovery MCP startup probe could not run inside the review container"
+                );
+            }
+        }
+    }
+
+    async fn append_gitlab_discovery_mcp_startup_failure(
+        &self,
+        run_history_id: Option<i64>,
+        advertise_url: &str,
+        detail: &str,
+    ) {
+        let message = format!(
+            "GitLab discovery MCP startup warning: endpoint {advertise_url} {detail}. MCP tools may be unavailable in this run."
+        );
+        let events = gitlab_discovery_mcp_startup_failure_events(&message);
+        self.replace_run_history_events_for_turn(
+            run_history_id,
+            GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID,
+            &events,
+        )
+        .await;
+    }
+
+    async fn clear_gitlab_discovery_mcp_startup_failure(&self, run_history_id: Option<i64>) {
+        self.replace_run_history_events_for_turn(
+            run_history_id,
+            GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID,
+            &[],
+        )
+        .await;
     }
 
     async fn unregister_gitlab_discovery_session(
@@ -1987,6 +2142,12 @@ exec codex app-server --listen stdio://
             ctx.run_history_id,
         )
         .await;
+        self.probe_gitlab_discovery_mcp_endpoint(
+            gitlab_discovery_mcp.as_ref(),
+            &container_id,
+            ctx.run_history_id,
+        )
+        .await;
         let repo_path = "/work/repo";
         self.update_run_history_session(
             ctx.run_history_id,
@@ -2061,10 +2222,21 @@ exec codex app-server --listen stdio://
             )
             .await;
             client
-                .stream_review(&review_thread_id, &turn_id, |events| async move {
-                    self.append_run_history_events(ctx.run_history_id, &events)
-                        .await;
-                })
+                .stream_review(
+                    &review_thread_id,
+                    &turn_id,
+                    gitlab_discovery_mcp
+                        .as_ref()
+                        .map(|prepared| prepared.runtime_config.server_name.as_str()),
+                    |events| async move {
+                        self.append_run_history_events(ctx.run_history_id, &events)
+                            .await;
+                    },
+                    || async move {
+                        self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
+                            .await;
+                    },
+                )
                 .await
         })
         .await;
@@ -2242,6 +2414,12 @@ exec codex app-server --listen stdio://
             ctx.run_history_id,
         )
         .await;
+        self.probe_gitlab_discovery_mcp_endpoint(
+            gitlab_discovery_mcp.as_ref(),
+            &container_id,
+            ctx.run_history_id,
+        )
+        .await;
         self.update_run_history_session(
             ctx.run_history_id,
             RunHistorySessionUpdate {
@@ -2354,10 +2532,21 @@ exec codex app-server --listen stdio://
             )
             .await;
             let mut reply_message = client
-                .stream_turn_message(&thread_id, &turn_id, |events| async move {
-                    self.append_run_history_events(ctx.run_history_id, &events)
-                        .await;
-                })
+                .stream_turn_message(
+                    &thread_id,
+                    &turn_id,
+                    gitlab_discovery_mcp
+                        .as_ref()
+                        .map(|prepared| prepared.runtime_config.server_name.as_str()),
+                    |events| async move {
+                        self.append_run_history_events(ctx.run_history_id, &events)
+                            .await;
+                    },
+                    || async move {
+                        self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
+                            .await;
+                    },
+                )
                 .await?;
             if reply_message.trim().is_empty() {
                 reply_message = "Mention command completed.".to_string();
@@ -2703,6 +2892,8 @@ struct TurnHistoryCapture {
     events: Vec<NewRunHistoryEvent>,
 }
 
+const GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID: &str = "gitlab-discovery-mcp-startup";
+
 impl TurnHistoryCapture {
     fn push(&mut self, turn_id: Option<&str>, event_type: &str, payload: Value) {
         self.next_sequence += 1;
@@ -2733,6 +2924,36 @@ fn annotate_event_payload(mut payload: Value) -> Value {
         );
     }
     payload
+}
+
+fn gitlab_discovery_mcp_startup_failure_events(message: &str) -> Vec<NewRunHistoryEvent> {
+    let turn_id = Some(GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID.to_string());
+    vec![
+        NewRunHistoryEvent {
+            sequence: 1,
+            turn_id: turn_id.clone(),
+            event_type: "turn_started".to_string(),
+            payload: annotate_event_payload(json!({})),
+        },
+        NewRunHistoryEvent {
+            sequence: 2,
+            turn_id: turn_id.clone(),
+            event_type: "item_completed".to_string(),
+            payload: annotate_event_payload(json!({
+                "type": "agentMessage",
+                "phase": "system",
+                "text": message,
+            })),
+        },
+        NewRunHistoryEvent {
+            sequence: 3,
+            turn_id,
+            event_type: "turn_completed".to_string(),
+            payload: annotate_event_payload(json!({
+                "status": "completed"
+            })),
+        },
+    ]
 }
 
 impl AppServerClient {
@@ -2774,17 +2995,22 @@ impl AppServerClient {
         self.send_json(&json!({ "method": "initialized" })).await
     }
 
-    async fn stream_review<F, Fut>(
+    async fn stream_review<FPersist, FGitLab, FPersistFut, FGitLabFut>(
         &mut self,
         thread_id: &str,
         turn_id: &str,
-        mut persist_events: F,
+        gitlab_discovery_server_name: Option<&str>,
+        mut persist_events: FPersist,
+        mut on_gitlab_discovery_success: FGitLab,
     ) -> Result<String>
     where
-        F: FnMut(Vec<NewRunHistoryEvent>) -> Fut,
-        Fut: Future<Output = ()>,
+        FPersist: FnMut(Vec<NewRunHistoryEvent>) -> FPersistFut,
+        FGitLab: FnMut() -> FGitLabFut,
+        FPersistFut: Future<Output = ()>,
+        FGitLabFut: Future<Output = ()>,
     {
         let mut review_text = None;
+        let mut gitlab_discovery_success_observed = false;
         let mut history_capture = TurnHistoryCapture::default();
         loop {
             let message = match self.next_notification().await {
@@ -2816,6 +3042,10 @@ impl AppServerClient {
                     {
                         review_text = Some(review.to_string());
                     }
+                    if item_is_successful_gitlab_discovery_call(item, gitlab_discovery_server_name)
+                    {
+                        gitlab_discovery_success_observed = true;
+                    }
                 },
             ) {
                 Ok(outcome) => outcome,
@@ -2824,6 +3054,9 @@ impl AppServerClient {
                     if !pending_events.is_empty() {
                         persist_events(pending_events).await;
                     }
+                    if gitlab_discovery_success_observed {
+                        on_gitlab_discovery_success().await;
+                    }
                     break Err(err);
                 }
             };
@@ -2831,24 +3064,33 @@ impl AppServerClient {
             if !pending_events.is_empty() {
                 persist_events(pending_events).await;
             }
+            if gitlab_discovery_success_observed {
+                on_gitlab_discovery_success().await;
+                gitlab_discovery_success_observed = false;
+            }
             if outcome == TurnStreamNotificationOutcome::TurnCompleted {
                 break review_text.ok_or_else(|| anyhow!("codex review missing review text"));
             }
         }
     }
 
-    async fn stream_turn_message<F, Fut>(
+    async fn stream_turn_message<FPersist, FGitLab, FPersistFut, FGitLabFut>(
         &mut self,
         thread_id: &str,
         turn_id: &str,
-        mut persist_events: F,
+        gitlab_discovery_server_name: Option<&str>,
+        mut persist_events: FPersist,
+        mut on_gitlab_discovery_success: FGitLab,
     ) -> Result<String>
     where
-        F: FnMut(Vec<NewRunHistoryEvent>) -> Fut,
-        Fut: Future<Output = ()>,
+        FPersist: FnMut(Vec<NewRunHistoryEvent>) -> FPersistFut,
+        FGitLab: FnMut() -> FGitLabFut,
+        FPersistFut: Future<Output = ()>,
+        FGitLabFut: Future<Output = ()>,
     {
         let final_message = RefCell::new(None);
         let message_deltas: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+        let mut gitlab_discovery_success_observed = false;
         let mut history_capture = TurnHistoryCapture::default();
         loop {
             let message = match self.next_notification().await {
@@ -2903,6 +3145,10 @@ impl AppServerClient {
                             *final_message.borrow_mut() = Some(extracted);
                         }
                     }
+                    if item_is_successful_gitlab_discovery_call(item, gitlab_discovery_server_name)
+                    {
+                        gitlab_discovery_success_observed = true;
+                    }
                 },
             ) {
                 Ok(outcome) => outcome,
@@ -2911,12 +3157,19 @@ impl AppServerClient {
                     if !pending_events.is_empty() {
                         persist_events(pending_events).await;
                     }
+                    if gitlab_discovery_success_observed {
+                        on_gitlab_discovery_success().await;
+                    }
                     break Err(err);
                 }
             };
             let pending_events = history_capture.take_pending();
             if !pending_events.is_empty() {
                 persist_events(pending_events).await;
+            }
+            if gitlab_discovery_success_observed {
+                on_gitlab_discovery_success().await;
+                gitlab_discovery_success_observed = false;
             }
             if outcome == TurnStreamNotificationOutcome::TurnCompleted {
                 break if let Some(message) = final_message.into_inner() {
@@ -3410,6 +3663,19 @@ fn turn_id_from_params(params: Option<&Value>) -> Option<&str> {
         .and_then(|value| value.as_str())
 }
 
+fn item_is_successful_gitlab_discovery_call(
+    item: &Value,
+    gitlab_discovery_server_name: Option<&str>,
+) -> bool {
+    let Some(server_name) = gitlab_discovery_server_name else {
+        return false;
+    };
+    item.get("type").and_then(|value| value.as_str()) == Some("mcpToolCall")
+        && item.get("server").and_then(|value| value.as_str()) == Some(server_name)
+        && item.get("status").and_then(|value| value.as_str()) == Some("completed")
+        && item.get("error").is_none_or(Value::is_null)
+}
+
 fn enrich_reasoning_item(item: &Value, item_id: &str, summary: &str, text: &str) -> Value {
     let mut enriched = item.clone();
     let Some(object) = enriched.as_object_mut() else {
@@ -3871,6 +4137,215 @@ fn auxiliary_git_exec_command(git_args: &[String]) -> Vec<String> {
         .collect::<Vec<_>>()
         .join(" ");
     vec!["bash".to_string(), "-lc".to_string(), git_command]
+}
+
+fn gitlab_discovery_mcp_probe_exec_command(
+    runtime_config: &GitLabDiscoveryMcpRuntimeConfig,
+) -> Option<Vec<String>> {
+    let parsed = Url::parse(&runtime_config.advertise_url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+
+    let url_q = shell_quote(&runtime_config.advertise_url);
+    let auth_var_q = shell_quote(&runtime_config.bearer_token_env_var);
+    let script = format!(
+        r#"set -u
+url={url_q}
+auth_var={auth_var_q}
+init_payload='{{"jsonrpc":"2.0","id":"probe-init","method":"initialize","params":{{"protocolVersion":"2025-03-26","capabilities":{{}},"clientInfo":{{"name":"codex-gitlab-review-probe","version":"0.0.0"}}}}}}'
+initialized_payload='{{"jsonrpc":"2.0","method":"notifications/initialized","params":{{}}}}'
+tools_payload='{{"jsonrpc":"2.0","id":"probe-tools","method":"tools/list","params":{{}}}}'
+if command -v curl >/dev/null 2>&1; then
+  auth_value="${{!auth_var-}}"
+  if [ -z "$auth_value" ]; then
+    printf 'ERROR missing bearer env %s\n' "$auth_var"
+    exit 0
+  fi
+  headers_file="$(mktemp)"
+  body_file="$(mktemp)"
+  tools_body_file="$(mktemp)"
+  cleanup() {{
+    rm -f "$headers_file" "$body_file" "$tools_body_file"
+  }}
+  trap cleanup EXIT
+  status="$(
+    curl -sS -o "$body_file" -D "$headers_file" --max-time 5 -w '%{{http_code}}' \
+      -X POST \
+      -H "Authorization: Bearer $auth_value" \
+      -H "Content-Type: application/json" \
+      -H "Accept: application/json, text/event-stream" \
+      --data "$init_payload" \
+      "$url" 2>&1
+  )"
+  curl_status=$?
+  if [ "$curl_status" -eq 0 ]; then
+    session_id="$(awk 'tolower($1)=="mcp-session-id:"{{print $2}}' "$headers_file" | tr -d '\r' | tail -n 1)"
+    if [ -z "$session_id" ]; then
+      printf 'ERROR initialize response missing mcp-session-id header (http %s)\n' "$status"
+      exit 0
+    fi
+    close_session() {{
+      curl -sS -o /dev/null --max-time 5 \
+        -X DELETE \
+        -H "Authorization: Bearer $auth_value" \
+        -H "MCP-Session-Id: $session_id" \
+        "$url" >/dev/null 2>&1 || true
+    }}
+    curl -sS -o /dev/null --max-time 5 \
+      -X POST \
+      -H "Authorization: Bearer $auth_value" \
+      -H "MCP-Session-Id: $session_id" \
+      -H "Content-Type: application/json" \
+      -H "Accept: application/json, text/event-stream" \
+      --data "$initialized_payload" \
+      "$url" >/dev/null 2>&1 || true
+    tools_status="$(
+      curl -sS -o "$tools_body_file" --max-time 5 -w '%{{http_code}}' \
+        -X POST \
+        -H "Authorization: Bearer $auth_value" \
+        -H "MCP-Session-Id: $session_id" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json, text/event-stream" \
+        --data "$tools_payload" \
+        "$url" 2>&1
+    )"
+    tools_curl_status=$?
+    if [ "$tools_curl_status" -ne 0 ]; then
+      probe_result="ERROR tools/list request failed: $tools_status"
+    elif grep -Eq '"name"[[:space:]]*:[[:space:]]*"list_gitlab_paths"' "$tools_body_file" && grep -Eq '"name"[[:space:]]*:[[:space:]]*"clone_gitlab_repo"' "$tools_body_file"; then
+      probe_result='OK gitlab discovery MCP tools reachable'
+    else
+      probe_result="ERROR tools/list response missing GitLab discovery tools (http $tools_status)"
+    fi
+    printf '%s\n' "$probe_result"
+    close_session
+  else
+    last_line="$(printf '%s\n' "$status" | tail -n 1)"
+    printf 'ERROR initialize request failed: %s\n' "$last_line"
+  fi
+elif command -v python3 >/dev/null 2>&1; then
+  URL="$url" AUTH_VAR="$auth_var" python3 - <<'PY'
+import json
+import os
+import urllib.error
+import urllib.request
+
+def decode_mcp_response(response, body_bytes):
+    body_text = body_bytes.decode()
+    content_type = response.headers.get("Content-Type", "")
+    if "text/event-stream" not in content_type:
+        return body_text
+    data_lines = []
+    for line in body_text.splitlines():
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    return "\n".join(data_lines)
+
+url = os.environ["URL"]
+auth_var = os.environ["AUTH_VAR"]
+token = os.environ.get(auth_var, "")
+if not token:
+    print(f"ERROR missing bearer env {{auth_var}}")
+else:
+    session_id = None
+    try:
+        init_request = urllib.request.Request(
+            url,
+            data=json.dumps(
+                {{
+                    "jsonrpc": "2.0",
+                    "id": "probe-init",
+                    "method": "initialize",
+                    "params": {{
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {{}},
+                        "clientInfo": {{"name": "codex-gitlab-review-probe", "version": "0.0.0"}},
+                    }},
+                }}
+            ).encode(),
+            method="POST",
+            headers={{
+                "Authorization": f"Bearer {{token}}",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            }},
+        )
+        with urllib.request.urlopen(init_request, timeout=5) as response:
+            session_id = response.headers.get("MCP-Session-Id")
+            if not session_id:
+                print(f"ERROR initialize response missing mcp-session-id header (http {{response.status}})")
+            else:
+                initialized_request = urllib.request.Request(
+                    url,
+                    data=json.dumps(
+                        {{"jsonrpc": "2.0", "method": "notifications/initialized", "params": {{}}}}
+                    ).encode(),
+                    method="POST",
+                    headers={{
+                        "Authorization": f"Bearer {{token}}",
+                        "MCP-Session-Id": session_id,
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream",
+                    }},
+                )
+                try:
+                    urllib.request.urlopen(initialized_request, timeout=5).read()
+                except Exception:
+                    pass
+                tools_request = urllib.request.Request(
+                    url,
+                    data=json.dumps(
+                        {{"jsonrpc": "2.0", "id": "probe-tools", "method": "tools/list", "params": {{}}}}
+                    ).encode(),
+                    method="POST",
+                    headers={{
+                        "Authorization": f"Bearer {{token}}",
+                        "MCP-Session-Id": session_id,
+                        "Content-Type": "application/json",
+                        "Accept": "application/json, text/event-stream",
+                    }},
+                )
+                with urllib.request.urlopen(tools_request, timeout=5) as tools_response:
+                    payload_text = decode_mcp_response(tools_response, tools_response.read())
+                    payload = json.loads(payload_text or "{{}}")
+                tools = {{
+                    tool.get("name")
+                    for tool in payload.get("result", {{}}).get("tools", [])
+                    if isinstance(tool, dict)
+                }}
+                if {{"list_gitlab_paths", "clone_gitlab_repo"}}.issubset(tools):
+                    print("OK gitlab discovery MCP tools reachable")
+                else:
+                    print("ERROR tools/list response missing GitLab discovery tools")
+    except urllib.error.HTTPError as err:
+        print(f"ERROR initialize request returned http {{err.code}} {{err.reason}}")
+    except Exception as err:
+        print(f"ERROR {{err}}")
+    finally:
+        if session_id:
+            close_request = urllib.request.Request(
+                url,
+                method="DELETE",
+                headers={{
+                    "Authorization": f"Bearer {{token}}",
+                    "MCP-Session-Id": session_id,
+                }},
+            )
+            try:
+                urllib.request.urlopen(close_request, timeout=5).read()
+            except Exception:
+                pass
+PY
+else
+  printf 'SKIP no curl or python3 available\n'
+fi
+"#,
+        url_q = url_q,
+        auth_var_q = auth_var_q,
+    );
+
+    Some(vec!["/bin/bash".to_string(), "-lc".to_string(), script])
 }
 
 fn restore_push_remote_url_exec_command(push_url: &str) -> Vec<String> {
@@ -5461,6 +5936,115 @@ mod tests {
             },
         );
         assert!(script.contains("exec codex -c 'mcp_servers.github.enabled=false' app-server"));
+    }
+
+    #[test]
+    fn gitlab_discovery_mcp_probe_exec_command_uses_runtime_url_and_env_var() {
+        let command = gitlab_discovery_mcp_probe_exec_command(&GitLabDiscoveryMcpRuntimeConfig {
+            server_name: "gitlab-discovery".to_string(),
+            advertise_url: "http://10.42.0.15:8081/mcp".to_string(),
+            bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN".to_string(),
+            clone_root: "/work/mcp".to_string(),
+        })
+        .expect("probe command");
+
+        assert_eq!(command[0], "/bin/bash");
+        assert_eq!(command[1], "-lc");
+        assert!(command[2].contains("http://10.42.0.15:8081/mcp"));
+        assert!(command[2].contains("CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"));
+        assert!(command[2].contains("command -v curl"));
+        assert!(command[2].contains("python3 - <<'PY'"));
+        assert!(command[2].contains("\"method\":\"initialize\""));
+        assert!(command[2].contains("\"method\":\"tools/list\""));
+        assert!(command[2].contains("gitlab discovery MCP tools reachable"));
+    }
+
+    #[test]
+    fn gitlab_discovery_mcp_probe_exec_command_rejects_invalid_url() {
+        assert!(
+            gitlab_discovery_mcp_probe_exec_command(&GitLabDiscoveryMcpRuntimeConfig {
+                server_name: "gitlab-discovery".to_string(),
+                advertise_url: "not-a-url".to_string(),
+                bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN".to_string(),
+                clone_root: "/work/mcp".to_string(),
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn gitlab_discovery_mcp_startup_failure_events_create_completed_system_turn() {
+        let events = gitlab_discovery_mcp_startup_failure_events(
+            "GitLab discovery MCP startup warning: endpoint http://10.0.0.5:8081/mcp was unreachable.",
+        );
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0].turn_id.as_deref(),
+            Some(GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID)
+        );
+        assert_eq!(events[0].event_type, "turn_started");
+        assert_eq!(
+            events[1].turn_id.as_deref(),
+            Some(GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID)
+        );
+        assert_eq!(events[1].event_type, "item_completed");
+        assert_eq!(events[1].payload["type"], json!("agentMessage"));
+        assert_eq!(events[1].payload["phase"], json!("system"));
+        assert!(
+            events[1].payload["text"]
+                .as_str()
+                .expect("message text")
+                .contains("GitLab discovery MCP startup warning")
+        );
+        assert_eq!(
+            events[2].turn_id.as_deref(),
+            Some(GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID)
+        );
+        assert_eq!(events[2].event_type, "turn_completed");
+        assert_eq!(events[2].payload["status"], json!("completed"));
+    }
+
+    #[test]
+    fn successful_gitlab_discovery_mcp_tool_call_is_detected() {
+        let item = json!({
+            "type": "mcpToolCall",
+            "server": "gitlab-discovery",
+            "tool": "list_gitlab_paths",
+            "status": "completed",
+            "result": {"paths": []}
+        });
+
+        assert!(item_is_successful_gitlab_discovery_call(
+            &item,
+            Some("gitlab-discovery")
+        ));
+    }
+
+    #[test]
+    fn failed_or_unrelated_mcp_tool_calls_do_not_clear_startup_warning() {
+        let failed = json!({
+            "type": "mcpToolCall",
+            "server": "gitlab-discovery",
+            "tool": "list_gitlab_paths",
+            "status": "failed",
+            "error": {"message": "boom"}
+        });
+        let other_server = json!({
+            "type": "mcpToolCall",
+            "server": "chrome-devtools",
+            "tool": "list_pages",
+            "status": "completed"
+        });
+
+        assert!(!item_is_successful_gitlab_discovery_call(
+            &failed,
+            Some("gitlab-discovery")
+        ));
+        assert!(!item_is_successful_gitlab_discovery_call(
+            &other_server,
+            Some("gitlab-discovery")
+        ));
     }
 
     #[test]

@@ -2860,4 +2860,76 @@ mod tests {
         assert_eq!(events[4].payload["label"], "turn-b-new-end");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn replace_run_history_events_for_turn_removes_turn_when_rewritten_empty() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let run_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 104,
+                head_sha: "sha-turn-remove".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .finish_run_history(
+                run_id,
+                RunHistoryFinish {
+                    result: "commented".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        store
+            .append_run_history_events(
+                run_id,
+                &[
+                    NewRunHistoryEvent {
+                        sequence: 1,
+                        turn_id: Some("turn-a".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({"label": "turn-a-start"}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 2,
+                        turn_id: Some("turn-a".to_string()),
+                        event_type: "turn_completed".to_string(),
+                        payload: serde_json::json!({"label": "turn-a-end"}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 3,
+                        turn_id: Some("turn-b".to_string()),
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({"label": "turn-b-start"}),
+                    },
+                    NewRunHistoryEvent {
+                        sequence: 4,
+                        turn_id: Some("turn-b".to_string()),
+                        event_type: "turn_completed".to_string(),
+                        payload: serde_json::json!({"label": "turn-b-end"}),
+                    },
+                ],
+            )
+            .await?;
+
+        store
+            .replace_run_history_events_for_turn(run_id, "turn-b", &[])
+            .await?;
+
+        let events = store.list_run_history_events(run_id).await?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[0].turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(events[0].payload["label"], "turn-a-start");
+        assert_eq!(events[1].sequence, 2);
+        assert_eq!(events[1].turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(events[1].payload["label"], "turn-a-end");
+        Ok(())
+    }
 }

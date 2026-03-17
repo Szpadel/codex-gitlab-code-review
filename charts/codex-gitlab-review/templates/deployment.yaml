@@ -89,6 +89,19 @@ spec:
                   key: {{ .Values.gitlab.token.secretKey }}
             - name: RUST_LOG
               value: "info"
+{{- if .Values.config.codex.gitlabDiscoveryMcp.enabled }}
+{{- $gitlabDiscoveryAdvertiseUrl := .Values.config.codex.gitlabDiscoveryMcp.advertiseUrl -}}
+{{- if not $gitlabDiscoveryAdvertiseUrl }}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+{{- end }}
+{{- if $gitlabDiscoveryAdvertiseUrl }}
+            - name: CODEX_REVIEW__CODEX__GITLAB_DISCOVERY_MCP__ADVERTISE_URL
+              value: {{ $gitlabDiscoveryAdvertiseUrl | quote }}
+{{- end }}
+{{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/codex

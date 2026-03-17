@@ -1,5 +1,5 @@
 use super::transcript::{
-    thread_snapshot_from_events, thread_snapshot_is_complete,
+    is_auxiliary_transcript_turn_id, thread_snapshot_from_events, thread_snapshot_is_complete,
     thread_snapshot_only_target_turn_is_incomplete,
 };
 use crate::codex_runner::CodexRunner;
@@ -597,14 +597,11 @@ async fn run_transcript_backfill(
         run.turn_id.as_deref(),
         review_wrapper_turn_events.as_deref(),
     );
-    let mut candidate_events = match (run.turn_id.as_deref(), turn_scoped_events) {
-        (Some(turn_id), Some(events)) => {
-            merge_rewritten_turn_events(persisted_events.clone(), turn_id, &events)?
-        }
-        (Some(_), None) => Vec::new(),
-        (None, Some(events)) => events,
-        (None, None) => anyhow::bail!(TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR),
-    };
+    let mut candidate_events = initial_backfill_candidate_events(
+        &persisted_events,
+        run.turn_id.as_deref(),
+        turn_scoped_events,
+    )?;
     let mut rebuilt_thread = (!candidate_events.is_empty())
         .then(|| thread_snapshot_from_events(run, &ephemeral_run_history_events(&candidate_events)))
         .flatten();
@@ -684,6 +681,10 @@ async fn run_transcript_backfill(
         }
         let filtered_full_thread_events =
             strip_missing_review_child_history_markers(filtered_full_thread_events);
+        let filtered_full_thread_events = preserve_auxiliary_persisted_events(
+            &persisted_events_for_full_thread,
+            filtered_full_thread_events,
+        );
         let filtered_thread = thread_snapshot_from_events(
             run,
             &ephemeral_run_history_events(&filtered_full_thread_events),
@@ -778,6 +779,24 @@ async fn run_transcript_backfill(
         .mark_run_history_transcript_backfill_complete(run.id)
         .await?;
     Ok(())
+}
+
+fn initial_backfill_candidate_events(
+    persisted_events: &[RunHistoryEventRecord],
+    turn_id: Option<&str>,
+    turn_scoped_events: Option<Vec<crate::state::NewRunHistoryEvent>>,
+) -> Result<Vec<crate::state::NewRunHistoryEvent>> {
+    match (turn_id, turn_scoped_events) {
+        (Some(turn_id), Some(events)) => {
+            merge_rewritten_turn_events(persisted_events.to_vec(), turn_id, &events)
+        }
+        (Some(_), None) => Ok(Vec::new()),
+        (None, Some(events)) => Ok(preserve_auxiliary_persisted_events(
+            persisted_events,
+            events,
+        )),
+        (None, None) => anyhow::bail!(TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR),
+    }
 }
 
 async fn load_validated_transcript_backfill_events(
@@ -1107,9 +1126,11 @@ fn persisted_turn_ids_are_covered(
     let full_thread_turn_ids = full_thread_events
         .iter()
         .filter_map(|event| event.turn_id.as_deref())
+        .filter(|turn_id| !is_auxiliary_transcript_turn_id(turn_id))
         .collect::<HashSet<_>>();
     persisted_turn_ids
         .iter()
+        .filter(|turn_id| !is_auxiliary_transcript_turn_id(turn_id))
         .all(|turn_id| full_thread_turn_ids.contains(turn_id.as_str()))
 }
 
@@ -1117,7 +1138,51 @@ fn turn_ids_from_new_events(events: &[crate::state::NewRunHistoryEvent]) -> Hash
     events
         .iter()
         .filter_map(|event| event.turn_id.clone())
+        .filter(|turn_id| !is_auxiliary_transcript_turn_id(turn_id))
         .collect::<HashSet<_>>()
+}
+
+fn preserve_auxiliary_persisted_events(
+    persisted_events: &[RunHistoryEventRecord],
+    mut rewritten_events: Vec<crate::state::NewRunHistoryEvent>,
+) -> Vec<crate::state::NewRunHistoryEvent> {
+    if rewritten_events.iter().any(|event| {
+        event
+            .turn_id
+            .as_deref()
+            .is_some_and(is_auxiliary_transcript_turn_id)
+    }) {
+        return rewritten_events;
+    }
+
+    let mut auxiliary_events = persisted_events
+        .iter()
+        .filter(|event| {
+            event
+                .turn_id
+                .as_deref()
+                .is_some_and(is_auxiliary_transcript_turn_id)
+        })
+        .map(|event| crate::state::NewRunHistoryEvent {
+            sequence: event.sequence,
+            turn_id: event.turn_id.clone(),
+            event_type: event.event_type.clone(),
+            payload: event.payload.clone(),
+        })
+        .collect::<Vec<_>>();
+    if auxiliary_events.is_empty() {
+        return rewritten_events;
+    }
+
+    auxiliary_events.sort_by_key(|event| event.sequence);
+    for event in &mut rewritten_events {
+        event.sequence += auxiliary_events.len() as i64;
+    }
+    auxiliary_events.extend(rewritten_events);
+    for (index, event) in auxiliary_events.iter_mut().enumerate() {
+        event.sequence = i64::try_from(index + 1).expect("auxiliary preserved event index");
+    }
+    auxiliary_events
 }
 
 fn merge_recovered_target_turn_events(
@@ -1328,12 +1393,14 @@ mod tests {
         StatusService, TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR,
         TRANSCRIPT_BACKFILL_STALE_INCOMPLETE_ERROR,
         TRANSCRIPT_BACKFILL_STALE_MISSING_HISTORY_ERROR, events_have_missing_review_child_history,
-        fallback_session_history_path, is_final_retry_window_attempt_pending,
-        merge_recovered_target_turn_events, missing_history_retry_window_open,
-        missing_review_child_history_has_renderable_fallback, primary_session_history_path,
-        sanitize_persisted_events_for_backfill, should_retry_transcript_backfill_error,
-        should_retry_transcript_backfill_failure, strip_missing_review_child_history_markers,
-        terminal_transcript_backfill_error_text,
+        fallback_session_history_path, initial_backfill_candidate_events,
+        is_final_retry_window_attempt_pending, merge_recovered_target_turn_events,
+        missing_history_retry_window_open, missing_review_child_history_has_renderable_fallback,
+        persisted_turn_ids_are_covered, preserve_auxiliary_persisted_events,
+        primary_session_history_path, sanitize_persisted_events_for_backfill,
+        should_retry_transcript_backfill_error, should_retry_transcript_backfill_failure,
+        strip_missing_review_child_history_markers, terminal_transcript_backfill_error_text,
+        turn_ids_from_new_events,
     };
     use crate::config::{
         BrowserMcpConfig, CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig,
@@ -1385,6 +1452,160 @@ mod tests {
                 "/srv/fallback-account",
             ),
             "/srv/fallback-account/sessions"
+        );
+    }
+
+    #[test]
+    fn turn_id_helpers_ignore_auxiliary_startup_warning_turns() {
+        let persisted_turn_ids = std::collections::HashSet::from([
+            "gitlab-discovery-mcp-startup".to_string(),
+            "turn-1".to_string(),
+        ]);
+        let full_thread_events = vec![
+            crate::state::NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            crate::state::NewRunHistoryEvent {
+                sequence: 2,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+        ];
+
+        assert!(persisted_turn_ids_are_covered(
+            &persisted_turn_ids,
+            &full_thread_events
+        ));
+        assert_eq!(
+            turn_ids_from_new_events(&full_thread_events),
+            std::collections::HashSet::from(["turn-1".to_string()])
+        );
+    }
+
+    #[test]
+    fn preserve_auxiliary_persisted_events_reinjects_startup_warning_turn() {
+        let persisted_events = vec![
+            RunHistoryEventRecord {
+                id: 1,
+                run_history_id: 1,
+                sequence: 1,
+                turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+                created_at: 0,
+            },
+            RunHistoryEventRecord {
+                id: 2,
+                run_history_id: 1,
+                sequence: 2,
+                turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                event_type: "item_completed".to_string(),
+                payload: json!({
+                    "type": "agentMessage",
+                    "text": "GitLab discovery MCP startup warning"
+                }),
+                created_at: 0,
+            },
+            RunHistoryEventRecord {
+                id: 3,
+                run_history_id: 1,
+                sequence: 3,
+                turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+                created_at: 0,
+            },
+        ];
+        let rewritten_events = vec![
+            crate::state::NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            crate::state::NewRunHistoryEvent {
+                sequence: 2,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+            },
+        ];
+
+        let merged = preserve_auxiliary_persisted_events(&persisted_events, rewritten_events);
+
+        assert_eq!(merged.len(), 5);
+        assert_eq!(
+            merged
+                .iter()
+                .filter_map(|event| event.turn_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                "gitlab-discovery-mcp-startup",
+                "gitlab-discovery-mcp-startup",
+                "gitlab-discovery-mcp-startup",
+                "turn-1",
+                "turn-1",
+            ]
+        );
+        assert_eq!(merged[0].sequence, 1);
+        assert_eq!(merged[4].sequence, 5);
+    }
+
+    #[test]
+    fn initial_backfill_candidate_events_preserves_auxiliary_turns_for_turnless_rewrite() {
+        let persisted_events = vec![
+            RunHistoryEventRecord {
+                id: 1,
+                run_history_id: 1,
+                sequence: 1,
+                turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+                created_at: 0,
+            },
+            RunHistoryEventRecord {
+                id: 2,
+                run_history_id: 1,
+                sequence: 2,
+                turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+                created_at: 0,
+            },
+        ];
+        let turn_scoped_events = Some(vec![
+            crate::state::NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            crate::state::NewRunHistoryEvent {
+                sequence: 2,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+            },
+        ]);
+
+        let merged = initial_backfill_candidate_events(&persisted_events, None, turn_scoped_events)
+            .expect("turn-less rewrite should keep auxiliary startup warning");
+
+        assert_eq!(
+            merged
+                .iter()
+                .filter_map(|event| event.turn_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                "gitlab-discovery-mcp-startup",
+                "gitlab-discovery-mcp-startup",
+                "turn-1",
+                "turn-1",
+            ]
         );
     }
 
