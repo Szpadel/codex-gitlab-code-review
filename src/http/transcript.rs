@@ -580,6 +580,7 @@ fn compact_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::FeatureFlagSnapshot;
     use crate::state::{RunHistoryKind, RunHistoryRecord};
     use serde_json::json;
 
@@ -642,6 +643,7 @@ mod tests {
             trigger_note_body: None,
             command_repo: None,
             commit_sha: None,
+            feature_flags: FeatureFlagSnapshot::default(),
             events_persisted_cleanly: false,
             transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
             transcript_backfill_error: None,
@@ -712,6 +714,7 @@ mod tests {
             trigger_note_body: None,
             command_repo: None,
             commit_sha: None,
+            feature_flags: FeatureFlagSnapshot::default(),
             events_persisted_cleanly: false,
             transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
             transcript_backfill_error: None,
@@ -808,6 +811,7 @@ mod tests {
             trigger_note_body: None,
             command_repo: None,
             commit_sha: None,
+            feature_flags: FeatureFlagSnapshot::default(),
             events_persisted_cleanly: false,
             transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
             transcript_backfill_error: None,
@@ -890,6 +894,7 @@ mod tests {
             trigger_note_body: None,
             command_repo: None,
             commit_sha: None,
+            feature_flags: FeatureFlagSnapshot::default(),
             events_persisted_cleanly: false,
             transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
             transcript_backfill_error: None,

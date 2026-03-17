@@ -15,6 +15,7 @@ use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOpt
 use codex_gitlab_code_review::config::Config;
 use codex_gitlab_code_review::demo_history::seed_example_history;
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
+use codex_gitlab_code_review::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use codex_gitlab_code_review::http::{StatusService, run_http_server};
 use codex_gitlab_code_review::review::{ReviewService, ScanRunStatus};
 use codex_gitlab_code_review::state::{ReviewStateStore, ScanMode, ScanOutcome};
@@ -245,11 +246,25 @@ async fn main() -> Result<()> {
     );
     let review_owner_id = state.get_or_create_review_owner_id().await?;
     let mention_commands_active = mention_commands_active(&config);
+    let gitlab_discovery_mcp = if config.codex.gitlab_discovery_mcp.enabled {
+        Some(Arc::new(GitLabDiscoveryMcpService::new(
+            config.docker.clone(),
+            &config.gitlab,
+            config.codex.gitlab_discovery_mcp.clone(),
+        )?))
+    } else {
+        None
+    };
+    if let Some(service) = gitlab_discovery_mcp.as_ref() {
+        let listener = service.bind_listener().await?;
+        tokio::spawn(Arc::clone(service).run(listener));
+    }
     let runner = Arc::new(DockerCodexRunner::new(
         config.docker.clone(),
         config.codex.clone(),
         git_base,
         Arc::clone(&state),
+        gitlab_discovery_mcp.clone(),
         RunnerRuntimeOptions {
             gitlab_token: config.gitlab.token.clone(),
             log_all_json: cli.debug,
@@ -348,6 +363,9 @@ async fn main() -> Result<()> {
     }
 
     service.request_shutdown();
+    if let Some(service) = gitlab_discovery_mcp.as_ref() {
+        service.shutdown();
+    }
     let _ = shutdown_tx.send(true);
     if let Err(err) = service.recover_in_progress_reviews().await {
         warn!(error = %err, "shutdown recovery of interrupted reviews failed");
@@ -565,10 +583,12 @@ mod tests {
         CodexResult, MentionCommandContext, MentionCommandResult, ReviewContext,
     };
     use codex_gitlab_code_review::config::{
-        BrowserMcpConfig, CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
-        McpServerOverridesConfig, ReasoningEffortOverridesConfig, ReasoningSummaryOverridesConfig,
-        ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
+        BrowserMcpConfig, CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig,
+        GitLabDiscoveryMcpConfig, GitLabTargets, McpServerOverridesConfig,
+        ReasoningEffortOverridesConfig, ReasoningSummaryOverridesConfig, ReviewConfig,
+        ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
     };
+    use codex_gitlab_code_review::feature_flags::FeatureFlagDefaults;
     use sqlx::Executor;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -673,6 +693,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            feature_flags: FeatureFlagDefaults::default(),
             gitlab: GitLabConfig {
                 base_url: "https://gitlab.example.com".to_string(),
                 token: String::new(),
@@ -716,6 +737,7 @@ mod tests {
                 usage_limit_fallback_cooldown_seconds: 3600,
                 deps: Default::default(),
                 browser_mcp: BrowserMcpConfig::default(),
+                gitlab_discovery_mcp: GitLabDiscoveryMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
                 reasoning_effort: ReasoningEffortOverridesConfig::default(),
                 reasoning_summary: ReasoningSummaryOverridesConfig::default(),

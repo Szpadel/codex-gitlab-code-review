@@ -1,16 +1,24 @@
+use crate::feature_flags::{
+    FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
+use url::Url;
 
 pub const BROWSER_MCP_REMOTE_DEBUGGING_PORT: u16 = 9222;
 const SUPPORTED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 const SUPPORTED_REASONING_SUMMARIES: &[&str] = &["none", "auto", "detailed"];
+const RESERVED_GITLAB_DISCOVERY_MCP_ENV_VARS: &[&str] =
+    &["GITLAB_TOKEN", "HOME", "CODEX_RUNNER_DEBUG"];
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub feature_flags: FeatureFlagDefaults,
     pub gitlab: GitLabConfig,
     pub schedule: ScheduleConfig,
     pub review: ReviewConfig,
@@ -177,6 +185,8 @@ pub struct CodexConfig {
     #[serde(default)]
     pub browser_mcp: BrowserMcpConfig,
     #[serde(default)]
+    pub gitlab_discovery_mcp: GitLabDiscoveryMcpConfig,
+    #[serde(default)]
     pub mcp_server_overrides: McpServerOverridesConfig,
     #[serde(default)]
     pub reasoning_effort: ReasoningEffortOverridesConfig,
@@ -202,6 +212,36 @@ pub struct BrowserMcpConfig {
     pub mcp_command: String,
     #[serde(default = "default_browser_mcp_args")]
     pub mcp_args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct GitLabDiscoveryMcpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_gitlab_discovery_mcp_server_name")]
+    pub server_name: String,
+    #[serde(default = "default_gitlab_discovery_mcp_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default)]
+    pub advertise_url: String,
+    #[serde(default = "default_gitlab_discovery_mcp_bearer_token_env_var")]
+    pub bearer_token_env_var: String,
+    #[serde(default = "default_gitlab_discovery_mcp_clone_root")]
+    pub clone_root: String,
+    #[serde(default)]
+    pub allow: Vec<GitLabDiscoveryAllowRule>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct GitLabDiscoveryAllowRule {
+    #[serde(default)]
+    pub source_repos: Vec<String>,
+    #[serde(default)]
+    pub source_group_prefixes: Vec<String>,
+    #[serde(default)]
+    pub target_repos: Vec<String>,
+    #[serde(default)]
+    pub target_groups: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -276,6 +316,22 @@ fn default_reasoning_summary_override() -> Option<String> {
     Some("detailed".to_string())
 }
 
+fn default_gitlab_discovery_mcp_server_name() -> String {
+    "gitlab-discovery".to_string()
+}
+
+fn default_gitlab_discovery_mcp_bind_addr() -> String {
+    "127.0.0.1:8091".to_string()
+}
+
+fn default_gitlab_discovery_mcp_bearer_token_env_var() -> String {
+    "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN".to_string()
+}
+
+fn default_gitlab_discovery_mcp_clone_root() -> String {
+    "/work/mcp".to_string()
+}
+
 impl Default for DockerConfig {
     fn default() -> Self {
         Self {
@@ -295,6 +351,20 @@ impl Default for BrowserMcpConfig {
             browser_args: Vec::new(),
             mcp_command: default_browser_mcp_command(),
             mcp_args: default_browser_mcp_args(),
+        }
+    }
+}
+
+impl Default for GitLabDiscoveryMcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_name: default_gitlab_discovery_mcp_server_name(),
+            bind_addr: default_gitlab_discovery_mcp_bind_addr(),
+            advertise_url: String::new(),
+            bearer_token_env_var: default_gitlab_discovery_mcp_bearer_token_env_var(),
+            clone_root: default_gitlab_discovery_mcp_clone_root(),
+            allow: Vec::new(),
         }
     }
 }
@@ -349,10 +419,31 @@ impl Config {
         }
         validate_codex_auth_accounts(&config.codex)?;
         validate_browser_mcp(&config.codex)?;
+        validate_gitlab_discovery_mcp(&config.codex)?;
+        validate_unique_injected_mcp_server_names(&config.codex)?;
+        validate_distinct_http_and_gitlab_discovery_bind_addrs(&config)?;
         validate_mcp_server_overrides(&config.codex)?;
         validate_reasoning_effort_overrides(&config.codex)?;
         validate_reasoning_summary_overrides(&config.codex)?;
         Ok(config)
+    }
+
+    pub fn feature_flag_availability(&self) -> FeatureFlagAvailability {
+        FeatureFlagAvailability {
+            gitlab_discovery_mcp: self.codex.gitlab_discovery_mcp.enabled
+                && !self.codex.gitlab_discovery_mcp.allow.is_empty(),
+        }
+    }
+
+    pub fn resolve_feature_flags(
+        &self,
+        overrides: &RuntimeFeatureFlagOverrides,
+    ) -> FeatureFlagSnapshot {
+        FeatureFlagSnapshot::resolve(
+            &self.feature_flags,
+            &self.feature_flag_availability(),
+            overrides,
+        )
     }
 }
 
@@ -479,6 +570,150 @@ fn validate_browser_mcp(codex: &CodexConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_gitlab_discovery_mcp(codex: &CodexConfig) -> Result<()> {
+    if !codex.gitlab_discovery_mcp.enabled {
+        return Ok(());
+    }
+
+    let mcp = &codex.gitlab_discovery_mcp;
+    anyhow::ensure!(
+        !mcp.server_name.trim().is_empty(),
+        "codex.gitlab_discovery_mcp.server_name must not be empty"
+    );
+    anyhow::ensure!(
+        mcp.server_name.chars().all(|ch| !ch.is_control()),
+        "codex.gitlab_discovery_mcp.server_name must not contain control characters"
+    );
+    anyhow::ensure!(
+        is_valid_mcp_server_name(&mcp.server_name),
+        "codex.gitlab_discovery_mcp.server_name must match ^[a-zA-Z0-9_-]+$"
+    );
+    anyhow::ensure!(
+        !mcp.bind_addr.trim().is_empty(),
+        "codex.gitlab_discovery_mcp.bind_addr must not be empty"
+    );
+    let bind_addr = Url::parse(&format!("tcp://{}", mcp.bind_addr))
+        .context("parse codex.gitlab_discovery_mcp.bind_addr")?;
+    anyhow::ensure!(
+        bind_addr.port().is_some_and(|port| port != 0),
+        "codex.gitlab_discovery_mcp.bind_addr must include a non-zero port"
+    );
+    anyhow::ensure!(
+        !mcp.advertise_url.trim().is_empty(),
+        "codex.gitlab_discovery_mcp.advertise_url must not be empty"
+    );
+    let advertise_url =
+        Url::parse(&mcp.advertise_url).context("parse codex.gitlab_discovery_mcp.advertise_url")?;
+    anyhow::ensure!(
+        matches!(advertise_url.scheme(), "http" | "https"),
+        "codex.gitlab_discovery_mcp.advertise_url must use http or https"
+    );
+    anyhow::ensure!(
+        !mcp.bearer_token_env_var.trim().is_empty(),
+        "codex.gitlab_discovery_mcp.bearer_token_env_var must not be empty"
+    );
+    anyhow::ensure!(
+        mcp.bearer_token_env_var
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "codex.gitlab_discovery_mcp.bearer_token_env_var must contain only letters, digits, or underscores"
+    );
+    anyhow::ensure!(
+        !RESERVED_GITLAB_DISCOVERY_MCP_ENV_VARS.contains(&mcp.bearer_token_env_var.as_str()),
+        "codex.gitlab_discovery_mcp.bearer_token_env_var must not override runner-owned env vars: {}",
+        RESERVED_GITLAB_DISCOVERY_MCP_ENV_VARS.join(", ")
+    );
+    anyhow::ensure!(
+        !mcp.clone_root.trim().is_empty(),
+        "codex.gitlab_discovery_mcp.clone_root must not be empty"
+    );
+    anyhow::ensure!(
+        mcp.clone_root.starts_with('/'),
+        "codex.gitlab_discovery_mcp.clone_root must be an absolute path"
+    );
+    for (index, rule) in mcp.allow.iter().enumerate() {
+        let rule_name = format!("codex.gitlab_discovery_mcp.allow[{index}]");
+        anyhow::ensure!(
+            !(rule.source_repos.is_empty() && rule.source_group_prefixes.is_empty()),
+            "{rule_name} must include at least one source_repos or source_group_prefixes entry"
+        );
+        anyhow::ensure!(
+            !(rule.target_repos.is_empty() && rule.target_groups.is_empty()),
+            "{rule_name} must include at least one target_repos or target_groups entry"
+        );
+
+        for (field, values) in [
+            ("source_repos", &rule.source_repos),
+            ("source_group_prefixes", &rule.source_group_prefixes),
+            ("target_repos", &rule.target_repos),
+            ("target_groups", &rule.target_groups),
+        ] {
+            for value in values {
+                anyhow::ensure!(
+                    !value.trim().is_empty(),
+                    "{rule_name}.{field} values must not be empty"
+                );
+                anyhow::ensure!(
+                    value.chars().all(|ch| !ch.is_control()),
+                    "{rule_name}.{field} values must not contain control characters"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_unique_injected_mcp_server_names(codex: &CodexConfig) -> Result<()> {
+    if codex.browser_mcp.enabled
+        && codex.gitlab_discovery_mcp.enabled
+        && codex.browser_mcp.server_name == codex.gitlab_discovery_mcp.server_name
+    {
+        anyhow::bail!(
+            "codex.browser_mcp.server_name and codex.gitlab_discovery_mcp.server_name must be distinct when both MCP injectors are enabled"
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_distinct_http_and_gitlab_discovery_bind_addrs(config: &Config) -> Result<()> {
+    if !config.codex.gitlab_discovery_mcp.enabled {
+        return Ok(());
+    }
+
+    let (http_host, http_port) = parse_bind_addr("server.bind_addr", &config.server.bind_addr)?;
+    let (mcp_host, mcp_port) = parse_bind_addr(
+        "codex.gitlab_discovery_mcp.bind_addr",
+        &config.codex.gitlab_discovery_mcp.bind_addr,
+    )?;
+    if http_port == mcp_port
+        && (http_host == mcp_host || is_wildcard_host(&http_host) || is_wildcard_host(&mcp_host))
+    {
+        anyhow::bail!(
+            "server.bind_addr and codex.gitlab_discovery_mcp.bind_addr must not target the same listener socket"
+        );
+    }
+
+    Ok(())
+}
+
+fn parse_bind_addr(field: &str, value: &str) -> Result<(String, u16)> {
+    let url = Url::parse(&format!("tcp://{value}")).with_context(|| format!("parse {field}"))?;
+    let host = url
+        .host_str()
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("{field} must include a host"))?;
+    let port = url
+        .port()
+        .with_context(|| format!("{field} must include a port"))?;
+    Ok((host, port))
+}
+
+fn is_wildcard_host(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::" | "0:0:0:0:0:0:0:0")
 }
 
 fn validate_reasoning_effort_overrides(codex: &CodexConfig) -> Result<()> {
@@ -1183,6 +1418,280 @@ server:
         assert!(result.is_err());
         let msg = format!("{:#}", result.expect_err("error"));
         assert!(msg.contains("must match ^[a-zA-Z0-9_-]+$"));
+    }
+
+    #[test]
+    fn loads_enabled_gitlab_discovery_mcp_without_allow_rules() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "0.0.0.0:8081"
+    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    clone_root: "/work/mcp"
+    allow: []
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let config = load_from_yaml(yaml);
+        assert!(config.codex.gitlab_discovery_mcp.enabled);
+        assert!(config.codex.gitlab_discovery_mcp.allow.is_empty());
+    }
+
+    #[test]
+    fn errors_on_gitlab_discovery_mcp_bind_addr_with_port_zero() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "127.0.0.1:0"
+    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("codex.gitlab_discovery_mcp.bind_addr must include a non-zero port"));
+    }
+
+    #[test]
+    fn errors_on_gitlab_discovery_mcp_reserved_bearer_token_env_var() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "0.0.0.0:8081"
+    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
+    bearer_token_env_var: "HOME"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains("must not override runner-owned env vars"));
+    }
+
+    #[test]
+    fn errors_on_duplicate_enabled_injected_mcp_server_names() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  browser_mcp:
+    enabled: true
+    server_name: "shared-mcp"
+    browser_image: "chromedp/headless-shell:latest"
+    remote_debugging_port: 9222
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "shared-mcp"
+    bind_addr: "0.0.0.0:8081"
+    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains(
+            "codex.browser_mcp.server_name and codex.gitlab_discovery_mcp.server_name must be distinct"
+        ));
+    }
+
+    #[test]
+    fn errors_on_http_and_gitlab_discovery_bind_addr_collision() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "0.0.0.0:8080"
+    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "0.0.0.0:8080"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains(
+            "server.bind_addr and codex.gitlab_discovery_mcp.bind_addr must not target the same listener socket"
+        ));
+    }
+
+    #[test]
+    fn errors_on_http_and_gitlab_discovery_bind_addr_collision_with_expanded_ipv6_wildcard() {
+        let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * * *"
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "[0:0:0:0:0:0:0:0]:8080"
+    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "[::]:8080"
+"#;
+        let result = try_load_from_yaml(yaml);
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.expect_err("error"));
+        assert!(msg.contains(
+            "server.bind_addr and codex.gitlab_discovery_mcp.bind_addr must not target the same listener socket"
+        ));
     }
 
     #[test]

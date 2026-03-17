@@ -109,6 +109,10 @@ spec:
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
+{{- if .Values.config.codex.gitlabDiscoveryMcp.enabled }}
+            - name: mcp
+              containerPort: {{ include "codex-gitlab-review.gitlabDiscoveryMcpPort" . }}
+{{- end }}
           resources:
 {{ toYaml .Values.resources | indent 12 }}
         - name: dind

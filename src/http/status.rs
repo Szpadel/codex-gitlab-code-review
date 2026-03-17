@@ -4,6 +4,9 @@ use super::transcript::{
 };
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
+use crate::feature_flags::{
+    FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
+};
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
     ProjectCatalogSummary, ReviewStateStore, RunHistoryEventRecord, RunHistoryKind,
@@ -15,7 +18,7 @@ use crate::transcript_backfill::{
     TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR, TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR,
     TranscriptBackfillSource,
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::warn;
+use uuid::Uuid;
 
 pub use super::transcript::{ThreadItemSnapshot, ThreadSnapshot};
 
@@ -56,6 +60,7 @@ pub struct StatusConfigSnapshot {
     pub dry_run: bool,
     pub mention_commands_enabled: bool,
     pub browser_mcp_enabled: bool,
+    pub gitlab_discovery_mcp_configured: bool,
     pub max_concurrent: usize,
     pub schedule_cron: String,
     pub schedule_timezone: String,
@@ -64,6 +69,16 @@ pub struct StatusConfigSnapshot {
     pub repo_targets_all: bool,
     pub group_targets: usize,
     pub group_targets_all: bool,
+    pub feature_flags: Vec<StatusFeatureFlagSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StatusFeatureFlagSnapshot {
+    pub name: String,
+    pub available: bool,
+    pub default_enabled: bool,
+    pub runtime_override: Option<bool>,
+    pub effective_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -81,6 +96,7 @@ pub struct StatusScanSnapshot {
 pub struct StatusService {
     config: StatusConfig,
     state: Arc<ReviewStateStore>,
+    feature_flag_csrf_token: String,
     default_transcript_backfill_source: Option<Arc<dyn TranscriptBackfillSource>>,
     account_transcript_backfill_sources: HashMap<String, Arc<dyn TranscriptBackfillSource>>,
     active_backfills: Arc<Mutex<HashSet<i64>>>,
@@ -96,6 +112,7 @@ struct StatusConfig {
     dry_run: bool,
     mention_commands_enabled: bool,
     browser_mcp_enabled: bool,
+    gitlab_discovery_mcp_configured: bool,
     max_concurrent: usize,
     schedule_cron: String,
     schedule_timezone: String,
@@ -103,6 +120,8 @@ struct StatusConfig {
     repo_targets_all: bool,
     group_targets: usize,
     group_targets_all: bool,
+    feature_flag_defaults: FeatureFlagDefaults,
+    feature_flag_availability: FeatureFlagAvailability,
 }
 
 impl StatusService {
@@ -114,6 +133,7 @@ impl StatusService {
         // Do not reintroduce synchronous Codex thread reads on the HTTP path.
         _runner: Option<Arc<dyn CodexRunner>>,
     ) -> Self {
+        let feature_flag_availability = config.feature_flag_availability();
         let default_transcript_backfill_source = Arc::new(SessionHistoryBackfillSource::new(
             primary_session_history_path(
                 &config.codex.auth_host_path,
@@ -134,6 +154,7 @@ impl StatusService {
                 dry_run: config.review.dry_run,
                 mention_commands_enabled: config.review.mention_commands.enabled,
                 browser_mcp_enabled: config.codex.browser_mcp.enabled,
+                gitlab_discovery_mcp_configured: config.codex.gitlab_discovery_mcp.enabled,
                 max_concurrent: config.review.max_concurrent,
                 schedule_cron: config.schedule.cron,
                 schedule_timezone: config
@@ -144,8 +165,11 @@ impl StatusService {
                 repo_targets_all: config.gitlab.targets.repos.is_all(),
                 group_targets: config.gitlab.targets.groups.list().len(),
                 group_targets_all: config.gitlab.targets.groups.is_all(),
+                feature_flag_defaults: config.feature_flags.clone(),
+                feature_flag_availability,
             },
             state,
+            feature_flag_csrf_token: Uuid::new_v4().to_string(),
             default_transcript_backfill_source: Some(default_transcript_backfill_source),
             account_transcript_backfill_sources,
             active_backfills: Arc::new(Mutex::new(HashSet::new())),
@@ -169,9 +193,14 @@ impl StatusService {
         self.config.status_ui_enabled
     }
 
+    pub(crate) fn feature_flag_csrf_token(&self) -> &str {
+        &self.feature_flag_csrf_token
+    }
+
     pub async fn snapshot(&self) -> Result<StatusSnapshot> {
         let created_after = self.state.get_created_after().await?;
         let scan = self.state.get_scan_status().await?;
+        let overrides = self.state.get_runtime_feature_flag_overrides().await?;
         Ok(StatusSnapshot {
             generated_at: Utc::now().to_rfc3339(),
             config: StatusConfigSnapshot {
@@ -181,6 +210,7 @@ impl StatusService {
                 dry_run: self.config.dry_run,
                 mention_commands_enabled: self.config.mention_commands_enabled,
                 browser_mcp_enabled: self.config.browser_mcp_enabled,
+                gitlab_discovery_mcp_configured: self.config.gitlab_discovery_mcp_configured,
                 max_concurrent: self.config.max_concurrent,
                 schedule_cron: self.config.schedule_cron.clone(),
                 schedule_timezone: self.config.schedule_timezone.clone(),
@@ -189,6 +219,7 @@ impl StatusService {
                 repo_targets_all: self.config.repo_targets_all,
                 group_targets: self.config.group_targets,
                 group_targets_all: self.config.group_targets_all,
+                feature_flags: self.feature_flag_snapshots(&overrides),
             },
             scan: scan_into_snapshot(scan),
             in_progress_reviews: self.state.list_in_progress_reviews().await?,
@@ -196,6 +227,50 @@ impl StatusService {
             auth_limit_resets: self.state.list_auth_limit_reset_entries().await?,
             project_catalogs: self.state.list_project_catalog_summaries().await?,
         })
+    }
+
+    pub async fn update_runtime_feature_flag(
+        &self,
+        flag_name: &str,
+        enabled: Option<bool>,
+    ) -> Result<StatusFeatureFlagSnapshot> {
+        match flag_name {
+            "gitlab_discovery_mcp" => {
+                if !self.config.feature_flag_availability.gitlab_discovery_mcp && enabled.is_some()
+                {
+                    bail!("invalid feature flag request: {flag_name} is unavailable");
+                }
+            }
+            other => bail!("invalid feature flag: {other}"),
+        }
+
+        let mut overrides = self.state.get_runtime_feature_flag_overrides().await?;
+        overrides.gitlab_discovery_mcp = enabled;
+        self.state
+            .set_runtime_feature_flag_overrides(&overrides)
+            .await?;
+        self.feature_flag_snapshots(&overrides)
+            .into_iter()
+            .find(|flag| flag.name == flag_name)
+            .ok_or_else(|| anyhow::anyhow!("missing feature flag after update: {flag_name}"))
+    }
+
+    fn feature_flag_snapshots(
+        &self,
+        overrides: &RuntimeFeatureFlagOverrides,
+    ) -> Vec<StatusFeatureFlagSnapshot> {
+        let effective = FeatureFlagSnapshot::resolve(
+            &self.config.feature_flag_defaults,
+            &self.config.feature_flag_availability,
+            overrides,
+        );
+        vec![StatusFeatureFlagSnapshot {
+            name: "gitlab_discovery_mcp".to_string(),
+            available: self.config.feature_flag_availability.gitlab_discovery_mcp,
+            default_enabled: self.config.feature_flag_defaults.gitlab_discovery_mcp,
+            runtime_override: overrides.gitlab_discovery_mcp,
+            effective_enabled: effective.gitlab_discovery_mcp,
+        }]
     }
 
     pub async fn mark_scan_started(&self, mode: ScanMode) -> Result<()> {
@@ -1250,7 +1325,8 @@ fn ephemeral_run_history_events(
 #[cfg(test)]
 mod tests {
     use super::{
-        TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR, TRANSCRIPT_BACKFILL_STALE_INCOMPLETE_ERROR,
+        StatusService, TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR,
+        TRANSCRIPT_BACKFILL_STALE_INCOMPLETE_ERROR,
         TRANSCRIPT_BACKFILL_STALE_MISSING_HISTORY_ERROR, events_have_missing_review_child_history,
         fallback_session_history_path, is_final_retry_window_attempt_pending,
         merge_recovered_target_turn_events, missing_history_retry_window_open,
@@ -1259,11 +1335,20 @@ mod tests {
         should_retry_transcript_backfill_failure, strip_missing_review_child_history_markers,
         terminal_transcript_backfill_error_text,
     };
+    use crate::config::{
+        BrowserMcpConfig, CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig,
+        GitLabDiscoveryMcpConfig, GitLabTargets, McpServerOverridesConfig,
+        ReasoningEffortOverridesConfig, ReasoningSummaryOverridesConfig, ReviewConfig,
+        ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
+    };
+    use crate::feature_flags::{FeatureFlagDefaults, FeatureFlagSnapshot};
     use crate::state::{
-        RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord, TranscriptBackfillState,
+        ReviewStateStore, RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord,
+        TranscriptBackfillState,
     };
     use crate::transcript_backfill::TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn primary_session_history_defaults_to_auth_host_sessions_dir() {
@@ -1313,6 +1398,100 @@ mod tests {
             ),
             "/var/lib/codex-history"
         );
+    }
+
+    #[tokio::test]
+    async fn status_snapshot_includes_feature_flag_state() -> anyhow::Result<()> {
+        let store = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let service = StatusService::new(test_config(), store, false, None);
+
+        let snapshot = service.snapshot().await?;
+
+        assert_eq!(snapshot.config.feature_flags.len(), 1);
+        assert_eq!(
+            snapshot.config.feature_flags[0].name,
+            "gitlab_discovery_mcp"
+        );
+        assert!(!snapshot.config.feature_flags[0].effective_enabled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_runtime_feature_flag_persists_override() -> anyhow::Result<()> {
+        let store = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let mut config = test_config();
+        config.codex.gitlab_discovery_mcp.enabled = true;
+        config.codex.gitlab_discovery_mcp.allow = vec![crate::config::GitLabDiscoveryAllowRule {
+            source_repos: vec!["group/source".to_string()],
+            source_group_prefixes: Vec::new(),
+            target_repos: vec!["group/target".to_string()],
+            target_groups: Vec::new(),
+        }];
+        let service = StatusService::new(config, Arc::clone(&store), false, None);
+
+        let updated = service
+            .update_runtime_feature_flag("gitlab_discovery_mcp", Some(true))
+            .await?;
+
+        assert_eq!(updated.runtime_override, Some(true));
+        assert!(updated.effective_enabled);
+        assert_eq!(
+            store
+                .get_runtime_feature_flag_overrides()
+                .await?
+                .gitlab_discovery_mcp,
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_runtime_feature_flag_rejects_unavailable_flags() -> anyhow::Result<()> {
+        let store = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+
+        let result = service
+            .update_runtime_feature_flag("gitlab_discovery_mcp", Some(true))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            store
+                .get_runtime_feature_flag_overrides()
+                .await?
+                .gitlab_discovery_mcp,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> anyhow::Result<()>
+    {
+        let store = Arc::new(ReviewStateStore::new(":memory:").await?);
+        store
+            .set_runtime_feature_flag_overrides(
+                &crate::feature_flags::RuntimeFeatureFlagOverrides {
+                    gitlab_discovery_mcp: Some(true),
+                },
+            )
+            .await?;
+        let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+
+        let updated = service
+            .update_runtime_feature_flag("gitlab_discovery_mcp", None)
+            .await?;
+
+        assert_eq!(updated.runtime_override, None);
+        assert!(!updated.effective_enabled);
+        assert_eq!(
+            store
+                .get_runtime_feature_flag_overrides()
+                .await?
+                .gitlab_discovery_mcp,
+            None
+        );
+        Ok(())
     }
 
     #[test]
@@ -2113,11 +2292,74 @@ mod tests {
             trigger_note_body: None,
             command_repo: None,
             commit_sha: None,
+            feature_flags: FeatureFlagSnapshot::default(),
             events_persisted_cleanly: false,
             transcript_backfill_state: TranscriptBackfillState::Failed,
             transcript_backfill_error: Some(
                 "matching Codex session history was not found".to_string(),
             ),
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            feature_flags: FeatureFlagDefaults::default(),
+            gitlab: GitLabConfig {
+                base_url: "https://gitlab.example.com".to_string(),
+                token: String::new(),
+                bot_user_id: Some(1),
+                created_after: None,
+                targets: GitLabTargets {
+                    repos: TargetSelector::List(vec!["group/repo".to_string()]),
+                    groups: TargetSelector::List(vec![]),
+                    exclude_repos: vec![],
+                    exclude_groups: vec![],
+                    refresh_seconds: 3600,
+                },
+            },
+            schedule: ScheduleConfig {
+                cron: "0 */10 * * * *".to_string(),
+                timezone: Some("UTC".to_string()),
+            },
+            review: ReviewConfig {
+                max_concurrent: 2,
+                eyes_emoji: "eyes".to_string(),
+                thumbs_emoji: "thumbsup".to_string(),
+                comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
+                stale_in_progress_minutes: 120,
+                dry_run: true,
+                additional_developer_instructions: None,
+                mention_commands: ReviewMentionCommandsConfig {
+                    enabled: false,
+                    bot_username: None,
+                    eyes_emoji: None,
+                    additional_developer_instructions: None,
+                },
+            },
+            codex: CodexConfig {
+                image: "ghcr.io/openai/codex-universal:latest".to_string(),
+                timeout_seconds: 1800,
+                auth_host_path: "/tmp/codex".to_string(),
+                auth_mount_path: "/root/.codex".to_string(),
+                session_history_path: None,
+                exec_sandbox: "danger-full-access".to_string(),
+                fallback_auth_accounts: vec![],
+                usage_limit_fallback_cooldown_seconds: 3600,
+                deps: Default::default(),
+                browser_mcp: BrowserMcpConfig::default(),
+                gitlab_discovery_mcp: GitLabDiscoveryMcpConfig::default(),
+                mcp_server_overrides: McpServerOverridesConfig::default(),
+                reasoning_effort: ReasoningEffortOverridesConfig::default(),
+                reasoning_summary: ReasoningSummaryOverridesConfig::default(),
+            },
+            docker: DockerConfig::default(),
+            database: DatabaseConfig {
+                path: ":memory:".to_string(),
+            },
+            server: ServerConfig {
+                bind_addr: "127.0.0.1:0".to_string(),
+                status_ui_enabled: true,
+            },
         }
     }
 }

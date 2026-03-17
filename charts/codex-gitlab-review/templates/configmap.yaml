@@ -1,3 +1,13 @@
+{{- $serverHost := include "codex-gitlab-review.serverBindHost" . -}}
+{{- $serverPort := include "codex-gitlab-review.serverBindPort" . -}}
+{{- $mcpHost := include "codex-gitlab-review.gitlabDiscoveryMcpBindHost" . -}}
+{{- $mcpPort := include "codex-gitlab-review.gitlabDiscoveryMcpPort" . -}}
+{{- if and .Values.config.codex.gitlabDiscoveryMcp.enabled (eq (include "codex-gitlab-review.gitlabDiscoveryMcpBindHostIsWildcard" .) "false") -}}
+{{- fail "config.codex.gitlabDiscoveryMcp.bindAddr must use a wildcard host (0.0.0.0 or [::]) in the Helm chart" -}}
+{{- end }}
+{{- if and .Values.config.codex.gitlabDiscoveryMcp.enabled (eq $serverPort $mcpPort) (or (eq $serverHost $mcpHost) (eq (include "codex-gitlab-review.serverBindHostIsWildcard" .) "true") (eq (include "codex-gitlab-review.gitlabDiscoveryMcpBindHostIsWildcard" .) "true")) -}}
+{{- fail "config.server.bindAddr and config.codex.gitlabDiscoveryMcp.bindAddr must not target the same listener socket" -}}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,6 +18,8 @@ metadata:
 
 data:
   config.yaml: |
+    feature_flags:
+      gitlab_discovery_mcp: {{ .Values.config.featureFlags.gitlabDiscoveryMcp }}
     gitlab:
       base_url: {{ .Values.gitlab.baseUrl | quote }}
       token: ""
@@ -122,6 +134,44 @@ data:
 {{ toYaml .Values.config.codex.browserMcp.mcpArgs | indent 10 }}
 {{- else }}
         mcp_args: []
+{{- end }}
+      gitlab_discovery_mcp:
+        enabled: {{ .Values.config.codex.gitlabDiscoveryMcp.enabled }}
+        server_name: {{ .Values.config.codex.gitlabDiscoveryMcp.serverName | quote }}
+        bind_addr: {{ default (printf "0.0.0.0:%s" (include "codex-gitlab-review.gitlabDiscoveryMcpPort" .)) .Values.config.codex.gitlabDiscoveryMcp.bindAddr | quote }}
+        advertise_url: {{ default (printf "http://%s:%s/mcp" (include "codex-gitlab-review.serviceFqdn" .) (include "codex-gitlab-review.gitlabDiscoveryMcpPort" .)) .Values.config.codex.gitlabDiscoveryMcp.advertiseUrl | quote }}
+        bearer_token_env_var: {{ .Values.config.codex.gitlabDiscoveryMcp.bearerTokenEnvVar | quote }}
+        clone_root: {{ .Values.config.codex.gitlabDiscoveryMcp.cloneRoot | quote }}
+{{- if .Values.config.codex.gitlabDiscoveryMcp.allow }}
+        allow:
+{{- range .Values.config.codex.gitlabDiscoveryMcp.allow }}
+          - source_repos:
+{{- if .sourceRepos }}
+{{ toYaml .sourceRepos | indent 12 }}
+{{- else }}
+              []
+{{- end }}
+            source_group_prefixes:
+{{- if .sourceGroupPrefixes }}
+{{ toYaml .sourceGroupPrefixes | indent 12 }}
+{{- else }}
+              []
+{{- end }}
+            target_repos:
+{{- if .targetRepos }}
+{{ toYaml .targetRepos | indent 12 }}
+{{- else }}
+              []
+{{- end }}
+            target_groups:
+{{- if .targetGroups }}
+{{ toYaml .targetGroups | indent 12 }}
+{{- else }}
+              []
+{{- end }}
+{{- end }}
+{{- else }}
+        allow: []
 {{- end }}
       mcp_server_overrides:
         review:

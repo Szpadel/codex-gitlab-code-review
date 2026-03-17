@@ -1,3 +1,4 @@
+use crate::feature_flags::{FeatureFlagSnapshot, RuntimeFeatureFlagOverrides};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 const AUTH_LIMIT_RESET_KEY_PREFIX: &str = "codex_auth_limit_reset_at::";
+const FEATURE_FLAG_OVERRIDES_KEY: &str = "feature_flag_overrides";
 const SCAN_STATUS_KEY: &str = "scan_status";
 
 pub struct ReviewStateStore {
@@ -95,6 +97,7 @@ pub struct RunHistoryRecord {
     pub trigger_note_body: Option<String>,
     pub command_repo: Option<String>,
     pub commit_sha: Option<String>,
+    pub feature_flags: FeatureFlagSnapshot,
     pub events_persisted_cleanly: bool,
     pub transcript_backfill_state: TranscriptBackfillState,
     pub transcript_backfill_error: Option<String>,
@@ -587,6 +590,30 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    pub async fn set_run_history_feature_flags(
+        &self,
+        run_id: i64,
+        feature_flags: &FeatureFlagSnapshot,
+    ) -> Result<()> {
+        let feature_flags_json =
+            serde_json::to_string(feature_flags).context("serialize feature flag snapshot")?;
+        sqlx::query(
+            r#"
+            UPDATE run_history
+            SET feature_flags_json = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(feature_flags_json)
+        .bind(Utc::now().timestamp())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .context("update run history feature flags")?;
+        Ok(())
+    }
+
     pub async fn update_run_history_head_sha(&self, run_id: i64, head_sha: &str) -> Result<()> {
         sqlx::query(
             r#"
@@ -871,7 +898,7 @@ impl ReviewStateStore {
             SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
-                   command_repo, commit_sha, events_persisted_cleanly,
+                   command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
                    transcript_backfill_state, transcript_backfill_error
             FROM run_history
             WHERE repo = ? AND iid = ?
@@ -892,7 +919,7 @@ impl ReviewStateStore {
             SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
-                   command_repo, commit_sha, events_persisted_cleanly,
+                   command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
                    transcript_backfill_state, transcript_backfill_error
             FROM run_history
             WHERE id = ?
@@ -914,7 +941,7 @@ impl ReviewStateStore {
             SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
-                   command_repo, commit_sha, events_persisted_cleanly,
+                   command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
                    transcript_backfill_state, transcript_backfill_error
             FROM run_history
             "#,
@@ -1263,6 +1290,25 @@ impl ReviewStateStore {
         &self.pool
     }
 
+    pub async fn get_runtime_feature_flag_overrides(&self) -> Result<RuntimeFeatureFlagOverrides> {
+        let raw = self
+            .get_service_state_value(FEATURE_FLAG_OVERRIDES_KEY)
+            .await?;
+        match raw {
+            Some(raw) => serde_json::from_str(&raw).context("deserialize feature flag overrides"),
+            None => Ok(RuntimeFeatureFlagOverrides::default()),
+        }
+    }
+
+    pub async fn set_runtime_feature_flag_overrides(
+        &self,
+        overrides: &RuntimeFeatureFlagOverrides,
+    ) -> Result<()> {
+        let raw = serde_json::to_string(overrides).context("serialize feature flag overrides")?;
+        self.set_service_state_value(FEATURE_FLAG_OVERRIDES_KEY, &raw)
+            .await
+    }
+
     async fn get_service_state_value(&self, key: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
             .bind(key)
@@ -1355,6 +1401,9 @@ fn map_run_history_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord>
     let trigger_note_id_raw: Option<i64> = row
         .try_get("trigger_note_id")
         .context("read run history trigger note id")?;
+    let feature_flags_json: String = row
+        .try_get("feature_flags_json")
+        .context("read run history feature_flags_json")?;
     Ok(RunHistoryRecord {
         id: row.try_get("id").context("read run history id")?,
         kind: parse_run_history_kind(
@@ -1409,6 +1458,8 @@ fn map_run_history_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord>
         commit_sha: row
             .try_get("commit_sha")
             .context("read run history commit sha")?,
+        feature_flags: serde_json::from_str(&feature_flags_json)
+            .context("deserialize run history feature flag snapshot")?,
         events_persisted_cleanly: row
             .try_get::<i64, _>("events_persisted_cleanly")
             .context("read run history events_persisted_cleanly")?
@@ -2248,6 +2299,57 @@ mod tests {
         );
         assert_eq!(record.command_repo.as_deref(), Some("fork/repo"));
         assert_eq!(record.commit_sha.as_deref(), Some("abc1234"));
+        assert_eq!(record.feature_flags, FeatureFlagSnapshot::default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_feature_flag_overrides_roundtrip() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+
+        assert_eq!(
+            store.get_runtime_feature_flag_overrides().await?,
+            RuntimeFeatureFlagOverrides::default()
+        );
+
+        let overrides = RuntimeFeatureFlagOverrides {
+            gitlab_discovery_mcp: Some(true),
+        };
+        store.set_runtime_feature_flag_overrides(&overrides).await?;
+
+        assert_eq!(store.get_runtime_feature_flag_overrides().await?, overrides);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_history_feature_flags_snapshot_roundtrip() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let run_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 13,
+                head_sha: "sha-flags".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+
+        let feature_flags = FeatureFlagSnapshot {
+            gitlab_discovery_mcp: true,
+        };
+        store
+            .set_run_history_feature_flags(run_id, &feature_flags)
+            .await?;
+
+        let record = store
+            .get_run_history(run_id)
+            .await?
+            .context("run history row should exist")?;
+        assert_eq!(record.feature_flags, feature_flags);
         Ok(())
     }
 

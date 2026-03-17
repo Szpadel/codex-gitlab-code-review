@@ -2,7 +2,12 @@ use crate::config::{
     BROWSER_MCP_REMOTE_DEBUGGING_PORT, BrowserMcpConfig, CodexConfig, DockerConfig,
 };
 use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
+use crate::feature_flags::FeatureFlagSnapshot;
 use crate::gitlab::MergeRequest;
+use crate::gitlab_discovery_mcp::{
+    GitLabDiscoveryMcpService, GitLabDiscoverySessionBinding, ResolvedGitLabDiscoveryAllowList,
+    generate_bearer_token,
+};
 use crate::review_prompt_templates::{
     append_additional_review_instructions, build_base_branch_review_prompt,
     build_commit_review_prompt, upstream_review_prompt_source_commit,
@@ -42,6 +47,7 @@ pub struct ReviewContext {
     pub project_path: String,
     pub mr: MergeRequest,
     pub head_sha: String,
+    pub feature_flags: FeatureFlagSnapshot,
     pub run_history_id: Option<i64>,
 }
 
@@ -57,6 +63,7 @@ pub struct MentionCommandContext {
     pub requester_email: String,
     pub additional_developer_instructions: Option<String>,
     pub prompt: String,
+    pub feature_flags: FeatureFlagSnapshot,
     pub run_history_id: Option<i64>,
 }
 
@@ -178,9 +185,27 @@ struct BrowserContainerDiagnostics {
 #[derive(Clone, Copy)]
 struct AppServerCommandOptions<'a> {
     browser_mcp: Option<&'a BrowserMcpConfig>,
+    gitlab_discovery_mcp: Option<&'a GitLabDiscoveryMcpRuntimeConfig>,
     mcp_server_overrides: &'a BTreeMap<String, bool>,
     reasoning_summary: Option<&'a str>,
     reasoning_effort: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitLabDiscoveryMcpRuntimeConfig {
+    server_name: String,
+    advertise_url: String,
+    bearer_token_env_var: String,
+    clone_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedGitLabDiscoveryMcp {
+    bearer_token: String,
+    source_repo: String,
+    feature_flags: FeatureFlagSnapshot,
+    allow: ResolvedGitLabDiscoveryAllowList,
+    runtime_config: GitLabDiscoveryMcpRuntimeConfig,
 }
 
 impl BrowserContainerDiagnostics {
@@ -280,6 +305,7 @@ pub trait CodexRunner: Send + Sync {
 pub struct DockerCodexRunner {
     docker: Docker,
     codex: CodexConfig,
+    gitlab_discovery_mcp: Option<Arc<GitLabDiscoveryMcpService>>,
     mention_commands_active: bool,
     review_additional_developer_instructions: Option<String>,
     git_base: Url,
@@ -371,6 +397,7 @@ impl DockerCodexRunner {
         codex: CodexConfig,
         git_base: Url,
         state: Arc<ReviewStateStore>,
+        gitlab_discovery_mcp: Option<Arc<GitLabDiscoveryMcpService>>,
         runtime: RunnerRuntimeOptions,
     ) -> Result<Self> {
         let docker = connect_docker(&docker_cfg)?;
@@ -378,6 +405,7 @@ impl DockerCodexRunner {
         Ok(Self {
             docker,
             codex,
+            gitlab_discovery_mcp,
             mention_commands_active: runtime.mention_commands_active,
             review_additional_developer_instructions: runtime
                 .review_additional_developer_instructions,
@@ -663,27 +691,49 @@ impl DockerCodexRunner {
         }
     }
 
-    fn env_vars(&self) -> Vec<String> {
+    fn env_vars(&self, extra_env: &[String]) -> Vec<String> {
         let mut env = vec![
             format!("GITLAB_TOKEN={}", self.gitlab_token),
             "HOME=/root".to_string(),
         ];
+        env.extend(extra_env.iter().cloned());
         if self.log_all_json {
             env.push("CODEX_RUNNER_DEBUG=1".to_string());
         }
         env
     }
 
+    fn effective_mcp_server_overrides_for_run(
+        &self,
+        overrides: &BTreeMap<String, bool>,
+        gitlab_discovery_injected: bool,
+    ) -> BTreeMap<String, bool> {
+        let mut effective = overrides.clone();
+        if !gitlab_discovery_injected
+            && effective
+                .get(&self.codex.gitlab_discovery_mcp.server_name)
+                .copied()
+                == Some(true)
+        {
+            effective.remove(&self.codex.gitlab_discovery_mcp.server_name);
+        }
+        effective
+    }
+
     fn command(
         &self,
         ctx: &ReviewContext,
-        browser_mcp: Option<&BrowserMcpConfig>,
+        app_server: AppServerCommandOptions<'_>,
     ) -> Result<String> {
         let clone_url = self.clone_url(&ctx.repo)?;
         let reasoning_summary =
             configured_reasoning_summary(self.codex.reasoning_summary.review.as_deref());
         let reasoning_effort =
             configured_reasoning_effort(self.codex.reasoning_effort.review.as_deref());
+        let mcp_server_overrides = self.effective_mcp_server_overrides_for_run(
+            app_server.mcp_server_overrides,
+            app_server.gitlab_discovery_mcp.is_some(),
+        );
         Ok(Self::build_command_script(
             &clone_url,
             &ctx.repo,
@@ -695,10 +745,11 @@ impl DockerCodexRunner {
                 .filter(|value| !value.is_empty()),
             self.codex.deps.enabled,
             AppServerCommandOptions {
-                browser_mcp,
-                mcp_server_overrides: &self.codex.mcp_server_overrides.review,
-                reasoning_summary,
-                reasoning_effort,
+                browser_mcp: app_server.browser_mcp,
+                gitlab_discovery_mcp: app_server.gitlab_discovery_mcp,
+                mcp_server_overrides: &mcp_server_overrides,
+                reasoning_summary: reasoning_summary.or(app_server.reasoning_summary),
+                reasoning_effort: reasoning_effort.or(app_server.reasoning_effort),
             },
         ))
     }
@@ -715,6 +766,111 @@ impl DockerCodexRunner {
         mcp_server_overrides: &BTreeMap<String, bool>,
     ) -> Option<&BrowserMcpConfig> {
         effective_browser_mcp(self.browser_mcp(), mcp_server_overrides)
+    }
+
+    fn prepare_gitlab_discovery_mcp(
+        &self,
+        source_repo: &str,
+        feature_flags: &FeatureFlagSnapshot,
+        mcp_server_overrides: &BTreeMap<String, bool>,
+    ) -> Option<PreparedGitLabDiscoveryMcp> {
+        if !feature_flags.gitlab_discovery_mcp {
+            return None;
+        }
+        if source_repo.trim().is_empty() {
+            return None;
+        }
+        let service = self.gitlab_discovery_mcp.as_ref()?;
+        if matches!(mcp_server_overrides.get(service.server_name()), Some(false)) {
+            return None;
+        }
+        let allow = service.resolve_allow_list(source_repo);
+        if allow.target_repos.is_empty() && allow.target_groups.is_empty() {
+            return None;
+        }
+        Some(PreparedGitLabDiscoveryMcp {
+            bearer_token: generate_bearer_token(),
+            source_repo: source_repo.to_string(),
+            feature_flags: feature_flags.clone(),
+            allow,
+            runtime_config: GitLabDiscoveryMcpRuntimeConfig {
+                server_name: service.server_name().to_string(),
+                advertise_url: service.advertise_url().to_string(),
+                bearer_token_env_var: service.bearer_token_env_var().to_string(),
+                clone_root: service.clone_root().to_string(),
+            },
+        })
+    }
+
+    fn effective_feature_flags(
+        requested: &FeatureFlagSnapshot,
+        gitlab_discovery_enabled: bool,
+    ) -> FeatureFlagSnapshot {
+        FeatureFlagSnapshot {
+            gitlab_discovery_mcp: requested.gitlab_discovery_mcp && gitlab_discovery_enabled,
+        }
+    }
+
+    async fn sync_effective_feature_flags(
+        &self,
+        run_history_id: Option<i64>,
+        requested: &FeatureFlagSnapshot,
+        gitlab_discovery_enabled: bool,
+    ) {
+        let Some(run_history_id) = run_history_id else {
+            return;
+        };
+        let effective = Self::effective_feature_flags(requested, gitlab_discovery_enabled);
+        if let Err(err) = self
+            .state
+            .set_run_history_feature_flags(run_history_id, &effective)
+            .await
+        {
+            warn!(
+                run_history_id,
+                error = %err,
+                "failed to persist effective feature flags for run"
+            );
+        }
+    }
+
+    async fn register_gitlab_discovery_session(
+        &self,
+        prepared: Option<&PreparedGitLabDiscoveryMcp>,
+        container_id: &str,
+        run_history_id: Option<i64>,
+    ) {
+        let (Some(service), Some(prepared)) = (self.gitlab_discovery_mcp.as_ref(), prepared) else {
+            return;
+        };
+        service
+            .registry()
+            .register_token(
+                prepared.bearer_token.clone(),
+                GitLabDiscoverySessionBinding {
+                    run_history_id: run_history_id.unwrap_or_default(),
+                    container_id: container_id.to_string(),
+                    source_repo: prepared.source_repo.clone(),
+                    clone_root: prepared.runtime_config.clone_root.clone(),
+                    feature_flags: prepared.feature_flags.clone(),
+                    allow: prepared.allow.clone(),
+                    created_at: Utc::now(),
+                },
+            )
+            .await;
+    }
+
+    async fn unregister_gitlab_discovery_session(
+        &self,
+        prepared: Option<&PreparedGitLabDiscoveryMcp>,
+    ) {
+        let (Some(service), Some(prepared)) = (self.gitlab_discovery_mcp.as_ref(), prepared) else {
+            return;
+        };
+        service
+            .registry()
+            .remove_token(&prepared.bearer_token)
+            .await;
     }
 
     fn mention_developer_instructions(ctx: &MentionCommandContext) -> String {
@@ -760,6 +916,7 @@ impl DockerCodexRunner {
         let browser_wait_script = browser_wait_script(app_server.browser_mcp);
         let app_server_exec_cmd = codex_app_server_exec_command(
             app_server.browser_mcp,
+            app_server.gitlab_discovery_mcp,
             app_server.mcp_server_overrides,
             app_server.reasoning_summary,
             app_server.reasoning_effort,
@@ -952,6 +1109,7 @@ export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
         let browser_wait_script = browser_wait_script(app_server.browser_mcp);
         let app_server_exec_cmd = codex_app_server_exec_command(
             app_server.browser_mcp,
+            app_server.gitlab_discovery_mcp,
             app_server.mcp_server_overrides,
             app_server.reasoning_summary,
             app_server.reasoning_effort,
@@ -1238,6 +1396,41 @@ exec codex app-server --listen stdio://
             "workspace-write" => "workspace-write",
             _ => "danger-full-access",
         }
+    }
+
+    fn thread_start_params(
+        &self,
+        cwd: &str,
+        developer_instructions: Option<String>,
+        extra_writable_roots: &[String],
+    ) -> Value {
+        let mut params = json!({
+            "cwd": cwd,
+            "approvalPolicy": "never",
+            "sandbox": self.sandbox_mode_value(),
+            "persistExtendedHistory": true,
+        });
+        if let Some(developer_instructions) = developer_instructions {
+            params["developerInstructions"] = Value::String(developer_instructions);
+        }
+        if self.sandbox_mode_value() == "workspace-write" && !extra_writable_roots.is_empty() {
+            let mut writable_roots = vec![cwd.to_string()];
+            writable_roots.extend(extra_writable_roots.iter().cloned());
+            writable_roots.sort();
+            writable_roots.dedup();
+            // Codex strips *TOKEN*, *SECRET*, and *KEY* variables out of
+            // agent-spawned tool environments, so keeping workspace-write
+            // network access enabled does not expose the runner's GitLab token.
+            params["config"] = json!({
+                "sandbox_workspace_write": {
+                    "writable_roots": writable_roots,
+                    "network_access": true,
+                    "exclude_tmpdir_env_var": false,
+                    "exclude_slash_tmp": false,
+                }
+            });
+        }
+        params
     }
 
     async fn remove_container_best_effort(&self, id: &str) {
@@ -1561,6 +1754,7 @@ exec codex app-server --listen stdio://
         script: String,
         auth_host_path: &str,
         extra_binds: Vec<String>,
+        extra_env: Vec<String>,
         browser_mcp: Option<&BrowserMcpConfig>,
     ) -> Result<StartedAppServer> {
         let image_ref = Self::normalize_image_reference(&self.codex.image);
@@ -1579,7 +1773,7 @@ exec codex app-server --listen stdio://
         let config = ContainerCreateBody {
             image: Some(image_ref.clone()),
             cmd: Some(Self::app_server_cmd(script)),
-            env: Some(self.env_vars()),
+            env: Some(self.env_vars(&extra_env)),
             labels: Some(Self::review_container_labels(&self.owner_id)),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
@@ -1742,14 +1936,57 @@ exec codex app-server --listen stdio://
         account: &AuthAccount,
     ) -> Result<String> {
         let browser_mcp = self.effective_browser_mcp(&self.codex.mcp_server_overrides.review);
-        let script = self.command(ctx, browser_mcp)?;
+        let gitlab_discovery_mcp = self.prepare_gitlab_discovery_mcp(
+            &ctx.project_path,
+            &ctx.feature_flags,
+            &self.codex.mcp_server_overrides.review,
+        );
+        self.sync_effective_feature_flags(
+            ctx.run_history_id,
+            &ctx.feature_flags,
+            gitlab_discovery_mcp.is_some(),
+        )
+        .await;
+        let script = self.command(
+            ctx,
+            AppServerCommandOptions {
+                browser_mcp,
+                gitlab_discovery_mcp: gitlab_discovery_mcp
+                    .as_ref()
+                    .map(|prepared| &prepared.runtime_config),
+                mcp_server_overrides: &self.codex.mcp_server_overrides.review,
+                reasoning_summary: None,
+                reasoning_effort: None,
+            },
+        )?;
+        let extra_env = gitlab_discovery_mcp
+            .as_ref()
+            .map(|prepared| {
+                vec![format!(
+                    "{}={}",
+                    prepared.runtime_config.bearer_token_env_var, prepared.bearer_token
+                )]
+            })
+            .unwrap_or_default();
         let StartedAppServer {
             container_id,
             browser_container_id,
             mut client,
         } = self
-            .start_app_server_container(script, &account.auth_host_path, Vec::new(), browser_mcp)
+            .start_app_server_container(
+                script,
+                &account.auth_host_path,
+                Vec::new(),
+                extra_env,
+                browser_mcp,
+            )
             .await?;
+        self.register_gitlab_discovery_session(
+            gitlab_discovery_mcp.as_ref(),
+            &container_id,
+            ctx.run_history_id,
+        )
+        .await;
         let repo_path = "/work/repo";
         self.update_run_history_session(
             ctx.run_history_id,
@@ -1767,15 +2004,14 @@ exec codex app-server --listen stdio://
             );
             client.initialize().await?;
             client.initialized().await?;
+            let extra_writable_roots = gitlab_discovery_mcp
+                .as_ref()
+                .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
+                .unwrap_or_default();
             let thread_response = client
                 .request(
                     "thread/start",
-                    json!({
-                        "cwd": repo_path,
-                        "approvalPolicy": "never",
-                        "sandbox": self.sandbox_mode_value(),
-                        "persistExtendedHistory": true,
-                    }),
+                    self.thread_start_params(repo_path, None, &extra_writable_roots),
                 )
                 .await?;
             let thread_id = thread_response
@@ -1852,6 +2088,8 @@ exec codex app-server --listen stdio://
         };
 
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
+            .await;
+        self.unregister_gitlab_discovery_session(gitlab_discovery_mcp.as_ref())
             .await;
 
         review_result
@@ -1939,31 +2177,71 @@ exec codex app-server --listen stdio://
         sandbox_mode: &str,
         account: &AuthAccount,
     ) -> Result<MentionCommandResult> {
+        debug_assert_eq!(sandbox_mode, self.sandbox_mode_value());
         let clone_url = self.clone_url(&ctx.repo)?;
         let repo_dir = "/work/repo";
         let browser_mcp = self.effective_browser_mcp(&self.codex.mcp_server_overrides.mention);
+        let gitlab_discovery_mcp = self.prepare_gitlab_discovery_mcp(
+            &ctx.project_path,
+            &ctx.feature_flags,
+            &self.codex.mcp_server_overrides.mention,
+        );
+        self.sync_effective_feature_flags(
+            ctx.run_history_id,
+            &ctx.feature_flags,
+            gitlab_discovery_mcp.is_some(),
+        )
+        .await;
         let reasoning_summary =
             configured_reasoning_summary(self.codex.reasoning_summary.mention.as_deref());
         let reasoning_effort =
             configured_reasoning_effort(self.codex.reasoning_effort.mention.as_deref());
+        let effective_mcp_server_overrides = self.effective_mcp_server_overrides_for_run(
+            &self.codex.mcp_server_overrides.mention,
+            gitlab_discovery_mcp.is_some(),
+        );
         let script = Self::build_mention_command_script(
             ctx,
             &clone_url,
             &self.codex.auth_mount_path,
             AppServerCommandOptions {
                 browser_mcp,
-                mcp_server_overrides: &self.codex.mcp_server_overrides.mention,
+                gitlab_discovery_mcp: gitlab_discovery_mcp
+                    .as_ref()
+                    .map(|prepared| &prepared.runtime_config),
+                mcp_server_overrides: &effective_mcp_server_overrides,
                 reasoning_summary,
                 reasoning_effort,
             },
         );
+        let extra_env = gitlab_discovery_mcp
+            .as_ref()
+            .map(|prepared| {
+                vec![format!(
+                    "{}={}",
+                    prepared.runtime_config.bearer_token_env_var, prepared.bearer_token
+                )]
+            })
+            .unwrap_or_default();
         let StartedAppServer {
             container_id,
             browser_container_id,
             mut client,
         } = self
-            .start_app_server_container(script, &account.auth_host_path, Vec::new(), browser_mcp)
+            .start_app_server_container(
+                script,
+                &account.auth_host_path,
+                Vec::new(),
+                extra_env,
+                browser_mcp,
+            )
             .await?;
+        self.register_gitlab_discovery_session(
+            gitlab_discovery_mcp.as_ref(),
+            &container_id,
+            ctx.run_history_id,
+        )
+        .await;
         self.update_run_history_session(
             ctx.run_history_id,
             RunHistorySessionUpdate {
@@ -1976,16 +2254,18 @@ exec codex app-server --listen stdio://
         let mention_result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
             client.initialize().await?;
             client.initialized().await?;
+            let extra_writable_roots = gitlab_discovery_mcp
+                .as_ref()
+                .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
+                .unwrap_or_default();
             let thread_response = client
                 .request(
                     "thread/start",
-                    json!({
-                        "cwd": repo_dir,
-                        "approvalPolicy": "never",
-                        "sandbox": sandbox_mode,
-                        "developerInstructions": Self::mention_developer_instructions(ctx),
-                        "persistExtendedHistory": true,
-                    }),
+                    self.thread_start_params(
+                        repo_dir,
+                        Some(Self::mention_developer_instructions(ctx)),
+                        &extra_writable_roots,
+                    ),
                 )
                 .await?;
             let thread_id = thread_response
@@ -2198,6 +2478,8 @@ exec codex app-server --listen stdio://
 
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
             .await;
+        self.unregister_gitlab_discovery_session(gitlab_discovery_mcp.as_ref())
+            .await;
 
         mention_result
     }
@@ -2297,7 +2579,13 @@ exec codex app-server --listen stdio://
             browser_container_id,
             mut client,
         } = self
-            .start_app_server_container(script, &account.auth_host_path, Vec::new(), None)
+            .start_app_server_container(
+                script,
+                &account.auth_host_path,
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
             .await?;
 
         let result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
@@ -3840,11 +4128,13 @@ fn configured_reasoning_summary(value: Option<&str>) -> Option<&str> {
 
 fn codex_app_server_exec_command(
     browser_mcp: Option<&BrowserMcpConfig>,
+    gitlab_discovery_mcp: Option<&GitLabDiscoveryMcpRuntimeConfig>,
     mcp_server_overrides: &BTreeMap<String, bool>,
     reasoning_summary: Option<&str>,
     reasoning_effort: Option<&str>,
 ) -> String {
     if browser_mcp.is_none()
+        && gitlab_discovery_mcp.is_none()
         && mcp_server_overrides.is_empty()
         && reasoning_summary.is_none()
         && reasoning_effort.is_none()
@@ -3898,6 +4188,26 @@ fn codex_app_server_exec_command(
             cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
         }
     }
+    if let Some(gitlab_discovery_mcp) = gitlab_discovery_mcp {
+        for override_value in [
+            format!(
+                "mcp_servers.{}.url={}",
+                gitlab_discovery_mcp.server_name,
+                toml_basic_string(&gitlab_discovery_mcp.advertise_url)
+            ),
+            format!(
+                "mcp_servers.{}.bearer_token_env_var={}",
+                gitlab_discovery_mcp.server_name,
+                toml_basic_string(&gitlab_discovery_mcp.bearer_token_env_var)
+            ),
+            format!(
+                "mcp_servers.{}.enabled=true",
+                gitlab_discovery_mcp.server_name
+            ),
+        ] {
+            cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
+        }
+    }
     for (server_name, enabled) in mcp_server_overrides {
         let override_value = format!("mcp_servers.{server_name}.enabled={enabled}");
         cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
@@ -3909,7 +4219,9 @@ fn codex_app_server_exec_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DepsConfig, FallbackAuthAccountConfig, McpServerOverridesConfig};
+    use crate::config::{
+        DepsConfig, FallbackAuthAccountConfig, GitLabTargets, McpServerOverridesConfig,
+    };
     use anyhow::Context;
     use chrono::TimeZone;
     use std::collections::BTreeMap;
@@ -4093,6 +4405,7 @@ mod tests {
                 diff_refs: None,
             },
             head_sha: "abc123".to_string(),
+            feature_flags: FeatureFlagSnapshot::default(),
             run_history_id: None,
         }
     }
@@ -4428,6 +4741,7 @@ mod tests {
             usage_limit_fallback_cooldown_seconds: 3600,
             deps: DepsConfig { enabled: false },
             browser_mcp: BrowserMcpConfig::default(),
+            gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
             reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
             reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
@@ -4475,10 +4789,12 @@ mod tests {
                 usage_limit_fallback_cooldown_seconds: 3600,
                 deps: DepsConfig { enabled: false },
                 browser_mcp: BrowserMcpConfig::default(),
+                gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
                 reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
                 reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
             },
+            gitlab_discovery_mcp: None,
             mention_commands_active: false,
             review_additional_developer_instructions: None,
             git_base: Url::parse("https://gitlab.example.com").expect("url"),
@@ -4495,7 +4811,7 @@ mod tests {
             next_image_pull_id: AtomicU64::new(1),
         };
 
-        let env = runner.env_vars();
+        let env = runner.env_vars(&[]);
 
         assert_eq!(
             env,
@@ -4647,7 +4963,7 @@ mod tests {
     #[test]
     fn codex_app_server_exec_command_without_mcp_overrides_is_plain() {
         let overrides = BTreeMap::new();
-        let cmd = codex_app_server_exec_command(None, &overrides, None, None);
+        let cmd = codex_app_server_exec_command(None, None, &overrides, None, None);
         assert_eq!(cmd, "exec codex app-server");
     }
 
@@ -4655,7 +4971,7 @@ mod tests {
     fn codex_app_server_exec_command_renders_sorted_mcp_overrides() {
         let overrides =
             BTreeMap::from([("serena".to_string(), false), ("github".to_string(), true)]);
-        let cmd = codex_app_server_exec_command(None, &overrides, None, None);
+        let cmd = codex_app_server_exec_command(None, None, &overrides, None, None);
         assert_eq!(
             cmd,
             "exec codex -c 'mcp_servers.github.enabled=true' -c 'mcp_servers.serena.enabled=false' app-server"
@@ -4664,7 +4980,7 @@ mod tests {
 
     #[test]
     fn codex_app_server_exec_command_includes_reasoning_effort_override() {
-        let cmd = codex_app_server_exec_command(None, &BTreeMap::new(), None, Some("high"));
+        let cmd = codex_app_server_exec_command(None, None, &BTreeMap::new(), None, Some("high"));
         assert_eq!(
             cmd,
             "exec codex -c 'model_reasoning_effort=\"high\"' app-server"
@@ -4673,7 +4989,8 @@ mod tests {
 
     #[test]
     fn codex_app_server_exec_command_includes_reasoning_summary_override() {
-        let cmd = codex_app_server_exec_command(None, &BTreeMap::new(), Some("detailed"), None);
+        let cmd =
+            codex_app_server_exec_command(None, None, &BTreeMap::new(), Some("detailed"), None);
         assert_eq!(
             cmd,
             "exec codex -c 'model_reasoning_summary=\"detailed\"' app-server"
@@ -4691,6 +5008,7 @@ mod tests {
                 remote_debugging_port: 9222,
                 ..BrowserMcpConfig::default()
             }),
+            None,
             &BTreeMap::new(),
             None,
             None,
@@ -4699,6 +5017,31 @@ mod tests {
         assert!(cmd.contains("chrome-devtools-mcp@latest"));
         assert!(cmd.contains("--browserUrl=http://127.0.0.1:9222"));
         assert!(cmd.contains("mcp_servers.chrome-devtools.enabled=true"));
+    }
+
+    #[test]
+    fn codex_app_server_exec_command_includes_gitlab_discovery_mcp_config() {
+        let cmd = codex_app_server_exec_command(
+            None,
+            Some(&GitLabDiscoveryMcpRuntimeConfig {
+                server_name: "gitlab-discovery".to_string(),
+                advertise_url: "http://gitlab-discovery.internal/mcp".to_string(),
+                bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_TOKEN".to_string(),
+                clone_root: "/work/mcp".to_string(),
+            }),
+            &BTreeMap::new(),
+            None,
+            None,
+        );
+        assert!(
+            cmd.contains(
+                "mcp_servers.gitlab-discovery.url=\"http://gitlab-discovery.internal/mcp\""
+            )
+        );
+        assert!(cmd.contains(
+            "mcp_servers.gitlab-discovery.bearer_token_env_var=\"CODEX_GITLAB_DISCOVERY_MCP_TOKEN\""
+        ));
+        assert!(cmd.contains("mcp_servers.gitlab-discovery.enabled=true"));
     }
 
     #[test]
@@ -4714,6 +5057,7 @@ mod tests {
                 mcp_command: "npx".to_string(),
                 mcp_args: vec!["-y".to_string(), "chrome-devtools-mcp@latest".to_string()],
             }),
+            None,
             &BTreeMap::from([("chrome-devtools".to_string(), false)]),
             None,
             None,
@@ -4728,7 +5072,7 @@ mod tests {
     #[test]
     fn codex_app_server_exec_command_places_reasoning_effort_before_mcp_overrides() {
         let overrides = BTreeMap::from([("github".to_string(), false)]);
-        let cmd = codex_app_server_exec_command(None, &overrides, None, Some("medium"));
+        let cmd = codex_app_server_exec_command(None, None, &overrides, None, Some("medium"));
         let reasoning = "-c 'model_reasoning_effort=\"medium\"'";
         let mcp = "-c 'mcp_servers.github.enabled=false'";
         assert!(cmd.contains(reasoning));
@@ -4738,8 +5082,13 @@ mod tests {
 
     #[test]
     fn codex_app_server_exec_command_places_reasoning_summary_before_effort() {
-        let cmd =
-            codex_app_server_exec_command(None, &BTreeMap::new(), Some("detailed"), Some("medium"));
+        let cmd = codex_app_server_exec_command(
+            None,
+            None,
+            &BTreeMap::new(),
+            Some("detailed"),
+            Some("medium"),
+        );
         let summary = "-c 'model_reasoning_summary=\"detailed\"'";
         let effort = "-c 'model_reasoning_effort=\"medium\"'";
         assert!(cmd.contains(summary));
@@ -4988,6 +5337,7 @@ mod tests {
             false,
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: None,
                 reasoning_effort: None,
@@ -5008,6 +5358,7 @@ mod tests {
             false,
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: None,
                 reasoning_effort: None,
@@ -5029,6 +5380,7 @@ mod tests {
             false,
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: None,
                 reasoning_effort: None,
@@ -5080,6 +5432,7 @@ mod tests {
             true,
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: None,
                 reasoning_effort: None,
@@ -5101,6 +5454,7 @@ mod tests {
             false,
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &overrides,
                 reasoning_summary: None,
                 reasoning_effort: None,
@@ -5120,6 +5474,7 @@ mod tests {
             false,
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: None,
                 reasoning_effort: Some("high"),
@@ -5139,6 +5494,7 @@ mod tests {
             false,
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: Some("detailed"),
                 reasoning_effort: None,
@@ -5165,6 +5521,7 @@ mod tests {
                     browser_args: vec!["--no-sandbox".to_string()],
                     ..BrowserMcpConfig::default()
                 }),
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: None,
                 reasoning_effort: None,
@@ -5174,6 +5531,118 @@ mod tests {
         assert!(script.contains("browser MCP requires $browser_mcp_command"));
         assert!(script.contains("127.0.0.1:9222/json/version"));
         assert!(script.contains("browser MCP endpoint did not become ready"));
+    }
+
+    #[test]
+    fn thread_start_params_include_extra_workspace_write_roots() {
+        let mut codex = test_codex_config();
+        codex.exec_sandbox = "workspace-write".to_string();
+        let runner = test_runner_with_codex(codex);
+
+        let params = runner.thread_start_params("/work/repo", None, &["/work/mcp".to_string()]);
+
+        assert_eq!(params["sandbox"], "workspace-write");
+        assert_eq!(
+            params["config"]["sandbox_workspace_write"]["writable_roots"],
+            serde_json::json!(["/work/mcp", "/work/repo"])
+        );
+        assert_eq!(
+            params["config"]["sandbox_workspace_write"]["network_access"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn thread_start_params_preserve_workspace_write_defaults_without_extra_roots() {
+        let mut codex = test_codex_config();
+        codex.exec_sandbox = "workspace-write".to_string();
+        let runner = test_runner_with_codex(codex);
+
+        let params = runner.thread_start_params("/work/repo", None, &[]);
+
+        assert_eq!(params["sandbox"], "workspace-write");
+        assert!(params.get("config").is_none());
+    }
+
+    #[test]
+    fn effective_feature_flags_require_injected_gitlab_discovery_mcp() {
+        let requested = FeatureFlagSnapshot {
+            gitlab_discovery_mcp: true,
+        };
+
+        assert!(DockerCodexRunner::effective_feature_flags(&requested, true).gitlab_discovery_mcp);
+        assert!(
+            !DockerCodexRunner::effective_feature_flags(&requested, false).gitlab_discovery_mcp
+        );
+    }
+
+    #[test]
+    fn command_skips_static_gitlab_discovery_enable_override_without_injection() {
+        let mut codex = test_codex_config();
+        codex.mcp_server_overrides.review =
+            BTreeMap::from([(codex.gitlab_discovery_mcp.server_name.clone(), true)]);
+        let runner = test_runner_with_codex(codex);
+        let ctx = review_context_with_target_branch(Some("main"));
+
+        let script = runner
+            .command(
+                &ctx,
+                AppServerCommandOptions {
+                    browser_mcp: None,
+                    gitlab_discovery_mcp: None,
+                    mcp_server_overrides: &runner.codex.mcp_server_overrides.review,
+                    reasoning_summary: None,
+                    reasoning_effort: None,
+                },
+            )
+            .expect("command script");
+
+        assert!(!script.contains("mcp_servers.gitlab-discovery.enabled=true"));
+    }
+
+    #[test]
+    fn prepare_gitlab_discovery_mcp_rejects_empty_source_repo() {
+        let mut codex = test_codex_config();
+        codex.gitlab_discovery_mcp = crate::config::GitLabDiscoveryMcpConfig {
+            enabled: true,
+            bind_addr: "127.0.0.1:8091".to_string(),
+            advertise_url: "http://mcp.internal:8091/mcp".to_string(),
+            allow: vec![crate::config::GitLabDiscoveryAllowRule {
+                source_repos: vec!["group/repo".to_string()],
+                source_group_prefixes: Vec::new(),
+                target_repos: vec!["group/shared".to_string()],
+                target_groups: Vec::new(),
+            }],
+            ..crate::config::GitLabDiscoveryMcpConfig::default()
+        };
+        let service = Arc::new(
+            crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService::new(
+                DockerConfig {
+                    host: "tcp://127.0.0.1:2375".to_string(),
+                },
+                &crate::config::GitLabConfig {
+                    base_url: "https://gitlab.example.com".to_string(),
+                    token: "token".to_string(),
+                    bot_user_id: Some(1),
+                    created_after: None,
+                    targets: GitLabTargets::default(),
+                },
+                codex.gitlab_discovery_mcp.clone(),
+            )
+            .expect("gitlab discovery service"),
+        );
+        let mut runner = test_runner_with_codex(codex);
+        runner.gitlab_discovery_mcp = Some(service);
+
+        let prepared = runner.prepare_gitlab_discovery_mcp(
+            "",
+            &FeatureFlagSnapshot {
+                gitlab_discovery_mcp: true,
+            },
+            &BTreeMap::new(),
+        );
+
+        assert!(prepared.is_none());
     }
 
     #[test]
@@ -5224,6 +5693,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            feature_flags: FeatureFlagSnapshot::default(),
             run_history_id: None,
         };
         let script = DockerCodexRunner::build_mention_command_script(
@@ -5232,6 +5702,7 @@ mod tests {
             "/root/.codex",
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: None,
                 reasoning_effort: None,
@@ -5279,6 +5750,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            feature_flags: FeatureFlagSnapshot::default(),
             run_history_id: None,
         };
         let overrides = BTreeMap::from([("playwright".to_string(), true)]);
@@ -5288,6 +5760,7 @@ mod tests {
             "/root/.codex",
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &overrides,
                 reasoning_summary: None,
                 reasoning_effort: None,
@@ -5324,6 +5797,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            feature_flags: FeatureFlagSnapshot::default(),
             run_history_id: None,
         };
         let script = DockerCodexRunner::build_mention_command_script(
@@ -5332,6 +5806,7 @@ mod tests {
             "/root/.codex",
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: None,
                 reasoning_effort: Some("low"),
@@ -5368,6 +5843,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            feature_flags: FeatureFlagSnapshot::default(),
             run_history_id: None,
         };
         let script = DockerCodexRunner::build_mention_command_script(
@@ -5376,6 +5852,7 @@ mod tests {
             "/root/.codex",
             AppServerCommandOptions {
                 browser_mcp: None,
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: Some("detailed"),
                 reasoning_effort: None,
@@ -5412,6 +5889,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            feature_flags: FeatureFlagSnapshot::default(),
             run_history_id: None,
         };
         let script = DockerCodexRunner::build_mention_command_script(
@@ -5427,6 +5905,7 @@ mod tests {
                     browser_args: vec![],
                     ..BrowserMcpConfig::default()
                 }),
+                gitlab_discovery_mcp: None,
                 mcp_server_overrides: &BTreeMap::new(),
                 reasoning_summary: None,
                 reasoning_effort: None,
@@ -5466,6 +5945,7 @@ mod tests {
             requester_email: "alice@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Do the change".to_string(),
+            feature_flags: FeatureFlagSnapshot::default(),
             run_history_id: None,
         };
         let instructions = DockerCodexRunner::mention_developer_instructions(&ctx);
@@ -5507,6 +5987,7 @@ mod tests {
                 "  Prefer minimal diffs and include tests.  ".to_string(),
             ),
             prompt: "Do the change".to_string(),
+            feature_flags: FeatureFlagSnapshot::default(),
             run_history_id: None,
         };
         let instructions = DockerCodexRunner::mention_developer_instructions(&ctx);
@@ -5682,6 +6163,7 @@ mod tests {
             usage_limit_fallback_cooldown_seconds: 3600,
             deps: DepsConfig { enabled: false },
             browser_mcp: BrowserMcpConfig::default(),
+            gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
             reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
             reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
@@ -5703,6 +6185,7 @@ mod tests {
             })
             .expect("docker client"),
             codex,
+            gitlab_discovery_mcp: None,
             mention_commands_active,
             review_additional_developer_instructions: None,
             git_base: Url::parse("https://gitlab.example.com").expect("url"),

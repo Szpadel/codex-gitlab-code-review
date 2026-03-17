@@ -14,3 +14,8 @@ spec:
     - name: http
       port: {{ .Values.service.port }}
       targetPort: http
+{{- if .Values.config.codex.gitlabDiscoveryMcp.enabled }}
+    - name: mcp
+      port: {{ include "codex-gitlab-review.gitlabDiscoveryMcpPort" . }}
+      targetPort: mcp
+{{- end }}

@@ -706,9 +706,14 @@ mod tests {
 
         async fn get_project(&self, project: &str) -> Result<crate::gitlab::GitLabProject> {
             let map = self.projects.lock().unwrap();
+            let mapped = map.get(project).cloned();
             Ok(crate::gitlab::GitLabProject {
-                path_with_namespace: Some(project.to_string()),
-                last_activity_at: map.get(project).cloned(),
+                path_with_namespace: mapped
+                    .as_deref()
+                    .filter(|value| value.contains('/'))
+                    .map(ToOwned::to_owned)
+                    .or_else(|| Some(project.to_string())),
+                last_activity_at: mapped.filter(|value| !value.contains('/')),
             })
         }
 
@@ -865,6 +870,26 @@ mod tests {
         }
     }
 
+    struct CapturingReviewRunner {
+        result: Mutex<Option<CodexResult>>,
+        review_contexts: Mutex<Vec<ReviewContext>>,
+    }
+
+    #[async_trait]
+    impl CodexRunner for CapturingReviewRunner {
+        async fn run_review(&self, ctx: ReviewContext) -> Result<CodexResult> {
+            self.review_contexts.lock().unwrap().push(ctx);
+            Ok(self
+                .result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or(CodexResult::Pass {
+                    summary: "ok".to_string(),
+                }))
+        }
+    }
+
     struct FailingRunner {
         calls: Mutex<u32>,
     }
@@ -874,6 +899,30 @@ mod tests {
         async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
             *self.calls.lock().unwrap() += 1;
             Err(anyhow!("runner failed"))
+        }
+    }
+
+    struct BlockingReviewRunner {
+        first_started: Arc<tokio::sync::Notify>,
+        release_first: Arc<tokio::sync::Notify>,
+        review_calls: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl CodexRunner for BlockingReviewRunner {
+        async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+            let call_index = {
+                let mut review_calls = self.review_calls.lock().unwrap();
+                *review_calls += 1;
+                *review_calls
+            };
+            if call_index == 1 {
+                self.first_started.notify_waiters();
+                self.release_first.notified().await;
+            }
+            Ok(CodexResult::Pass {
+                summary: "ok".to_string(),
+            })
         }
     }
 
@@ -898,6 +947,41 @@ mod tests {
                 status: MentionCommandStatus::Committed,
                 commit_sha: Some("deadbeef".to_string()),
                 reply_message: "Implemented and committed deadbeef".to_string(),
+            })
+        }
+    }
+
+    struct BlockingMentionRunner {
+        first_started: Arc<tokio::sync::Notify>,
+        release_first: Arc<tokio::sync::Notify>,
+        mention_calls: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl CodexRunner for BlockingMentionRunner {
+        async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+            Ok(CodexResult::Pass {
+                summary: "ok".to_string(),
+            })
+        }
+
+        async fn run_mention_command(
+            &self,
+            _ctx: MentionCommandContext,
+        ) -> Result<MentionCommandResult> {
+            let call_index = {
+                let mut mention_calls = self.mention_calls.lock().unwrap();
+                *mention_calls += 1;
+                *mention_calls
+            };
+            if call_index == 1 {
+                self.first_started.notify_waiters();
+                self.release_first.notified().await;
+            }
+            Ok(MentionCommandResult {
+                status: MentionCommandStatus::NoChanges,
+                commit_sha: None,
+                reply_message: "No code changes required.".to_string(),
             })
         }
     }
@@ -1267,6 +1351,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            feature_flags: crate::feature_flags::FeatureFlagDefaults::default(),
             gitlab: GitLabConfig {
                 base_url: "https://gitlab.example.com".to_string(),
                 token: "token".to_string(),
@@ -1302,6 +1387,7 @@ mod tests {
                 usage_limit_fallback_cooldown_seconds: 3600,
                 deps: crate::config::DepsConfig { enabled: false },
                 browser_mcp: crate::config::BrowserMcpConfig::default(),
+                gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
                 reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
                 reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
@@ -1658,6 +1744,62 @@ mod tests {
         assert_eq!(*runner.calls.lock().unwrap(), 1);
         let calls = gitlab.calls.lock().unwrap();
         assert!(calls.iter().all(|call| !call.starts_with("create_note:")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_reviews_use_source_project_path_for_runner_context() -> Result<()> {
+        let mut config = test_config();
+        config.gitlab.targets.repos = TargetSelector::List(vec!["target/repo".to_string()]);
+        let bot_user = GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        };
+        let mut fork_mr = mr(12, "sha1");
+        fork_mr.source_project_id = Some(42);
+        fork_mr.target_project_id = Some(7);
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user,
+            mrs: Mutex::new(vec![fork_mr]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::from([(
+                "42".to_string(),
+                "forks/source-repo".to_string(),
+            )])),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(CapturingReviewRunner {
+            result: Mutex::new(Some(CodexResult::Pass {
+                summary: "ok".to_string(),
+            })),
+            review_contexts: Mutex::new(Vec::new()),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let service = ReviewService::new(
+            config,
+            gitlab,
+            state,
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+
+        let _ = service.scan_once().await?;
+
+        let contexts = runner.review_contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].repo, "target/repo");
+        assert_eq!(contexts[0].project_path, "forks/source-repo");
         Ok(())
     }
 
@@ -2366,7 +2508,13 @@ mod tests {
         };
 
         review_context
-            .run("group/repo", mr(22, "sha22"), "sha22", 0)
+            .run(
+                "group/repo",
+                mr(22, "sha22"),
+                "sha22",
+                crate::feature_flags::FeatureFlagSnapshot::default(),
+                0,
+            )
             .await?;
 
         assert_eq!(*runner.calls.lock().unwrap(), 1);
@@ -2459,7 +2607,13 @@ mod tests {
         };
 
         review_context
-            .run("group/repo", mr(23, "sha23"), "sha23", 0)
+            .run(
+                "group/repo",
+                mr(23, "sha23"),
+                "sha23",
+                crate::feature_flags::FeatureFlagSnapshot::default(),
+                0,
+            )
             .await?;
 
         assert_eq!(*runner.calls.lock().unwrap(), 0);
@@ -2552,7 +2706,13 @@ mod tests {
         };
 
         review_context
-            .run("group/repo", mr(24, "sha24"), "sha24", 0)
+            .run(
+                "group/repo",
+                mr(24, "sha24"),
+                "sha24",
+                crate::feature_flags::FeatureFlagSnapshot::default(),
+                0,
+            )
             .await?;
 
         assert_eq!(*runner.calls.lock().unwrap(), 1);
@@ -2587,6 +2747,128 @@ mod tests {
         let result: Option<String> = row.try_get("result")?;
         assert_eq!(status, "done");
         assert_eq!(result, Some("cancelled".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<()> {
+        let mut config = test_config();
+        config.review.max_concurrent = 1;
+        config.codex.gitlab_discovery_mcp.enabled = true;
+        config.codex.gitlab_discovery_mcp.allow = vec![crate::config::GitLabDiscoveryAllowRule {
+            source_repos: vec!["group/repo".to_string()],
+            source_group_prefixes: Vec::new(),
+            target_repos: vec!["group/shared".to_string()],
+            target_groups: Vec::new(),
+        }];
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user,
+            mrs: Mutex::new(vec![mr(60, "sha60"), mr(61, "sha61")]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let runner = Arc::new(BlockingReviewRunner {
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+            review_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state
+            .set_runtime_feature_flag_overrides(
+                &crate::feature_flags::RuntimeFeatureFlagOverrides {
+                    gitlab_discovery_mcp: Some(true),
+                },
+            )
+            .await?;
+        let service = Arc::new(ReviewService::new(
+            config,
+            gitlab,
+            Arc::clone(&state),
+            runner,
+            1,
+            default_created_after(),
+        ));
+
+        let first_started_wait = first_started.notified();
+        let scan_task = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.scan_once().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_started_wait).await?;
+
+        for _ in 0..50 {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM run_history WHERE kind = 'review'")
+                    .fetch_one(state.pool())
+                    .await?;
+            if count == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        state
+            .set_runtime_feature_flag_overrides(
+                &crate::feature_flags::RuntimeFeatureFlagOverrides {
+                    gitlab_discovery_mcp: Some(false),
+                },
+            )
+            .await?;
+
+        let mut snapshots = Vec::new();
+        for _ in 0..50 {
+            let rows = sqlx::query(
+                "SELECT feature_flags_json FROM run_history WHERE kind = 'review' ORDER BY iid",
+            )
+            .fetch_all(state.pool())
+            .await?;
+            if rows.len() == 2 {
+                snapshots = rows
+                    .into_iter()
+                    .map(|row| {
+                        let json: String = row.try_get("feature_flags_json")?;
+                        let snapshot = serde_json::from_str::<
+                            crate::feature_flags::FeatureFlagSnapshot,
+                        >(&json)?;
+                        Ok(snapshot)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if snapshots
+                    .iter()
+                    .all(|snapshot| snapshot.gitlab_discovery_mcp)
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(snapshots.len(), 2);
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| snapshot.gitlab_discovery_mcp)
+        );
+
+        release_first.notify_waiters();
+        scan_task.await??;
         Ok(())
     }
 
@@ -2986,6 +3268,209 @@ mod tests {
         .await?;
         let head_sha: String = row.try_get("head_sha")?;
         assert_eq!(head_sha, "sha-new");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<()> {
+        let mut config = test_config();
+        config.review.max_concurrent = 1;
+        config.review.mention_commands.enabled = true;
+        config.review.mention_commands.bot_username = Some("botuser".to_string());
+        config.codex.gitlab_discovery_mcp.enabled = true;
+        config.codex.gitlab_discovery_mcp.allow = vec![crate::config::GitLabDiscoveryAllowRule {
+            source_repos: vec!["group/repo".to_string()],
+            source_group_prefixes: Vec::new(),
+            target_repos: vec!["group/shared".to_string()],
+            target_groups: Vec::new(),
+        }];
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let requester = GitLabUser {
+            id: 7,
+            username: Some("alice".to_string()),
+            name: Some("Alice".to_string()),
+        };
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(vec![mr(52, "sha52"), mr(53, "sha53")]),
+            awards: Mutex::new(HashMap::from([
+                (
+                    ("group/repo".to_string(), 52),
+                    vec![AwardEmoji {
+                        id: 521,
+                        name: "thumbsup".to_string(),
+                        user: bot_user.clone(),
+                    }],
+                ),
+                (
+                    ("group/repo".to_string(), 53),
+                    vec![AwardEmoji {
+                        id: 531,
+                        name: "thumbsup".to_string(),
+                        user: bot_user.clone(),
+                    }],
+                ),
+            ])),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::from([
+                (
+                    ("group/repo".to_string(), 52),
+                    vec![MergeRequestDiscussion {
+                        id: "discussion-52".to_string(),
+                        notes: vec![
+                            DiscussionNote {
+                                id: 952,
+                                body: "initial review comment".to_string(),
+                                author: bot_user.clone(),
+                                system: false,
+                                in_reply_to_id: None,
+                                created_at: None,
+                            },
+                            DiscussionNote {
+                                id: 953,
+                                body: "@botuser please implement change".to_string(),
+                                author: requester.clone(),
+                                system: false,
+                                in_reply_to_id: Some(952),
+                                created_at: None,
+                            },
+                        ],
+                    }],
+                ),
+                (
+                    ("group/repo".to_string(), 53),
+                    vec![MergeRequestDiscussion {
+                        id: "discussion-53".to_string(),
+                        notes: vec![
+                            DiscussionNote {
+                                id: 962,
+                                body: "initial review comment".to_string(),
+                                author: bot_user.clone(),
+                                system: false,
+                                in_reply_to_id: None,
+                                created_at: None,
+                            },
+                            DiscussionNote {
+                                id: 963,
+                                body: "@botuser please implement another change".to_string(),
+                                author: requester.clone(),
+                                system: false,
+                                in_reply_to_id: Some(962),
+                                created_at: None,
+                            },
+                        ],
+                    }],
+                ),
+            ])),
+            users: Mutex::new(HashMap::from([(
+                7,
+                GitLabUserDetail {
+                    id: 7,
+                    username: Some("alice".to_string()),
+                    name: Some("Alice".to_string()),
+                    public_email: Some("alice@example.com".to_string()),
+                },
+            )])),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let runner = Arc::new(BlockingMentionRunner {
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+            mention_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state
+            .set_runtime_feature_flag_overrides(
+                &crate::feature_flags::RuntimeFeatureFlagOverrides {
+                    gitlab_discovery_mcp: Some(true),
+                },
+            )
+            .await?;
+        let service = Arc::new(ReviewService::new(
+            config,
+            gitlab,
+            Arc::clone(&state),
+            runner,
+            1,
+            default_created_after(),
+        ));
+
+        let first_started_wait = first_started.notified();
+        let scan_task = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.scan_once().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_started_wait).await?;
+
+        for _ in 0..50 {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM run_history WHERE kind = 'mention'")
+                    .fetch_one(state.pool())
+                    .await?;
+            if count == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        state
+            .set_runtime_feature_flag_overrides(
+                &crate::feature_flags::RuntimeFeatureFlagOverrides {
+                    gitlab_discovery_mcp: Some(false),
+                },
+            )
+            .await?;
+
+        let mut snapshots = Vec::new();
+        for _ in 0..50 {
+            let rows = sqlx::query(
+                "SELECT feature_flags_json FROM run_history WHERE kind = 'mention' ORDER BY trigger_note_id",
+            )
+            .fetch_all(state.pool())
+            .await?;
+            if rows.len() == 2 {
+                snapshots = rows
+                    .into_iter()
+                    .map(|row| {
+                        let json: String = row.try_get("feature_flags_json")?;
+                        let snapshot = serde_json::from_str::<
+                            crate::feature_flags::FeatureFlagSnapshot,
+                        >(&json)?;
+                        Ok(snapshot)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if snapshots
+                    .iter()
+                    .all(|snapshot| snapshot.gitlab_discovery_mcp)
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(snapshots.len(), 2);
+        assert!(
+            snapshots
+                .iter()
+                .all(|snapshot| snapshot.gitlab_discovery_mcp)
+        );
+
+        release_first.notify_waiters();
+        scan_task.await??;
         Ok(())
     }
 

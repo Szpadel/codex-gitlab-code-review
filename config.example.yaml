@@ -39,6 +39,11 @@ schedule:
   # Optional. IANA timezone name; null or omitted means UTC.
   timezone: "UTC"
 
+feature_flags:
+  # Optional. Runtime defaults for feature flags. Operators can override these
+  # live from the status UI/API; changes apply only to newly started runs.
+  gitlab_discovery_mcp: false
+
 review:
   # Required. Max concurrent reviews.
   max_concurrent: 2
@@ -119,9 +124,38 @@ codex:
     mcp_args:
       - "-y"
       - "chrome-devtools-mcp@latest"
+  gitlab_discovery_mcp:
+    # Optional. Serve an internal MCP endpoint that lets Codex browse allowed
+    # GitLab paths and request repository clones through docker exec without
+    # exposing GitLab credentials to the agent surface.
+    enabled: false
+    # Optional. MCP server name injected into the Codex runtime config.
+    server_name: "gitlab-discovery"
+    # Optional. Listener address for the internal MCP server hosted by this service.
+    bind_addr: "127.0.0.1:8091"
+    # Required when enabled. Full streamable HTTP MCP URL reachable from the
+    # Codex review containers, for example via host networking or an internal proxy.
+    advertise_url: "http://host.docker.internal:8091/mcp"
+    # Optional. Env var name injected into the Codex app-server process with the
+    # per-run bearer token used to authenticate MCP requests.
+    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_TOKEN"
+    # Optional. Writable path inside the Codex container used for MCP-triggered clones.
+    clone_root: "/work/mcp"
+    # Required when enabled. Allow rules map the currently reviewed repo/group to
+    # the GitLab repos/groups that Codex may browse and clone through this MCP.
+    allow:
+      - source_repos:
+          - "group/project-a"
+        source_group_prefixes:
+          - "group/subgroup"
+        target_repos:
+          - "group/other-project"
+        target_groups:
+          - "group/platform"
   # Optional. Per-mode runtime overrides for MCP servers already configured in Codex config.toml.
   # Override keys must match ^[a-zA-Z0-9_-]+$ because Codex CLI -c overrides use dotted paths.
-  # This also applies to browser_mcp.server_name, so review/mention can disable the injected browser MCP independently.
+  # This also applies to browser_mcp.server_name and gitlab_discovery_mcp.server_name,
+  # so review/mention can disable the injected MCP servers independently.
   # Each entry maps MCP server name -> enabled flag and becomes:
   #   codex -c mcp_servers.<name>.enabled=<true|false> app-server
   mcp_server_overrides:

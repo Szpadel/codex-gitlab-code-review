@@ -5,6 +5,9 @@ image:
 
 service:
   port: 8080
+  mcpPort: 8081
+
+clusterDomain: "cluster.local"
 
 ingress:
   enabled: false
@@ -31,6 +34,10 @@ persistence:
   storageClass: ""
 
 config:
+  featureFlags:
+    # Runtime feature flag snapshot default. The MCP server is configured below,
+    # but agent access stays off until this flag is enabled at runtime.
+    gitlabDiscoveryMcp: false
   schedule:
     cron: "0 * * * * *"
     timezone: "UTC"
@@ -91,6 +98,52 @@ config:
       mcpArgs:
         - "-y"
         - "chrome-devtools-mcp@latest"
+    gitlabDiscoveryMcp:
+      # Enable the internal MCP listener and inject its config into new runs when
+      # the runtime feature flag is switched on.
+      enabled: true
+      serverName: "gitlab-discovery"
+      # Leave empty to default to 0.0.0.0:<service.mcpPort>.
+      # In the Helm chart this must stay a wildcard host so the Service can
+      # reach the pod listener.
+      bindAddr: ""
+      # Leave empty to default to the in-cluster service FQDN and MCP port.
+      advertiseUrl: ""
+      bearerTokenEnvVar: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+      cloneRoot: "/work/mcp"
+      # Empty by default: the server starts, but exposes no repositories until
+      # explicit allow rules are configured.
+      #
+      # Example 1: allow reviews from one source group to browse and clone repos
+      # from a shared platform group.
+      # allow:
+      #   - sourceGroupPrefixes:
+      #       - "company/product"
+      #     targetGroups:
+      #       - "company/platform"
+      #
+      # Example 2: allow a specific source repo to clone one fixed repo plus
+      # browse a release-tools group.
+      # allow:
+      #   - sourceRepos:
+      #       - "company/product/backend"
+      #     targetRepos:
+      #       - "company/shared/contracts"
+      #     targetGroups:
+      #       - "company/release-tools"
+      #
+      # Example 3: combine exact repo and source group rules. Matching rules are
+      # unioned, so the same review can see both shared libraries and platform repos.
+      # allow:
+      #   - sourceRepos:
+      #       - "company/product/frontend"
+      #     targetRepos:
+      #       - "company/design-system/ui-kit"
+      #   - sourceGroupPrefixes:
+      #       - "company/product"
+      #     targetGroups:
+      #       - "company/platform"
+      allow: []
     # Optional. Per-mode MCP server enabled flags for servers defined in Codex config.toml.
     # Override keys must match ^[a-zA-Z0-9_-]+$ because Codex CLI -c overrides use dotted paths.
     # This also applies to browserMcp.serverName, so review/mention can disable the injected browser MCP independently.
@@ -117,6 +170,7 @@ config:
     bindAddr: "0.0.0.0:8080"
     # Keep this independent from ingress.enabled.
     # If false, ingress can still route to /healthz but the status UI/API stays disabled.
+    # Runtime feature-flag changes through the web UI require this to be true.
     statusUiEnabled: false
 
 gitlab:

@@ -1,9 +1,10 @@
 use crate::codex_runner::{CodexResult, ReviewContext};
 use crate::config::Config;
+use crate::feature_flags::FeatureFlagSnapshot;
 use crate::flow::{FlowShared, MergeRequestFlow};
 use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, Note};
 use crate::state::{NewRunHistory, ReviewStateStore, RunHistoryFinish, RunHistoryKind};
-use anyhow::Result;
+use anyhow::{Error, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
@@ -269,7 +270,33 @@ impl ReviewFlow {
                 return Err(err);
             }
         };
-        let permit = self.shared.semaphore.clone().acquire_owned().await?;
+        let feature_flags = match self.resolve_feature_flags().await {
+            Ok(feature_flags) => feature_flags,
+            Err(err) => {
+                self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
+                    .await;
+                return Err(err);
+            }
+        };
+        if let Err(err) = self
+            .shared
+            .state
+            .set_run_history_feature_flags(run_history_id, &feature_flags)
+            .await
+        {
+            self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
+                .await;
+            return Err(err);
+        }
+        let permit = match self.shared.semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                let err = Error::from(err);
+                self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
+                    .await;
+                return Err(err);
+            }
+        };
         let repo_name = repo.to_string();
         let review_context = ReviewRunContext {
             config: self.shared.config.clone(),
@@ -284,7 +311,7 @@ impl ReviewFlow {
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
             if let Err(err) = review_context
-                .run(&repo_name, mr, &head_sha, run_history_id)
+                .run(&repo_name, mr, &head_sha, feature_flags, run_history_id)
                 .await
             {
                 warn!(repo = repo_name.as_str(), error = %err, "review failed");
@@ -326,7 +353,33 @@ impl ReviewFlow {
                 return Err(err);
             }
         };
-        let _permit = self.shared.semaphore.clone().acquire_owned().await?;
+        let feature_flags = match self.resolve_feature_flags().await {
+            Ok(feature_flags) => feature_flags,
+            Err(err) => {
+                self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
+                    .await;
+                return Err(err);
+            }
+        };
+        if let Err(err) = self
+            .shared
+            .state
+            .set_run_history_feature_flags(run_history_id, &feature_flags)
+            .await
+        {
+            self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
+                .await;
+            return Err(err);
+        }
+        let _permit = match self.shared.semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                let err = Error::from(err);
+                self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
+                    .await;
+                return Err(err);
+            }
+        };
         let review_context = ReviewRunContext {
             config: self.shared.config.clone(),
             gitlab: Arc::clone(&self.shared.gitlab),
@@ -337,9 +390,18 @@ impl ReviewFlow {
             shutdown: Arc::clone(&self.shared.shutdown),
         };
         review_context
-            .run(repo, mr, head_sha, run_history_id)
+            .run(repo, mr, head_sha, feature_flags, run_history_id)
             .await?;
         Ok(ReviewScheduleOutcome::Scheduled)
+    }
+
+    async fn resolve_feature_flags(&self) -> Result<FeatureFlagSnapshot> {
+        let overrides = self
+            .shared
+            .state
+            .get_runtime_feature_flag_overrides()
+            .await?;
+        Ok(self.shared.config.resolve_feature_flags(&overrides))
     }
 
     async fn release_review_lock_after_history_failure(
@@ -360,6 +422,40 @@ impl ReviewFlow {
                 head_sha = head_sha,
                 error = %recovery_err,
                 "failed to release review lock after run history creation error"
+            );
+        }
+    }
+
+    async fn abort_review_after_setup_failure(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        run_history_id: i64,
+        err: &anyhow::Error,
+    ) {
+        self.release_review_lock_after_history_failure(repo, iid, head_sha)
+            .await;
+        if let Err(recovery_err) = self
+            .shared
+            .state
+            .finish_run_history(
+                run_history_id,
+                RunHistoryFinish {
+                    result: "error".to_string(),
+                    preview: Some(format!("Review {repo} !{iid}")),
+                    error: Some(format!("{err:#}")),
+                    ..RunHistoryFinish::default()
+                },
+            )
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                head_sha = head_sha,
+                error = %recovery_err,
+                "failed to finalize run history after review setup error"
             );
         }
     }
@@ -393,6 +489,49 @@ pub(crate) struct ReviewRunContext {
 impl ReviewRunContext {
     fn shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    async fn resolve_review_project_path(&self, repo: &str, mr: &MergeRequest) -> String {
+        let Some(source_project_id) = mr.source_project_id else {
+            return repo.to_string();
+        };
+        if mr.target_project_id == Some(source_project_id) {
+            return repo.to_string();
+        }
+
+        match self
+            .gitlab
+            .get_project(&source_project_id.to_string())
+            .await
+        {
+            Ok(project) => match project
+                .path_with_namespace
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(path_with_namespace) => path_with_namespace.to_string(),
+                None => {
+                    warn!(
+                        repo,
+                        iid = mr.iid,
+                        source_project_id,
+                        "source project path missing for fork MR; disabling GitLab discovery for this run"
+                    );
+                    String::new()
+                }
+            },
+            Err(err) => {
+                warn!(
+                    repo,
+                    iid = mr.iid,
+                    source_project_id,
+                    error = %err,
+                    "failed to resolve source project path for fork MR; disabling GitLab discovery for this run"
+                );
+                String::new()
+            }
+        }
     }
 
     async fn remove_eyes_best_effort(&self, repo: &str, iid: u64) {
@@ -450,6 +589,7 @@ impl ReviewRunContext {
         repo: &str,
         mr: MergeRequest,
         head_sha: &str,
+        feature_flags: FeatureFlagSnapshot,
         run_history_id: i64,
     ) -> Result<()> {
         let retry_key = RetryKey::new(repo, mr.iid, head_sha);
@@ -468,11 +608,13 @@ impl ReviewRunContext {
                 .ok();
         }
 
+        let project_path = self.resolve_review_project_path(repo, &mr).await;
         let review_ctx = ReviewContext {
             repo: repo.to_string(),
-            project_path: repo.to_string(),
+            project_path,
             mr: mr.clone(),
             head_sha: head_sha.to_string(),
+            feature_flags,
             run_history_id: Some(run_history_id),
         };
 

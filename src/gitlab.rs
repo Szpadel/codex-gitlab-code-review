@@ -58,6 +58,11 @@ pub struct GitLabProjectSummary {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GitLabGroupSummary {
+    pub full_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AwardEmoji {
     pub id: u64,
     pub name: String,
@@ -105,6 +110,12 @@ pub trait GitLabApi: Send + Sync {
     async fn current_user(&self) -> Result<GitLabUser>;
     async fn list_projects(&self) -> Result<Vec<GitLabProjectSummary>>;
     async fn list_group_projects(&self, group: &str) -> Result<Vec<GitLabProjectSummary>>;
+    async fn list_direct_group_projects(&self, _group: &str) -> Result<Vec<GitLabProjectSummary>> {
+        Ok(Vec::new())
+    }
+    async fn list_group_subgroups(&self, _group: &str) -> Result<Vec<GitLabGroupSummary>> {
+        Ok(Vec::new())
+    }
     async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>>;
     async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>>;
     async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest>;
@@ -347,6 +358,21 @@ impl GitLabApi for GitLabClient {
             "{}/groups/{}/projects?include_subgroups=true&simple=true",
             self.api_base, encoded
         );
+        self.get_paginated(&url).await
+    }
+
+    async fn list_direct_group_projects(&self, group: &str) -> Result<Vec<GitLabProjectSummary>> {
+        let encoded = urlencoding::encode(group);
+        let url = format!(
+            "{}/groups/{}/projects?include_subgroups=false&simple=true",
+            self.api_base, encoded
+        );
+        self.get_paginated(&url).await
+    }
+
+    async fn list_group_subgroups(&self, group: &str) -> Result<Vec<GitLabGroupSummary>> {
+        let encoded = urlencoding::encode(group);
+        let url = format!("{}/groups/{}/subgroups?simple=true", self.api_base, encoded);
         self.get_paginated(&url).await
     }
 
@@ -870,6 +896,55 @@ mod tests {
         let projects = client.list_group_projects("group/sub").await?;
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].path_with_namespace, "group/sub/repo");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_direct_group_projects_excludes_subgroups() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(vec![serde_json::json!({
+            "path_with_namespace": "group/sub/repo"
+        })]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/groups/group%2Fsub/projects"))
+            .and(query_param("include_subgroups", "false"))
+            .and(query_param("simple", "true"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let projects = client.list_direct_group_projects("group/sub").await?;
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path_with_namespace, "group/sub/repo");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_group_subgroups_returns_full_paths() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(vec![serde_json::json!({
+            "full_path": "group/sub/child"
+        })]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/groups/group%2Fsub/subgroups"))
+            .and(query_param("simple", "true"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let groups = client.list_group_subgroups("group/sub").await?;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].full_path, "group/sub/child");
         Ok(())
     }
 

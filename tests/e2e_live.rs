@@ -33,6 +33,7 @@ async fn e2e_live_dry_run() -> Result<()> {
     let created_after = Utc::now() - Duration::days(3650);
 
     let config = Config {
+        feature_flags: codex_gitlab_code_review::feature_flags::FeatureFlagDefaults::default(),
         gitlab: GitLabConfig {
             base_url: base_url.clone(),
             token: token.clone(),
@@ -68,6 +69,8 @@ async fn e2e_live_dry_run() -> Result<()> {
             usage_limit_fallback_cooldown_seconds: 3600,
             deps: codex_gitlab_code_review::config::DepsConfig { enabled: false },
             browser_mcp: codex_gitlab_code_review::config::BrowserMcpConfig::default(),
+            gitlab_discovery_mcp:
+                codex_gitlab_code_review::config::GitLabDiscoveryMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
             reasoning_effort:
                 codex_gitlab_code_review::config::ReasoningEffortOverridesConfig::default(),
@@ -107,6 +110,7 @@ async fn e2e_live_dry_run() -> Result<()> {
         config.codex.clone(),
         git_base,
         Arc::clone(&state),
+        None,
         RunnerRuntimeOptions {
             gitlab_token: config.gitlab.token.clone(),
             log_all_json: false,

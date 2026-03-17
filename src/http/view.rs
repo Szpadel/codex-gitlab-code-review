@@ -1,6 +1,6 @@
 use super::status::{
-    HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, StatusSnapshot, ThreadItemSnapshot,
-    ThreadSnapshot, TranscriptBackfillSnapshot,
+    HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, StatusFeatureFlagSnapshot,
+    StatusSnapshot, ThreadItemSnapshot, ThreadSnapshot, TranscriptBackfillSnapshot,
 };
 use super::timestamp::{self, UiTimestamp};
 use crate::state::{
@@ -9,7 +9,7 @@ use crate::state::{
 };
 use serde::Deserialize;
 
-pub(super) fn render_status_page(snapshot: &StatusSnapshot) -> String {
+pub(super) fn render_status_page(snapshot: &StatusSnapshot, csrf_token: Option<&str>) -> String {
     let scan = &snapshot.scan;
     let config = &snapshot.config;
     let scan_summary = vec![
@@ -59,6 +59,10 @@ pub(super) fn render_status_page(snapshot: &StatusSnapshot) -> String {
             escape_html(bool_label(config.browser_mcp_enabled)),
         ),
         (
+            "GitLab Discovery MCP".to_string(),
+            escape_html(bool_label(config.gitlab_discovery_mcp_configured)),
+        ),
+        (
             "Max concurrent".to_string(),
             escape_html(&config.max_concurrent.to_string()),
         ),
@@ -89,19 +93,20 @@ pub(super) fn render_status_page(snapshot: &StatusSnapshot) -> String {
          <article class=\"card\"><h2>Scan</h2><dl>{}</dl></article>\
          <article class=\"card\"><h2>Configuration</h2><dl>{}</dl></article>\
          </section>\
-         {}{}{}{}",
+         {}{}{}{}{}",
         render_rfc3339_timestamp(Some(&snapshot.generated_at)),
         render_definition_list(&scan_summary),
         render_definition_list(&config_summary),
+        render_feature_flags_section(&config.feature_flags),
         render_reviews_section(&snapshot.in_progress_reviews),
         render_mentions_section(&snapshot.in_progress_mentions),
         render_auth_section(&snapshot.auth_limit_resets),
         render_catalog_section(&snapshot.project_catalogs),
     );
-    render_shell("Status", NavItem::Status, body)
+    render_shell("Status", NavItem::Status, body, csrf_token)
 }
 
-pub(super) fn render_history_page(snapshot: &HistorySnapshot) -> String {
+pub(super) fn render_history_page(snapshot: &HistorySnapshot, csrf_token: Option<&str>) -> String {
     let filters = &snapshot.filters;
     let body = format!(
         "<section class=\"hero\"><h1>Run history</h1><p class=\"muted\">Append-only review and mention sessions.</p></section>\
@@ -110,10 +115,13 @@ pub(super) fn render_history_page(snapshot: &HistorySnapshot) -> String {
         render_history_filters(filters),
         render_run_table("All runs", &snapshot.runs)
     );
-    render_shell("History", NavItem::History, body)
+    render_shell("History", NavItem::History, body, csrf_token)
 }
 
-pub(super) fn render_mr_history_page(snapshot: &MrHistorySnapshot) -> String {
+pub(super) fn render_mr_history_page(
+    snapshot: &MrHistorySnapshot,
+    csrf_token: Option<&str>,
+) -> String {
     let body = format!(
         "<section class=\"hero\"><h1>MR history</h1><p class=\"muted\">{} !{} has {} recorded session(s).</p></section>{}",
         escape_html(&snapshot.repo),
@@ -121,10 +129,13 @@ pub(super) fn render_mr_history_page(snapshot: &MrHistorySnapshot) -> String {
         snapshot.runs.len(),
         render_run_table("Sessions for this MR", &snapshot.runs)
     );
-    render_shell("MR History", NavItem::History, body)
+    render_shell("MR History", NavItem::History, body, csrf_token)
 }
 
-pub(super) fn render_run_detail_page(snapshot: &RunDetailSnapshot) -> String {
+pub(super) fn render_run_detail_page(
+    snapshot: &RunDetailSnapshot,
+    csrf_token: Option<&str>,
+) -> String {
     let run = &snapshot.run;
     let body = format!(
         "<section class=\"hero\"><h1>Run {}</h1><p class=\"muted\">{} run for {} !{}.</p></section>\
@@ -145,7 +156,7 @@ pub(super) fn render_run_detail_page(snapshot: &RunDetailSnapshot) -> String {
             snapshot.transcript_backfill.as_ref(),
         ),
     );
-    render_shell("Run Detail", NavItem::History, body)
+    render_shell("Run Detail", NavItem::History, body, csrf_token)
 }
 
 pub(super) fn encode_repo_key(repo: &str) -> String {
@@ -384,8 +395,83 @@ fn render_run_metadata(run: &RunHistoryRecord) -> String {
             "Commit SHA".to_string(),
             escape_html(run.commit_sha.as_deref().unwrap_or("-")),
         ),
+        (
+            "Feature flags".to_string(),
+            escape_html(&render_run_feature_flags(run)),
+        ),
     ];
     format!("<dl>{}</dl>", render_definition_list(&items))
+}
+
+fn render_run_feature_flags(run: &RunHistoryRecord) -> String {
+    let mut flags = vec![format!(
+        "gitlab_discovery_mcp={}",
+        bool_label(run.feature_flags.gitlab_discovery_mcp)
+    )];
+    flags.sort();
+    flags.join(", ")
+}
+
+fn render_feature_flags_section(flags: &[StatusFeatureFlagSnapshot]) -> String {
+    render_table_section(
+        "Feature flags",
+        if flags.is_empty() {
+            "<p class=\"empty\">No runtime feature flags are registered.</p>".to_string()
+        } else {
+            let rows = flags
+                .iter()
+                .map(|flag| {
+                    let runtime_override = match flag.runtime_override {
+                        Some(value) => bool_label(value),
+                        None => "default",
+                    };
+                    format!(
+                        "<tr>\
+                         <td><code>{}</code></td>\
+                         <td>{}</td>\
+                         <td>{}</td>\
+                         <td>{}</td>\
+                         <td>{}</td>\
+                         <td>{}</td>\
+                         </tr>",
+                        escape_html(&flag.name),
+                        escape_html(bool_label(flag.available)),
+                        escape_html(bool_label(flag.default_enabled)),
+                        escape_html(runtime_override),
+                        escape_html(bool_label(flag.effective_enabled)),
+                        render_feature_flag_controls(flag),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            format!(
+                "<p class=\"muted\">Runtime changes apply only to newly started runs.</p>\
+                 <table><thead><tr><th>Flag</th><th>Available</th><th>Default</th><th>Runtime override</th><th>Effective</th><th>Controls</th></tr></thead><tbody>{rows}</tbody></table>"
+            )
+        },
+    )
+}
+
+fn render_feature_flag_controls(flag: &StatusFeatureFlagSnapshot) -> String {
+    if !flag.available {
+        return "<span class=\"muted\">Unavailable</span>".to_string();
+    }
+    [
+        ("true", "Enable"),
+        ("false", "Disable"),
+        ("default", "Default"),
+    ]
+    .into_iter()
+    .map(|(value, label)| {
+        format!(
+            "<button type=\"button\" data-feature-flag=\"{name}\" data-feature-flag-value=\"{value}\" style=\"margin-right:0.4rem;\">{label}</button>",
+            name = escape_html(&flag.name),
+            value = value,
+            label = label,
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("")
 }
 
 fn render_related_runs(runs: &[RunHistoryRecord], current_id: i64) -> String {
@@ -1181,21 +1267,24 @@ fn render_definition_list(items: &[(String, String)]) -> String {
         .join("")
 }
 
-fn render_shell(title: &str, active: NavItem, content: String) -> String {
+fn render_shell(title: &str, active: NavItem, content: String, csrf_token: Option<&str>) -> String {
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>Codex GitLab Review {}</title><style>{}{}</style></head><body>\
+         <title>Codex GitLab Review {}</title>{}<style>{}{}</style></head><body>\
          <div class=\"layout\">\
          <aside class=\"sidebar\"><div class=\"brand\">Codex GitLab Review</div>{}</aside>\
          <main class=\"content\">{}</main>\
-         </div>{}</body></html>",
+         </div>{}\
+         <script>{}</script></body></html>",
         escape_html(title),
+        render_feature_flag_csrf_meta_tag(csrf_token),
         page_style(),
         timestamp::style_fragment(),
         render_nav(active),
         content,
         timestamp::script_tag(),
+        feature_flag_script(),
     )
 }
 
@@ -1275,6 +1364,75 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn render_feature_flag_csrf_meta_tag(csrf_token: Option<&str>) -> String {
+    csrf_token
+        .map(|csrf_token| {
+            format!(
+                "<meta name=\"codex-status-csrf\" content=\"{}\">",
+                escape_html(csrf_token)
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn feature_flag_script() -> &'static str {
+    r#"
+function resolveAppBasePath(pathname) {
+  const patterns = [
+    /\/mr\/[^/]+\/[^/]+\/history\/?$/,
+    /\/history\/[^/]+\/?$/,
+    /\/history\/?$/,
+    /\/status\/?$/
+  ];
+  for (const pattern of patterns) {
+    if (pattern.test(pathname)) {
+      return pathname.replace(pattern, '/');
+    }
+  }
+  return pathname.endsWith('/') ? pathname : `${pathname}/`;
+}
+
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('button[data-feature-flag]');
+  if (!button) return;
+  const flagName = button.getAttribute('data-feature-flag');
+  const rawValue = button.getAttribute('data-feature-flag-value');
+  const csrfToken = document.querySelector('meta[name="codex-status-csrf"]')?.getAttribute('content');
+  if (!flagName || !rawValue) return;
+  if (!csrfToken) {
+    window.alert('Feature flag controls are unavailable.');
+    return;
+  }
+  const enabled = rawValue === 'default' ? null : rawValue === 'true';
+  const basePath = resolveAppBasePath(window.location.pathname);
+  const featureFlagUrl = new URL(
+    `api/feature-flags/${encodeURIComponent(flagName)}`,
+    `${window.location.origin}${basePath.endsWith('/') ? basePath : `${basePath}/`}`
+  );
+  button.disabled = true;
+  try {
+    const response = await fetch(featureFlagUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Codex-Status-Csrf': csrfToken,
+      },
+      body: JSON.stringify({ enabled }),
+      credentials: 'same-origin',
+    });
+    if (!response.ok) {
+      throw new Error(`feature flag update failed: ${response.status}`);
+    }
+    window.location.reload();
+  } catch (error) {
+    console.error(error);
+    button.disabled = false;
+    window.alert('Feature flag update failed.');
+  }
+});
+"#
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

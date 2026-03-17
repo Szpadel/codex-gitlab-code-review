@@ -1,4 +1,5 @@
 use crate::codex_runner::{MentionCommandContext, MentionCommandResult, MentionCommandStatus};
+use crate::feature_flags::FeatureFlagSnapshot;
 use crate::flow::{FlowShared, MergeRequestFlow};
 use crate::gitlab::{DiscussionNote, GitLabApi, GitLabUser, MergeRequest, MergeRequestDiscussion};
 use crate::state::{NewRunHistory, RunHistoryFinish, RunHistoryKind};
@@ -468,6 +469,40 @@ impl MentionFlow {
                 .filter(|value| !value.is_empty())
                 .unwrap_or("(unknown-source-branch)")
                 .to_string();
+            let feature_flags = match self.resolve_feature_flags().await {
+                Ok(feature_flags) => feature_flags,
+                Err(err) => {
+                    self.abort_mention_after_setup_failure(
+                        repo,
+                        mr.iid,
+                        &trigger.discussion_id,
+                        trigger_note_id,
+                        head_sha,
+                        run_history_id,
+                        &err,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            };
+            if let Err(err) = self
+                .shared
+                .state
+                .set_run_history_feature_flags(run_history_id, &feature_flags)
+                .await
+            {
+                self.abort_mention_after_setup_failure(
+                    repo,
+                    mr.iid,
+                    &trigger.discussion_id,
+                    trigger_note_id,
+                    head_sha,
+                    run_history_id,
+                    &err,
+                )
+                .await;
+                return Err(err);
+            }
             let branch_lock = self.mention_branch_lock(&command_repo, &source_branch_key);
             let semaphore = Arc::clone(&self.shared.semaphore);
             let gitlab = Arc::clone(&self.shared.gitlab);
@@ -596,6 +631,7 @@ impl MentionFlow {
                     requester_email: requester.email.clone(),
                     additional_developer_instructions,
                     prompt,
+                    feature_flags,
                     run_history_id: Some(run_history_id),
                 };
                 let outcome = codex.run_mention_command(command_context).await;
@@ -865,6 +901,61 @@ impl MentionFlow {
                 head_sha = head_sha,
                 error = %recovery_err,
                 "failed to release mention lock after run history creation error"
+            );
+        }
+    }
+
+    async fn resolve_feature_flags(&self) -> Result<FeatureFlagSnapshot> {
+        let overrides = self
+            .shared
+            .state
+            .get_runtime_feature_flag_overrides()
+            .await?;
+        Ok(self.shared.config.resolve_feature_flags(&overrides))
+    }
+
+    async fn abort_mention_after_setup_failure(
+        &self,
+        repo: &str,
+        iid: u64,
+        discussion_id: &str,
+        trigger_note_id: u64,
+        head_sha: &str,
+        run_history_id: i64,
+        err: &anyhow::Error,
+    ) {
+        self.release_mention_lock_after_history_failure(
+            repo,
+            iid,
+            discussion_id,
+            trigger_note_id,
+            head_sha,
+        )
+        .await;
+        if let Err(finish_err) = self
+            .shared
+            .state
+            .finish_run_history(
+                run_history_id,
+                RunHistoryFinish {
+                    result: "error".to_string(),
+                    preview: Some(format!(
+                        "Mention {} !{} note {}",
+                        repo, iid, trigger_note_id
+                    )),
+                    error: Some(format!("{err:#}")),
+                    ..RunHistoryFinish::default()
+                },
+            )
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                discussion_id = discussion_id,
+                trigger_note_id = trigger_note_id,
+                error = %finish_err,
+                "failed to finalize mention run history after setup failure"
             );
         }
     }

@@ -1,0 +1,108 @@
+suite: gitlab discovery mcp defaults
+templates:
+  - templates/codex-auth-configmap.yaml
+  - templates/configmap.yaml
+  - templates/deployment.yaml
+  - templates/secret.yaml
+  - templates/service.yaml
+release:
+  namespace: review-system
+tests:
+  - it: renders the runtime flag disabled and the MCP listener enabled by default
+    template: templates/configmap.yaml
+    asserts:
+      - equal:
+          path: kind
+          value: ConfigMap
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "(?m)^feature_flags:\\n  gitlab_discovery_mcp: false$"
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "(?m)^  gitlab_discovery_mcp:\\n    enabled: true$"
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    advertise_url: "http://RELEASE-NAME-codex-gitlab-review.review-system.svc.cluster.local:8081/mcp"$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "(?m)^    allow: \\[\\]$"
+  - it: exposes a dedicated MCP container port
+    template: templates/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: mcp
+            containerPort: 8081
+  - it: exposes a dedicated MCP service port
+    template: templates/service.yaml
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            name: mcp
+            port: 8081
+            targetPort: mcp
+  - it: syncs the rendered MCP port with a custom bind_addr port
+    template: templates/configmap.yaml
+    set:
+      config.codex.gitlabDiscoveryMcp.bindAddr: "0.0.0.0:19091"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    bind_addr: "0.0.0.0:19091"$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    advertise_url: "http://RELEASE-NAME-codex-gitlab-review.review-system.svc.cluster.local:19091/mcp"$'
+  - it: syncs the deployment MCP port with a custom bind_addr port
+    template: templates/deployment.yaml
+    set:
+      config.codex.gitlabDiscoveryMcp.bindAddr: "0.0.0.0:19091"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: mcp
+            containerPort: 19091
+  - it: syncs the service MCP port with a custom bind_addr port
+    template: templates/service.yaml
+    set:
+      config.codex.gitlabDiscoveryMcp.bindAddr: "0.0.0.0:19091"
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            name: mcp
+            port: 19091
+            targetPort: mcp
+  - it: hides the MCP ports when the listener is disabled
+    set:
+      config.codex.gitlabDiscoveryMcp.enabled: false
+    asserts:
+      - notContains:
+          template: templates/deployment.yaml
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: mcp
+            containerPort: 8081
+      - notContains:
+          template: templates/service.yaml
+          path: spec.ports
+          content:
+            name: mcp
+            port: 8081
+            targetPort: mcp
+  - it: rejects non-wildcard MCP bind hosts in the chart
+    template: templates/deployment.yaml
+    set:
+      config.codex.gitlabDiscoveryMcp.bindAddr: "10.0.0.5:8081"
+    asserts:
+      - failedTemplate:
+          errorMessage: config.codex.gitlabDiscoveryMcp.bindAddr must use a wildcard host (0.0.0.0 or [::]) in the Helm chart
+  - it: rejects HTTP and MCP listener port collisions in the chart
+    template: templates/deployment.yaml
+    set:
+      service.mcpPort: 8080
+    asserts:
+      - failedTemplate:
+          errorMessage: config.server.bindAddr and config.codex.gitlabDiscoveryMcp.bindAddr must not target the same listener socket

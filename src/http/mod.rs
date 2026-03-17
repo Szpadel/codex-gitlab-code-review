@@ -6,8 +6,9 @@ mod view;
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
+    http::HeaderMap,
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -22,8 +23,9 @@ use view::{
 pub fn app_router(status_service: Arc<StatusService>) -> Router {
     let mut router = Router::new().route("/healthz", get(healthcheck));
     if status_service.status_ui_enabled() {
-        // The status UI is expected to sit behind the same trusted auth proxy for
-        // both operational status and historical session data when enabled.
+        // The status UI is expected to sit behind an admin-only trusted auth
+        // proxy when enabled. Server-side CSRF enforcement protects the
+        // runtime feature-flag write path within that authenticated surface.
         router = router
             .route("/", get(status_page))
             .route("/status", get(status_page))
@@ -31,6 +33,10 @@ pub fn app_router(status_service: Arc<StatusService>) -> Router {
             .route("/history/{run_id}", get(run_detail_page))
             .route("/mr/{repo_key}/{iid}/history", get(mr_history_page))
             .route("/api/status", get(status_json))
+            .route(
+                "/api/feature-flags/{flag_name}",
+                post(update_feature_flag_json),
+            )
             .route("/api/history", get(history_json))
             .route("/api/history/{run_id}", get(run_detail_json))
             .route("/api/mr/{repo_key}/{iid}/history", get(mr_history_json));
@@ -65,7 +71,10 @@ async fn status_page(
     State(status_service): State<Arc<StatusService>>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     let snapshot = status_service.snapshot().await?;
-    Ok(Html(render_status_page(&snapshot)))
+    Ok(Html(render_status_page(
+        &snapshot,
+        Some(status_service.feature_flag_csrf_token()),
+    )))
 }
 
 async fn history_json(
@@ -85,7 +94,10 @@ async fn history_page(
     let snapshot = status_service
         .history_snapshot(params.into_query()?)
         .await?;
-    Ok(Html(render_history_page(&snapshot)))
+    Ok(Html(render_history_page(
+        &snapshot,
+        Some(status_service.feature_flag_csrf_token()),
+    )))
 }
 
 async fn mr_history_json(
@@ -102,7 +114,10 @@ async fn mr_history_page(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     let repo = decode_repo_key(&repo_key)?;
     let snapshot = status_service.mr_history_snapshot(&repo, iid).await?;
-    Ok(Html(render_mr_history_page(&snapshot)))
+    Ok(Html(render_mr_history_page(
+        &snapshot,
+        Some(status_service.feature_flag_csrf_token()),
+    )))
 }
 
 async fn run_detail_json(
@@ -122,7 +137,24 @@ async fn run_detail_page(
     let Some(snapshot) = status_service.run_detail_snapshot(run_id).await? else {
         return Err(StatusHandlerError(anyhow::anyhow!("run not found")));
     };
-    Ok(Html(render_run_detail_page(&snapshot)))
+    Ok(Html(render_run_detail_page(
+        &snapshot,
+        Some(status_service.feature_flag_csrf_token()),
+    )))
+}
+
+async fn update_feature_flag_json(
+    State(status_service): State<Arc<StatusService>>,
+    Path(flag_name): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<FeatureFlagUpdateJson>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    require_feature_flag_csrf_header(&headers, status_service.feature_flag_csrf_token())?;
+    Ok(Json(
+        status_service
+            .update_runtime_feature_flag(&flag_name, request.enabled)
+            .await?,
+    ))
 }
 
 #[derive(Debug)]
@@ -156,6 +188,26 @@ struct HistoryQueryParams {
     result: Option<String>,
     q: Option<String>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeatureFlagUpdateJson {
+    enabled: Option<bool>,
+}
+
+fn require_feature_flag_csrf_header(
+    headers: &HeaderMap,
+    expected_token: &str,
+) -> anyhow::Result<()> {
+    let matches_expected = headers
+        .get("x-codex-status-csrf")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected_token);
+    if matches_expected {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid feature flag csrf token")
+    }
 }
 
 impl HistoryQueryParams {
@@ -300,7 +352,143 @@ mod tests {
         assert!(body.contains("datetime=\"2026-03-10T12:00:00Z\""));
         assert!(body.contains("Mar 10, 2026, 11:59 AM UTC"));
         assert!(body.contains("Mar 10, 2026, 12:00 PM UTC"));
+        assert!(body.contains("name=\"codex-status-csrf\""));
+        assert!(body.contains("function resolveAppBasePath(pathname)"));
         assert!(!body.contains("primary<script>"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feature_flag_update_endpoint_persists_runtime_override() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let mut config = test_config();
+        config.codex.gitlab_discovery_mcp.enabled = true;
+        config.codex.gitlab_discovery_mcp.allow = vec![crate::config::GitLabDiscoveryAllowRule {
+            source_repos: vec!["group/source".to_string()],
+            source_group_prefixes: Vec::new(),
+            target_repos: vec!["group/target".to_string()],
+            target_groups: Vec::new(),
+        }];
+        let status_service = Arc::new(StatusService::new(config, Arc::clone(&state), false, None));
+        let csrf_token = status_service.feature_flag_csrf_token().to_string();
+        let address = spawn_test_server(app_router(status_service)).await?;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!(
+                "http://{address}/api/feature-flags/gitlab_discovery_mcp"
+            ))
+            .header("x-codex-status-csrf", csrf_token)
+            .json(&json!({ "enabled": true }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("\"runtime_override\":true"));
+        assert!(body.contains("\"effective_enabled\":true"));
+
+        assert_eq!(
+            state
+                .get_runtime_feature_flag_overrides()
+                .await?
+                .gitlab_discovery_mcp,
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feature_flag_update_endpoint_requires_csrf_header() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let mut config = test_config();
+        config.codex.gitlab_discovery_mcp.enabled = true;
+        let status_service = Arc::new(StatusService::new(config, Arc::clone(&state), false, None));
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/api/feature-flags/gitlab_discovery_mcp"
+            ))
+            .json(&json!({ "enabled": true }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state
+                .get_runtime_feature_flag_overrides()
+                .await?
+                .gitlab_discovery_mcp,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feature_flag_update_endpoint_rejects_unavailable_flags() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let status_service = Arc::new(StatusService::new(
+            test_config(),
+            Arc::clone(&state),
+            false,
+            None,
+        ));
+        let csrf_token = status_service.feature_flag_csrf_token().to_string();
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/api/feature-flags/gitlab_discovery_mcp"
+            ))
+            .header("x-codex-status-csrf", csrf_token)
+            .json(&json!({ "enabled": true }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state
+                .get_runtime_feature_flag_overrides()
+                .await?
+                .gitlab_discovery_mcp,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state
+            .set_runtime_feature_flag_overrides(
+                &crate::feature_flags::RuntimeFeatureFlagOverrides {
+                    gitlab_discovery_mcp: Some(true),
+                },
+            )
+            .await?;
+        let status_service = Arc::new(StatusService::new(
+            test_config(),
+            Arc::clone(&state),
+            false,
+            None,
+        ));
+        let csrf_token = status_service.feature_flag_csrf_token().to_string();
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/api/feature-flags/gitlab_discovery_mcp"
+            ))
+            .header("x-codex-status-csrf", csrf_token)
+            .json(&json!({ "enabled": null }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .get_runtime_feature_flag_overrides()
+                .await?
+                .gitlab_discovery_mcp,
+            None
+        );
         Ok(())
     }
 
@@ -6431,6 +6619,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            feature_flags: crate::feature_flags::FeatureFlagDefaults::default(),
             gitlab: GitLabConfig {
                 base_url: "https://gitlab.example.com".to_string(),
                 token: String::new(),
@@ -6474,6 +6663,7 @@ mod tests {
                 usage_limit_fallback_cooldown_seconds: 3600,
                 deps: Default::default(),
                 browser_mcp: BrowserMcpConfig::default(),
+                gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
                 reasoning_effort: ReasoningEffortOverridesConfig::default(),
                 reasoning_summary: ReasoningSummaryOverridesConfig::default(),
