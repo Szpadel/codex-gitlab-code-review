@@ -13,14 +13,18 @@ use tracing::{info, warn};
 use codex_gitlab_code_review::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
 use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
 use codex_gitlab_code_review::config::{
-    Config, gitlab_discovery_mcp_uses_cluster_service_advertise_url,
+    Config, DockerConfig, gitlab_discovery_mcp_uses_cluster_service_advertise_url,
 };
 use codex_gitlab_code_review::demo_history::seed_example_history;
+use codex_gitlab_code_review::docker_utils::wait_for_docker_ready;
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use codex_gitlab_code_review::http::{StatusService, run_http_server};
 use codex_gitlab_code_review::review::{ReviewService, ScanRunStatus};
 use codex_gitlab_code_review::state::{ReviewStateStore, ScanMode, ScanOutcome};
+
+const STARTUP_DOCKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const STARTUP_DOCKER_READY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Codex GitLab review service")]
@@ -156,6 +160,7 @@ async fn main() -> Result<()> {
         dry_run = config.review.dry_run,
         "starting codex gitlab review"
     );
+    wait_for_startup_docker(&config.docker).await?;
     let gitlab_client = GitLabClient::new(&config.gitlab.base_url, &config.gitlab.token)?;
     let needs_current_user_for_bot_user_id = config.gitlab.bot_user_id.is_none();
     let needs_current_user_for_mention = config.review.mention_commands.enabled
@@ -439,6 +444,25 @@ fn mention_commands_active(config: &Config) -> bool {
             .as_deref()
             .map(str::trim)
             .is_some_and(|value| !value.is_empty())
+}
+
+async fn wait_for_startup_docker(docker_cfg: &DockerConfig) -> Result<()> {
+    info!(
+        docker_host = docker_cfg.host.as_str(),
+        timeout_secs = STARTUP_DOCKER_READY_TIMEOUT.as_secs(),
+        "waiting for docker daemon readiness"
+    );
+    wait_for_docker_ready(
+        docker_cfg,
+        STARTUP_DOCKER_READY_TIMEOUT,
+        STARTUP_DOCKER_READY_POLL_INTERVAL,
+    )
+    .await?;
+    info!(
+        docker_host = docker_cfg.host.as_str(),
+        "docker daemon is ready"
+    );
+    Ok(())
 }
 
 fn spawn_startup_warmup(
