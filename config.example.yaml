@@ -134,8 +134,9 @@ codex:
     # Optional. Listener address for the internal MCP server hosted by this service.
     bind_addr: "0.0.0.0:8091"
     # Required when enabled. Full streamable HTTP MCP URL reachable from the
-    # Codex review containers. Leave empty in the Helm chart to default to
-    # http://host.docker.internal:<port>/mcp with a host-gateway mapping.
+    # Codex review containers. Leave empty in the Helm chart to prefer
+    # http://$POD_IP:<port>/mcp when POD_IP is present, otherwise the runtime
+    # falls back to http://host.docker.internal:<port>/mcp.
     advertise_url: "http://host.docker.internal:8091/mcp"
     # Optional. Writable path inside the Codex container used for MCP-triggered clones.
     clone_root: "/work/mcp"

@@ -90,7 +90,13 @@ spec:
             - name: RUST_LOG
               value: "info"
 {{- if .Values.config.codex.gitlabDiscoveryMcp.enabled }}
-{{- $gitlabDiscoveryAdvertiseUrl := .Values.config.codex.gitlabDiscoveryMcp.advertiseUrl -}}
+{{- $gitlabDiscoveryAdvertiseUrl := .Values.config.codex.gitlabDiscoveryMcp.advertiseUrl | default "" | trim -}}
+{{- if not $gitlabDiscoveryAdvertiseUrl }}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+{{- end }}
 {{- if $gitlabDiscoveryAdvertiseUrl }}
             - name: CODEX_REVIEW__CODEX__GITLAB_DISCOVERY_MCP__ADVERTISE_URL
               value: {{ $gitlabDiscoveryAdvertiseUrl | quote }}

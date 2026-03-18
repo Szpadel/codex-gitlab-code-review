@@ -105,10 +105,10 @@ config:
       serverName: "gitlab-discovery"
       # Leave empty to default to 0.0.0.0:<service.mcpPort>.
       bindAddr: ""
-      # Leave empty to let the service derive
-      # http://host.docker.internal:<service.mcpPort>/mcp at startup. Review
-      # containers are spawned by Docker-in-Docker, so the runtime adds a
-      # host-gateway mapping instead of relying on Kubernetes Service DNS.
+      # Leave empty to let the service derive a reachable runtime address.
+      # Helm injects POD_IP, so the runtime prefers
+      # http://$POD_IP:<service.mcpPort>/mcp and falls back to
+      # http://host.docker.internal:<service.mcpPort>/mcp when POD_IP is absent.
       advertiseUrl: ""
       cloneRoot: "/work/mcp"
       # Empty by default: the server starts, but exposes no repositories until

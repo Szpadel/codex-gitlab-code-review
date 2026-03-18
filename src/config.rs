@@ -455,12 +455,40 @@ fn apply_gitlab_discovery_mcp_runtime_defaults(config: &mut Config) -> Result<()
         "codex.gitlab_discovery_mcp.bind_addr",
         &config.codex.gitlab_discovery_mcp.bind_addr,
     )?;
-    anyhow::ensure!(
-        is_wildcard_host(&bind_host),
-        "codex.gitlab_discovery_mcp.advertise_url cannot default to host.docker.internal when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
-    );
-    config.codex.gitlab_discovery_mcp.advertise_url =
-        format!("http://host.docker.internal:{port}/mcp");
+    let pod_ip = env::var("POD_IP")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match pod_ip {
+        Some(pod_ip) => {
+            anyhow::ensure!(
+                is_wildcard_host(&bind_host),
+                "codex.gitlab_discovery_mcp.advertise_url cannot default from POD_IP when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
+            );
+            let pod_ip = pod_ip
+                .parse::<std::net::IpAddr>()
+                .context("parse POD_IP for gitlab discovery MCP advertise_url default")?;
+            if bind_host_supports_ip(&bind_host, pod_ip) {
+                let host = match pod_ip {
+                    std::net::IpAddr::V4(ip) => ip.to_string(),
+                    std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+                };
+                config.codex.gitlab_discovery_mcp.advertise_url =
+                    format!("http://{host}:{port}/mcp");
+            } else {
+                config.codex.gitlab_discovery_mcp.advertise_url =
+                    format!("http://host.docker.internal:{port}/mcp");
+            }
+        }
+        None => {
+            anyhow::ensure!(
+                is_wildcard_host(&bind_host),
+                "codex.gitlab_discovery_mcp.advertise_url cannot default to host.docker.internal when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
+            );
+            config.codex.gitlab_discovery_mcp.advertise_url =
+                format!("http://host.docker.internal:{port}/mcp");
+        }
+    }
     Ok(())
 }
 
@@ -736,6 +764,13 @@ fn is_wildcard_host(host: &str) -> bool {
     matches!(host, "0.0.0.0" | "::" | "[::]" | "0:0:0:0:0:0:0:0")
 }
 
+fn bind_host_supports_ip(bind_host: &str, ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(_) => bind_host == "0.0.0.0",
+        std::net::IpAddr::V6(_) => matches!(bind_host, "::" | "[::]" | "0:0:0:0:0:0:0:0"),
+    }
+}
+
 fn validate_reasoning_effort_overrides(codex: &CodexConfig) -> Result<()> {
     for (field, value) in [
         ("review", codex.reasoning_effort.review.as_deref()),
@@ -836,6 +871,29 @@ mod tests {
 
     fn load_from_yaml(contents: &str) -> Config {
         try_load_from_yaml(contents).expect("load config")
+    }
+
+    fn with_env_var<T>(name: &str, value: Option<&str>, action: impl FnOnce() -> T) -> T {
+        let _lock = ENV_LOCK.lock().expect("lock env");
+        let previous = env::var(name).ok();
+        match value {
+            Some(value) => unsafe {
+                env::set_var(name, value);
+            },
+            None => unsafe {
+                env::remove_var(name);
+            },
+        }
+        let result = action();
+        match previous {
+            Some(value) => unsafe {
+                env::set_var(name, value);
+            },
+            None => unsafe {
+                env::remove_var(name);
+            },
+        }
+        result
     }
 
     fn base_config_yaml(extra: &str) -> String {
@@ -2285,17 +2343,19 @@ server:
         );
         config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
-        apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
-            .expect("host-gateway default should be applied");
+        with_env_var("POD_IP", Some("10.42.0.15"), || {
+            apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
+                .expect("pod IP default should be applied");
+        });
 
         assert_eq!(
             config.codex.gitlab_discovery_mcp.advertise_url,
-            "http://host.docker.internal:19091/mcp"
+            "http://10.42.0.15:19091/mcp"
         );
     }
 
     #[test]
-    fn fills_gitlab_discovery_advertise_url_from_ipv6_bind_port() {
+    fn fills_gitlab_discovery_advertise_url_from_ipv6_pod_ip() {
         let mut config = load_from_yaml(
             r#"
 gitlab:
@@ -2335,17 +2395,123 @@ server:
         );
         config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
-        apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
-            .expect("host-gateway default should be applied");
+        with_env_var("POD_IP", Some("fd00::123"), || {
+            apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
+                .expect("IPv6 pod IP default should be applied");
+        });
 
         assert_eq!(
             config.codex.gitlab_discovery_mcp.advertise_url,
-            "http://host.docker.internal:8081/mcp"
+            "http://[fd00::123]:8081/mcp"
         );
     }
 
     #[test]
-    fn rejects_host_gateway_default_for_non_wildcard_bind_host() {
+    fn falls_back_to_host_gateway_when_pod_ip_is_absent() {
+        let mut config = load_from_yaml(
+            r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "0.0.0.0:19091"
+    advertise_url: "http://10.42.0.15:19091/mcp"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#,
+        );
+        config.codex.gitlab_discovery_mcp.advertise_url.clear();
+
+        with_env_var("POD_IP", None, || {
+            apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
+                .expect("host-gateway fallback should be applied");
+        });
+
+        assert_eq!(
+            config.codex.gitlab_discovery_mcp.advertise_url,
+            "http://host.docker.internal:19091/mcp"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_host_gateway_when_pod_ip_family_does_not_match_bind_host() {
+        let mut config = load_from_yaml(
+            r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  gitlab_discovery_mcp:
+    enabled: true
+    server_name: "gitlab-discovery"
+    bind_addr: "0.0.0.0:19091"
+    advertise_url: "http://10.42.0.15:19091/mcp"
+    clone_root: "/work/mcp"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#,
+        );
+        config.codex.gitlab_discovery_mcp.advertise_url.clear();
+
+        with_env_var("POD_IP", Some("fd00::123"), || {
+            apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
+                .expect("host-gateway fallback should be applied for address-family mismatch");
+        });
+
+        assert_eq!(
+            config.codex.gitlab_discovery_mcp.advertise_url,
+            "http://host.docker.internal:19091/mcp"
+        );
+    }
+
+    #[test]
+    fn rejects_pod_ip_default_for_non_wildcard_bind_host() {
         let mut config = load_from_yaml(
             r#"
 gitlab:
@@ -2385,9 +2551,11 @@ server:
         );
         config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
-        let err = apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
-            .expect_err("non-wildcard bind host should require an explicit advertise_url");
+        let err = with_env_var("POD_IP", Some("10.42.0.15"), || {
+            apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
+                .expect_err("non-wildcard bind host should require an explicit advertise_url")
+        });
 
-        assert!(format!("{err:#}").contains("cannot default to host.docker.internal"));
+        assert!(format!("{err:#}").contains("cannot default from POD_IP"));
     }
 }
