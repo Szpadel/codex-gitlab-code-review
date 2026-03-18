@@ -113,344 +113,353 @@ impl DockerCodexRunner {
                 gitlab_discovery_extra_hosts,
             )
             .await?;
-        let gitlab_discovery_session = match self
-            .register_gitlab_discovery_session(
-                gitlab_discovery_mcp.as_ref(),
-                &container_id,
-                browser_container_id.as_deref().unwrap_or(&container_id),
-                ctx.run_history_id,
-            )
-            .await
-        {
-            Ok(session) => session,
-            Err(err) => {
-                warn!(
-                    container_id,
-                    error = %err,
-                    "failed to register gitlab discovery MCP session"
-                );
-                self.append_gitlab_discovery_mcp_startup_failure(
+        let mention_result = async {
+            let gitlab_discovery_session = match self
+                .register_gitlab_discovery_session(
+                    gitlab_discovery_mcp.as_ref(),
+                    &container_id,
+                    browser_container_id.as_deref().unwrap_or(&container_id),
                     ctx.run_history_id,
-                    gitlab_discovery_mcp
-                        .as_ref()
-                        .map(|prepared| prepared.runtime_config.advertise_url.as_str())
-                        .unwrap_or("<unknown>"),
-                    "failed to register MCP session binding",
+                )
+                .await
+            {
+                Ok(session) => session,
+                Err(err) => {
+                    warn!(
+                        container_id,
+                        error = %err,
+                        "failed to register gitlab discovery MCP session"
+                    );
+                    self.append_gitlab_discovery_mcp_startup_failure(
+                        ctx.run_history_id,
+                        gitlab_discovery_mcp
+                            .as_ref()
+                            .map(|prepared| prepared.runtime_config.advertise_url.as_str())
+                            .unwrap_or("<unknown>"),
+                        "failed to register MCP session binding",
+                    )
+                    .await;
+                    None
+                }
+            };
+            let mention_result = async {
+                self.probe_gitlab_discovery_mcp_endpoint(
+                    gitlab_discovery_mcp.as_ref(),
+                    &container_id,
+                    gitlab_discovery_session.as_ref(),
+                    ctx.run_history_id,
                 )
                 .await;
-                None
-            }
-        };
-        self.probe_gitlab_discovery_mcp_endpoint(
-            gitlab_discovery_mcp.as_ref(),
-            &container_id,
-            gitlab_discovery_session.as_ref(),
-            ctx.run_history_id,
-        )
-        .await;
-        self.update_run_history_session(
-            ctx.run_history_id,
-            RunHistorySessionUpdate {
-                auth_account_name: Some(account.name.clone()),
-                ..RunHistorySessionUpdate::default()
-            },
-        )
-        .await;
-        let run_timeout = Duration::from_secs(self.codex.timeout_seconds);
-        let run_started_at = Instant::now();
-        let _composer_install = self
-            .run_composer_install_step(
-                &container_id,
-                repo_dir,
-                &ctx.project_path,
-                &ctx.feature_flags,
-                self.codex
-                    .timeout_seconds
-                    .min(DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS),
-                ctx.run_history_id,
-            )
-            .await;
-        let baseline_worktree_state = self
-            .exec_container_git_command(
-                &container_id,
-                &["status".to_string(), "--porcelain".to_string()],
-                Some(repo_dir),
-            )
-            .await?
-            .stdout;
-        let baseline_worktree_paths = git_status_paths(&baseline_worktree_state);
-        let remaining_timeout = run_timeout.saturating_sub(run_started_at.elapsed());
-
-        let mention_result = timeout(remaining_timeout, async {
-            client.initialize().await?;
-            client.initialized().await?;
-            let extra_writable_roots = gitlab_discovery_mcp
-                .as_ref()
-                .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
-                .unwrap_or_default();
-            let thread_response = client
-                .request(
-                    "thread/start",
-                    self.thread_start_params(
+                self.update_run_history_session(
+                    ctx.run_history_id,
+                    RunHistorySessionUpdate {
+                        auth_account_name: Some(account.name.clone()),
+                        ..RunHistorySessionUpdate::default()
+                    },
+                )
+                .await;
+                let run_timeout = Duration::from_secs(self.codex.timeout_seconds);
+                let run_started_at = Instant::now();
+                let _composer_install = self
+                    .run_composer_install_step(
+                        &container_id,
                         repo_dir,
-                        Some(Self::mention_developer_instructions(ctx)),
-                        &extra_writable_roots,
-                    ),
-                )
-                .await?;
-            let thread_id = thread_response
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(|id| id.as_str())
-                .ok_or_else(|| anyhow!("thread/start missing thread id"))?
-                .to_string();
-            self.update_run_history_session(
-                ctx.run_history_id,
-                RunHistorySessionUpdate {
-                    thread_id: Some(thread_id.clone()),
-                    auth_account_name: Some(account.name.clone()),
-                    ..RunHistorySessionUpdate::default()
-                },
-            )
-            .await;
-
-            self.exec_container_git_command(
-                &container_id,
-                &[
-                    "config".to_string(),
-                    "user.name".to_string(),
-                    ctx.requester_name.clone(),
-                ],
-                Some(repo_dir),
-            )
-            .await?;
-            self.exec_container_git_command(
-                &container_id,
-                &[
-                    "config".to_string(),
-                    "user.email".to_string(),
-                    ctx.requester_email.clone(),
-                ],
-                Some(repo_dir),
-            )
-            .await?;
-            self.exec_container_git_command(
-                &container_id,
-                &[
-                    "remote".to_string(),
-                    "set-url".to_string(),
-                    "--push".to_string(),
-                    "origin".to_string(),
-                    "no_push://disabled".to_string(),
-                ],
-                Some(repo_dir),
-            )
-            .await?;
-            let before_sha = self
-                .exec_container_git_command(
-                    &container_id,
-                    &["rev-parse".to_string(), "HEAD".to_string()],
-                    Some(repo_dir),
-                )
-                .await?
-                .stdout
-                .trim()
-                .to_string();
-
-            let turn_response = client
-                .request(
-                    "turn/start",
-                    json!({
-                        "threadId": thread_id.as_str(),
-                        "cwd": repo_dir,
-                        "input": [{ "type": "text", "text": ctx.prompt.as_str() }],
-                    }),
-                )
-                .await?;
-            let turn_id = turn_response
-                .get("turn")
-                .and_then(|turn| turn.get("id"))
-                .and_then(|id| id.as_str())
-                .ok_or_else(|| anyhow!("turn/start missing turn id"))?
-                .to_string();
-            self.update_run_history_session(
-                ctx.run_history_id,
-                RunHistorySessionUpdate {
-                    thread_id: Some(thread_id.clone()),
-                    turn_id: Some(turn_id.clone()),
-                    auth_account_name: Some(account.name.clone()),
-                    ..RunHistorySessionUpdate::default()
-                },
-            )
-            .await;
-            let mut reply_message = client
-                .stream_turn_message(
-                    &thread_id,
-                    &turn_id,
-                    gitlab_discovery_mcp
-                        .as_ref()
-                        .map(|prepared| prepared.runtime_config.server_name.as_str()),
-                    |events| async move {
-                        self.append_run_history_events(ctx.run_history_id, &events)
-                            .await;
-                    },
-                    || async move {
-                        self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
-                            .await;
-                    },
-                )
-                .await?;
-            if reply_message.trim().is_empty() {
-                reply_message = "Mention command completed.".to_string();
-            }
-
-            let after_sha = self
-                .exec_container_git_command(
-                    &container_id,
-                    &["rev-parse".to_string(), "HEAD".to_string()],
-                    Some(repo_dir),
-                )
-                .await?
-                .stdout
-                .trim()
-                .to_string();
-            let (status, commit_sha) = if after_sha != before_sha {
-                let source_branch = ctx
-                    .mr
-                    .source_branch
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow!("merge request source branch is missing"))?;
-                if let Err(err) = self
-                    .exec_container_git_command(
-                        &container_id,
-                        &[
-                            "merge-base".to_string(),
-                            "--is-ancestor".to_string(),
-                            before_sha.clone(),
-                            after_sha.clone(),
-                        ],
-                        Some(repo_dir),
+                        &ctx.project_path,
+                        &ctx.feature_flags,
+                        self.codex
+                            .timeout_seconds
+                            .min(DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS),
+                        ctx.run_history_id,
                     )
-                    .await
-                {
-                    bail!("mention command moved HEAD outside MR ancestry: {err}");
-                }
-                let commit_count_output = self
-                    .exec_container_git_command(
-                        &container_id,
-                        &[
-                            "rev-list".to_string(),
-                            "--count".to_string(),
-                            format!("{before_sha}..{after_sha}"),
-                        ],
-                        Some(repo_dir),
-                    )
-                    .await?;
-                let commit_count = commit_count_output
-                    .stdout
-                    .trim()
-                    .parse::<u64>()
-                    .with_context(|| {
-                        format!(
-                            "parse commit count for mention command range {}..{}",
-                            before_sha, after_sha
-                        )
-                    })?;
-                if commit_count == 0 {
-                    bail!("mention command moved HEAD without producing new commits");
-                }
-                if !baseline_worktree_paths.is_empty() {
-                    let committed_paths_output = self
-                        .exec_container_git_command(
-                            &container_id,
-                            &[
-                                "diff".to_string(),
-                                "--name-only".to_string(),
-                                format!("{before_sha}..{after_sha}"),
-                            ],
-                            Some(repo_dir),
-                        )
-                        .await?;
-                    let committed_paths = committed_paths_output
-                        .stdout
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .collect::<BTreeSet<_>>();
-                    let overlapping_baseline_paths = baseline_worktree_paths
-                        .iter()
-                        .filter(|path| committed_paths.contains(path.as_str()))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if !overlapping_baseline_paths.is_empty() {
-                        bail!(
-                            "mention command commit included baseline composer-install changes: {}",
-                            overlapping_baseline_paths.join(", ")
-                        );
-                    }
-                }
-                self.exec_container_command_with_env(
-                    &container_id,
-                    restore_push_remote_url_exec_command(&clone_url),
-                    Some(repo_dir),
-                    Some(vec![format!("GITLAB_TOKEN={}", self.gitlab_token)]),
-                )
-                .await?;
-                self.exec_container_git_command(
-                    &container_id,
-                    &[
-                        "push".to_string(),
-                        "origin".to_string(),
-                        format!("HEAD:{source_branch}"),
-                    ],
-                    Some(repo_dir),
-                )
-                .await?;
-                (MentionCommandStatus::Committed, Some(after_sha))
-            } else {
-                let worktree_state = self
+                    .await;
+                let baseline_worktree_state = self
                     .exec_container_git_command(
                         &container_id,
                         &["status".to_string(), "--porcelain".to_string()],
                         Some(repo_dir),
                     )
-                    .await?;
-                if worktree_state.stdout != baseline_worktree_state {
-                    bail!("mention command left uncommitted changes without creating a commit");
-                }
-                (MentionCommandStatus::NoChanges, None)
-            };
+                    .await?
+                    .stdout;
+                let baseline_worktree_paths = git_status_paths(&baseline_worktree_state);
+                let remaining_timeout = run_timeout.saturating_sub(run_started_at.elapsed());
 
-            Ok::<MentionCommandResult, anyhow::Error>(MentionCommandResult {
-                status,
-                commit_sha,
-                reply_message,
-            })
-        })
+                let mention_result = timeout(remaining_timeout, async {
+                    client.initialize().await?;
+                    client.initialized().await?;
+                    let extra_writable_roots = gitlab_discovery_mcp
+                        .as_ref()
+                        .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
+                        .unwrap_or_default();
+                    let thread_response = client
+                        .request(
+                            "thread/start",
+                            self.thread_start_params(
+                                repo_dir,
+                                Some(Self::mention_developer_instructions(ctx)),
+                                &extra_writable_roots,
+                            ),
+                        )
+                        .await?;
+                    let thread_id = thread_response
+                        .get("thread")
+                        .and_then(|thread| thread.get("id"))
+                        .and_then(|id| id.as_str())
+                        .ok_or_else(|| anyhow!("thread/start missing thread id"))?
+                        .to_string();
+                    self.update_run_history_session(
+                        ctx.run_history_id,
+                        RunHistorySessionUpdate {
+                            thread_id: Some(thread_id.clone()),
+                            auth_account_name: Some(account.name.clone()),
+                            ..RunHistorySessionUpdate::default()
+                        },
+                    )
+                    .await;
+
+                    self.exec_container_git_command(
+                        &container_id,
+                        &[
+                            "config".to_string(),
+                            "user.name".to_string(),
+                            ctx.requester_name.clone(),
+                        ],
+                        Some(repo_dir),
+                    )
+                    .await?;
+                    self.exec_container_git_command(
+                        &container_id,
+                        &[
+                            "config".to_string(),
+                            "user.email".to_string(),
+                            ctx.requester_email.clone(),
+                        ],
+                        Some(repo_dir),
+                    )
+                    .await?;
+                    self.exec_container_git_command(
+                        &container_id,
+                        &[
+                            "remote".to_string(),
+                            "set-url".to_string(),
+                            "--push".to_string(),
+                            "origin".to_string(),
+                            "no_push://disabled".to_string(),
+                        ],
+                        Some(repo_dir),
+                    )
+                    .await?;
+                    let before_sha = self
+                        .exec_container_git_command(
+                            &container_id,
+                            &["rev-parse".to_string(), "HEAD".to_string()],
+                            Some(repo_dir),
+                        )
+                        .await?
+                        .stdout
+                        .trim()
+                        .to_string();
+
+                    let turn_response = client
+                        .request(
+                            "turn/start",
+                            json!({
+                                "threadId": thread_id.as_str(),
+                                "cwd": repo_dir,
+                                "input": [{ "type": "text", "text": ctx.prompt.as_str() }],
+                            }),
+                        )
+                        .await?;
+                    let turn_id = turn_response
+                        .get("turn")
+                        .and_then(|turn| turn.get("id"))
+                        .and_then(|id| id.as_str())
+                        .ok_or_else(|| anyhow!("turn/start missing turn id"))?
+                        .to_string();
+                    self.update_run_history_session(
+                        ctx.run_history_id,
+                        RunHistorySessionUpdate {
+                            thread_id: Some(thread_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            auth_account_name: Some(account.name.clone()),
+                            ..RunHistorySessionUpdate::default()
+                        },
+                    )
+                    .await;
+                    let mut reply_message = client
+                        .stream_turn_message(
+                            &thread_id,
+                            &turn_id,
+                            gitlab_discovery_mcp
+                                .as_ref()
+                                .map(|prepared| prepared.runtime_config.server_name.as_str()),
+                            |events| async move {
+                                self.append_run_history_events(ctx.run_history_id, &events)
+                                    .await;
+                            },
+                            || async move {
+                                self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
+                                    .await;
+                            },
+                        )
+                        .await?;
+                    if reply_message.trim().is_empty() {
+                        reply_message = "Mention command completed.".to_string();
+                    }
+
+                    let after_sha = self
+                        .exec_container_git_command(
+                            &container_id,
+                            &["rev-parse".to_string(), "HEAD".to_string()],
+                            Some(repo_dir),
+                        )
+                        .await?
+                        .stdout
+                        .trim()
+                        .to_string();
+                    let (status, commit_sha) = if after_sha != before_sha {
+                        let source_branch = ctx
+                            .mr
+                            .source_branch
+                            .as_deref()
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| anyhow!("merge request source branch is missing"))?;
+                        if let Err(err) = self
+                            .exec_container_git_command(
+                                &container_id,
+                                &[
+                                    "merge-base".to_string(),
+                                    "--is-ancestor".to_string(),
+                                    before_sha.clone(),
+                                    after_sha.clone(),
+                                ],
+                                Some(repo_dir),
+                            )
+                            .await
+                        {
+                            bail!("mention command moved HEAD outside MR ancestry: {err}");
+                        }
+                        let commit_count_output = self
+                            .exec_container_git_command(
+                                &container_id,
+                                &[
+                                    "rev-list".to_string(),
+                                    "--count".to_string(),
+                                    format!("{before_sha}..{after_sha}"),
+                                ],
+                                Some(repo_dir),
+                            )
+                            .await?;
+                        let commit_count = commit_count_output
+                            .stdout
+                            .trim()
+                            .parse::<u64>()
+                            .with_context(|| {
+                                format!(
+                                    "parse commit count for mention command range {}..{}",
+                                    before_sha, after_sha
+                                )
+                            })?;
+                        if commit_count == 0 {
+                            bail!("mention command moved HEAD without producing new commits");
+                        }
+                        if !baseline_worktree_paths.is_empty() {
+                            let committed_paths_output = self
+                                .exec_container_git_command(
+                                    &container_id,
+                                    &[
+                                        "diff".to_string(),
+                                        "--name-only".to_string(),
+                                        format!("{before_sha}..{after_sha}"),
+                                    ],
+                                    Some(repo_dir),
+                                )
+                                .await?;
+                            let committed_paths = committed_paths_output
+                                .stdout
+                                .lines()
+                                .map(str::trim)
+                                .filter(|line| !line.is_empty())
+                                .collect::<BTreeSet<_>>();
+                            let overlapping_baseline_paths = baseline_worktree_paths
+                                .iter()
+                                .filter(|path| committed_paths.contains(path.as_str()))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            if !overlapping_baseline_paths.is_empty() {
+                                bail!(
+                                    "mention command commit included baseline composer-install changes: {}",
+                                    overlapping_baseline_paths.join(", ")
+                                );
+                            }
+                        }
+                        self.exec_container_command_with_env(
+                            &container_id,
+                            restore_push_remote_url_exec_command(&clone_url),
+                            Some(repo_dir),
+                            Some(vec![format!("GITLAB_TOKEN={}", self.gitlab_token)]),
+                        )
+                        .await?;
+                        self.exec_container_git_command(
+                            &container_id,
+                            &[
+                                "push".to_string(),
+                                "origin".to_string(),
+                                format!("HEAD:{source_branch}"),
+                            ],
+                            Some(repo_dir),
+                        )
+                        .await?;
+                        (MentionCommandStatus::Committed, Some(after_sha))
+                    } else {
+                        let worktree_state = self
+                            .exec_container_git_command(
+                                &container_id,
+                                &["status".to_string(), "--porcelain".to_string()],
+                                Some(repo_dir),
+                            )
+                            .await?;
+                        if worktree_state.stdout != baseline_worktree_state {
+                            bail!(
+                                "mention command left uncommitted changes without creating a commit"
+                            );
+                        }
+                        (MentionCommandStatus::NoChanges, None)
+                    };
+
+                    Ok::<MentionCommandResult, anyhow::Error>(MentionCommandResult {
+                        status,
+                        commit_sha,
+                        reply_message,
+                    })
+                })
+                .await;
+
+                match mention_result {
+                    Ok(Ok(result)) => Ok(result),
+                    Ok(Err(err)) => Err(self
+                        .enrich_error_with_browser_diagnostics(
+                            err,
+                            browser_container_id.as_deref(),
+                            browser_mcp,
+                        )
+                        .await),
+                    Err(_) => Err(self
+                        .enrich_error_with_browser_diagnostics(
+                            anyhow!("codex mention command timed out"),
+                            browser_container_id.as_deref(),
+                            browser_mcp,
+                        )
+                        .await),
+                }
+            }
+            .await;
+            self.unregister_gitlab_discovery_session(gitlab_discovery_session.as_ref())
+                .await;
+            mention_result
+        }
         .await;
 
-        let mention_result = match mention_result {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(err)) => Err(self
-                .enrich_error_with_browser_diagnostics(
-                    err,
-                    browser_container_id.as_deref(),
-                    browser_mcp,
-                )
-                .await),
-            Err(_) => Err(self
-                .enrich_error_with_browser_diagnostics(
-                    anyhow!("codex mention command timed out"),
-                    browser_container_id.as_deref(),
-                    browser_mcp,
-                )
-                .await),
-        };
-
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
-            .await;
-        self.unregister_gitlab_discovery_session(gitlab_discovery_session.as_ref())
             .await;
 
         mention_result

@@ -1,5 +1,43 @@
 use super::*;
+use crate::gitlab_discovery_mcp::GitLabDiscoverySessionBinding;
 use std::collections::BTreeSet;
+
+#[async_trait]
+pub(crate) trait GitLabDiscoveryHandle: Send + Sync {
+    fn server_name(&self) -> &str;
+    fn advertise_url(&self) -> &str;
+    fn clone_root(&self) -> &str;
+    fn resolve_allow_list(&self, source_repo: &str) -> ResolvedGitLabDiscoveryAllowList;
+    async fn register_binding(&self, binding: GitLabDiscoverySessionBinding);
+    async fn remove_binding(&self, network_container_id: &str);
+}
+
+#[async_trait]
+impl GitLabDiscoveryHandle for GitLabDiscoveryMcpService {
+    fn server_name(&self) -> &str {
+        self.server_name()
+    }
+
+    fn advertise_url(&self) -> &str {
+        self.advertise_url()
+    }
+
+    fn clone_root(&self) -> &str {
+        self.clone_root()
+    }
+
+    fn resolve_allow_list(&self, source_repo: &str) -> ResolvedGitLabDiscoveryAllowList {
+        self.resolve_allow_list(source_repo)
+    }
+
+    async fn register_binding(&self, binding: GitLabDiscoverySessionBinding) {
+        self.registry().register_binding(binding).await;
+    }
+
+    async fn remove_binding(&self, network_container_id: &str) {
+        self.registry().remove_binding(network_container_id).await;
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GitLabDiscoveryMcpRuntimeConfig {
@@ -116,7 +154,6 @@ impl DockerCodexRunner {
             .collect_container_peer_ips(network_container_id)
             .await?;
         service
-            .registry()
             .register_binding(GitLabDiscoverySessionBinding {
                 run_history_id: run_history_id.unwrap_or_default(),
                 container_id: container_id.to_string(),
@@ -304,7 +341,6 @@ impl DockerCodexRunner {
             return;
         };
         service
-            .registry()
             .remove_binding(&registered.network_container_id)
             .await;
     }
@@ -312,8 +348,19 @@ impl DockerCodexRunner {
 
 impl DockerCodexRunner {
     async fn collect_container_peer_ips(&self, container_id: &str) -> Result<BTreeSet<String>> {
-        let inspect = self
-            .docker
+        #[cfg(test)]
+        if let RunnerRuntime::Fake(harness) = &self.runtime {
+            return harness.collect_container_peer_ips(container_id).await;
+        }
+
+        #[cfg(test)]
+        let docker = match &self.runtime {
+            RunnerRuntime::Docker { docker, .. } => docker,
+            RunnerRuntime::Fake(_) => unreachable!("fake runtime handled above"),
+        };
+        #[cfg(not(test))]
+        let RunnerRuntime::Docker { docker, .. } = &self.runtime;
+        let inspect = docker
             .inspect_container(
                 container_id,
                 None::<bollard::query_parameters::InspectContainerOptions>,

@@ -644,8 +644,11 @@ impl ReviewService {
 mod tests {
     use super::*;
     use crate::codex_runner::{
-        CodexResult, CodexRunner, MentionCommandContext, MentionCommandResult,
-        MentionCommandStatus, ReviewContext,
+        CodexResult, CodexRunner, DockerCodexRunner, MentionCommandContext, MentionCommandResult,
+        MentionCommandStatus, ReviewContext, RunnerRuntimeOptions,
+        test_support::{
+            FakeRunnerHarness, ScriptedAppChunk, ScriptedAppRequest, ScriptedAppServer,
+        },
     };
     use crate::config::{
         CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
@@ -1503,6 +1506,116 @@ mod tests {
             target_project_id: Some(1),
             diff_refs: None,
         }
+    }
+
+    #[tokio::test]
+    async fn scan_once_with_fake_runtime_runner_posts_review_comment() -> Result<()> {
+        let config = test_config();
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user: GitLabUser {
+                id: 1,
+                username: Some("bot".to_string()),
+                name: Some("Bot".to_string()),
+            },
+            mrs: Mutex::new(vec![mr(41, "sha41")]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let harness = Arc::new(FakeRunnerHarness::default());
+        harness.push_app_server(ScriptedAppServer::from_requests(vec![
+            ScriptedAppRequest::result("initialize", serde_json::json!({})),
+            ScriptedAppRequest::result(
+                "thread/start",
+                serde_json::json!({ "thread": { "id": "thread-41" } }),
+            ),
+            ScriptedAppRequest::result(
+                "review/start",
+                serde_json::json!({
+                    "turn": { "id": "turn-41" },
+                    "reviewThreadId": "thread-41",
+                }),
+            )
+            .with_after_response(vec![
+                ScriptedAppChunk::Json(serde_json::json!({
+                    "method": "turn/started",
+                    "params": { "threadId": "thread-41", "turnId": "turn-41" }
+                })),
+                ScriptedAppChunk::Json(serde_json::json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-41",
+                        "turnId": "turn-41",
+                        "item": {
+                            "id": "review-item-41",
+                            "type": "exitedReviewMode",
+                            "review": "{\"verdict\":\"comment\",\"summary\":\"needs changes\",\"comment_markdown\":\"- scan-level check\"}"
+                        }
+                    }
+                })),
+                ScriptedAppChunk::Json(serde_json::json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-41",
+                        "turnId": "turn-41",
+                        "turn": { "status": "completed" }
+                    }
+                })),
+            ]),
+        ]));
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let runner = Arc::new(DockerCodexRunner::new_with_test_runtime(
+            config.codex.clone(),
+            url::Url::parse("https://gitlab.example.com").expect("url"),
+            Arc::clone(&state),
+            None,
+            RunnerRuntimeOptions {
+                gitlab_token: config.gitlab.token.clone(),
+                log_all_json: false,
+                owner_id: state.get_or_create_review_owner_id().await?,
+                mention_commands_active: false,
+                review_additional_developer_instructions: None,
+            },
+            harness.clone(),
+        ));
+        let service = ReviewService::new(
+            config.clone(),
+            gitlab.clone(),
+            state,
+            runner,
+            1,
+            default_created_after(),
+        );
+
+        service.scan_once().await?;
+
+        let calls = gitlab.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "add_award:group/repo:41:eyes")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("create_note:group/repo:41"))
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call == "add_award:group/repo:41:thumbsup")
+        );
+        assert_eq!(harness.removed_containers(), vec!["app-1"]);
+        Ok(())
     }
 
     #[tokio::test]

@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::codex_runner::browser_mcp::BrowserLaunchConfig;
 
 #[derive(Clone)]
 pub(crate) struct InFlightImagePull {
@@ -6,7 +8,7 @@ pub(crate) struct InFlightImagePull {
     pub(crate) future: Shared<BoxFuture<'static, std::result::Result<(), Arc<String>>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ContainerExecOutput {
     pub(crate) exit_code: i64,
     pub(crate) stdout: String,
@@ -38,51 +40,54 @@ impl DockerCodexRunner {
 
     pub(crate) async fn ensure_image_available(&self, image: &str) -> Result<()> {
         let image = Self::normalize_image_reference(image);
-        let in_flight = {
-            let mut image_pulls = self
-                .image_pulls
-                .lock()
-                .expect("image pull map lock poisoned");
-            if let Some(in_flight) = image_pulls.get(&image) {
-                in_flight.clone()
-            } else {
-                let pull_id = self.next_image_pull_id.fetch_add(1, Ordering::Relaxed);
-                let docker = self.docker.clone();
-                let image_for_pull = image.clone();
-                let future = async move {
-                    ensure_image(&docker, &image_for_pull)
-                        .await
-                        .map_err(|err| Arc::new(format!("{err:#}")))
-                }
-                .boxed()
-                .shared();
-                let in_flight = InFlightImagePull {
-                    id: pull_id,
-                    future,
+        match &self.runtime {
+            RunnerRuntime::Docker {
+                docker,
+                image_pulls,
+                next_image_pull_id,
+            } => {
+                let in_flight = {
+                    let mut image_pulls = image_pulls.lock().expect("image pull map lock poisoned");
+                    if let Some(in_flight) = image_pulls.get(&image) {
+                        in_flight.clone()
+                    } else {
+                        let pull_id = next_image_pull_id.fetch_add(1, Ordering::Relaxed);
+                        let docker = docker.clone();
+                        let image_for_pull = image.clone();
+                        let future = async move {
+                            ensure_image(&docker, &image_for_pull)
+                                .await
+                                .map_err(|err| Arc::new(format!("{err:#}")))
+                        }
+                        .boxed()
+                        .shared();
+                        let in_flight = InFlightImagePull {
+                            id: pull_id,
+                            future,
+                        };
+                        image_pulls.insert(image.clone(), in_flight.clone());
+                        in_flight
+                    }
                 };
-                image_pulls.insert(image.clone(), in_flight.clone());
-                in_flight
-            }
-        };
 
-        let result = in_flight.future.await;
-        {
-            let mut image_pulls = self
-                .image_pulls
-                .lock()
-                .expect("image pull map lock poisoned");
-            if image_pulls
-                .get(&image)
-                .is_some_and(|current| current.id == in_flight.id)
-            {
-                image_pulls.remove(&image);
+                let result = in_flight.future.await;
+                {
+                    let mut image_pulls = image_pulls.lock().expect("image pull map lock poisoned");
+                    if image_pulls
+                        .get(&image)
+                        .is_some_and(|current| current.id == in_flight.id)
+                    {
+                        image_pulls.remove(&image);
+                    }
+                }
+                if let Err(err) = result {
+                    return Err(anyhow!(err.as_ref().clone()));
+                }
+                Ok(())
             }
+            #[cfg(test)]
+            RunnerRuntime::Fake(harness) => harness.ensure_image_available(&image).await,
         }
-        if let Err(err) = result {
-            return Err(anyhow!(err.as_ref().clone()));
-        }
-
-        Ok(())
     }
 
     pub(crate) fn normalize_image_reference(image: &str) -> String {
@@ -90,13 +95,18 @@ impl DockerCodexRunner {
     }
 
     pub(crate) async fn remove_container_best_effort(&self, id: &str) {
-        let _ = self
-            .docker
-            .remove_container(
-                id,
-                Some(RemoveContainerOptionsBuilder::new().force(true).build()),
-            )
-            .await;
+        match &self.runtime {
+            RunnerRuntime::Docker { docker, .. } => {
+                let _ = docker
+                    .remove_container(
+                        id,
+                        Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+                    )
+                    .await;
+            }
+            #[cfg(test)]
+            RunnerRuntime::Fake(harness) => harness.remove_container_best_effort(id).await,
+        }
     }
 
     pub(crate) async fn cleanup_app_server_containers(
@@ -142,6 +152,20 @@ impl DockerCodexRunner {
         cwd: Option<&str>,
         env: Option<Vec<String>>,
     ) -> Result<ContainerExecOutput> {
+        #[cfg(test)]
+        if let RunnerRuntime::Fake(harness) = &self.runtime {
+            return harness
+                .exec_container_command_with_env_allow_failure(
+                    test_support::ExecContainerCommandRequest {
+                        container_id: container_id.to_string(),
+                        command,
+                        cwd: cwd.map(ToOwned::to_owned),
+                        env,
+                    },
+                )
+                .await;
+        }
+
         let command_display = format_command_for_log(&command);
         let cwd_display = cwd.unwrap_or("<default>");
         info!(
@@ -153,8 +177,14 @@ impl DockerCodexRunner {
 
         // Deliberately bypass app-server command RPC and its sandbox semantics for
         // mention auxiliary git operations.
-        let exec = self
-            .docker
+        #[cfg(test)]
+        let docker = match &self.runtime {
+            RunnerRuntime::Docker { docker, .. } => docker,
+            RunnerRuntime::Fake(_) => unreachable!("fake runtime handled above"),
+        };
+        #[cfg(not(test))]
+        let RunnerRuntime::Docker { docker, .. } = &self.runtime;
+        let exec = docker
             .create_exec(
                 container_id,
                 ExecConfig {
@@ -174,8 +204,7 @@ impl DockerCodexRunner {
                 )
             })?;
 
-        let start_result = self
-            .docker
+        let start_result = docker
             .start_exec(&exec.id, None::<StartExecOptions>)
             .await
             .with_context(|| {
@@ -215,7 +244,7 @@ impl DockerCodexRunner {
             }
         }
 
-        let inspect = self.docker.inspect_exec(&exec.id).await.with_context(|| {
+        let inspect = docker.inspect_exec(&exec.id).await.with_context(|| {
             format!(
                 "inspect docker exec command '{}' in container {}",
                 command_display, container_id
@@ -285,13 +314,51 @@ impl DockerCodexRunner {
     }
 
     pub(crate) async fn stop_active_review_containers_best_effort(&self) {
+        #[cfg(test)]
+        if let RunnerRuntime::Fake(harness) = &self.runtime {
+            let containers = match harness.list_managed_containers(&self.owner_id).await {
+                Ok(containers) => containers,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "failed to list fake containers while stopping active codex reviews"
+                    );
+                    return;
+                }
+            };
+            for container in containers {
+                if !container
+                    .names
+                    .iter()
+                    .any(|name| Self::is_managed_container_name(name))
+                {
+                    continue;
+                }
+                if !Self::has_review_owner_label(container.labels.as_ref(), &self.owner_id) {
+                    continue;
+                }
+                let Some(id) = container.id.as_deref() else {
+                    continue;
+                };
+                harness.remove_container_best_effort(id).await;
+            }
+            return;
+        }
+
+        #[cfg(test)]
+        let docker = match &self.runtime {
+            RunnerRuntime::Docker { docker, .. } => docker,
+            RunnerRuntime::Fake(_) => unreachable!("fake runtime handled above"),
+        };
+        #[cfg(not(test))]
+        let RunnerRuntime::Docker { docker, .. } = &self.runtime;
         let filters = Self::review_container_filters(&self.owner_id);
         let options = ListContainersOptionsBuilder::new()
             .all(true)
             .filters(&filters)
             .build();
 
-        let containers = match self.docker.list_containers(Some(options)).await {
+        let containers = match docker.list_containers(Some(options)).await {
             Ok(containers) => containers,
             Err(err) => {
                 warn!(
@@ -327,8 +394,7 @@ impl DockerCodexRunner {
                 continue;
             };
 
-            if let Err(err) = self
-                .docker
+            if let Err(err) = docker
                 .remove_container(
                     id,
                     Some(RemoveContainerOptionsBuilder::new().force(true).build()),
@@ -359,6 +425,55 @@ impl DockerCodexRunner {
         browser_mcp: Option<&BrowserMcpConfig>,
         extra_hosts: Vec<String>,
     ) -> Result<StartedAppServer> {
+        #[cfg(test)]
+        if let RunnerRuntime::Fake(harness) = &self.runtime {
+            let image_ref = Self::normalize_image_reference(&self.codex.image);
+            self.ensure_image_available(&image_ref).await?;
+            let browser_launch = browser_mcp.map(BrowserLaunchConfig::from_browser_mcp);
+            if let Some(launch) = browser_launch.as_ref() {
+                self.ensure_image_available(&launch.image).await?;
+            }
+            let mut binds = vec![format!(
+                "{}:{}:rw",
+                auth_host_path, self.codex.auth_mount_path
+            )];
+            binds.extend(extra_binds);
+            let started = harness
+                .start_app_server_container(test_support::StartAppServerContainerRequest {
+                    image: image_ref,
+                    cmd: Self::app_server_cmd(script),
+                    env: self.env_vars(&extra_env),
+                    binds,
+                    labels: Self::review_container_labels(&self.owner_id),
+                    extra_hosts,
+                    browser_mcp: browser_mcp.cloned(),
+                    log_all_json: self.log_all_json,
+                })
+                .await?;
+            if let (Some(browser_container_id), Some(launch)) = (
+                started.browser_container_id.as_deref(),
+                browser_launch.as_ref(),
+            ) && let Err(err) = self
+                .wait_for_browser_container_ready(browser_container_id, launch)
+                .await
+            {
+                self.cleanup_app_server_containers(
+                    &started.container_id,
+                    started.browser_container_id.as_deref(),
+                )
+                .await;
+                return Err(err);
+            }
+            return Ok(started);
+        }
+
+        #[cfg(test)]
+        let docker = match &self.runtime {
+            RunnerRuntime::Docker { docker, .. } => docker,
+            RunnerRuntime::Fake(_) => unreachable!("fake runtime handled above"),
+        };
+        #[cfg(not(test))]
+        let RunnerRuntime::Docker { docker, .. } = &self.runtime;
         let image_ref = Self::normalize_image_reference(&self.codex.image);
         self.ensure_image_available(&image_ref).await?;
         let browser_container_id = if let Some(browser_mcp) = browser_mcp {
@@ -398,8 +513,7 @@ impl DockerCodexRunner {
             ..Default::default()
         };
 
-        let create = match self
-            .docker
+        let create = match docker
             .create_container(
                 Some(CreateContainerOptionsBuilder::new().name(&name).build()),
                 config,
@@ -416,8 +530,7 @@ impl DockerCodexRunner {
             }
         };
         let id = create.id;
-        let start_result = self
-            .docker
+        let start_result = docker
             .start_container(&id, Some(StartContainerOptionsBuilder::new().build()))
             .await
             .with_context(|| format!("start docker container {}", id));
@@ -429,8 +542,7 @@ impl DockerCodexRunner {
             return Err(err);
         }
 
-        let attach = match self
-            .docker
+        let attach = match docker
             .attach_container(
                 &id,
                 Some(

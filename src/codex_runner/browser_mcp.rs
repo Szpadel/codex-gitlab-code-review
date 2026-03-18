@@ -130,8 +130,21 @@ impl DockerCodexRunner {
         browser_container_id: &str,
         launch: &BrowserLaunchConfig,
     ) -> BrowserContainerDiagnostics {
-        let (state, state_collection_error) = match self
-            .docker
+        #[cfg(test)]
+        if let RunnerRuntime::Fake(harness) = &self.runtime {
+            return harness
+                .collect_browser_container_diagnostics(browser_container_id, launch)
+                .await;
+        }
+
+        #[cfg(test)]
+        let docker = match &self.runtime {
+            RunnerRuntime::Docker { docker, .. } => docker,
+            RunnerRuntime::Fake(_) => unreachable!("fake runtime handled above"),
+        };
+        #[cfg(not(test))]
+        let RunnerRuntime::Docker { docker, .. } = &self.runtime;
+        let (state, state_collection_error) = match docker
             .inspect_container(
                 browser_container_id,
                 None::<bollard::query_parameters::InspectContainerOptions>,
@@ -173,9 +186,18 @@ impl DockerCodexRunner {
         &self,
         browser_container_id: &str,
     ) -> Result<BrowserLogTail> {
+        #[cfg(test)]
+        let docker = match &self.runtime {
+            RunnerRuntime::Docker { docker, .. } => docker,
+            RunnerRuntime::Fake(_) => {
+                bail!("fake runtime should not collect live browser logs directly");
+            }
+        };
+        #[cfg(not(test))]
+        let RunnerRuntime::Docker { docker, .. } = &self.runtime;
         let mut stdout = String::new();
         let mut stderr = String::new();
-        let mut stream = self.docker.logs(
+        let mut stream = docker.logs(
             browser_container_id,
             Some(
                 LogsOptionsBuilder::default()
@@ -308,6 +330,15 @@ impl DockerCodexRunner {
         browser_mcp: &BrowserMcpConfig,
         extra_hosts: Vec<String>,
     ) -> Result<String> {
+        #[cfg(test)]
+        let docker = match &self.runtime {
+            RunnerRuntime::Docker { docker, .. } => docker,
+            RunnerRuntime::Fake(_) => {
+                bail!("fake runtime should start browser sidecars via start_app_server_container");
+            }
+        };
+        #[cfg(not(test))]
+        let RunnerRuntime::Docker { docker, .. } = &self.runtime;
         let launch = BrowserLaunchConfig::from_browser_mcp(browser_mcp);
         let image_ref = launch.image.clone();
         self.ensure_image_available(&image_ref).await?;
@@ -335,8 +366,7 @@ impl DockerCodexRunner {
             ..Default::default()
         };
 
-        let create = self
-            .docker
+        let create = docker
             .create_container(
                 Some(CreateContainerOptionsBuilder::new().name(&name).build()),
                 config,
@@ -349,8 +379,7 @@ impl DockerCodexRunner {
                 )
             })?;
         let id = create.id;
-        let start_result = self
-            .docker
+        let start_result = docker
             .start_container(&id, Some(StartContainerOptionsBuilder::new().build()))
             .await
             .with_context(|| format!("start docker browser container {}", id));

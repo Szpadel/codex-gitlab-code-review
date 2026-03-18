@@ -4,9 +4,7 @@ use crate::config::{
 use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
 use crate::feature_flags::FeatureFlagSnapshot;
 use crate::gitlab::MergeRequest;
-use crate::gitlab_discovery_mcp::{
-    GitLabDiscoveryMcpService, GitLabDiscoverySessionBinding, ResolvedGitLabDiscoveryAllowList,
-};
+use crate::gitlab_discovery_mcp::{GitLabDiscoveryMcpService, ResolvedGitLabDiscoveryAllowList};
 use crate::review_prompt_templates::{
     append_additional_review_instructions, build_base_branch_review_prompt,
     build_commit_review_prompt, upstream_review_prompt_source_commit,
@@ -49,6 +47,8 @@ mod gitlab_discovery;
 mod mention_flow;
 mod review_flow;
 mod scripts;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use self::app_server::*;
 use self::auth::*;
@@ -118,6 +118,16 @@ pub(crate) struct StartedAppServer {
     client: AppServerClient,
 }
 
+enum RunnerRuntime {
+    Docker {
+        docker: Docker,
+        image_pulls: Mutex<HashMap<String, InFlightImagePull>>,
+        next_image_pull_id: AtomicU64,
+    },
+    #[cfg(test)]
+    Fake(Arc<dyn test_support::RunnerHarness>),
+}
+
 #[async_trait]
 pub trait CodexRunner: Send + Sync {
     async fn warm_up_images(&self) -> Result<()> {
@@ -143,9 +153,9 @@ pub trait CodexRunner: Send + Sync {
 }
 
 pub struct DockerCodexRunner {
-    docker: Docker,
+    runtime: RunnerRuntime,
     codex: CodexConfig,
-    gitlab_discovery_mcp: Option<Arc<GitLabDiscoveryMcpService>>,
+    gitlab_discovery_mcp: Option<Arc<dyn GitLabDiscoveryHandle>>,
     mention_commands_active: bool,
     review_additional_developer_instructions: Option<String>,
     git_base: Url,
@@ -154,8 +164,6 @@ pub struct DockerCodexRunner {
     owner_id: String,
     state: Arc<ReviewStateStore>,
     auth_accounts: Vec<AuthAccount>,
-    image_pulls: Mutex<HashMap<String, InFlightImagePull>>,
-    next_image_pull_id: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -271,7 +279,40 @@ impl DockerCodexRunner {
         let docker = connect_docker(&docker_cfg)?;
         let auth_accounts = Self::build_auth_accounts(&codex);
         Ok(Self {
-            docker,
+            runtime: RunnerRuntime::Docker {
+                docker,
+                image_pulls: Mutex::new(HashMap::new()),
+                next_image_pull_id: AtomicU64::new(1),
+            },
+            codex,
+            gitlab_discovery_mcp: gitlab_discovery_mcp.map(|service| {
+                let handle: Arc<dyn GitLabDiscoveryHandle> = service;
+                handle
+            }),
+            mention_commands_active: runtime.mention_commands_active,
+            review_additional_developer_instructions: runtime
+                .review_additional_developer_instructions,
+            git_base,
+            gitlab_token: runtime.gitlab_token,
+            log_all_json: runtime.log_all_json,
+            owner_id: runtime.owner_id,
+            state,
+            auth_accounts,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_test_runtime(
+        codex: CodexConfig,
+        git_base: Url,
+        state: Arc<ReviewStateStore>,
+        gitlab_discovery_mcp: Option<Arc<dyn GitLabDiscoveryHandle>>,
+        runtime: RunnerRuntimeOptions,
+        harness: Arc<dyn test_support::RunnerHarness>,
+    ) -> Self {
+        let auth_accounts = Self::build_auth_accounts(&codex);
+        Self {
+            runtime: RunnerRuntime::Fake(harness),
             codex,
             gitlab_discovery_mcp,
             mention_commands_active: runtime.mention_commands_active,
@@ -283,9 +324,7 @@ impl DockerCodexRunner {
             owner_id: runtime.owner_id,
             state,
             auth_accounts,
-            image_pulls: Mutex::new(HashMap::new()),
-            next_image_pull_id: AtomicU64::new(1),
-        })
+        }
     }
 }
 
@@ -452,13 +491,18 @@ mod tests {
         BrowserLogTail, browser_container_cmd, browser_container_has_exited,
         browser_logs_report_ready,
     };
+    use super::test_support::{
+        ExecContainerCommandRequest, FakeGitLabDiscoveryHandle, FakeRunnerHarness,
+        ManagedContainerSummary, ScriptedAppChunk, ScriptedAppRequest, ScriptedAppServer,
+    };
     use super::*;
     use crate::config::{
         DepsConfig, FallbackAuthAccountConfig, GitLabTargets, McpServerOverridesConfig,
     };
+    use crate::state::{NewRunHistory, RunHistoryKind};
     use anyhow::Context;
     use chrono::TimeZone;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn empty_app_server_client() -> AppServerClient {
         AppServerClient {
@@ -1008,10 +1052,14 @@ mod tests {
     fn runner_env_vars_do_not_include_proxy_settings() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let runner = DockerCodexRunner {
-            docker: connect_docker(&DockerConfig {
-                host: "tcp://127.0.0.1:2375".to_string(),
-            })
-            .expect("docker client"),
+            runtime: RunnerRuntime::Docker {
+                docker: connect_docker(&DockerConfig {
+                    host: "tcp://127.0.0.1:2375".to_string(),
+                })
+                .expect("docker client"),
+                image_pulls: Mutex::new(HashMap::new()),
+                next_image_pull_id: AtomicU64::new(1),
+            },
             codex: CodexConfig {
                 image: "ghcr.io/openai/codex-universal:latest".to_string(),
                 timeout_seconds: 300,
@@ -1041,8 +1089,6 @@ mod tests {
                     .expect("state"),
             ),
             auth_accounts: Vec::new(),
-            image_pulls: Mutex::new(HashMap::new()),
-            next_image_pull_id: AtomicU64::new(1),
         };
 
         let env = runner.env_vars(&[]);
@@ -2064,7 +2110,7 @@ mod tests {
             .expect("gitlab discovery service"),
         );
         let mut runner = test_runner_with_codex(codex);
-        runner.gitlab_discovery_mcp = Some(service);
+        runner.gitlab_discovery_mcp = Some(service as Arc<dyn GitLabDiscoveryHandle>);
 
         let prepared = runner.prepare_gitlab_discovery_mcp(
             "",
@@ -2617,16 +2663,42 @@ mod tests {
         test_runner_with_codex_and_mentions(codex, false)
     }
 
+    async fn test_runner_with_fake_runtime(
+        codex: CodexConfig,
+        mention_commands_active: bool,
+        harness: Arc<FakeRunnerHarness>,
+        gitlab_discovery_mcp: Option<Arc<dyn GitLabDiscoveryHandle>>,
+    ) -> DockerCodexRunner {
+        DockerCodexRunner::new_with_test_runtime(
+            codex,
+            Url::parse("https://gitlab.example.com").expect("url"),
+            Arc::new(ReviewStateStore::new(":memory:").await.expect("state")),
+            gitlab_discovery_mcp,
+            RunnerRuntimeOptions {
+                gitlab_token: "token".to_string(),
+                log_all_json: false,
+                owner_id: "owner-id".to_string(),
+                mention_commands_active,
+                review_additional_developer_instructions: None,
+            },
+            harness,
+        )
+    }
+
     fn test_runner_with_codex_and_mentions(
         codex: CodexConfig,
         mention_commands_active: bool,
     ) -> DockerCodexRunner {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         DockerCodexRunner {
-            docker: connect_docker(&DockerConfig {
-                host: "tcp://127.0.0.1:2375".to_string(),
-            })
-            .expect("docker client"),
+            runtime: RunnerRuntime::Docker {
+                docker: connect_docker(&DockerConfig {
+                    host: "tcp://127.0.0.1:2375".to_string(),
+                })
+                .expect("docker client"),
+                image_pulls: Mutex::new(HashMap::new()),
+                next_image_pull_id: AtomicU64::new(1),
+            },
             codex,
             gitlab_discovery_mcp: None,
             mention_commands_active,
@@ -2641,9 +2713,659 @@ mod tests {
                     .expect("state"),
             ),
             auth_accounts: Vec::new(),
-            image_pulls: Mutex::new(HashMap::new()),
-            next_image_pull_id: AtomicU64::new(1),
         }
+    }
+
+    #[tokio::test]
+    async fn run_review_with_fake_runtime_starts_browser_and_returns_comment() -> Result<()> {
+        let harness = Arc::new(FakeRunnerHarness::default());
+        harness.push_app_server(ScriptedAppServer::from_requests(vec![
+            ScriptedAppRequest::result("initialize", json!({})),
+            ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "thread-1" } })),
+            ScriptedAppRequest::result(
+                "review/start",
+                json!({
+                    "turn": { "id": "turn-1" },
+                    "reviewThreadId": "thread-1",
+                }),
+            )
+            .with_after_response(vec![
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/started",
+                    "params": { "threadId": "thread-1", "turnId": "turn-1" }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "review-item-1",
+                            "type": "exitedReviewMode",
+                            "review": "{\"verdict\":\"comment\",\"summary\":\"needs changes\",\"comment_markdown\":\"- fix it\"}"
+                        }
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "turn": { "status": "completed" }
+                    }
+                })),
+            ]),
+        ]));
+
+        let mut codex = test_codex_config();
+        codex.browser_mcp.enabled = true;
+        codex.mcp_server_overrides.review = BTreeMap::from([("serena".to_string(), false)]);
+        let runner = test_runner_with_fake_runtime(codex, false, Arc::clone(&harness), None).await;
+
+        let result = runner
+            .run_review(review_context_with_target_branch(Some("main")))
+            .await?;
+
+        match result {
+            CodexResult::Comment { summary, body } => {
+                assert_eq!(summary, "needs changes");
+                assert_eq!(body, "- fix it");
+            }
+            _ => bail!("expected comment result"),
+        }
+
+        let app_starts = harness.app_server_starts();
+        assert_eq!(app_starts.len(), 1);
+        assert_eq!(
+            app_starts[0].browser_container_id.as_deref(),
+            Some("browser-1")
+        );
+        assert_eq!(
+            app_starts[0].network_mode.as_deref(),
+            Some("container:browser-1")
+        );
+        assert!(app_starts[0].request.cmd[1].contains("--browserUrl=http://127.0.0.1:9222"));
+        assert!(app_starts[0].request.cmd[1].contains("mcp_servers.serena.enabled=false"));
+
+        let browser_starts = harness.browser_starts();
+        assert_eq!(browser_starts.len(), 1);
+        assert_eq!(browser_starts[0].container_id, "browser-1");
+        assert_eq!(
+            harness.ensured_images(),
+            vec![
+                "ghcr.io/openai/codex-universal:latest".to_string(),
+                "chromedp/headless-shell:latest".to_string(),
+            ]
+        );
+        let request_methods = harness
+            .app_protocol_requests()
+            .into_iter()
+            .filter_map(|message| {
+                message
+                    .get("method")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            request_methods,
+            vec![
+                "initialize".to_string(),
+                "initialized".to_string(),
+                "thread/start".to_string(),
+                "review/start".to_string(),
+            ]
+        );
+        assert_eq!(harness.removed_containers(), vec!["app-1", "browser-1"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_browser_container_ready_with_fake_runtime_reports_exit() {
+        let harness = Arc::new(FakeRunnerHarness::default());
+        harness.set_browser_diagnostics(
+            "browser-1",
+            vec![BrowserContainerDiagnostics {
+                container_id: "browser-1".to_string(),
+                launch: BrowserLaunchConfig::from_browser_mcp(&BrowserMcpConfig::default()),
+                state: Some(BrowserContainerStateSnapshot {
+                    status: Some("exited".to_string()),
+                    running: Some(false),
+                    exit_code: Some(137),
+                    oom_killed: Some(false),
+                    error: Some("process exited".to_string()),
+                    started_at: Some("2026-03-18T10:00:00Z".to_string()),
+                    finished_at: Some("2026-03-18T10:00:02Z".to_string()),
+                }),
+                state_collection_error: None,
+                log_tail: BrowserLogTail {
+                    stdout: Vec::new(),
+                    stderr: vec!["browser failed to boot".to_string()],
+                },
+                log_collection_error: None,
+            }],
+        );
+        let runner =
+            test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None)
+                .await;
+
+        let err = runner
+            .wait_for_browser_container_ready(
+                "browser-1",
+                &BrowserLaunchConfig::from_browser_mcp(&BrowserMcpConfig::default()),
+            )
+            .await
+            .expect_err("browser readiness should fail");
+
+        let text = format!("{err:#}");
+        assert!(text.contains("browser container exited before reporting readiness on port 9222"));
+        assert!(text.contains("browser failed to boot"));
+    }
+
+    #[tokio::test]
+    async fn run_mention_command_with_fake_runtime_executes_git_helpers_and_returns_commit()
+    -> Result<()> {
+        let harness = Arc::new(FakeRunnerHarness::default());
+        harness.push_app_server(ScriptedAppServer::from_requests(vec![
+            ScriptedAppRequest::result("initialize", json!({})),
+            ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "thread-1" } })),
+            ScriptedAppRequest::result("turn/start", json!({ "turn": { "id": "turn-1" } }))
+                .with_after_response(vec![
+                    ScriptedAppChunk::Json(json!({
+                        "method": "turn/started",
+                        "params": { "threadId": "thread-1", "turnId": "turn-1" }
+                    })),
+                    ScriptedAppChunk::Json(json!({
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "itemId": "agent-1",
+                            "delta": "Implemented and committed deadbeef"
+                        }
+                    })),
+                    ScriptedAppChunk::Json(json!({
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "agent-1",
+                                "type": "AgentMessage",
+                                "phase": "final"
+                            }
+                        }
+                    })),
+                    ScriptedAppChunk::Json(json!({
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "turn": { "status": "completed" }
+                        }
+                    })),
+                ]),
+        ]));
+
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: auxiliary_git_exec_command(&[
+                    "status".to_string(),
+                    "--porcelain".to_string(),
+                ]),
+                cwd: Some("/work/repo".to_string()),
+                env: None,
+            },
+            ContainerExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        for command in [
+            vec![
+                "config".to_string(),
+                "user.name".to_string(),
+                "Requester".to_string(),
+            ],
+            vec![
+                "config".to_string(),
+                "user.email".to_string(),
+                "requester@example.com".to_string(),
+            ],
+            vec![
+                "remote".to_string(),
+                "set-url".to_string(),
+                "--push".to_string(),
+                "origin".to_string(),
+                "no_push://disabled".to_string(),
+            ],
+        ] {
+            harness.push_exec_output(
+                ExecContainerCommandRequest {
+                    container_id: "app-1".to_string(),
+                    command: auxiliary_git_exec_command(&command),
+                    cwd: Some("/work/repo".to_string()),
+                    env: None,
+                },
+                ContainerExecOutput {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            );
+        }
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: auxiliary_git_exec_command(&["rev-parse".to_string(), "HEAD".to_string()]),
+                cwd: Some("/work/repo".to_string()),
+                env: None,
+            },
+            ContainerExecOutput {
+                exit_code: 0,
+                stdout: "before-sha\n".to_string(),
+                stderr: String::new(),
+            },
+        );
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: auxiliary_git_exec_command(&["rev-parse".to_string(), "HEAD".to_string()]),
+                cwd: Some("/work/repo".to_string()),
+                env: None,
+            },
+            ContainerExecOutput {
+                exit_code: 0,
+                stdout: "after-sha\n".to_string(),
+                stderr: String::new(),
+            },
+        );
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: auxiliary_git_exec_command(&[
+                    "merge-base".to_string(),
+                    "--is-ancestor".to_string(),
+                    "before-sha".to_string(),
+                    "after-sha".to_string(),
+                ]),
+                cwd: Some("/work/repo".to_string()),
+                env: None,
+            },
+            ContainerExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: auxiliary_git_exec_command(&[
+                    "rev-list".to_string(),
+                    "--count".to_string(),
+                    "before-sha..after-sha".to_string(),
+                ]),
+                cwd: Some("/work/repo".to_string()),
+                env: None,
+            },
+            ContainerExecOutput {
+                exit_code: 0,
+                stdout: "1\n".to_string(),
+                stderr: String::new(),
+            },
+        );
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: restore_push_remote_url_exec_command(
+                    "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git",
+                ),
+                cwd: Some("/work/repo".to_string()),
+                env: Some(vec!["GITLAB_TOKEN=token".to_string()]),
+            },
+            ContainerExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: auxiliary_git_exec_command(&[
+                    "push".to_string(),
+                    "origin".to_string(),
+                    "HEAD:feature".to_string(),
+                ]),
+                cwd: Some("/work/repo".to_string()),
+                env: None,
+            },
+            ContainerExecOutput {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+
+        let runner =
+            test_runner_with_fake_runtime(test_codex_config(), true, Arc::clone(&harness), None)
+                .await;
+        let result = runner
+            .run_mention_command(MentionCommandContext {
+                repo: "group/repo".to_string(),
+                project_path: "group/repo".to_string(),
+                mr: MergeRequest {
+                    iid: 11,
+                    title: Some("Title".to_string()),
+                    web_url: None,
+                    created_at: None,
+                    updated_at: None,
+                    sha: Some("before-sha".to_string()),
+                    source_branch: Some("feature".to_string()),
+                    target_branch: Some("main".to_string()),
+                    author: None,
+                    source_project_id: Some(1),
+                    target_project_id: Some(1),
+                    diff_refs: None,
+                },
+                head_sha: "before-sha".to_string(),
+                discussion_id: "discussion-1".to_string(),
+                trigger_note_id: 77,
+                requester_name: "Requester".to_string(),
+                requester_email: "requester@example.com".to_string(),
+                additional_developer_instructions: None,
+                prompt: "Please fix it".to_string(),
+                feature_flags: FeatureFlagSnapshot::default(),
+                run_history_id: None,
+            })
+            .await?;
+
+        assert_eq!(result.status, MentionCommandStatus::Committed);
+        assert_eq!(result.commit_sha.as_deref(), Some("after-sha"));
+        assert_eq!(result.reply_message, "Implemented and committed deadbeef");
+
+        let exec_requests = harness.exec_requests();
+        assert_eq!(exec_requests.len(), 10);
+        assert_eq!(
+            exec_requests.last().unwrap().command,
+            auxiliary_git_exec_command(&[
+                "push".to_string(),
+                "origin".to_string(),
+                "HEAD:feature".to_string(),
+            ])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_mention_command_with_fake_runtime_surfaces_exec_failures() {
+        let harness = Arc::new(FakeRunnerHarness::default());
+        harness.push_app_server(ScriptedAppServer::from_requests(Vec::new()));
+        harness.push_exec_error(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: auxiliary_git_exec_command(&[
+                    "status".to_string(),
+                    "--porcelain".to_string(),
+                ]),
+                cwd: Some("/work/repo".to_string()),
+                env: None,
+            },
+            "git status failed",
+        );
+
+        let runner =
+            test_runner_with_fake_runtime(test_codex_config(), true, Arc::clone(&harness), None)
+                .await;
+        let err = runner
+            .run_mention_command(MentionCommandContext {
+                repo: "group/repo".to_string(),
+                project_path: "group/repo".to_string(),
+                mr: MergeRequest {
+                    iid: 11,
+                    title: Some("Title".to_string()),
+                    web_url: None,
+                    created_at: None,
+                    updated_at: None,
+                    sha: Some("before-sha".to_string()),
+                    source_branch: Some("feature".to_string()),
+                    target_branch: Some("main".to_string()),
+                    author: None,
+                    source_project_id: Some(1),
+                    target_project_id: Some(1),
+                    diff_refs: None,
+                },
+                head_sha: "before-sha".to_string(),
+                discussion_id: "discussion-1".to_string(),
+                trigger_note_id: 77,
+                requester_name: "Requester".to_string(),
+                requester_email: "requester@example.com".to_string(),
+                additional_developer_instructions: None,
+                prompt: "Please fix it".to_string(),
+                feature_flags: FeatureFlagSnapshot::default(),
+                run_history_id: None,
+            })
+            .await
+            .expect_err("mention command should fail");
+
+        assert!(format!("{err:#}").contains("git status failed"));
+        assert_eq!(harness.removed_containers(), vec!["app-1"]);
+    }
+
+    #[tokio::test]
+    async fn run_review_with_fake_runtime_surfaces_closed_stdout_with_recent_runner_errors() {
+        let harness = Arc::new(FakeRunnerHarness::default());
+        harness.push_app_server(ScriptedAppServer::from_requests(vec![
+            ScriptedAppRequest::result("initialize", json!({})),
+            ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "thread-1" } })),
+            ScriptedAppRequest::result(
+                "review/start",
+                json!({
+                    "turn": { "id": "turn-1" },
+                    "reviewThreadId": "thread-1",
+                }),
+            )
+            .with_after_response(vec![
+                ScriptedAppChunk::Line("codex-runner-error: git clone failed with 429".to_string()),
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/started",
+                    "params": { "threadId": "thread-1", "turnId": "turn-1" }
+                })),
+            ])
+            .close_output_after(),
+        ]));
+        let runner =
+            test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None)
+                .await;
+
+        let err = runner
+            .run_review(review_context_with_target_branch(Some("main")))
+            .await
+            .expect_err("review should fail when app-server closes stdout");
+
+        let text = format!("{err:#}");
+        assert!(text.contains("codex app-server closed stdout"));
+        assert!(
+            text.contains("recent runner errors: codex-runner-error: git clone failed with 429")
+        );
+        assert_eq!(harness.removed_containers(), vec!["app-1"]);
+    }
+
+    #[tokio::test]
+    async fn run_review_with_fake_runtime_persists_gitlab_discovery_startup_warning() -> Result<()>
+    {
+        let harness = Arc::new(FakeRunnerHarness::default());
+        harness.set_peer_ips("app-1", BTreeSet::from(["10.42.0.15".to_string()]));
+        let discovery = Arc::new(FakeGitLabDiscoveryHandle::new(
+            "gitlab-discovery",
+            "http://gitlab-discovery.internal:8091/mcp",
+            "/work/mcp",
+        ));
+        discovery.set_allow_list(
+            "group/repo",
+            ResolvedGitLabDiscoveryAllowList {
+                target_repos: BTreeSet::from(["group/shared".to_string()]),
+                target_groups: BTreeSet::new(),
+            },
+        );
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: gitlab_discovery_mcp_probe_exec_command(
+                    &GitLabDiscoveryMcpRuntimeConfig {
+                        server_name: "gitlab-discovery".to_string(),
+                        advertise_url: "http://gitlab-discovery.internal:8091/mcp".to_string(),
+                        clone_root: "/work/mcp".to_string(),
+                    },
+                )
+                .expect("probe command"),
+                cwd: None,
+                env: None,
+            },
+            ContainerExecOutput {
+                exit_code: 0,
+                stdout: "ERROR healthz failed\n".to_string(),
+                stderr: String::new(),
+            },
+        );
+        harness.push_app_server(ScriptedAppServer::from_requests(vec![
+            ScriptedAppRequest::result("initialize", json!({})),
+            ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "thread-1" } })),
+            ScriptedAppRequest::result(
+                "review/start",
+                json!({
+                    "turn": { "id": "turn-1" },
+                    "reviewThreadId": "thread-1",
+                }),
+            )
+            .with_after_response(vec![
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/started",
+                    "params": { "threadId": "thread-1", "turnId": "turn-1" }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "review-item-1",
+                            "type": "exitedReviewMode",
+                            "review": "{\"verdict\":\"pass\",\"summary\":\"ok\",\"comment_markdown\":\"\"}"
+                        }
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "turn": { "status": "completed" }
+                    }
+                })),
+            ]),
+        ]));
+
+        let runner = test_runner_with_fake_runtime(
+            test_codex_config(),
+            false,
+            Arc::clone(&harness),
+            Some(discovery.clone() as Arc<dyn GitLabDiscoveryHandle>),
+        )
+        .await;
+        let run_history_id = runner
+            .state
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 11,
+                head_sha: "abc123".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+
+        let result = runner
+            .run_review(ReviewContext {
+                run_history_id: Some(run_history_id),
+                feature_flags: FeatureFlagSnapshot {
+                    gitlab_discovery_mcp: true,
+                    composer_install: false,
+                    composer_safe_install: false,
+                },
+                ..review_context_with_target_branch(Some("main"))
+            })
+            .await?;
+        assert!(matches!(result, CodexResult::Pass { .. }));
+
+        let app_start = harness.app_server_starts();
+        assert_eq!(app_start.len(), 1);
+        assert!(app_start[0].request.cmd[1].contains(
+            "mcp_servers.gitlab-discovery.url=\"http://gitlab-discovery.internal:8091/mcp\""
+        ));
+
+        let events = runner.state.list_run_history_events(run_history_id).await?;
+        assert!(events
+            .iter()
+            .any(|event| event.turn_id.as_deref() == Some(GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID)));
+        assert_eq!(discovery.registered_bindings().len(), 1);
+        assert_eq!(discovery.removed_bindings(), vec!["app-1"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_active_review_containers_with_fake_runtime_filters_to_owned_managed_names() {
+        let harness = Arc::new(FakeRunnerHarness::default());
+        harness.set_managed_containers(vec![
+            ManagedContainerSummary {
+                id: Some("remove-review".to_string()),
+                names: vec!["/codex-review-123".to_string()],
+                labels: Some(HashMap::from([(
+                    REVIEW_OWNER_LABEL_KEY.to_string(),
+                    "owner-id".to_string(),
+                )])),
+            },
+            ManagedContainerSummary {
+                id: Some("remove-browser".to_string()),
+                names: vec!["/codex-browser-456".to_string()],
+                labels: Some(HashMap::from([(
+                    REVIEW_OWNER_LABEL_KEY.to_string(),
+                    "owner-id".to_string(),
+                )])),
+            },
+            ManagedContainerSummary {
+                id: Some("skip-other-owner".to_string()),
+                names: vec!["/codex-review-789".to_string()],
+                labels: Some(HashMap::from([(
+                    REVIEW_OWNER_LABEL_KEY.to_string(),
+                    "someone-else".to_string(),
+                )])),
+            },
+            ManagedContainerSummary {
+                id: Some("skip-unmanaged".to_string()),
+                names: vec!["/not-codex".to_string()],
+                labels: Some(HashMap::from([(
+                    REVIEW_OWNER_LABEL_KEY.to_string(),
+                    "owner-id".to_string(),
+                )])),
+            },
+        ]);
+        let runner =
+            test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None)
+                .await;
+
+        runner.stop_active_review_containers_best_effort().await;
+
+        assert_eq!(
+            harness.removed_containers(),
+            vec!["remove-review".to_string(), "remove-browser".to_string()]
+        );
     }
 
     #[test]
