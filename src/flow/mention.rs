@@ -34,6 +34,16 @@ pub(crate) struct MentionScheduleOutcome {
     pub(crate) blocked_pending_work: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MentionSetupFailureContext<'a> {
+    repo: &'a str,
+    iid: u64,
+    discussion_id: &'a str,
+    trigger_note_id: u64,
+    head_sha: &'a str,
+    run_history_id: i64,
+}
+
 pub(crate) struct MentionFlow {
     shared: FlowShared,
     mention_branch_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
@@ -502,12 +512,14 @@ impl MentionFlow {
                 Ok(feature_flags) => feature_flags,
                 Err(err) => {
                     self.abort_mention_after_setup_failure(
-                        repo,
-                        mr.iid,
-                        &trigger.discussion_id,
-                        trigger_note_id,
-                        head_sha,
-                        run_history_id,
+                        MentionSetupFailureContext {
+                            repo,
+                            iid: mr.iid,
+                            discussion_id: &trigger.discussion_id,
+                            trigger_note_id,
+                            head_sha,
+                            run_history_id,
+                        },
                         &err,
                     )
                     .await;
@@ -521,12 +533,14 @@ impl MentionFlow {
                 .await
             {
                 self.abort_mention_after_setup_failure(
-                    repo,
-                    mr.iid,
-                    &trigger.discussion_id,
-                    trigger_note_id,
-                    head_sha,
-                    run_history_id,
+                    MentionSetupFailureContext {
+                        repo,
+                        iid: mr.iid,
+                        discussion_id: &trigger.discussion_id,
+                        trigger_note_id,
+                        head_sha,
+                        run_history_id,
+                    },
                     &err,
                 )
                 .await;
@@ -946,32 +960,27 @@ impl MentionFlow {
 
     async fn abort_mention_after_setup_failure(
         &self,
-        repo: &str,
-        iid: u64,
-        discussion_id: &str,
-        trigger_note_id: u64,
-        head_sha: &str,
-        run_history_id: i64,
+        ctx: MentionSetupFailureContext<'_>,
         err: &anyhow::Error,
     ) {
         self.release_mention_lock_after_history_failure(
-            repo,
-            iid,
-            discussion_id,
-            trigger_note_id,
-            head_sha,
+            ctx.repo,
+            ctx.iid,
+            ctx.discussion_id,
+            ctx.trigger_note_id,
+            ctx.head_sha,
         )
         .await;
         if let Err(finish_err) = self
             .shared
             .state
             .finish_run_history(
-                run_history_id,
+                ctx.run_history_id,
                 RunHistoryFinish {
                     result: "error".to_string(),
                     preview: Some(format!(
                         "Mention {} !{} note {}",
-                        repo, iid, trigger_note_id
+                        ctx.repo, ctx.iid, ctx.trigger_note_id
                     )),
                     error: Some(format!("{err:#}")),
                     ..RunHistoryFinish::default()
@@ -980,10 +989,10 @@ impl MentionFlow {
             .await
         {
             warn!(
-                repo = repo,
-                iid = iid,
-                discussion_id = discussion_id,
-                trigger_note_id = trigger_note_id,
+                repo = ctx.repo,
+                iid = ctx.iid,
+                discussion_id = ctx.discussion_id,
+                trigger_note_id = ctx.trigger_note_id,
                 error = %finish_err,
                 "failed to finalize mention run history after setup failure"
             );

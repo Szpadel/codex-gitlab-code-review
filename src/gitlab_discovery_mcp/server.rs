@@ -1,8 +1,8 @@
 use super::service::mcp_internal_error;
 use super::{
     CloneGitLabRepoRequest, CloneGitLabRepoResponse, GitLabDiscoveryMcpService,
-    GitLabDiscoveryPathEntry, GitLabDiscoveryPathEntryKind, GitLabDiscoverySessionBinding,
-    ListGitLabPathsRequest, ListGitLabPathsResponse,
+    GitLabDiscoverySessionBinding, GitLabPathListing, ListGitLabPathsRequest,
+    ListGitLabPathsResponse,
 };
 use crate::gitlab::GitLabApi;
 use anyhow::Result;
@@ -35,7 +35,7 @@ struct GitLabDiscoveryMcpServer {
 impl ServerHandler for GitLabDiscoveryMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Browse allowed GitLab groups and clone allowed repositories into the current Codex container without exposing GitLab credentials to the agent.",
+            "Browse allowed GitLab paths. Call list_gitlab_paths without a path first to see top-level accessible groups, then call it again with a returned subgroup path to navigate deeper. Each response separates subgroup paths from repository paths. Use clone_gitlab_repo to clone an allowed repository into the current Codex container. Pass checkout_ref for branch or tag checkout, or commit_sha for a detached commit checkout.",
         )
     }
 }
@@ -44,7 +44,7 @@ impl ServerHandler for GitLabDiscoveryMcpServer {
 impl GitLabDiscoveryMcpServer {
     #[tool(
         name = "list_gitlab_paths",
-        description = "List allowed GitLab groups and repositories for the current review context."
+        description = "List the immediate child subgroups and repositories visible from the requested GitLab path. Omit path to list top-level accessible groups. The response returns separate subgroup and repository arrays."
     )]
     async fn list_gitlab_paths(
         &self,
@@ -58,13 +58,13 @@ impl GitLabDiscoveryMcpServer {
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
-        let entries = match current_path {
-            None => binding.allow.root_entries(),
+        let listing = match current_path {
+            None => binding.allow.root_listing(),
             Some(path) => {
                 if binding.allow.is_repo_allowed(path) {
-                    Vec::new()
+                    GitLabPathListing::default()
                 } else if binding.allow.can_browse_group(path) {
-                    let mut entries = Vec::new();
+                    let mut subgroups = Vec::new();
                     for group in self
                         .service
                         .gitlab
@@ -75,12 +75,10 @@ impl GitLabDiscoveryMcpServer {
                         if binding.allow.can_browse_group(&group.full_path)
                             || binding.allow.has_repo_within_group(&group.full_path)
                         {
-                            entries.push(GitLabDiscoveryPathEntry {
-                                kind: GitLabDiscoveryPathEntryKind::Group,
-                                path: group.full_path,
-                            });
+                            subgroups.push(group.full_path);
                         }
                     }
+                    let mut repositories = Vec::new();
                     for project in self
                         .service
                         .gitlab
@@ -89,18 +87,10 @@ impl GitLabDiscoveryMcpServer {
                         .map_err(mcp_internal_error)?
                     {
                         if binding.allow.is_repo_allowed(&project.path_with_namespace) {
-                            entries.push(GitLabDiscoveryPathEntry {
-                                kind: GitLabDiscoveryPathEntryKind::Repo,
-                                path: project.path_with_namespace,
-                            });
+                            repositories.push(project.path_with_namespace);
                         }
                     }
-                    entries.sort_by(|left, right| {
-                        left.path.cmp(&right.path).then(left.kind.cmp(&right.kind))
-                    });
-                    entries
-                        .dedup_by(|left, right| left.kind == right.kind && left.path == right.path);
-                    entries
+                    GitLabPathListing::new(subgroups, repositories)
                 } else {
                     return Err(McpError::resource_not_found(
                         format!("GitLab path is not allowed for this run: {path}"),
@@ -112,13 +102,14 @@ impl GitLabDiscoveryMcpServer {
 
         Ok(McpJson(ListGitLabPathsResponse {
             current_path: current_path.map(ToOwned::to_owned),
-            entries,
+            subgroups: listing.subgroups,
+            repositories: listing.repositories,
         }))
     }
 
     #[tool(
         name = "clone_gitlab_repo",
-        description = "Clone an allowed GitLab repository into the current Codex container and return the local path plus available branches and tags."
+        description = "Clone an allowed GitLab repository into the current Codex container and return the local path plus available branches and tags. Use checkout_ref for a branch or tag, or commit_sha for a detached checkout by commit SHA."
     )]
     async fn clone_gitlab_repo(
         &self,
@@ -160,18 +151,34 @@ impl GitLabDiscoveryMcpServer {
             .default_branch(&binding.container_id, &path)
             .await
             .map_err(mcp_internal_error)?;
-        let (checked_out_ref, checked_out_kind) = match request
+        let checkout_ref = request
             .checkout_ref
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.is_empty());
+        let commit_sha = request
+            .commit_sha
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let (checked_out_ref, checked_out_kind) = if checkout_ref.is_none() && commit_sha.is_none()
         {
-            Some(checkout_ref) => self
-                .service
-                .checkout_ref(&binding.container_id, &path, checkout_ref, &branches, &tags)
+            (default_branch.clone(), super::GitLabCheckoutKind::Branch)
+        } else {
+            self.service
+                .checkout_target(
+                    &binding.container_id,
+                    super::service::CheckoutTargetRequest {
+                        repo_path: &path,
+                        gitlab_repo_path: repo_path,
+                        checkout_ref,
+                        commit_sha,
+                        branches: &branches,
+                        tags: &tags,
+                    },
+                )
                 .await
-                .map_err(mcp_internal_error)?,
-            None => (default_branch.clone(), super::GitLabCheckoutKind::Branch),
+                .map_err(mcp_internal_error)?
         };
         let head_sha = self
             .service
@@ -268,25 +275,22 @@ async fn authenticate_mcp_request(
     request.extensions_mut().insert(binding.clone());
 
     let response = next.run(request).await;
-    if incoming_session_id.is_none() {
-        if let Some(session_id) = response
+    if incoming_session_id.is_none()
+        && let Some(session_id) = response
             .headers()
             .get("mcp-session-id")
             .and_then(|value| value.to_str().ok())
-        {
-            if let Err(err) = registry
-                .bind_session(&binding.network_container_id, session_id)
-                .await
-            {
-                warn!(
-                    error = %err,
-                    session_id,
-                    peer_ip,
-                    network_container_id = binding.network_container_id.as_str(),
-                    "failed to bind MCP session to gitlab discovery peer identity"
-                );
-            }
-        }
+        && let Err(err) = registry
+            .bind_session(&binding.network_container_id, session_id)
+            .await
+    {
+        warn!(
+            error = %err,
+            session_id,
+            peer_ip,
+            network_container_id = binding.network_container_id.as_str(),
+            "failed to bind MCP session to gitlab discovery peer identity"
+        );
     }
     response
 }

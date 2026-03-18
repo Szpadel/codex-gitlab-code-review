@@ -329,19 +329,19 @@ impl DockerCodexRunner {
 
 fn container_peer_ips(inspect: &ContainerInspectResponse) -> BTreeSet<String> {
     let mut peer_ips = BTreeSet::new();
-    if let Some(settings) = inspect.network_settings.as_ref() {
-        if let Some(networks) = settings.networks.as_ref() {
-            for network in networks.values() {
-                if let Some(ip_address) = network.ip_address.as_deref().map(str::trim)
-                    && !ip_address.is_empty()
-                {
-                    peer_ips.insert(ip_address.to_string());
-                }
-                if let Some(ip_address) = network.global_ipv6_address.as_deref().map(str::trim)
-                    && !ip_address.is_empty()
-                {
-                    peer_ips.insert(ip_address.to_string());
-                }
+    if let Some(settings) = inspect.network_settings.as_ref()
+        && let Some(networks) = settings.networks.as_ref()
+    {
+        for network in networks.values() {
+            if let Some(ip_address) = network.ip_address.as_deref().map(str::trim)
+                && !ip_address.is_empty()
+            {
+                peer_ips.insert(ip_address.to_string());
+            }
+            if let Some(ip_address) = network.global_ipv6_address.as_deref().map(str::trim)
+                && !ip_address.is_empty()
+            {
+                peer_ips.insert(ip_address.to_string());
             }
         }
     }

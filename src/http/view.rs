@@ -404,11 +404,10 @@ fn render_run_metadata(run: &RunHistoryRecord) -> String {
 }
 
 fn render_run_feature_flags(run: &RunHistoryRecord) -> String {
-    let mut flags = vec![format!(
+    let flags = [format!(
         "gitlab_discovery_mcp={}",
         bool_label(run.feature_flags.gitlab_discovery_mcp)
     )];
-    flags.sort();
     flags.join(", ")
 }
 

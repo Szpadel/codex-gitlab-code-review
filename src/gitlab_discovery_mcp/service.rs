@@ -37,6 +37,72 @@ struct ContainerExecOutput {
     stderr: String,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CheckoutTargetRequest<'a> {
+    pub(crate) repo_path: &'a str,
+    pub(crate) gitlab_repo_path: &'a str,
+    pub(crate) checkout_ref: Option<&'a str>,
+    pub(crate) commit_sha: Option<&'a str>,
+    pub(crate) branches: &'a [String],
+    pub(crate) tags: &'a [String],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolvedCheckoutTarget {
+    Branch {
+        requested_ref: String,
+        branch_name: String,
+    },
+    Tag {
+        requested_ref: String,
+        tag_name: String,
+    },
+    Commit {
+        commit_sha: String,
+    },
+}
+
+impl ResolvedCheckoutTarget {
+    fn checked_out_ref(&self) -> &str {
+        match self {
+            Self::Branch { requested_ref, .. } | Self::Tag { requested_ref, .. } => requested_ref,
+            Self::Commit { commit_sha } => commit_sha,
+        }
+    }
+
+    fn checked_out_kind(&self) -> GitLabCheckoutKind {
+        match self {
+            Self::Branch { .. } => GitLabCheckoutKind::Branch,
+            Self::Tag { .. } => GitLabCheckoutKind::Tag,
+            Self::Commit { .. } => GitLabCheckoutKind::Commit,
+        }
+    }
+
+    fn checkout_command(&self) -> Vec<String> {
+        match self {
+            Self::Branch { branch_name, .. } => vec![
+                "git".to_string(),
+                "checkout".to_string(),
+                "-B".to_string(),
+                branch_name.to_string(),
+                format!("refs/remotes/origin/{branch_name}"),
+            ],
+            Self::Tag { tag_name, .. } => vec![
+                "git".to_string(),
+                "checkout".to_string(),
+                "--detach".to_string(),
+                format!("refs/tags/{tag_name}"),
+            ],
+            Self::Commit { commit_sha } => vec![
+                "git".to_string(),
+                "checkout".to_string(),
+                "--detach".to_string(),
+                commit_sha.to_string(),
+            ],
+        }
+    }
+}
+
 impl GitLabDiscoveryMcpService {
     pub fn new(
         docker_cfg: DockerConfig,
@@ -238,81 +304,38 @@ printf '%s\n' "$dest"
             .context("parse default branch from refs/remotes/origin/HEAD")
     }
 
-    pub(crate) async fn checkout_ref(
+    pub(crate) async fn checkout_target(
         &self,
         container_id: &str,
-        repo_path: &str,
-        checkout_ref: &str,
-        branches: &[String],
-        tags: &[String],
+        request: CheckoutTargetRequest<'_>,
     ) -> Result<(String, GitLabCheckoutKind)> {
-        let (resolved_ref, kind, command) =
-            if let Some(branch_name) = checkout_ref.strip_prefix("refs/heads/") {
-                ensure_contains(branches, branch_name, "branch")?;
-                (
-                    checkout_ref.to_string(),
-                    GitLabCheckoutKind::Branch,
-                    vec![
-                        "git".to_string(),
-                        "checkout".to_string(),
-                        "-B".to_string(),
-                        branch_name.to_string(),
-                        format!("refs/remotes/origin/{branch_name}"),
-                    ],
-                )
-            } else if let Some(tag_name) = checkout_ref.strip_prefix("refs/tags/") {
-                ensure_contains(tags, tag_name, "tag")?;
-                (
-                    checkout_ref.to_string(),
-                    GitLabCheckoutKind::Tag,
-                    vec![
-                        "git".to_string(),
-                        "checkout".to_string(),
-                        "--detach".to_string(),
-                        format!("refs/tags/{tag_name}"),
-                    ],
-                )
-            } else {
-                let branch_exists = branches.iter().any(|branch| branch == checkout_ref);
-                let tag_exists = tags.iter().any(|tag| tag == checkout_ref);
-                match (branch_exists, tag_exists) {
-                    (true, true) => bail!(
-                        "checkout_ref '{}' is ambiguous; use refs/heads/{} or refs/tags/{}",
-                        checkout_ref,
-                        checkout_ref,
-                        checkout_ref
-                    ),
-                    (true, false) => (
-                        checkout_ref.to_string(),
-                        GitLabCheckoutKind::Branch,
-                        vec![
-                            "git".to_string(),
-                            "checkout".to_string(),
-                            "-B".to_string(),
-                            checkout_ref.to_string(),
-                            format!("refs/remotes/origin/{checkout_ref}"),
-                        ],
-                    ),
-                    (false, true) => (
-                        checkout_ref.to_string(),
-                        GitLabCheckoutKind::Tag,
-                        vec![
-                            "git".to_string(),
-                            "checkout".to_string(),
-                            "--detach".to_string(),
-                            format!("refs/tags/{checkout_ref}"),
-                        ],
-                    ),
-                    (false, false) => bail!(
-                        "checkout_ref '{}' does not match any fetched branch or tag",
-                        checkout_ref
-                    ),
-                }
-            };
-
-        self.exec_container_command(container_id, command, Some(repo_path), None)
+        let target = resolve_checkout_target(
+            request.checkout_ref,
+            request.commit_sha,
+            request.branches,
+            request.tags,
+        )?;
+        if let ResolvedCheckoutTarget::Commit { commit_sha } = &target {
+            self.fetch_commit_if_missing(
+                container_id,
+                request.repo_path,
+                request.gitlab_repo_path,
+                commit_sha,
+            )
             .await?;
-        Ok((resolved_ref, kind))
+        }
+
+        self.exec_container_command(
+            container_id,
+            target.checkout_command(),
+            Some(request.repo_path),
+            None,
+        )
+        .await?;
+        Ok((
+            target.checked_out_ref().to_string(),
+            target.checked_out_kind(),
+        ))
     }
 
     pub(crate) async fn head_sha(&self, container_id: &str, repo_path: &str) -> Result<String> {
@@ -332,6 +355,27 @@ printf '%s\n' "$dest"
     }
 
     async fn exec_container_command(
+        &self,
+        container_id: &str,
+        command: Vec<String>,
+        cwd: Option<&str>,
+        env: Option<Vec<String>>,
+    ) -> Result<ContainerExecOutput> {
+        let output = self
+            .exec_container_command_allow_failure(container_id, command, cwd, env)
+            .await?;
+        if output.exit_code != 0 {
+            bail!(
+                "docker exec failed (exit={}): stdout='{}' stderr='{}'",
+                output.exit_code,
+                output.stdout.trim(),
+                output.stderr.trim()
+            );
+        }
+        Ok(output)
+    }
+
+    async fn exec_container_command_allow_failure(
         &self,
         container_id: &str,
         command: Vec<String>,
@@ -389,15 +433,74 @@ printf '%s\n' "$dest"
             stdout: self.redact_sensitive_output(&stdout),
             stderr: self.redact_sensitive_output(&stderr),
         };
-        if output.exit_code != 0 {
+        Ok(output)
+    }
+
+    async fn fetch_commit_if_missing(
+        &self,
+        container_id: &str,
+        repo_path: &str,
+        gitlab_repo_path: &str,
+        commit_sha: &str,
+    ) -> Result<()> {
+        if self
+            .commit_exists(container_id, repo_path, commit_sha)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let fetch_url = self
+            .clone_url_template(gitlab_repo_path)?
+            .replace("${GITLAB_TOKEN}", &self.gitlab_token);
+
+        self.exec_container_command(
+            container_id,
+            vec![
+                "git".to_string(),
+                "fetch".to_string(),
+                fetch_url,
+                commit_sha.to_string(),
+            ],
+            Some(repo_path),
+            None,
+        )
+        .await
+        .with_context(|| format!("fetch commit '{commit_sha}' from origin"))?;
+
+        if self
+            .commit_exists(container_id, repo_path, commit_sha)
+            .await?
+        {
+            Ok(())
+        } else {
             bail!(
-                "docker exec failed (exit={}): stdout='{}' stderr='{}'",
-                output.exit_code,
-                output.stdout.trim(),
-                output.stderr.trim()
+                "commit '{}' was not fetched for the cloned repository",
+                commit_sha
             );
         }
-        Ok(output)
+    }
+
+    async fn commit_exists(
+        &self,
+        container_id: &str,
+        repo_path: &str,
+        commit_sha: &str,
+    ) -> Result<bool> {
+        let output = self
+            .exec_container_command_allow_failure(
+                container_id,
+                vec![
+                    "git".to_string(),
+                    "cat-file".to_string(),
+                    "-e".to_string(),
+                    format!("{commit_sha}^{{commit}}"),
+                ],
+                Some(repo_path),
+                None,
+            )
+            .await?;
+        Ok(output.exit_code == 0)
     }
 
     fn clone_url_template(&self, repo: &str) -> Result<String> {
@@ -466,6 +569,75 @@ fn ensure_contains(values: &[String], wanted: &str, label: &str) -> Result<()> {
     }
 }
 
+fn ensure_valid_commit_sha(commit_sha: &str) -> Result<()> {
+    anyhow::ensure!(
+        (7..=40).contains(&commit_sha.len()) && commit_sha.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "commit_sha must be a 7-40 character hexadecimal Git commit SHA"
+    );
+    Ok(())
+}
+
+pub(crate) fn resolve_checkout_target(
+    checkout_ref: Option<&str>,
+    commit_sha: Option<&str>,
+    branches: &[String],
+    tags: &[String],
+) -> Result<ResolvedCheckoutTarget> {
+    let checkout_ref = checkout_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let commit_sha = commit_sha.map(str::trim).filter(|value| !value.is_empty());
+
+    if checkout_ref.is_some() && commit_sha.is_some() {
+        bail!("checkout_ref and commit_sha are mutually exclusive");
+    }
+
+    if let Some(commit_sha) = commit_sha {
+        ensure_valid_commit_sha(commit_sha)?;
+        return Ok(ResolvedCheckoutTarget::Commit {
+            commit_sha: commit_sha.to_string(),
+        });
+    }
+
+    let checkout_ref = checkout_ref.context("checkout_ref or commit_sha is required")?;
+    if let Some(branch_name) = checkout_ref.strip_prefix("refs/heads/") {
+        ensure_contains(branches, branch_name, "branch")?;
+        Ok(ResolvedCheckoutTarget::Branch {
+            requested_ref: checkout_ref.to_string(),
+            branch_name: branch_name.to_string(),
+        })
+    } else if let Some(tag_name) = checkout_ref.strip_prefix("refs/tags/") {
+        ensure_contains(tags, tag_name, "tag")?;
+        Ok(ResolvedCheckoutTarget::Tag {
+            requested_ref: checkout_ref.to_string(),
+            tag_name: tag_name.to_string(),
+        })
+    } else {
+        let branch_exists = branches.iter().any(|branch| branch == checkout_ref);
+        let tag_exists = tags.iter().any(|tag| tag == checkout_ref);
+        match (branch_exists, tag_exists) {
+            (true, true) => bail!(
+                "checkout_ref '{}' is ambiguous; use refs/heads/{} or refs/tags/{}",
+                checkout_ref,
+                checkout_ref,
+                checkout_ref
+            ),
+            (true, false) => Ok(ResolvedCheckoutTarget::Branch {
+                requested_ref: checkout_ref.to_string(),
+                branch_name: checkout_ref.to_string(),
+            }),
+            (false, true) => Ok(ResolvedCheckoutTarget::Tag {
+                requested_ref: checkout_ref.to_string(),
+                tag_name: checkout_ref.to_string(),
+            }),
+            (false, false) => bail!(
+                "checkout_ref '{}' does not match any fetched branch or tag",
+                checkout_ref
+            ),
+        }
+    }
+}
+
 pub(crate) fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
@@ -476,7 +648,8 @@ pub(crate) fn mcp_internal_error(err: anyhow::Error) -> McpError {
 
 #[cfg(test)]
 mod tests {
-    use super::GitLabDiscoveryMcpService;
+    use super::{GitLabDiscoveryMcpService, ResolvedCheckoutTarget, resolve_checkout_target};
+    use crate::gitlab_discovery_mcp::GitLabCheckoutKind;
 
     #[test]
     fn redact_sensitive_output_removes_gitlab_tokens_from_urls_and_plain_text() {
@@ -498,5 +671,76 @@ mod tests {
         assert!(!output.contains("secret-token"));
         assert!(output.contains("oauth2:[REDACTED]@gitlab.example.com/group/repo.git"));
         assert!(output.contains("[REDACTED_GITLAB_TOKEN]"));
+    }
+
+    #[test]
+    fn resolve_checkout_target_rejects_checkout_ref_and_commit_sha() {
+        let err =
+            resolve_checkout_target(Some("main"), Some("deadbeef"), &["main".to_string()], &[])
+                .expect_err("mutually exclusive inputs must fail");
+
+        assert!(
+            err.to_string()
+                .contains("checkout_ref and commit_sha are mutually exclusive")
+        );
+    }
+
+    #[test]
+    fn resolve_checkout_target_resolves_commit_sha_to_detached_checkout() {
+        let resolved =
+            resolve_checkout_target(None, Some("deadbeef"), &[], &[]).expect("commit target");
+
+        assert_eq!(
+            resolved,
+            ResolvedCheckoutTarget::Commit {
+                commit_sha: "deadbeef".to_string(),
+            }
+        );
+        assert_eq!(resolved.checked_out_ref(), "deadbeef");
+        assert_eq!(resolved.checked_out_kind(), GitLabCheckoutKind::Commit);
+    }
+
+    #[test]
+    fn resolve_checkout_target_rejects_non_sha_commit_values() {
+        let err = resolve_checkout_target(None, Some("main"), &[], &[])
+            .expect_err("non-SHA commit target must fail");
+
+        assert!(
+            err.to_string()
+                .contains("commit_sha must be a 7-40 character hexadecimal Git commit SHA")
+        );
+    }
+
+    #[test]
+    fn resolve_checkout_target_preserves_branch_and_tag_behavior() {
+        let branch = resolve_checkout_target(
+            Some("main"),
+            None,
+            &["main".to_string()],
+            &["v1.0.0".to_string()],
+        )
+        .expect("branch target");
+        assert_eq!(
+            branch,
+            ResolvedCheckoutTarget::Branch {
+                requested_ref: "main".to_string(),
+                branch_name: "main".to_string(),
+            }
+        );
+
+        let tag = resolve_checkout_target(
+            Some("refs/tags/v1.0.0"),
+            None,
+            &["main".to_string()],
+            &["v1.0.0".to_string()],
+        )
+        .expect("tag target");
+        assert_eq!(
+            tag,
+            ResolvedCheckoutTarget::Tag {
+                requested_ref: "refs/tags/v1.0.0".to_string(),
+                tag_name: "v1.0.0".to_string(),
+            }
+        );
     }
 }

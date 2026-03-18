@@ -9,6 +9,17 @@ pub(crate) struct AppServerCommandOptions<'a> {
     pub(crate) reasoning_effort: Option<&'a str>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct BuildCommandScriptInput<'a> {
+    pub(crate) clone_url: &'a str,
+    pub(crate) gitlab_token: &'a str,
+    pub(crate) repo: &'a str,
+    pub(crate) head_sha: &'a str,
+    pub(crate) auth_mount_path: &'a str,
+    pub(crate) target_branch: Option<&'a str>,
+    pub(crate) deps_enabled: bool,
+}
+
 impl DockerCodexRunner {
     pub(crate) fn clone_url(&self, repo: &str) -> Result<String> {
         let scheme = self.git_base.scheme();
@@ -78,16 +89,19 @@ impl DockerCodexRunner {
             app_server.gitlab_discovery_mcp.is_some(),
         );
         Ok(Self::build_command_script(
-            &clone_url,
-            &self.gitlab_token,
-            &ctx.repo,
-            ctx.head_sha.as_str(),
-            &self.codex.auth_mount_path,
-            ctx.mr
-                .target_branch
-                .as_deref()
-                .filter(|value| !value.is_empty()),
-            self.codex.deps.enabled,
+            BuildCommandScriptInput {
+                clone_url: &clone_url,
+                gitlab_token: &self.gitlab_token,
+                repo: &ctx.repo,
+                head_sha: ctx.head_sha.as_str(),
+                auth_mount_path: &self.codex.auth_mount_path,
+                target_branch: ctx
+                    .mr
+                    .target_branch
+                    .as_deref()
+                    .filter(|value| !value.is_empty()),
+                deps_enabled: self.codex.deps.enabled,
+            },
             AppServerCommandOptions {
                 browser_mcp: app_server.browser_mcp,
                 gitlab_discovery_mcp: app_server.gitlab_discovery_mcp,
@@ -205,16 +219,11 @@ fi
     }
 
     pub(crate) fn build_command_script(
-        clone_url: &str,
-        gitlab_token: &str,
-        repo: &str,
-        head_sha: &str,
-        auth_mount_path: &str,
-        target_branch: Option<&str>,
-        deps_enabled: bool,
+        input: BuildCommandScriptInput<'_>,
         app_server: AppServerCommandOptions<'_>,
     ) -> String {
-        let target_branch_script = target_branch
+        let target_branch_script = input
+            .target_branch
             .map(|branch| {
                 format!(
                     "run_git fetch git fetch --depth 1 origin \"{branch}\"\n\
@@ -224,7 +233,7 @@ run_git fetch git fetch --unshallow\n"
                 )
             })
             .unwrap_or_default();
-        let deps_prefetch_script = if deps_enabled {
+        let deps_prefetch_script = if input.deps_enabled {
             r#"
 prefetch_deps() (
   set +e
@@ -324,9 +333,10 @@ export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
         } else {
             ""
         };
-        let git_auth_setup_script = git_bootstrap_auth_setup_script(clone_url, repo, gitlab_token);
+        let git_auth_setup_script =
+            git_bootstrap_auth_setup_script(input.clone_url, input.repo, input.gitlab_token);
         let git_auth_cleanup_script = git_bootstrap_auth_cleanup_script();
-        let gitlab_token_q = shell_quote(gitlab_token);
+        let gitlab_token_q = shell_quote(input.gitlab_token);
         let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
         let browser_wait_script = browser_wait_script(app_server.browser_mcp);
         let app_server_exec_cmd = codex_app_server_exec_command(
@@ -386,12 +396,12 @@ if ! command -v codex >/dev/null 2>&1; then
 fi
 {browser_prereq_script}
 {browser_wait_script}
-{app_server_exec_cmd}
+	{app_server_exec_cmd}
         "#,
-            clone_url = clone_url,
+            clone_url = input.clone_url,
             gitlab_token_q = gitlab_token_q,
-            head_sha = head_sha,
-            auth_mount_path = auth_mount_path,
+            head_sha = input.head_sha,
+            auth_mount_path = input.auth_mount_path,
             target_branch_script = target_branch_script,
             deps_prefetch_script = deps_prefetch_script,
             git_auth_setup_script = git_auth_setup_script,

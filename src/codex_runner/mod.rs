@@ -1555,13 +1555,15 @@ mod tests {
     #[test]
     fn build_command_script_sets_writable_codex_home() {
         let script = DockerCodexRunner::build_command_script(
-            "https://example.com/repo.git",
-            "token",
-            "repo",
-            "abc",
-            "/root/.codex",
-            None,
-            false,
+            BuildCommandScriptInput {
+                clone_url: "https://example.com/repo.git",
+                gitlab_token: "token",
+                repo: "repo",
+                head_sha: "abc",
+                auth_mount_path: "/root/.codex",
+                target_branch: None,
+                deps_enabled: false,
+            },
             AppServerCommandOptions {
                 browser_mcp: None,
                 gitlab_discovery_mcp: None,
@@ -1577,13 +1579,15 @@ mod tests {
     #[test]
     fn build_command_script_fetches_target_branch() {
         let script = DockerCodexRunner::build_command_script(
-            "https://example.com/repo.git",
-            "token",
-            "repo",
-            "abc",
-            "/root/.codex",
-            Some("main"),
-            false,
+            BuildCommandScriptInput {
+                clone_url: "https://example.com/repo.git",
+                gitlab_token: "token",
+                repo: "repo",
+                head_sha: "abc",
+                auth_mount_path: "/root/.codex",
+                target_branch: Some("main"),
+                deps_enabled: false,
+            },
             AppServerCommandOptions {
                 browser_mcp: None,
                 gitlab_discovery_mcp: None,
@@ -1600,13 +1604,15 @@ mod tests {
     #[test]
     fn build_command_script_updates_submodules() {
         let script = DockerCodexRunner::build_command_script(
-            "https://example.com/repo.git",
-            "token",
-            "repo",
-            "abc",
-            "/root/.codex",
-            None,
-            false,
+            BuildCommandScriptInput {
+                clone_url: "https://example.com/repo.git",
+                gitlab_token: "token",
+                repo: "repo",
+                head_sha: "abc",
+                auth_mount_path: "/root/.codex",
+                target_branch: None,
+                deps_enabled: false,
+            },
             AppServerCommandOptions {
                 browser_mcp: None,
                 gitlab_discovery_mcp: None,
@@ -1680,13 +1686,15 @@ mod tests {
     #[test]
     fn build_command_script_clears_bootstrap_git_auth_before_app_server() {
         let script = DockerCodexRunner::build_command_script(
-            "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
-            "token",
-            "repo",
-            "abc",
-            "/root/.codex",
-            Some("main"),
-            false,
+            BuildCommandScriptInput {
+                clone_url: "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+                gitlab_token: "token",
+                repo: "repo",
+                head_sha: "abc",
+                auth_mount_path: "/root/.codex",
+                target_branch: Some("main"),
+                deps_enabled: false,
+            },
             AppServerCommandOptions {
                 browser_mcp: None,
                 gitlab_discovery_mcp: None,
@@ -1716,13 +1724,15 @@ mod tests {
     #[test]
     fn build_command_script_includes_prefetch_when_enabled() {
         let script = DockerCodexRunner::build_command_script(
-            "https://example.com/repo.git",
-            "token",
-            "repo",
-            "abc",
-            "/root/.codex",
-            None,
-            true,
+            BuildCommandScriptInput {
+                clone_url: "https://example.com/repo.git",
+                gitlab_token: "token",
+                repo: "repo",
+                head_sha: "abc",
+                auth_mount_path: "/root/.codex",
+                target_branch: None,
+                deps_enabled: true,
+            },
             AppServerCommandOptions {
                 browser_mcp: None,
                 gitlab_discovery_mcp: None,
@@ -1739,13 +1749,15 @@ mod tests {
     fn build_command_script_includes_mcp_server_overrides() {
         let overrides = BTreeMap::from([("github".to_string(), false)]);
         let script = DockerCodexRunner::build_command_script(
-            "https://example.com/repo.git",
-            "token",
-            "repo",
-            "abc",
-            "/root/.codex",
-            None,
-            false,
+            BuildCommandScriptInput {
+                clone_url: "https://example.com/repo.git",
+                gitlab_token: "token",
+                repo: "repo",
+                head_sha: "abc",
+                auth_mount_path: "/root/.codex",
+                target_branch: None,
+                deps_enabled: false,
+            },
             AppServerCommandOptions {
                 browser_mcp: None,
                 gitlab_discovery_mcp: None,
@@ -1869,13 +1881,15 @@ mod tests {
     #[test]
     fn build_command_script_includes_reasoning_effort_override() {
         let script = DockerCodexRunner::build_command_script(
-            "https://example.com/repo.git",
-            "token",
-            "repo",
-            "abc",
-            "/root/.codex",
-            None,
-            false,
+            BuildCommandScriptInput {
+                clone_url: "https://example.com/repo.git",
+                gitlab_token: "token",
+                repo: "repo",
+                head_sha: "abc",
+                auth_mount_path: "/root/.codex",
+                target_branch: None,
+                deps_enabled: false,
+            },
             AppServerCommandOptions {
                 browser_mcp: None,
                 gitlab_discovery_mcp: None,
@@ -1890,13 +1904,15 @@ mod tests {
     #[test]
     fn build_command_script_includes_reasoning_summary_override() {
         let script = DockerCodexRunner::build_command_script(
-            "https://example.com/repo.git",
-            "token",
-            "repo",
-            "abc",
-            "/root/.codex",
-            None,
-            false,
+            BuildCommandScriptInput {
+                clone_url: "https://example.com/repo.git",
+                gitlab_token: "token",
+                repo: "repo",
+                head_sha: "abc",
+                auth_mount_path: "/root/.codex",
+                target_branch: None,
+                deps_enabled: false,
+            },
             AppServerCommandOptions {
                 browser_mcp: None,
                 gitlab_discovery_mcp: None,
@@ -1911,13 +1927,15 @@ mod tests {
     #[test]
     fn build_command_script_waits_for_browser_when_enabled() {
         let script = DockerCodexRunner::build_command_script(
-            "https://example.com/repo.git",
-            "token",
-            "repo",
-            "abc",
-            "/root/.codex",
-            None,
-            false,
+            BuildCommandScriptInput {
+                clone_url: "https://example.com/repo.git",
+                gitlab_token: "token",
+                repo: "repo",
+                head_sha: "abc",
+                auth_mount_path: "/root/.codex",
+                target_branch: None,
+                deps_enabled: false,
+            },
             AppServerCommandOptions {
                 browser_mcp: Some(&BrowserMcpConfig {
                     enabled: true,

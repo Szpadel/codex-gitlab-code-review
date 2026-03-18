@@ -1,4 +1,3 @@
-use super::{GitLabDiscoveryPathEntry, GitLabDiscoveryPathEntryKind};
 use crate::config::GitLabDiscoveryAllowRule;
 use crate::feature_flags::FeatureFlagSnapshot;
 use anyhow::{Result, bail};
@@ -23,6 +22,12 @@ pub struct GitLabDiscoverySessionBinding {
 pub struct ResolvedGitLabDiscoveryAllowList {
     pub target_repos: BTreeSet<String>,
     pub target_groups: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitLabPathListing {
+    pub subgroups: Vec<String>,
+    pub repositories: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -166,13 +171,14 @@ impl ResolvedGitLabDiscoveryAllowList {
     }
 
     pub fn can_browse_group(&self, group_path: &str) -> bool {
-        self.target_groups
+        self.target_groups.iter().any(|group| {
+            group == group_path
+                || repo_belongs_to_group(group_path, group)
+                || repo_belongs_to_group(group, group_path)
+        }) || self
+            .target_repos
             .iter()
-            .any(|group| group == group_path || repo_belongs_to_group(group_path, group))
-            || self
-                .target_repos
-                .iter()
-                .any(|repo| repo_belongs_to_group(repo, group_path))
+            .any(|repo| repo_belongs_to_group(repo, group_path))
     }
 
     pub fn has_repo_within_group(&self, group_path: &str) -> bool {
@@ -185,23 +191,10 @@ impl ResolvedGitLabDiscoveryAllowList {
                 .any(|group| repo_belongs_to_group(group, group_path))
     }
 
-    pub fn root_entries(&self) -> Vec<GitLabDiscoveryPathEntry> {
-        let mut entries = self
-            .target_groups
-            .iter()
-            .map(|path| GitLabDiscoveryPathEntry {
-                kind: GitLabDiscoveryPathEntryKind::Group,
-                path: path.clone(),
-            })
-            .chain(
-                self.target_repos
-                    .iter()
-                    .map(|path| GitLabDiscoveryPathEntry {
-                        kind: GitLabDiscoveryPathEntryKind::Repo,
-                        path: path.clone(),
-                    }),
-            )
-            .collect::<Vec<_>>();
+    pub fn root_listing(&self) -> GitLabPathListing {
+        let mut subgroups = self.target_groups.clone();
+        let repositories = self.target_repos.clone();
+
         for repo in &self.target_repos {
             if self
                 .target_groups
@@ -210,17 +203,32 @@ impl ResolvedGitLabDiscoveryAllowList {
             {
                 continue;
             }
-            let Some((top_group, _)) = repo.split_once('/') else {
-                continue;
-            };
-            entries.push(GitLabDiscoveryPathEntry {
-                kind: GitLabDiscoveryPathEntryKind::Group,
-                path: top_group.to_string(),
-            });
+            if let Some((root_group, _)) = repo.split_once('/') {
+                subgroups.insert(root_group.to_string());
+            }
         }
-        entries.sort_by(|left, right| left.path.cmp(&right.path).then(left.kind.cmp(&right.kind)));
-        entries.dedup_by(|left, right| left.kind == right.kind && left.path == right.path);
-        entries
+
+        GitLabPathListing::new(subgroups, repositories)
+    }
+}
+
+impl GitLabPathListing {
+    pub fn new(
+        subgroups: impl IntoIterator<Item = String>,
+        repositories: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let mut subgroups = subgroups.into_iter().collect::<Vec<_>>();
+        subgroups.sort();
+        subgroups.dedup();
+
+        let mut repositories = repositories.into_iter().collect::<Vec<_>>();
+        repositories.sort();
+        repositories.dedup();
+
+        Self {
+            subgroups,
+            repositories,
+        }
     }
 }
 
@@ -293,17 +301,11 @@ mod tests {
         assert!(allow.can_browse_group("company/shared"));
         assert!(!allow.can_browse_group("company/other"));
         assert_eq!(
-            allow.root_entries(),
-            vec![
-                GitLabDiscoveryPathEntry {
-                    kind: GitLabDiscoveryPathEntryKind::Group,
-                    path: "company".to_string(),
-                },
-                GitLabDiscoveryPathEntry {
-                    kind: GitLabDiscoveryPathEntryKind::Repo,
-                    path: "company/shared/contracts".to_string(),
-                },
-            ]
+            allow.root_listing(),
+            GitLabPathListing {
+                subgroups: vec!["company".to_string()],
+                repositories: vec!["company/shared/contracts".to_string()],
+            }
         );
     }
 
@@ -314,9 +316,46 @@ mod tests {
             target_groups: BTreeSet::from(["company/platform".to_string()]),
         };
 
+        assert!(allow.can_browse_group("company"));
         assert!(allow.can_browse_group("company/platform"));
         assert!(allow.is_repo_allowed("company/platform/service"));
         assert!(!allow.is_repo_allowed("company/platform"));
+        assert_eq!(
+            allow.root_listing(),
+            GitLabPathListing {
+                subgroups: vec!["company/platform".to_string()],
+                repositories: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn root_listing_collapses_nested_groups_to_immediate_children() {
+        let allow = ResolvedGitLabDiscoveryAllowList {
+            target_repos: BTreeSet::from([
+                "company/apps/console".to_string(),
+                "company/shared/contracts".to_string(),
+            ]),
+            target_groups: BTreeSet::from([
+                "company/platform".to_string(),
+                "vendor/security".to_string(),
+            ]),
+        };
+
+        assert_eq!(
+            allow.root_listing(),
+            GitLabPathListing {
+                subgroups: vec![
+                    "company".to_string(),
+                    "company/platform".to_string(),
+                    "vendor/security".to_string(),
+                ],
+                repositories: vec![
+                    "company/apps/console".to_string(),
+                    "company/shared/contracts".to_string(),
+                ],
+            }
+        );
     }
 
     #[tokio::test]
