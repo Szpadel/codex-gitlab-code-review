@@ -1615,41 +1615,71 @@ mod tests {
                 reasoning_effort: None,
             },
         );
-        assert!(script.contains("git_with_rewrites clone --depth 1 --recurse-submodules"));
-        assert!(script.contains("git_with_rewrites submodule update --init --recursive"));
-        assert!(script.contains("git_with_rewrites()"));
-        assert!(script.contains("-c \"url.https://example.com/.insteadOf=git@example.com:\""));
+        assert!(script.contains("run_git clone git clone --depth 1 --recurse-submodules"));
+        assert!(script.contains("run_git submodule_update git submodule update --init --recursive"));
+        assert!(script.contains("export GIT_CONFIG_COUNT="));
+        assert!(script.contains("export GIT_CONFIG_KEY_0="));
+        assert!(script.contains("export GIT_CONFIG_VALUE_0="));
     }
 
     #[test]
-    fn git_url_rewrite_script_prefers_relative_url_root_when_present() {
-        let script = git_url_rewrite_script(
+    fn git_bootstrap_auth_setup_script_prefers_relative_url_root_when_present() {
+        let script = git_bootstrap_auth_setup_script(
             "https://oauth2:${GITLAB_TOKEN}@example.com/gitlab/group/repo.git",
             "group/repo",
+            "token",
         );
 
-        assert!(script.contains("git_with_rewrites()"));
+        assert!(script.contains("export GIT_CONFIG_COUNT='4'"));
         assert!(script.contains(
-            "-c \"url.https://oauth2:${GITLAB_TOKEN}@example.com/gitlab/.insteadOf=git@example.com:\""
+            "export GIT_CONFIG_KEY_0='url.https://oauth2:token@example.com/gitlab/.insteadOf'"
         ));
+        assert!(script.contains("export GIT_CONFIG_VALUE_0='git@example.com:'"));
+        assert!(script.contains("export GIT_CONFIG_VALUE_2='git@example.com:gitlab/'"));
+        assert!(script.contains("export GIT_CONFIG_VALUE_3='ssh://git@example.com/gitlab/'"));
+    }
+
+    #[test]
+    fn git_bootstrap_auth_setup_script_preserves_explicit_host_port_for_ssh_urls() {
+        let script = git_bootstrap_auth_setup_script(
+            "https://oauth2:${GITLAB_TOKEN}@example.com:8443/group/repo.git",
+            "group/repo",
+            "token",
+        );
+
         assert!(script.contains(
-            "-c \"url.https://oauth2:${GITLAB_TOKEN}@example.com/gitlab/.insteadOf=git@example.com:gitlab/\""
-        ));
-        assert!(script.contains(
-            "-c \"url.https://oauth2:${GITLAB_TOKEN}@example.com/gitlab/.insteadOf=ssh://git@example.com/gitlab/\""
+            "export GIT_CONFIG_VALUE_1='ssh://git@example.com:8443/'"
         ));
     }
 
     #[test]
-    fn git_url_rewrite_script_preserves_explicit_host_port_for_ssh_urls() {
-        let script = git_url_rewrite_script(
-            "https://oauth2:${GITLAB_TOKEN}@example.com:8443/group/repo.git",
-            "group/repo",
+    fn build_command_script_clears_bootstrap_git_auth_before_app_server() {
+        let script = DockerCodexRunner::build_command_script(
+            "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "token",
+            "repo",
+            "abc",
+            "/root/.codex",
+            Some("main"),
+            false,
+            AppServerCommandOptions {
+                browser_mcp: None,
+                gitlab_discovery_mcp: None,
+                mcp_server_overrides: &BTreeMap::new(),
+                reasoning_summary: None,
+                reasoning_effort: None,
+            },
         );
 
-        assert!(script.contains(
-            "-c \"url.https://oauth2:${GITLAB_TOKEN}@example.com:8443/.insteadOf=ssh://git@example.com:8443/\""
-        ));
+        let unset_pos = script.find("unset GIT_CONFIG_COUNT").expect("bootstrap git auth cleanup");
+        let unset_token_pos = script.find("unset GITLAB_TOKEN").expect("gitlab token cleanup");
+        let target_fetch_pos = script
+            .find("git fetch --depth 1 origin \"main\"")
+            .expect("target branch fetch");
+        let exec_pos = script.find("exec codex app-server").expect("app server exec");
+        assert!(target_fetch_pos < unset_pos);
+        assert!(unset_pos < exec_pos);
+        assert!(unset_token_pos < exec_pos);
     }
 
     #[test]
@@ -2055,12 +2085,14 @@ mod tests {
             },
         );
         assert!(
-            script.contains("git_with_rewrites clone --depth 1 --recurse-submodules \"https://oauth2:${GITLAB_TOKEN}@example.com/repo.git\"")
+            script.contains("run_git clone git clone --depth 1 --recurse-submodules \"https://oauth2:${GITLAB_TOKEN}@example.com/repo.git\"")
         );
-        assert!(script.contains("GITLAB_TOKEN='token'"));
+        assert!(script.contains("export GITLAB_TOKEN='token'"));
         assert!(script.contains(
-            "-c \"url.https://oauth2:${GITLAB_TOKEN}@example.com/.insteadOf=git@example.com:\""
+            "export GIT_CONFIG_KEY_0='url.https://oauth2:token@example.com/.insteadOf'"
         ));
+        assert!(script.contains("unset GIT_CONFIG_COUNT"));
+        assert!(script.contains("unset GITLAB_TOKEN"));
         assert!(!script.contains("rm -rf"));
         assert!(script.contains("git remote set-url --push origin \"no_push://disabled\""));
         assert!(script.contains("exec codex app-server"));

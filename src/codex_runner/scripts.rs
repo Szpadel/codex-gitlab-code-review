@@ -123,7 +123,8 @@ impl DockerCodexRunner {
         let head_sha_q = shell_quote(&ctx.head_sha);
         let gitlab_token_q = shell_quote(gitlab_token);
         let auth_mount_path_q = shell_quote(auth_mount_path);
-        let git_url_rewrite_script = git_url_rewrite_script(clone_url, &ctx.repo);
+        let git_auth_setup_script = git_bootstrap_auth_setup_script(clone_url, &ctx.repo, gitlab_token);
+        let git_auth_cleanup_script = git_bootstrap_auth_cleanup_script();
         let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
         let browser_wait_script = browser_wait_script(app_server.browser_mcp);
         let app_server_exec_cmd = codex_app_server_exec_command(
@@ -153,12 +154,14 @@ run_git() {{
     fi
   fi
 }}
-{git_url_rewrite_script}
-run_git clone git_with_rewrites clone --depth 1 --recurse-submodules "{clone_url_dq}" "$repo_dir"
+export GITLAB_TOKEN={gitlab_token_q}
+{git_auth_setup_script}
+run_git clone git clone --depth 1 --recurse-submodules "{clone_url_dq}" "$repo_dir"
 cd "$repo_dir"
 run_git fetch git fetch --depth 1 origin {head_sha_q}
 run_git checkout git checkout {head_sha_q}
-run_git submodule_update git_with_rewrites submodule update --init --recursive
+run_git submodule_update git submodule update --init --recursive
+{git_auth_cleanup_script}
 origin_url="$(git remote get-url origin || true)"
 if [ -n "$origin_url" ]; then
   sanitized_origin="$(printf '%s' "$origin_url" | sed -E 's#(https?://)oauth2:[^@]*@#\1#')"
@@ -192,7 +195,8 @@ fi
             gitlab_token_q = gitlab_token_q,
             head_sha_q = head_sha_q,
             auth_mount_path_q = auth_mount_path_q,
-            git_url_rewrite_script = git_url_rewrite_script,
+            git_auth_setup_script = git_auth_setup_script,
+            git_auth_cleanup_script = git_auth_cleanup_script,
             browser_prereq_script = browser_prereq_script,
             browser_wait_script = browser_wait_script,
             app_server_exec_cmd = app_server_exec_cmd,
@@ -319,7 +323,8 @@ export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
         } else {
             ""
         };
-        let git_url_rewrite_script = git_url_rewrite_script(clone_url, repo);
+        let git_auth_setup_script = git_bootstrap_auth_setup_script(clone_url, repo, gitlab_token);
+        let git_auth_cleanup_script = git_bootstrap_auth_cleanup_script();
         let gitlab_token_q = shell_quote(gitlab_token);
         let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
         let browser_wait_script = browser_wait_script(app_server.browser_mcp);
@@ -349,13 +354,15 @@ run_git() {{
     fi
   fi
 }}
-{git_url_rewrite_script}
-run_git clone git_with_rewrites clone --depth 1 --recurse-submodules "{clone_url}" repo
+export GITLAB_TOKEN={gitlab_token_q}
+{git_auth_setup_script}
+run_git clone git clone --depth 1 --recurse-submodules "{clone_url}" repo
 cd repo
 run_git fetch git fetch --depth 1 origin "{head_sha}"
 run_git checkout git checkout "{head_sha}"
-run_git submodule_update git_with_rewrites submodule update --init --recursive
-{target_branch_script}{deps_prefetch_script}# Use the mounted auth directory directly so token refresh persists.
+run_git submodule_update git submodule update --init --recursive
+{target_branch_script}{git_auth_cleanup_script}
+{deps_prefetch_script}# Use the mounted auth directory directly so token refresh persists.
 mkdir -p "{auth_mount_path}"
 export CODEX_HOME="{auth_mount_path}"
 # Ensure Codex CLI is available for app-server mode
@@ -386,7 +393,8 @@ fi
             auth_mount_path = auth_mount_path,
             target_branch_script = target_branch_script,
             deps_prefetch_script = deps_prefetch_script,
-            git_url_rewrite_script = git_url_rewrite_script,
+            git_auth_setup_script = git_auth_setup_script,
+            git_auth_cleanup_script = git_auth_cleanup_script,
             browser_prereq_script = browser_prereq_script,
             browser_wait_script = browser_wait_script,
             app_server_exec_cmd = app_server_exec_cmd
@@ -440,20 +448,19 @@ pub(crate) fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
-pub(crate) fn git_url_rewrite_script(clone_url: &str, repo: &str) -> String {
+fn git_url_rewrites(clone_url: &str, repo: &str) -> Vec<(String, String)> {
     let Some((scheme, rest)) = clone_url.split_once("://") else {
-        return String::new();
+        return Vec::new();
     };
     let Some((authority, path_with_slash)) = rest.split_once('/') else {
-        return String::new();
+        return Vec::new();
     };
 
-    let sanitized_clone_url = clone_url.replace("${GITLAB_TOKEN}", "token");
-    let Ok(parsed_clone_url) = Url::parse(&sanitized_clone_url) else {
-        return String::new();
+    let Ok(parsed_clone_url) = Url::parse(clone_url) else {
+        return Vec::new();
     };
     let Some(host) = parsed_clone_url.host_str() else {
-        return String::new();
+        return Vec::new();
     };
     let host_endpoint = authority
         .rsplit_once('@')
@@ -492,15 +499,43 @@ pub(crate) fn git_url_rewrite_script(clone_url: &str, repo: &str) -> String {
         ));
     }
 
-    let mut script = "git_with_rewrites() {\n  git".to_string();
-    for (key, value) in rewrites {
-        let pair = format!("{key}={value}")
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        script.push_str(&format!(" -c \"{pair}\""));
+    rewrites
+}
+
+pub(crate) fn git_bootstrap_auth_setup_script(
+    clone_url: &str,
+    repo: &str,
+    gitlab_token: &str,
+) -> String {
+    let materialized_clone_url = clone_url.replace("${GITLAB_TOKEN}", gitlab_token);
+    let rewrites = git_url_rewrites(&materialized_clone_url, repo);
+    if rewrites.is_empty() {
+        return String::new();
     }
-    script.push_str(" \"$@\"\n}\n");
+
+    let mut script = format!("export GIT_CONFIG_COUNT={}\n", shell_quote(&rewrites.len().to_string()));
+    for (index, (key, value)) in rewrites.into_iter().enumerate() {
+        script.push_str(&format!(
+            "export GIT_CONFIG_KEY_{index}={}\nexport GIT_CONFIG_VALUE_{index}={}\n",
+            shell_quote(&key),
+            shell_quote(&value)
+        ));
+    }
     script
+}
+
+pub(crate) fn git_bootstrap_auth_cleanup_script() -> &'static str {
+    r#"if [ -n "${GIT_CONFIG_COUNT:-}" ]; then
+  git_config_count="$GIT_CONFIG_COUNT"
+  unset GIT_CONFIG_COUNT
+  i=0
+  while [ "$i" -lt "$git_config_count" ]; do
+    unset "GIT_CONFIG_KEY_$i" "GIT_CONFIG_VALUE_$i"
+    i=$((i + 1))
+  done
+fi
+unset GITLAB_TOKEN
+"#
 }
 
 pub(crate) fn escape_toml_basic_string(value: &str) -> String {
