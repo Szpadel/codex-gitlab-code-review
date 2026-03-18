@@ -55,11 +55,35 @@ pub struct DiffRefs {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitLabProjectSummary {
     pub path_with_namespace: String,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub marked_for_deletion_on: Option<String>,
+    #[serde(default)]
+    pub marked_for_deletion_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GitLabGroupSummary {
     pub full_path: String,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub marked_for_deletion_on: Option<String>,
+}
+
+impl GitLabProjectSummary {
+    fn is_active(&self) -> bool {
+        !self.archived
+            && self.marked_for_deletion_on.is_none()
+            && self.marked_for_deletion_at.is_none()
+    }
+}
+
+impl GitLabGroupSummary {
+    fn is_active(&self) -> bool {
+        !self.archived && self.marked_for_deletion_on.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -381,7 +405,12 @@ impl GitLabApi for GitLabClient {
 
     async fn list_projects(&self) -> Result<Vec<GitLabProjectSummary>> {
         let url = format!("{}/projects?simple=true", self.api_base);
-        self.get_paginated(&url).await
+        Ok(self
+            .get_paginated::<GitLabProjectSummary>(&url)
+            .await?
+            .into_iter()
+            .filter(GitLabProjectSummary::is_active)
+            .collect())
     }
 
     async fn list_group_projects(&self, group: &str) -> Result<Vec<GitLabProjectSummary>> {
@@ -390,7 +419,12 @@ impl GitLabApi for GitLabClient {
             "{}/groups/{}/projects?include_subgroups=true&simple=true",
             self.api_base, encoded
         );
-        self.get_paginated(&url).await
+        Ok(self
+            .get_paginated::<GitLabProjectSummary>(&url)
+            .await?
+            .into_iter()
+            .filter(GitLabProjectSummary::is_active)
+            .collect())
     }
 
     async fn list_direct_group_projects(&self, group: &str) -> Result<Vec<GitLabProjectSummary>> {
@@ -399,13 +433,23 @@ impl GitLabApi for GitLabClient {
             "{}/groups/{}/projects?include_subgroups=false&simple=true",
             self.api_base, encoded
         );
-        self.get_paginated(&url).await
+        Ok(self
+            .get_paginated::<GitLabProjectSummary>(&url)
+            .await?
+            .into_iter()
+            .filter(GitLabProjectSummary::is_active)
+            .collect())
     }
 
     async fn list_group_subgroups(&self, group: &str) -> Result<Vec<GitLabGroupSummary>> {
         let encoded = urlencoding::encode(group);
         let url = format!("{}/groups/{}/subgroups?simple=true", self.api_base, encoded);
-        self.get_paginated(&url).await
+        Ok(self
+            .get_paginated::<GitLabGroupSummary>(&url)
+            .await?
+            .into_iter()
+            .filter(GitLabGroupSummary::is_active)
+            .collect())
     }
 
     async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>> {
@@ -919,6 +963,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_projects_excludes_inactive_entries() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(vec![
+            serde_json::json!({
+                "path_with_namespace": "group/active",
+                "archived": false,
+                "marked_for_deletion_on": null
+            }),
+            serde_json::json!({
+                "path_with_namespace": "group/archived",
+                "archived": true,
+                "marked_for_deletion_on": null
+            }),
+            serde_json::json!({
+                "path_with_namespace": "group/deleting",
+                "archived": false,
+                "marked_for_deletion_on": "2026-03-18"
+            }),
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects"))
+            .and(query_param("simple", "true"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let projects = client.list_projects().await?;
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path_with_namespace, "group/active");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn create_note_error_is_self_contained() -> Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -970,6 +1052,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_group_projects_excludes_inactive_entries() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(vec![
+            serde_json::json!({
+                "path_with_namespace": "group/sub/active",
+                "archived": false,
+                "marked_for_deletion_at": null
+            }),
+            serde_json::json!({
+                "path_with_namespace": "group/sub/archived",
+                "archived": true,
+                "marked_for_deletion_at": null
+            }),
+            serde_json::json!({
+                "path_with_namespace": "group/sub/deleting",
+                "archived": false,
+                "marked_for_deletion_at": "2026-03-18"
+            }),
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/groups/group%2Fsub/projects"))
+            .and(query_param("include_subgroups", "true"))
+            .and(query_param("simple", "true"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let projects = client.list_group_projects("group/sub").await?;
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path_with_namespace, "group/sub/active");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn list_direct_group_projects_excludes_subgroups() -> Result<()> {
         let server = MockServer::start().await;
         let response = ResponseTemplate::new(200).set_body_json(vec![serde_json::json!({
@@ -1015,6 +1136,44 @@ mod tests {
         let groups = client.list_group_subgroups("group/sub").await?;
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].full_path, "group/sub/child");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_group_subgroups_excludes_inactive_entries() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(vec![
+            serde_json::json!({
+                "full_path": "group/sub/active",
+                "archived": false,
+                "marked_for_deletion_on": null
+            }),
+            serde_json::json!({
+                "full_path": "group/sub/archived",
+                "archived": true,
+                "marked_for_deletion_on": null
+            }),
+            serde_json::json!({
+                "full_path": "group/sub/deleting",
+                "archived": false,
+                "marked_for_deletion_on": "2026-03-18"
+            }),
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/groups/group%2Fsub/subgroups"))
+            .and(query_param("simple", "true"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let groups = client.list_group_subgroups("group/sub").await?;
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].full_path, "group/sub/active");
         Ok(())
     }
 

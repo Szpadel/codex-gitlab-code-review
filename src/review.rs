@@ -668,6 +668,9 @@ mod tests {
                 .into_iter()
                 .map(|path| crate::gitlab::GitLabProjectSummary {
                     path_with_namespace: path,
+                    archived: false,
+                    marked_for_deletion_on: None,
+                    marked_for_deletion_at: None,
                 })
                 .collect())
         }
@@ -683,6 +686,9 @@ mod tests {
                 .into_iter()
                 .map(|path| crate::gitlab::GitLabProjectSummary {
                     path_with_namespace: path,
+                    archived: false,
+                    marked_for_deletion_on: None,
+                    marked_for_deletion_at: None,
                 })
                 .collect())
         }
