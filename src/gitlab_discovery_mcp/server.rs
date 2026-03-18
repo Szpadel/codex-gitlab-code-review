@@ -451,17 +451,17 @@ mod tests {
     async fn browse_listing_returns_live_children_for_group_descendants() {
         let allow = ResolvedGitLabDiscoveryAllowList {
             target_repos: BTreeSet::new(),
-            target_groups: BTreeSet::from(["shopware".to_string()]),
+            target_groups: BTreeSet::from(["example-org".to_string()]),
         };
         let gitlab = FakeGitLab {
             groups: BTreeSet::from([
-                "shopware".to_string(),
-                "shopware/infrastructure".to_string(),
+                "example-org".to_string(),
+                "example-org/platform".to_string(),
             ]),
             projects: BTreeMap::from([(
-                "shopware/infrastructure".to_string(),
+                "example-org/platform".to_string(),
                 vec![GitLabProjectSummary {
-                    path_with_namespace: "shopware/infrastructure/shopware-chart".to_string(),
+                    path_with_namespace: "example-org/platform/placeholder-service".to_string(),
                     archived: false,
                     marked_for_deletion_on: None,
                     marked_for_deletion_at: None,
@@ -470,7 +470,7 @@ mod tests {
             ..Default::default()
         };
 
-        let listing = browse_listing_for_path(&gitlab, &allow, Some("shopware/infrastructure"))
+        let listing = browse_listing_for_path(&gitlab, &allow, Some("example-org/platform"))
             .await
             .expect("listing");
 
@@ -478,7 +478,7 @@ mod tests {
             listing,
             crate::gitlab_discovery_mcp::GitLabPathListing {
                 subgroups: Vec::new(),
-                repositories: vec!["shopware/infrastructure/shopware-chart".to_string()],
+                repositories: vec!["example-org/platform/placeholder-service".to_string()],
             }
         );
     }

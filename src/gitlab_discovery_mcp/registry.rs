@@ -432,21 +432,21 @@ mod tests {
     fn target_group_descendants_do_not_leak_repo_leaves_into_root_projection() {
         let allow = ResolvedGitLabDiscoveryAllowList {
             target_repos: BTreeSet::from([
-                "shopware/payment-costs-deleted-3058".to_string(),
-                "shopware/playwright-tests-deleted-3060".to_string(),
+                "example-org/placeholder-service-a".to_string(),
+                "example-org/placeholder-service-b".to_string(),
             ]),
-            target_groups: BTreeSet::from(["shopware".to_string()]),
+            target_groups: BTreeSet::from(["example-org".to_string()]),
         };
 
         assert_eq!(
             allow.listing_for_path(None),
             Some(GitLabPathListing {
-                subgroups: vec!["shopware".to_string()],
+                subgroups: vec!["example-org".to_string()],
                 repositories: Vec::new(),
             })
         );
         assert_eq!(
-            allow.listing_for_path(Some("shopware")),
+            allow.listing_for_path(Some("example-org")),
             Some(GitLabPathListing::default())
         );
     }
