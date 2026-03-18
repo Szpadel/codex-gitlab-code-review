@@ -1169,14 +1169,11 @@ fn preserve_auxiliary_persisted_events(
     persisted_events: &[RunHistoryEventRecord],
     mut rewritten_events: Vec<crate::state::NewRunHistoryEvent>,
 ) -> Vec<crate::state::NewRunHistoryEvent> {
-    if rewritten_events.iter().any(|event| {
-        event
-            .turn_id
-            .as_deref()
-            .is_some_and(is_auxiliary_transcript_turn_id)
-    }) {
-        return rewritten_events;
-    }
+    let rewritten_auxiliary_turn_ids = rewritten_events
+        .iter()
+        .filter_map(|event| event.turn_id.as_deref())
+        .filter(|turn_id| is_auxiliary_transcript_turn_id(turn_id))
+        .collect::<std::collections::HashSet<_>>();
 
     let mut auxiliary_events = persisted_events
         .iter()
@@ -1185,6 +1182,12 @@ fn preserve_auxiliary_persisted_events(
                 .turn_id
                 .as_deref()
                 .is_some_and(is_auxiliary_transcript_turn_id)
+        })
+        .filter(|event| {
+            !event
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn_id| rewritten_auxiliary_turn_ids.contains(turn_id))
         })
         .map(|event| crate::state::NewRunHistoryEvent {
             sequence: event.sequence,
@@ -1482,6 +1485,7 @@ mod tests {
     fn turn_id_helpers_ignore_auxiliary_startup_warning_turns() {
         let persisted_turn_ids = std::collections::HashSet::from([
             "gitlab-discovery-mcp-startup".to_string(),
+            "composer-install".to_string(),
             "turn-1".to_string(),
         ]);
         let full_thread_events = vec![
@@ -1493,6 +1497,12 @@ mod tests {
             },
             crate::state::NewRunHistoryEvent {
                 sequence: 2,
+                turn_id: Some("composer-install".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            crate::state::NewRunHistoryEvent {
+                sequence: 3,
                 turn_id: Some("turn-1".to_string()),
                 event_type: "turn_started".to_string(),
                 payload: json!({}),
@@ -1576,6 +1586,153 @@ mod tests {
         );
         assert_eq!(merged[0].sequence, 1);
         assert_eq!(merged[4].sequence, 5);
+    }
+
+    #[test]
+    fn preserve_auxiliary_persisted_events_reinjects_composer_install_turn() {
+        let persisted_events = vec![
+            RunHistoryEventRecord {
+                id: 1,
+                run_history_id: 1,
+                sequence: 1,
+                turn_id: Some("composer-install".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+                created_at: 0,
+            },
+            RunHistoryEventRecord {
+                id: 2,
+                run_history_id: 1,
+                sequence: 2,
+                turn_id: Some("composer-install".to_string()),
+                event_type: "item_completed".to_string(),
+                payload: json!({
+                    "type": "commandExecution",
+                    "command": "composer install --no-interaction --no-progress",
+                    "aggregatedOutput": "Installing dependencies",
+                    "status": "completed"
+                }),
+                created_at: 0,
+            },
+            RunHistoryEventRecord {
+                id: 3,
+                run_history_id: 1,
+                sequence: 3,
+                turn_id: Some("composer-install".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+                created_at: 0,
+            },
+        ];
+        let rewritten_events = vec![
+            crate::state::NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            crate::state::NewRunHistoryEvent {
+                sequence: 2,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+            },
+        ];
+
+        let merged = preserve_auxiliary_persisted_events(&persisted_events, rewritten_events);
+
+        assert_eq!(merged.len(), 5);
+        assert_eq!(
+            merged
+                .iter()
+                .filter_map(|event| event.turn_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                "composer-install",
+                "composer-install",
+                "composer-install",
+                "turn-1",
+                "turn-1",
+            ]
+        );
+        assert_eq!(merged[0].sequence, 1);
+        assert_eq!(merged[4].sequence, 5);
+    }
+
+    #[test]
+    fn preserve_auxiliary_persisted_events_keeps_missing_auxiliary_turns_in_mixed_runs() {
+        let persisted_events = vec![
+            RunHistoryEventRecord {
+                id: 1,
+                run_history_id: 1,
+                sequence: 1,
+                turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+                created_at: 0,
+            },
+            RunHistoryEventRecord {
+                id: 2,
+                run_history_id: 1,
+                sequence: 2,
+                turn_id: Some("composer-install".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+                created_at: 0,
+            },
+            RunHistoryEventRecord {
+                id: 3,
+                run_history_id: 1,
+                sequence: 3,
+                turn_id: Some("composer-install".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+                created_at: 0,
+            },
+        ];
+        let rewritten_events = vec![
+            crate::state::NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            crate::state::NewRunHistoryEvent {
+                sequence: 2,
+                turn_id: Some("gitlab-discovery-mcp-startup".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+            },
+            crate::state::NewRunHistoryEvent {
+                sequence: 3,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            crate::state::NewRunHistoryEvent {
+                sequence: 4,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+            },
+        ];
+
+        let merged = preserve_auxiliary_persisted_events(&persisted_events, rewritten_events);
+
+        assert_eq!(
+            merged
+                .iter()
+                .filter_map(|event| event.turn_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                "composer-install",
+                "composer-install",
+                "gitlab-discovery-mcp-startup",
+                "gitlab-discovery-mcp-startup",
+                "turn-1",
+                "turn-1",
+            ]
+        );
     }
 
     #[test]

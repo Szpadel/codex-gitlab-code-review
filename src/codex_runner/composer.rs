@@ -1,12 +1,10 @@
 use super::*;
 use crate::composer_install::{
-    ComposerAuthLookup, ComposerInstallMode, ComposerInstallResult, composer_install_exec_command,
-    composer_install_result_from_exec_output, redact_composer_related_output,
-    resolve_composer_auth,
+    COMPOSER_INSTALL_TURN_ID, ComposerAuthLookup, ComposerInstallMode, ComposerInstallResult,
+    composer_install_exec_command, composer_install_result_from_exec_output,
+    redact_composer_related_output, resolve_composer_auth,
 };
 use crate::gitlab::GitLabClient;
-
-pub(crate) const COMPOSER_INSTALL_FAILURE_TURN_ID: &str = "composer-install";
 
 impl DockerCodexRunner {
     pub(crate) async fn run_composer_install_step(
@@ -56,16 +54,18 @@ impl DockerCodexRunner {
             ),
         };
 
-        if result.attempted && !result.success {
-            warn!(
-                container_id,
-                repo_path,
-                project_path,
-                command = command_label,
-                auth_source = result.auth_source.as_deref().unwrap_or("none"),
-                "composer install failed; continuing run"
-            );
-            self.append_composer_install_failure(run_history_id, command_label, &result)
+        if result.attempted {
+            if !result.success {
+                warn!(
+                    container_id,
+                    repo_path,
+                    project_path,
+                    command = command_label,
+                    auth_source = result.auth_source.as_deref().unwrap_or("none"),
+                    "composer install failed; continuing run"
+                );
+            }
+            self.append_composer_install_result(run_history_id, command_label, &result)
                 .await;
         }
 
@@ -89,41 +89,41 @@ impl DockerCodexRunner {
         }
     }
 
-    async fn append_composer_install_failure(
+    async fn append_composer_install_result(
         &self,
         run_history_id: Option<i64>,
         command: &str,
         result: &ComposerInstallResult,
     ) {
-        let Some(log_excerpt) = result.log_excerpt.as_deref() else {
-            return;
-        };
-        let events = composer_install_failure_events(command, result, log_excerpt);
+        let events = composer_install_events(command, result);
         self.append_run_history_events(run_history_id, &events)
             .await;
     }
 }
 
-pub(crate) fn composer_install_failure_events(
+pub(crate) fn composer_install_events(
     command: &str,
     result: &ComposerInstallResult,
-    log_excerpt: &str,
 ) -> Vec<NewRunHistoryEvent> {
-    let turn_id = Some(COMPOSER_INSTALL_FAILURE_TURN_ID.to_string());
+    let turn_id = Some(COMPOSER_INSTALL_TURN_ID.to_string());
     let mut item = json!({
         "type": "commandExecution",
         "command": command,
-        "aggregatedOutput": log_excerpt,
-        "status": "failed",
+        "status": if result.success { "completed" } else { "failed" },
     });
+    if let Some(log_excerpt) = result.log_excerpt.as_deref() {
+        item["aggregatedOutput"] = json!(log_excerpt);
+    }
     if let Some(auth_source) = result.auth_source.as_deref() {
         item["metadata"] = json!({
             "authSource": auth_source,
             "mode": result.mode,
+            "success": result.success,
         });
     } else {
         item["metadata"] = json!({
             "mode": result.mode,
+            "success": result.success,
         });
     }
     vec![
@@ -163,11 +163,7 @@ mod tests {
             "install failed".to_string(),
         );
 
-        let events = composer_install_failure_events(
-            "composer install --no-dev --no-scripts",
-            &result,
-            "install failed",
-        );
+        let events = composer_install_events("composer install --no-dev --no-scripts", &result);
 
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].event_type, "turn_started");
@@ -181,5 +177,30 @@ mod tests {
         );
         assert_eq!(events[2].event_type, "turn_completed");
         assert_eq!(events[2].payload["status"], "completed");
+    }
+
+    #[test]
+    fn composer_install_success_events_create_completed_command_turn() {
+        let result = ComposerInstallResult::succeeded(
+            ComposerInstallMode::Full,
+            Some("project:group/repo".to_string()),
+            Some("Installing dependencies from lock file".to_string()),
+        );
+
+        let events =
+            composer_install_events("composer install --no-interaction --no-progress", &result);
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].payload["type"], "commandExecution");
+        assert_eq!(events[1].payload["status"], "completed");
+        assert_eq!(
+            events[1].payload["aggregatedOutput"],
+            "Installing dependencies from lock file"
+        );
+        assert_eq!(events[1].payload["metadata"]["success"], true);
+        assert_eq!(
+            events[1].payload["metadata"]["authSource"],
+            "project:group/repo"
+        );
     }
 }

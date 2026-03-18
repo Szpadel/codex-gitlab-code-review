@@ -6,7 +6,10 @@ use serde_json::Value;
 
 pub const COMPOSER_AUTH_VARIABLE_KEY: &str = "COMPOSER_AUTH";
 pub const COMPOSER_SKIP_MARKER: &str = "CODEX_COMPOSER_SKIP";
+pub const COMPOSER_INSTALL_TURN_ID: &str = "composer-install";
 pub const DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS: u64 = 300;
+const COMPOSER_SKIP_EXIT_CODE: i64 = 86;
+const COMPOSER_SKIP_REASON_MISSING_JSON: &str = "missing-composer-json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -66,13 +69,17 @@ impl ComposerInstallResult {
         }
     }
 
-    pub fn succeeded(mode: ComposerInstallMode, auth_source: Option<String>) -> Self {
+    pub fn succeeded(
+        mode: ComposerInstallMode,
+        auth_source: Option<String>,
+        log_excerpt: Option<String>,
+    ) -> Self {
         Self {
             attempted: true,
             success: true,
             mode,
             auth_source,
-            log_excerpt: None,
+            log_excerpt,
         }
     }
 
@@ -96,11 +103,12 @@ pub fn composer_install_exec_command(
     timeout_seconds: u64,
 ) -> Vec<String> {
     let composer_command = mode.command_label();
+    let skip_line = composer_skip_line();
     let script = format!(
         r#"set +e
 if [ ! -f composer.json ]; then
-  printf '{skip_marker} composer.json not found\n'
-  exit 0
+  printf '{skip_line}\n'
+  exit {skip_exit_code}
 fi
 if ! command -v composer >/dev/null 2>&1; then
   echo "composer not found in PATH" >&2
@@ -130,6 +138,7 @@ status="$?"
 kill "$watchdog_pid" 2>/dev/null || true
 wait "$watchdog_pid" 2>/dev/null || true
 if [ "$status" -eq 0 ]; then
+  tail -n 100 "$log_file"
   exit 0
 fi
 if [ -s "$timeout_marker" ]; then
@@ -138,9 +147,10 @@ if [ -s "$timeout_marker" ]; then
   exit 124
 fi
 tail -n 100 "$log_file"
-exit "$status"
+    exit "$status"
 "#,
-        skip_marker = COMPOSER_SKIP_MARKER,
+        skip_line = skip_line,
+        skip_exit_code = COMPOSER_SKIP_EXIT_CODE,
         composer_command = composer_command,
         timeout_seconds = timeout_seconds,
     );
@@ -188,20 +198,30 @@ pub fn composer_install_result_from_exec_output(
 ) -> ComposerInstallResult {
     let redacted_stdout = redact_composer_related_output(stdout, gitlab_token, composer_auth);
     let redacted_stderr = redact_composer_related_output(stderr, gitlab_token, composer_auth);
-    if redacted_stdout
-        .lines()
-        .any(|line| line.starts_with(COMPOSER_SKIP_MARKER))
-    {
+    if exit_code == COMPOSER_SKIP_EXIT_CODE && is_preflight_skip_output(&redacted_stdout) {
         return ComposerInstallResult::skipped(mode, auth_source);
     }
     if exit_code == 0 {
-        return ComposerInstallResult::succeeded(mode, auth_source);
+        return ComposerInstallResult::succeeded(
+            mode,
+            auth_source,
+            composer_success_log_excerpt(&redacted_stdout, &redacted_stderr),
+        );
     }
     ComposerInstallResult::failed(
         mode,
         auth_source,
         composer_failure_log_excerpt(&redacted_stdout, &redacted_stderr),
     )
+}
+
+fn is_preflight_skip_output(stdout: &str) -> bool {
+    let skip_line = composer_skip_line();
+    stdout.lines().any(|line| line.trim() == skip_line)
+}
+
+fn composer_skip_line() -> String {
+    format!("{COMPOSER_SKIP_MARKER}:{COMPOSER_SKIP_REASON_MISSING_JSON}")
 }
 
 pub fn redact_composer_related_output(
@@ -273,6 +293,17 @@ fn composer_failure_log_excerpt(stdout: &str, stderr: &str) -> String {
         sections.join("\n")
     };
     truncate_excerpt(&combined, 8_000)
+}
+
+fn composer_success_log_excerpt(stdout: &str, stderr: &str) -> Option<String> {
+    let mut sections = Vec::new();
+    if !stdout.trim().is_empty() {
+        sections.push(stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        sections.push(stderr.trim());
+    }
+    (!sections.is_empty()).then(|| truncate_excerpt(&sections.join("\n"), 8_000))
 }
 
 fn truncate_excerpt(input: &str, max_chars: usize) -> String {
@@ -454,8 +485,58 @@ mod tests {
         let result = composer_install_result_from_exec_output(
             ComposerInstallMode::Full,
             None,
+            86,
+            "CODEX_COMPOSER_SKIP:missing-composer-json\n",
+            "",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            result,
+            ComposerInstallResult::skipped(ComposerInstallMode::Full, None)
+        );
+    }
+
+    #[test]
+    fn composer_install_result_does_not_treat_success_log_as_skip_marker() {
+        let result = composer_install_result_from_exec_output(
+            ComposerInstallMode::Full,
+            None,
             0,
-            "CODEX_COMPOSER_SKIP composer.json not found\n",
+            "Installing\nCODEX_COMPOSER_SKIP not actually a preflight skip\nDone",
+            "",
+            None,
+            None,
+        );
+
+        assert!(result.attempted);
+        assert!(result.success);
+    }
+
+    #[test]
+    fn composer_install_result_does_not_treat_success_exit_with_marker_line_as_skipped() {
+        let result = composer_install_result_from_exec_output(
+            ComposerInstallMode::Full,
+            None,
+            0,
+            "CODEX_COMPOSER_SKIP:missing-composer-json",
+            "",
+            None,
+            None,
+        );
+
+        assert!(result.attempted);
+        assert!(result.success);
+    }
+
+    #[test]
+    fn composer_install_result_treats_skip_marker_line_with_noise_as_skipped() {
+        let result = composer_install_result_from_exec_output(
+            ComposerInstallMode::Full,
+            None,
+            86,
+            "wrapper noise\nCODEX_COMPOSER_SKIP:missing-composer-json\nmore wrapper noise",
             "",
             None,
             None,
@@ -482,6 +563,25 @@ mod tests {
         assert!(result.attempted);
         assert!(!result.success);
         let excerpt = result.log_excerpt.expect("failure excerpt");
+        assert!(!excerpt.contains("s3cr3t"));
+        assert!(!excerpt.contains("token@example.com"));
+    }
+
+    #[test]
+    fn composer_install_result_keeps_redacted_success_excerpt() {
+        let result = composer_install_result_from_exec_output(
+            ComposerInstallMode::Full,
+            Some("project:group/repo".to_string()),
+            0,
+            "Installing package with s3cr3t",
+            "https://oauth2:token@example.com/repo.git",
+            Some("token"),
+            Some(r#"{"http-basic":{"example.com":{"password":"s3cr3t"}}}"#),
+        );
+
+        assert!(result.attempted);
+        assert!(result.success);
+        let excerpt = result.log_excerpt.expect("success excerpt");
         assert!(!excerpt.contains("s3cr3t"));
         assert!(!excerpt.contains("token@example.com"));
     }

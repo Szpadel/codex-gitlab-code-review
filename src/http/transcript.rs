@@ -1,4 +1,5 @@
 use super::timestamp::UiTimestamp;
+use crate::composer_install::COMPOSER_INSTALL_TURN_ID;
 use crate::state::{RunHistoryEventRecord, RunHistoryRecord};
 use serde::Serialize;
 use serde_json::Value;
@@ -6,7 +7,10 @@ use serde_json::Value;
 const GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID: &str = "gitlab-discovery-mcp-startup";
 
 pub(crate) fn is_auxiliary_transcript_turn_id(turn_id: &str) -> bool {
-    turn_id == GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID
+    matches!(
+        turn_id,
+        GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID | COMPOSER_INSTALL_TURN_ID
+    )
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -988,6 +992,114 @@ mod tests {
         .expect("thread snapshot");
 
         assert!(thread_snapshot_is_complete(&thread));
+    }
+
+    #[test]
+    fn thread_snapshot_ignores_composer_install_turn_for_completeness() {
+        let run = RunHistoryRecord {
+            id: 1,
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 1,
+            head_sha: "sha".to_string(),
+            status: "done".to_string(),
+            result: Some("commented".to_string()),
+            started_at: 0,
+            finished_at: Some(0),
+            updated_at: 0,
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            review_thread_id: None,
+            preview: Some("Preview".to_string()),
+            summary: None,
+            error: None,
+            auth_account_name: None,
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+            commit_sha: None,
+            feature_flags: FeatureFlagSnapshot::default(),
+            events_persisted_cleanly: false,
+            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
+            transcript_backfill_error: None,
+        };
+        let thread = thread_snapshot_from_events(
+            &run,
+            &[
+                crate::state::RunHistoryEventRecord {
+                    id: 1,
+                    run_history_id: 1,
+                    sequence: 1,
+                    turn_id: Some("composer-install".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 2,
+                    run_history_id: 1,
+                    sequence: 2,
+                    turn_id: Some("composer-install".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "commandExecution",
+                        "command": "composer install --no-interaction --no-progress",
+                        "aggregatedOutput": "Installing dependencies",
+                        "status": "completed"
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 3,
+                    run_history_id: 1,
+                    sequence: 3,
+                    turn_id: Some("composer-install".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 4,
+                    run_history_id: 1,
+                    sequence: 4,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: json!({}),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 5,
+                    run_history_id: 1,
+                    sequence: 5,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "item_completed".to_string(),
+                    payload: json!({
+                        "type": "agentMessage",
+                        "text": "All clear."
+                    }),
+                    created_at: 0,
+                },
+                crate::state::RunHistoryEventRecord {
+                    id: 6,
+                    run_history_id: 1,
+                    sequence: 6,
+                    turn_id: Some("turn-1".to_string()),
+                    event_type: "turn_completed".to_string(),
+                    payload: json!({"status": "completed"}),
+                    created_at: 0,
+                },
+            ],
+        )
+        .expect("thread snapshot");
+
+        assert!(thread_snapshot_is_complete(&thread));
+    }
+
+    #[test]
+    fn composer_install_turn_is_treated_as_auxiliary() {
+        assert!(is_auxiliary_transcript_turn_id(COMPOSER_INSTALL_TURN_ID));
     }
 
     #[test]
