@@ -140,7 +140,6 @@ data:
         server_name: {{ .Values.config.codex.gitlabDiscoveryMcp.serverName | quote }}
         bind_addr: {{ default (printf "0.0.0.0:%s" (include "codex-gitlab-review.gitlabDiscoveryMcpPort" .)) .Values.config.codex.gitlabDiscoveryMcp.bindAddr | quote }}
         advertise_url: {{ default "" .Values.config.codex.gitlabDiscoveryMcp.advertiseUrl | quote }}
-        bearer_token_env_var: {{ .Values.config.codex.gitlabDiscoveryMcp.bearerTokenEnvVar | quote }}
         clone_root: {{ .Values.config.codex.gitlabDiscoveryMcp.cloneRoot | quote }}
 {{- if .Values.config.codex.gitlabDiscoveryMcp.allow }}
         allow:

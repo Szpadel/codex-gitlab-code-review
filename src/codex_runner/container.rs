@@ -117,6 +117,17 @@ impl DockerCodexRunner {
         command: Vec<String>,
         cwd: Option<&str>,
     ) -> Result<ContainerExecOutput> {
+        self.exec_container_command_with_env(container_id, command, cwd, None)
+            .await
+    }
+
+    pub(crate) async fn exec_container_command_with_env(
+        &self,
+        container_id: &str,
+        command: Vec<String>,
+        cwd: Option<&str>,
+        env: Option<Vec<String>>,
+    ) -> Result<ContainerExecOutput> {
         let command_display = format_command_for_log(&command);
         let cwd_display = cwd.unwrap_or("<default>");
         info!(
@@ -137,6 +148,7 @@ impl DockerCodexRunner {
                     attach_stderr: Some(true),
                     cmd: Some(command.clone()),
                     working_dir: cwd.map(|value| value.to_string()),
+                    env,
                     ..Default::default()
                 },
             )
@@ -335,11 +347,12 @@ impl DockerCodexRunner {
         extra_binds: Vec<String>,
         extra_env: Vec<String>,
         browser_mcp: Option<&BrowserMcpConfig>,
+        extra_hosts: Vec<String>,
     ) -> Result<StartedAppServer> {
         let image_ref = Self::normalize_image_reference(&self.codex.image);
         self.ensure_image_available(&image_ref).await?;
         let browser_container_id = if let Some(browser_mcp) = browser_mcp {
-            Some(self.start_browser_container(browser_mcp).await?)
+            Some(self.start_browser_container(browser_mcp, extra_hosts.clone()).await?)
         } else {
             None
         };
@@ -361,6 +374,8 @@ impl DockerCodexRunner {
             tty: Some(false),
             host_config: Some(HostConfig {
                 binds: Some(binds),
+                extra_hosts: (browser_container_id.is_none() && !extra_hosts.is_empty())
+                    .then_some(extra_hosts),
                 network_mode: browser_container_id
                     .as_ref()
                     .map(|id| format!("container:{id}")),

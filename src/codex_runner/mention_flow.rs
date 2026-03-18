@@ -62,6 +62,7 @@ impl DockerCodexRunner {
         let script = Self::build_mention_command_script(
             ctx,
             &clone_url,
+            &self.gitlab_token,
             &self.codex.auth_mount_path,
             AppServerCommandOptions {
                 browser_mcp,
@@ -73,14 +74,9 @@ impl DockerCodexRunner {
                 reasoning_effort,
             },
         );
-        let extra_env = gitlab_discovery_mcp
+        let gitlab_discovery_extra_hosts = gitlab_discovery_mcp
             .as_ref()
-            .map(|prepared| {
-                vec![format!(
-                    "{}={}",
-                    prepared.runtime_config.bearer_token_env_var, prepared.bearer_token
-                )]
-            })
+            .map(|prepared| self.gitlab_discovery_extra_hosts(&prepared.runtime_config))
             .unwrap_or_default();
         let StartedAppServer {
             container_id,
@@ -91,19 +87,43 @@ impl DockerCodexRunner {
                 script,
                 &account.auth_host_path,
                 Vec::new(),
-                extra_env,
+                Vec::new(),
                 browser_mcp,
+                gitlab_discovery_extra_hosts,
             )
             .await?;
-        self.register_gitlab_discovery_session(
+        let gitlab_discovery_session = match self
+            .register_gitlab_discovery_session(
             gitlab_discovery_mcp.as_ref(),
             &container_id,
+            browser_container_id.as_deref().unwrap_or(&container_id),
             ctx.run_history_id,
         )
-        .await;
+        .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                warn!(
+                    container_id,
+                    error = %err,
+                    "failed to register gitlab discovery MCP session"
+                );
+                self.append_gitlab_discovery_mcp_startup_failure(
+                    ctx.run_history_id,
+                    gitlab_discovery_mcp
+                        .as_ref()
+                        .map(|prepared| prepared.runtime_config.advertise_url.as_str())
+                        .unwrap_or("<unknown>"),
+                    "failed to register MCP session binding",
+                )
+                .await;
+                None
+            }
+        };
         self.probe_gitlab_discovery_mcp_endpoint(
             gitlab_discovery_mcp.as_ref(),
             &container_id,
+            gitlab_discovery_session.as_ref(),
             ctx.run_history_id,
         )
         .await;
@@ -295,10 +315,11 @@ impl DockerCodexRunner {
                 if commit_count == 0 {
                     bail!("mention command moved HEAD without producing new commits");
                 }
-                self.exec_container_command(
+                self.exec_container_command_with_env(
                     &container_id,
                     restore_push_remote_url_exec_command(&clone_url),
                     Some(repo_dir),
+                    Some(vec![format!("GITLAB_TOKEN={}", self.gitlab_token)]),
                 )
                 .await?;
                 self.exec_container_git_command(
@@ -354,7 +375,7 @@ impl DockerCodexRunner {
 
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
             .await;
-        self.unregister_gitlab_discovery_session(gitlab_discovery_mcp.as_ref())
+        self.unregister_gitlab_discovery_session(gitlab_discovery_session.as_ref())
             .await;
 
         mention_result

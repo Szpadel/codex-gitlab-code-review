@@ -12,8 +12,6 @@ use url::Url;
 pub const BROWSER_MCP_REMOTE_DEBUGGING_PORT: u16 = 9222;
 const SUPPORTED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 const SUPPORTED_REASONING_SUMMARIES: &[&str] = &["none", "auto", "detailed"];
-const RESERVED_GITLAB_DISCOVERY_MCP_ENV_VARS: &[&str] =
-    &["GITLAB_TOKEN", "HOME", "CODEX_RUNNER_DEBUG"];
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -224,8 +222,6 @@ pub struct GitLabDiscoveryMcpConfig {
     pub bind_addr: String,
     #[serde(default)]
     pub advertise_url: String,
-    #[serde(default = "default_gitlab_discovery_mcp_bearer_token_env_var")]
-    pub bearer_token_env_var: String,
     #[serde(default = "default_gitlab_discovery_mcp_clone_root")]
     pub clone_root: String,
     #[serde(default)]
@@ -321,11 +317,7 @@ fn default_gitlab_discovery_mcp_server_name() -> String {
 }
 
 fn default_gitlab_discovery_mcp_bind_addr() -> String {
-    "127.0.0.1:8091".to_string()
-}
-
-fn default_gitlab_discovery_mcp_bearer_token_env_var() -> String {
-    "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN".to_string()
+    "0.0.0.0:8091".to_string()
 }
 
 fn default_gitlab_discovery_mcp_clone_root() -> String {
@@ -362,7 +354,6 @@ impl Default for GitLabDiscoveryMcpConfig {
             server_name: default_gitlab_discovery_mcp_server_name(),
             bind_addr: default_gitlab_discovery_mcp_bind_addr(),
             advertise_url: String::new(),
-            bearer_token_env_var: default_gitlab_discovery_mcp_bearer_token_env_var(),
             clone_root: default_gitlab_discovery_mcp_clone_root(),
             allow: Vec::new(),
         }
@@ -417,10 +408,7 @@ impl Config {
         if config.docker.host.trim().is_empty() {
             config.docker.host = default_docker_host();
         }
-        apply_gitlab_discovery_mcp_runtime_defaults(
-            &mut config,
-            env::var("POD_IP").ok().as_deref(),
-        )?;
+        apply_gitlab_discovery_mcp_runtime_defaults(&mut config)?;
         validate_codex_auth_accounts(&config.codex)?;
         validate_browser_mcp(&config.codex)?;
         validate_gitlab_discovery_mcp(&config.codex)?;
@@ -451,10 +439,7 @@ impl Config {
     }
 }
 
-fn apply_gitlab_discovery_mcp_runtime_defaults(
-    config: &mut Config,
-    pod_ip: Option<&str>,
-) -> Result<()> {
+fn apply_gitlab_discovery_mcp_runtime_defaults(config: &mut Config) -> Result<()> {
     if !config.codex.gitlab_discovery_mcp.enabled
         || !config
             .codex
@@ -466,23 +451,16 @@ fn apply_gitlab_discovery_mcp_runtime_defaults(
         return Ok(());
     }
 
-    let Some(pod_ip) = pod_ip.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(());
-    };
     let (bind_host, port) = parse_bind_addr(
         "codex.gitlab_discovery_mcp.bind_addr",
         &config.codex.gitlab_discovery_mcp.bind_addr,
     )?;
     anyhow::ensure!(
-        is_wildcard_host(&bind_host) || bind_host == pod_ip,
-        "codex.gitlab_discovery_mcp.advertise_url cannot default from POD_IP when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
+        is_wildcard_host(&bind_host),
+        "codex.gitlab_discovery_mcp.advertise_url cannot default to host.docker.internal when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
     );
-    let host = if pod_ip.contains(':') {
-        format!("[{pod_ip}]")
-    } else {
-        pod_ip.to_string()
-    };
-    config.codex.gitlab_discovery_mcp.advertise_url = format!("http://{host}:{port}/mcp");
+    config.codex.gitlab_discovery_mcp.advertise_url =
+        format!("http://host.docker.internal:{port}/mcp");
     Ok(())
 }
 
@@ -664,21 +642,9 @@ fn validate_gitlab_discovery_mcp(codex: &CodexConfig) -> Result<()> {
         matches!(advertise_url.scheme(), "http" | "https"),
         "codex.gitlab_discovery_mcp.advertise_url must use http or https"
     );
-    anyhow::ensure!(
-        !mcp.bearer_token_env_var.trim().is_empty(),
-        "codex.gitlab_discovery_mcp.bearer_token_env_var must not be empty"
-    );
-    anyhow::ensure!(
-        mcp.bearer_token_env_var
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
-        "codex.gitlab_discovery_mcp.bearer_token_env_var must contain only letters, digits, or underscores"
-    );
-    anyhow::ensure!(
-        !RESERVED_GITLAB_DISCOVERY_MCP_ENV_VARS.contains(&mcp.bearer_token_env_var.as_str()),
-        "codex.gitlab_discovery_mcp.bearer_token_env_var must not override runner-owned env vars: {}",
-        RESERVED_GITLAB_DISCOVERY_MCP_ENV_VARS.join(", ")
-    );
+    advertise_url
+        .host_str()
+        .context("parse codex.gitlab_discovery_mcp.advertise_url host")?;
     anyhow::ensure!(
         !mcp.clone_root.trim().is_empty(),
         "codex.gitlab_discovery_mcp.clone_root must not be empty"
@@ -1504,8 +1470,7 @@ codex:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:8081"
-    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
-    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    advertise_url: "http://host.docker.internal:8081/mcp"
     clone_root: "/work/mcp"
     allow: []
 database:
@@ -1548,8 +1513,7 @@ codex:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "127.0.0.1:0"
-    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
-    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    advertise_url: "http://host.docker.internal:8081/mcp"
     clone_root: "/work/mcp"
 database:
   path: "/tmp/state.sqlite"
@@ -1563,7 +1527,7 @@ server:
     }
 
     #[test]
-    fn errors_on_gitlab_discovery_mcp_reserved_bearer_token_env_var() {
+    fn defaults_gitlab_discovery_advertise_url_to_host_gateway_when_unspecified() {
         let yaml = r#"
 gitlab:
   base_url: "https://gitlab.example.com"
@@ -1592,18 +1556,18 @@ codex:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:8081"
-    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
-    bearer_token_env_var: "HOME"
+    advertise_url: ""
     clone_root: "/work/mcp"
 database:
   path: "/tmp/state.sqlite"
 server:
   bind_addr: "127.0.0.1:0"
 "#;
-        let result = try_load_from_yaml(yaml);
-        assert!(result.is_err());
-        let msg = format!("{:#}", result.expect_err("error"));
-        assert!(msg.contains("must not override runner-owned env vars"));
+        let config = load_from_yaml(yaml);
+        assert_eq!(
+            config.codex.gitlab_discovery_mcp.advertise_url,
+            "http://host.docker.internal:8081/mcp"
+        );
     }
 
     #[test]
@@ -1641,8 +1605,7 @@ codex:
     enabled: true
     server_name: "shared-mcp"
     bind_addr: "0.0.0.0:8081"
-    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
-    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    advertise_url: "http://host.docker.internal:8081/mcp"
     clone_root: "/work/mcp"
 database:
   path: "/tmp/state.sqlite"
@@ -1687,8 +1650,7 @@ codex:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:8080"
-    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
-    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    advertise_url: "http://host.docker.internal:8081/mcp"
     clone_root: "/work/mcp"
 database:
   path: "/tmp/state.sqlite"
@@ -1732,8 +1694,7 @@ codex:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "[0:0:0:0:0:0:0:0]:8080"
-    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
-    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    advertise_url: "http://host.docker.internal:8081/mcp"
     clone_root: "/work/mcp"
 database:
   path: "/tmp/state.sqlite"
@@ -2192,7 +2153,7 @@ server:
 
     #[test]
     fn detects_cluster_service_advertise_urls() {
-        let config = load_from_yaml(
+        let mut config = load_from_yaml(
             r#"
 gitlab:
   base_url: "https://gitlab.example.com"
@@ -2221,8 +2182,7 @@ codex:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:8081"
-    advertise_url: "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp"
-    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
+    advertise_url: "http://host.docker.internal:8081/mcp"
     clone_root: "/work/mcp"
 database:
   path: "/tmp/state.sqlite"
@@ -2231,9 +2191,10 @@ server:
 "#,
         );
 
-        assert!(gitlab_discovery_mcp_uses_cluster_service_advertise_url(
-            &config.codex
-        ));
+        config.codex.gitlab_discovery_mcp.advertise_url =
+            "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp".to_string();
+
+        assert!(gitlab_discovery_mcp_uses_cluster_service_advertise_url(&config.codex));
     }
 
     #[test]
@@ -2268,7 +2229,6 @@ codex:
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:8081"
     advertise_url: "http://10.42.0.15:8081/mcp"
-    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
     clone_root: "/work/mcp"
 database:
   path: "/tmp/state.sqlite"
@@ -2314,7 +2274,6 @@ codex:
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:19091"
     advertise_url: "http://10.42.0.15:19091/mcp"
-    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
     clone_root: "/work/mcp"
 database:
   path: "/tmp/state.sqlite"
@@ -2324,17 +2283,17 @@ server:
         );
         config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
-        apply_gitlab_discovery_mcp_runtime_defaults(&mut config, Some("10.42.0.15"))
-            .expect("pod IP default should be applied");
+        apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
+            .expect("host-gateway default should be applied");
 
         assert_eq!(
             config.codex.gitlab_discovery_mcp.advertise_url,
-            "http://10.42.0.15:19091/mcp"
+            "http://host.docker.internal:19091/mcp"
         );
     }
 
     #[test]
-    fn fills_gitlab_discovery_advertise_url_from_ipv6_pod_ip() {
+    fn fills_gitlab_discovery_advertise_url_from_ipv6_bind_port() {
         let mut config = load_from_yaml(
             r#"
 gitlab:
@@ -2365,7 +2324,6 @@ codex:
     server_name: "gitlab-discovery"
     bind_addr: "[::]:8081"
     advertise_url: "http://[fd00::123]:8081/mcp"
-    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
     clone_root: "/work/mcp"
 database:
   path: "/tmp/state.sqlite"
@@ -2375,17 +2333,17 @@ server:
         );
         config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
-        apply_gitlab_discovery_mcp_runtime_defaults(&mut config, Some("fd00::123"))
-            .expect("IPv6 pod IP default should be applied");
+        apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
+            .expect("host-gateway default should be applied");
 
         assert_eq!(
             config.codex.gitlab_discovery_mcp.advertise_url,
-            "http://[fd00::123]:8081/mcp"
+            "http://host.docker.internal:8081/mcp"
         );
     }
 
     #[test]
-    fn rejects_pod_ip_default_for_non_wildcard_bind_host() {
+    fn rejects_host_gateway_default_for_non_wildcard_bind_host() {
         let mut config = load_from_yaml(
             r#"
 gitlab:
@@ -2416,7 +2374,6 @@ codex:
     server_name: "gitlab-discovery"
     bind_addr: "127.0.0.1:19091"
     advertise_url: "http://127.0.0.1:19091/mcp"
-    bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"
     clone_root: "/work/mcp"
 database:
   path: "/tmp/state.sqlite"
@@ -2426,9 +2383,9 @@ server:
         );
         config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
-        let err = apply_gitlab_discovery_mcp_runtime_defaults(&mut config, Some("10.42.0.15"))
+        let err = apply_gitlab_discovery_mcp_runtime_defaults(&mut config)
             .expect_err("non-wildcard bind host should require an explicit advertise_url");
 
-        assert!(format!("{err:#}").contains("cannot default from POD_IP"));
+        assert!(format!("{err:#}").contains("cannot default to host.docker.internal"));
     }
 }

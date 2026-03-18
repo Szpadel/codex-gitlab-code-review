@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
     if gitlab_discovery_mcp_uses_cluster_service_advertise_url(&config.codex) {
         warn!(
             advertise_url = config.codex.gitlab_discovery_mcp.advertise_url.as_str(),
-            "gitlab discovery MCP advertise_url uses cluster service DNS; Docker review containers may fail to reach it, so prefer a directly reachable pod IP or explicit routable address"
+            "gitlab discovery MCP advertise_url uses cluster service DNS; Docker review containers may fail to reach it, so prefer host.docker.internal with host-gateway mapping or another explicit routable address"
         );
     }
     if let Some(command) = cli.command {

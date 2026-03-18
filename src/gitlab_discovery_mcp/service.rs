@@ -69,10 +69,6 @@ impl GitLabDiscoveryMcpService {
         &self.config.server_name
     }
 
-    pub fn bearer_token_env_var(&self) -> &str {
-        &self.config.bearer_token_env_var
-    }
-
     pub fn clone_root(&self) -> &str {
         &self.config.clone_root
     }
@@ -94,7 +90,7 @@ impl GitLabDiscoveryMcpService {
 
     pub async fn run(self: Arc<Self>, listener: TcpListener) {
         let app = build_router(Arc::clone(&self));
-        if let Err(err) = axum::serve(listener, app)
+        if let Err(err) = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .with_graceful_shutdown(async move { self.shutdown.cancelled().await })
             .await
         {

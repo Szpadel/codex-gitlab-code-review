@@ -23,22 +23,19 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: "(?m)^    allow: \\[\\]$"
-  - it: leaves advertise_url empty in config so the service can derive it from POD_IP
+  - it: leaves advertise_url empty in config so the service can derive the host-gateway default
     template: templates/configmap.yaml
     asserts:
       - matchRegex:
           path: data["config.yaml"]
           pattern: '(?m)^    advertise_url: ""$'
-  - it: exposes POD_IP to the service by default for runtime advertise URL derivation
+  - it: does not inject POD_IP when advertiseUrl is left empty
     template: templates/deployment.yaml
     asserts:
-      - contains:
+      - notContains:
           path: spec.template.spec.containers[0].env
           content:
             name: POD_IP
-            valueFrom:
-              fieldRef:
-                fieldPath: status.podIP
   - it: exposes a dedicated MCP container port
     template: templates/deployment.yaml
     asserts:
@@ -83,7 +80,7 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: '(?m)^    advertise_url: "http://gitlab-discovery.example.internal:18081/mcp"$'
-  - it: skips POD_IP injection when advertiseUrl is explicit
+  - it: still avoids POD_IP injection when advertiseUrl is explicit
     template: templates/deployment.yaml
     set:
       config.codex.gitlabDiscoveryMcp.advertiseUrl: "http://gitlab-discovery.example.internal:18081/mcp"

@@ -6,7 +6,6 @@ use crate::feature_flags::FeatureFlagSnapshot;
 use crate::gitlab::MergeRequest;
 use crate::gitlab_discovery_mcp::{
     GitLabDiscoveryMcpService, GitLabDiscoverySessionBinding, ResolvedGitLabDiscoveryAllowList,
-    generate_bearer_token,
 };
 use crate::review_prompt_templates::{
     append_additional_review_instructions, build_base_branch_review_prompt,
@@ -356,6 +355,7 @@ impl DockerCodexRunner {
                 Vec::new(),
                 Vec::new(),
                 None,
+                Vec::new(),
             )
             .await?;
 
@@ -1046,10 +1046,7 @@ mod tests {
 
         let env = runner.env_vars(&[]);
 
-        assert_eq!(
-            env,
-            vec!["GITLAB_TOKEN=token".to_string(), "HOME=/root".to_string(),]
-        );
+        assert_eq!(env, vec!["HOME=/root".to_string(),]);
     }
 
     #[test]
@@ -1259,7 +1256,6 @@ mod tests {
             Some(&GitLabDiscoveryMcpRuntimeConfig {
                 server_name: "gitlab-discovery".to_string(),
                 advertise_url: "http://gitlab-discovery.internal/mcp".to_string(),
-                bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_TOKEN".to_string(),
                 clone_root: "/work/mcp".to_string(),
             }),
             &BTreeMap::new(),
@@ -1271,9 +1267,6 @@ mod tests {
                 "mcp_servers.gitlab-discovery.url=\"http://gitlab-discovery.internal/mcp\""
             )
         );
-        assert!(cmd.contains(
-            "mcp_servers.gitlab-discovery.bearer_token_env_var=\"CODEX_GITLAB_DISCOVERY_MCP_TOKEN\""
-        ));
         assert!(cmd.contains("mcp_servers.gitlab-discovery.enabled=true"));
     }
 
@@ -1563,6 +1556,7 @@ mod tests {
     fn build_command_script_sets_writable_codex_home() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "token",
             "repo",
             "abc",
             "/root/.codex",
@@ -1584,6 +1578,7 @@ mod tests {
     fn build_command_script_fetches_target_branch() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "token",
             "repo",
             "abc",
             "/root/.codex",
@@ -1606,6 +1601,7 @@ mod tests {
     fn build_command_script_updates_submodules() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "token",
             "repo",
             "abc",
             "/root/.codex",
@@ -1619,10 +1615,10 @@ mod tests {
                 reasoning_effort: None,
             },
         );
-        assert!(script.contains("git clone --depth 1 --recurse-submodules"));
-        assert!(script.contains("git submodule update --init --recursive"));
-        assert!(script.contains("export GIT_CONFIG_KEY_0=\"url.https://example.com/.insteadOf\""));
-        assert!(script.contains("export GIT_CONFIG_VALUE_0=\"git@example.com:\""));
+        assert!(script.contains("git_with_rewrites clone --depth 1 --recurse-submodules"));
+        assert!(script.contains("git_with_rewrites submodule update --init --recursive"));
+        assert!(script.contains("git_with_rewrites()"));
+        assert!(script.contains("-c \"url.https://example.com/.insteadOf=git@example.com:\""));
     }
 
     #[test]
@@ -1632,13 +1628,16 @@ mod tests {
             "group/repo",
         );
 
-        assert!(script.contains("export GIT_CONFIG_COUNT=\"4\""));
+        assert!(script.contains("git_with_rewrites()"));
         assert!(script.contains(
-            "export GIT_CONFIG_KEY_0=\"url.https://oauth2:${GITLAB_TOKEN}@example.com/gitlab/.insteadOf\""
+            "-c \"url.https://oauth2:${GITLAB_TOKEN}@example.com/gitlab/.insteadOf=git@example.com:\""
         ));
-        assert!(script.contains("export GIT_CONFIG_VALUE_0=\"git@example.com:\""));
-        assert!(script.contains("export GIT_CONFIG_VALUE_2=\"git@example.com:gitlab/\""));
-        assert!(script.contains("export GIT_CONFIG_VALUE_3=\"ssh://git@example.com/gitlab/\""));
+        assert!(script.contains(
+            "-c \"url.https://oauth2:${GITLAB_TOKEN}@example.com/gitlab/.insteadOf=git@example.com:gitlab/\""
+        ));
+        assert!(script.contains(
+            "-c \"url.https://oauth2:${GITLAB_TOKEN}@example.com/gitlab/.insteadOf=ssh://git@example.com/gitlab/\""
+        ));
     }
 
     #[test]
@@ -1649,15 +1648,15 @@ mod tests {
         );
 
         assert!(script.contains(
-            "export GIT_CONFIG_KEY_1=\"url.https://oauth2:${GITLAB_TOKEN}@example.com:8443/.insteadOf\""
+            "-c \"url.https://oauth2:${GITLAB_TOKEN}@example.com:8443/.insteadOf=ssh://git@example.com:8443/\""
         ));
-        assert!(script.contains("export GIT_CONFIG_VALUE_1=\"ssh://git@example.com:8443/\""));
     }
 
     #[test]
     fn build_command_script_includes_prefetch_when_enabled() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "token",
             "repo",
             "abc",
             "/root/.codex",
@@ -1680,6 +1679,7 @@ mod tests {
         let overrides = BTreeMap::from([("github".to_string(), false)]);
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "token",
             "repo",
             "abc",
             "/root/.codex",
@@ -1697,11 +1697,10 @@ mod tests {
     }
 
     #[test]
-    fn gitlab_discovery_mcp_probe_exec_command_uses_runtime_url_and_env_var() {
+    fn gitlab_discovery_mcp_probe_exec_command_uses_runtime_url_and_health_check() {
         let command = gitlab_discovery_mcp_probe_exec_command(&GitLabDiscoveryMcpRuntimeConfig {
             server_name: "gitlab-discovery".to_string(),
             advertise_url: "http://10.42.0.15:8081/mcp".to_string(),
-            bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN".to_string(),
             clone_root: "/work/mcp".to_string(),
         })
         .expect("probe command");
@@ -1709,9 +1708,11 @@ mod tests {
         assert_eq!(command[0], "/bin/bash");
         assert_eq!(command[1], "-lc");
         assert!(command[2].contains("http://10.42.0.15:8081/mcp"));
-        assert!(command[2].contains("CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN"));
+        assert!(command[2].contains("http://10.42.0.15:8081/healthz"));
         assert!(command[2].contains("command -v curl"));
         assert!(command[2].contains("python3 - <<'PY'"));
+        assert!(command[2].contains("healthz unavailable"));
+        assert!(!command[2].contains("ERROR healthz failed"));
         assert!(command[2].contains("\"method\":\"initialize\""));
         assert!(command[2].contains("\"method\":\"tools/list\""));
         assert!(command[2].contains("gitlab discovery MCP tools reachable"));
@@ -1723,7 +1724,6 @@ mod tests {
             gitlab_discovery_mcp_probe_exec_command(&GitLabDiscoveryMcpRuntimeConfig {
                 server_name: "gitlab-discovery".to_string(),
                 advertise_url: "not-a-url".to_string(),
-                bearer_token_env_var: "CODEX_GITLAB_DISCOVERY_MCP_BEARER_TOKEN".to_string(),
                 clone_root: "/work/mcp".to_string(),
             })
             .is_none()
@@ -1809,6 +1809,7 @@ mod tests {
     fn build_command_script_includes_reasoning_effort_override() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "token",
             "repo",
             "abc",
             "/root/.codex",
@@ -1829,6 +1830,7 @@ mod tests {
     fn build_command_script_includes_reasoning_summary_override() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "token",
             "repo",
             "abc",
             "/root/.codex",
@@ -1849,6 +1851,7 @@ mod tests {
     fn build_command_script_waits_for_browser_when_enabled() {
         let script = DockerCodexRunner::build_command_script(
             "https://example.com/repo.git",
+            "token",
             "repo",
             "abc",
             "/root/.codex",
@@ -2041,6 +2044,7 @@ mod tests {
         let script = DockerCodexRunner::build_mention_command_script(
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "token",
             "/root/.codex",
             AppServerCommandOptions {
                 browser_mcp: None,
@@ -2051,12 +2055,12 @@ mod tests {
             },
         );
         assert!(
-            script.contains("git clone --depth 1 --recurse-submodules \"https://oauth2:${GITLAB_TOKEN}@example.com/repo.git\"")
+            script.contains("git_with_rewrites clone --depth 1 --recurse-submodules \"https://oauth2:${GITLAB_TOKEN}@example.com/repo.git\"")
         );
+        assert!(script.contains("GITLAB_TOKEN='token'"));
         assert!(script.contains(
-            "export GIT_CONFIG_KEY_0=\"url.https://oauth2:${GITLAB_TOKEN}@example.com/.insteadOf\""
+            "-c \"url.https://oauth2:${GITLAB_TOKEN}@example.com/.insteadOf=git@example.com:\""
         ));
-        assert!(script.contains("export GIT_CONFIG_VALUE_0=\"git@example.com:\""));
         assert!(!script.contains("rm -rf"));
         assert!(script.contains("git remote set-url --push origin \"no_push://disabled\""));
         assert!(script.contains("exec codex app-server"));
@@ -2099,6 +2103,7 @@ mod tests {
         let script = DockerCodexRunner::build_mention_command_script(
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "token",
             "/root/.codex",
             AppServerCommandOptions {
                 browser_mcp: None,
@@ -2145,6 +2150,7 @@ mod tests {
         let script = DockerCodexRunner::build_mention_command_script(
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "token",
             "/root/.codex",
             AppServerCommandOptions {
                 browser_mcp: None,
@@ -2191,6 +2197,7 @@ mod tests {
         let script = DockerCodexRunner::build_mention_command_script(
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "token",
             "/root/.codex",
             AppServerCommandOptions {
                 browser_mcp: None,
@@ -2237,6 +2244,7 @@ mod tests {
         let script = DockerCodexRunner::build_mention_command_script(
             &ctx,
             "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+            "token",
             "/root/.codex",
             AppServerCommandOptions {
                 browser_mcp: Some(&BrowserMcpConfig {

@@ -5,12 +5,13 @@ use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeSet, HashMap};
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitLabDiscoverySessionBinding {
     pub run_history_id: i64,
     pub container_id: String,
+    pub network_container_id: String,
+    pub peer_ips: BTreeSet<String>,
     pub source_repo: String,
     pub clone_root: String,
     pub feature_flags: FeatureFlagSnapshot,
@@ -26,8 +27,9 @@ pub struct ResolvedGitLabDiscoveryAllowList {
 
 #[derive(Debug, Default)]
 struct RegistryState {
-    bindings_by_token: HashMap<String, GitLabDiscoverySessionBinding>,
-    tokens_by_session: HashMap<String, String>,
+    bindings_by_network_container: HashMap<String, GitLabDiscoverySessionBinding>,
+    network_containers_by_peer_ip: HashMap<String, String>,
+    network_containers_by_session: HashMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -35,49 +37,114 @@ pub struct GitLabDiscoverySessionRegistry {
     state: RwLock<RegistryState>,
 }
 
-impl GitLabDiscoverySessionRegistry {
-    pub async fn register_token(&self, token: String, binding: GitLabDiscoverySessionBinding) {
-        self.state
-            .write()
-            .await
-            .bindings_by_token
-            .insert(token, binding);
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitLabDiscoveryRegistrySnapshot {
+    pub network_container_ids: Vec<String>,
+    pub peer_ips: Vec<String>,
+    pub session_ids: Vec<String>,
+}
 
-    pub async fn bind_session(&self, token: &str, session_id: &str) -> Result<()> {
+impl GitLabDiscoverySessionRegistry {
+    pub async fn register_binding(&self, binding: GitLabDiscoverySessionBinding) {
         let mut state = self.state.write().await;
-        if !state.bindings_by_token.contains_key(token) {
-            bail!("cannot bind MCP session to unknown token");
+        remove_binding_locked(&mut state, &binding.network_container_id);
+        for peer_ip in &binding.peer_ips {
+            state.network_containers_by_peer_ip.insert(
+                peer_ip.to_string(),
+                binding.network_container_id.clone(),
+            );
         }
         state
-            .tokens_by_session
-            .insert(session_id.to_string(), token.to_string());
+            .bindings_by_network_container
+            .insert(binding.network_container_id.clone(), binding);
+    }
+
+    pub async fn bind_session(&self, network_container_id: &str, session_id: &str) -> Result<()> {
+        let mut state = self.state.write().await;
+        if !state
+            .bindings_by_network_container
+            .contains_key(network_container_id)
+        {
+            bail!("cannot bind MCP session to unknown network container");
+        }
+        state
+            .network_containers_by_session
+            .insert(session_id.to_string(), network_container_id.to_string());
         Ok(())
     }
 
-    pub async fn remove_token(&self, token: &str) {
+    pub async fn remove_binding(&self, network_container_id: &str) {
         let mut state = self.state.write().await;
-        state.bindings_by_token.remove(token);
-        state
-            .tokens_by_session
-            .retain(|_, current| current != token);
+        remove_binding_locked(&mut state, network_container_id);
     }
 
-    pub async fn binding_for_request(
-        &self,
-        token: &str,
-        session_id: Option<&str>,
-    ) -> Option<GitLabDiscoverySessionBinding> {
+    pub async fn binding_for_peer(&self, peer_ip: &str) -> Option<GitLabDiscoverySessionBinding> {
         let state = self.state.read().await;
-        let binding = state.bindings_by_token.get(token)?;
-        if let Some(session_id) = session_id {
-            let bound_token = state.tokens_by_session.get(session_id)?;
-            if bound_token != token {
-                return None;
-            }
-        }
+        let network_container_id = state.network_containers_by_peer_ip.get(peer_ip)?;
+        let binding = state.bindings_by_network_container.get(network_container_id)?;
         Some(binding.clone())
     }
+
+    pub async fn binding_for_session_and_peer(
+        &self,
+        session_id: &str,
+        peer_ip: &str,
+    ) -> Option<GitLabDiscoverySessionBinding> {
+        let state = self.state.read().await;
+        let network_container_id = state.network_containers_by_session.get(session_id)?;
+        let peer_binding = state.network_containers_by_peer_ip.get(peer_ip)?;
+        if peer_binding != network_container_id {
+            return None;
+        }
+        let binding = state.bindings_by_network_container.get(network_container_id)?;
+        Some(binding.clone())
+    }
+
+    pub async fn snapshot(&self) -> GitLabDiscoveryRegistrySnapshot {
+        let state = self.state.read().await;
+        let mut network_container_ids = state
+            .bindings_by_network_container
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        network_container_ids.sort();
+        let mut peer_ips = state
+            .network_containers_by_peer_ip
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        peer_ips.sort();
+        let mut session_ids = state
+            .network_containers_by_session
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        session_ids.sort();
+        GitLabDiscoveryRegistrySnapshot {
+            network_container_ids,
+            peer_ips,
+            session_ids,
+        }
+    }
+}
+
+fn remove_binding_locked(state: &mut RegistryState, network_container_id: &str) {
+    let Some(binding) = state.bindings_by_network_container.remove(network_container_id) else {
+        state
+            .network_containers_by_session
+            .retain(|_, current| current != network_container_id);
+        return;
+    };
+    for peer_ip in binding.peer_ips {
+        if state.network_containers_by_peer_ip.get(&peer_ip).map(String::as_str)
+            == Some(network_container_id)
+        {
+            state.network_containers_by_peer_ip.remove(&peer_ip);
+        }
+    }
+    state
+        .network_containers_by_session
+        .retain(|_, current| current != network_container_id);
 }
 
 impl ResolvedGitLabDiscoveryAllowList {
@@ -172,10 +239,6 @@ pub fn resolve_allow_list(
     resolved
 }
 
-pub fn generate_bearer_token() -> String {
-    Uuid::new_v4().to_string()
-}
-
 fn repo_belongs_to_group(path: &str, group: &str) -> bool {
     path == group || path.starts_with(&format!("{group}/"))
 }
@@ -248,14 +311,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_binds_sessions_to_tokens() -> anyhow::Result<()> {
+    async fn registry_binds_sessions_to_network_container_and_peer_ip() -> anyhow::Result<()> {
         let registry = GitLabDiscoverySessionRegistry::default();
         registry
-            .register_token(
-                "token-1".to_string(),
+            .register_binding(
                 GitLabDiscoverySessionBinding {
                     run_history_id: 1,
                     container_id: "container".to_string(),
+                    network_container_id: "network-container".to_string(),
+                    peer_ips: BTreeSet::from(["172.17.0.2".to_string()]),
                     source_repo: "group/repo".to_string(),
                     clone_root: "/work/mcp".to_string(),
                     feature_flags: FeatureFlagSnapshot {
@@ -269,30 +333,34 @@ mod tests {
 
         assert!(
             registry
-                .binding_for_request("token-1", None)
+                .binding_for_peer("172.17.0.2")
                 .await
                 .is_some()
         );
         assert!(
             registry
-                .binding_for_request("token-1", Some("session-1"))
+                .binding_for_session_and_peer("session-1", "172.17.0.2")
                 .await
                 .is_none()
         );
 
-        registry.bind_session("token-1", "session-1").await?;
+        registry
+            .bind_session("network-container", "session-1")
+            .await?;
         assert!(
             registry
-                .binding_for_request("token-1", Some("session-1"))
+                .binding_for_session_and_peer("session-1", "172.17.0.2")
                 .await
                 .is_some()
         );
         assert!(
             registry
-                .binding_for_request("other", Some("session-1"))
+                .binding_for_session_and_peer("session-1", "172.17.0.3")
                 .await
                 .is_none()
         );
+        registry.remove_binding("network-container").await;
+        assert!(registry.binding_for_peer("172.17.0.2").await.is_none());
         Ok(())
     }
 }

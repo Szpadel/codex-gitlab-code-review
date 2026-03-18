@@ -8,8 +8,7 @@ use crate::gitlab::GitLabApi;
 use anyhow::Result;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::header::AUTHORIZATION;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -22,6 +21,7 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::{
     ErrorData as McpError, Json as McpJson, ServerHandler, tool, tool_handler, tool_router,
 };
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -196,17 +196,10 @@ impl GitLabDiscoveryMcpServer {
         &self,
         parts: &axum::http::request::Parts,
     ) -> Result<GitLabDiscoverySessionBinding, McpError> {
-        let token = extract_bearer_token(&parts.headers)
-            .ok_or_else(|| McpError::invalid_params("missing bearer token", None))?;
-        let session_id = parts
-            .headers
-            .get("mcp-session-id")
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| McpError::invalid_params("missing mcp-session-id header", None))?;
-        self.service
-            .registry()
-            .binding_for_request(&token, Some(session_id))
-            .await
+        parts
+            .extensions
+            .get::<GitLabDiscoverySessionBinding>()
+            .cloned()
             .ok_or_else(|| McpError::resource_not_found("MCP session binding not found", None))
     }
 }
@@ -223,13 +216,12 @@ pub(crate) fn build_router(service: Arc<GitLabDiscoveryMcpService>) -> Router {
             StreamableHttpServerConfig::default(),
         );
 
-    let protected_mcp =
-        Router::new()
-            .nest_service("/", rmcp_service)
-            .layer(middleware::from_fn_with_state(
-                service.registry(),
-                authenticate_mcp_request,
-            ));
+    let protected_mcp = Router::new()
+        .nest_service("/", rmcp_service)
+        .layer(middleware::from_fn_with_state(
+            service.registry(),
+            authenticate_mcp_request,
+        ));
 
     Router::new()
         .route("/healthz", get(|| async { "OK" }))
@@ -238,29 +230,41 @@ pub(crate) fn build_router(service: Arc<GitLabDiscoveryMcpService>) -> Router {
 
 async fn authenticate_mcp_request(
     State(registry): State<Arc<super::GitLabDiscoverySessionRegistry>>,
-    request: Request<Body>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    let peer_ip = canonical_peer_ip(peer_addr.ip());
     let incoming_session_id = request
         .headers()
         .get("mcp-session-id")
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
-    let Some(token) = extract_bearer_token(request.headers()) else {
-        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+    let binding = if let Some(session_id) = incoming_session_id.as_deref() {
+        registry
+            .binding_for_session_and_peer(session_id, &peer_ip)
+            .await
+    } else {
+        registry.binding_for_peer(&peer_ip).await
     };
-    if registry
-        .binding_for_request(&token, incoming_session_id.as_deref())
-        .await
-        .is_none()
-    {
+    let Some(binding) = binding else {
+        let snapshot = registry.snapshot().await;
+        warn!(
+            peer_ip,
+            session_id = incoming_session_id.as_deref().unwrap_or("<none>"),
+            registered_peer_ips = snapshot.peer_ips.join(","),
+            registered_network_containers = snapshot.network_container_ids.join(","),
+            "gitlab discovery MCP request did not match any registered session"
+        );
         let status = if incoming_session_id.is_some() {
             StatusCode::NOT_FOUND
         } else {
             StatusCode::UNAUTHORIZED
         };
         return (status, "MCP session is not authorized").into_response();
-    }
+    };
+
+    request.extensions_mut().insert(binding.clone());
 
     let response = next.run(request).await;
     if incoming_session_id.is_none() {
@@ -269,15 +273,27 @@ async fn authenticate_mcp_request(
             .get("mcp-session-id")
             .and_then(|value| value.to_str().ok())
         {
-            if let Err(err) = registry.bind_session(&token, session_id).await {
-                warn!(error = %err, session_id, "failed to bind MCP session to bearer token");
+            if let Err(err) = registry.bind_session(&binding.network_container_id, session_id).await
+            {
+                warn!(
+                    error = %err,
+                    session_id,
+                    peer_ip,
+                    network_container_id = binding.network_container_id.as_str(),
+                    "failed to bind MCP session to gitlab discovery peer identity"
+                );
             }
         }
     }
     response
 }
 
-fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<String> {
-    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
-    value.strip_prefix("Bearer ").map(ToOwned::to_owned)
+fn canonical_peer_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|mapped| mapped.to_string())
+            .unwrap_or_else(|| v6.to_string()),
+    }
 }

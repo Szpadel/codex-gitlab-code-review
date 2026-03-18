@@ -306,6 +306,7 @@ impl DockerCodexRunner {
     pub(crate) async fn start_browser_container(
         &self,
         browser_mcp: &BrowserMcpConfig,
+        extra_hosts: Vec<String>,
     ) -> Result<String> {
         let launch = BrowserLaunchConfig::from_browser_mcp(browser_mcp);
         let image_ref = launch.image.clone();
@@ -328,6 +329,7 @@ impl DockerCodexRunner {
             labels: Some(Self::review_container_labels(&self.owner_id)),
             host_config: Some(HostConfig {
                 auto_remove: Some(false),
+                extra_hosts: (!extra_hosts.is_empty()).then_some(extra_hosts),
                 ..Default::default()
             }),
             ..Default::default()

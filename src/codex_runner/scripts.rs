@@ -38,10 +38,7 @@ impl DockerCodexRunner {
     }
 
     pub(crate) fn env_vars(&self, extra_env: &[String]) -> Vec<String> {
-        let mut env = vec![
-            format!("GITLAB_TOKEN={}", self.gitlab_token),
-            "HOME=/root".to_string(),
-        ];
+        let mut env = vec!["HOME=/root".to_string()];
         env.extend(extra_env.iter().cloned());
         if self.log_all_json {
             env.push("CODEX_RUNNER_DEBUG=1".to_string());
@@ -82,6 +79,7 @@ impl DockerCodexRunner {
         );
         Ok(Self::build_command_script(
             &clone_url,
+            &self.gitlab_token,
             &ctx.repo,
             ctx.head_sha.as_str(),
             &self.codex.auth_mount_path,
@@ -117,11 +115,13 @@ impl DockerCodexRunner {
     pub(crate) fn build_mention_command_script(
         ctx: &MentionCommandContext,
         clone_url: &str,
+        gitlab_token: &str,
         auth_mount_path: &str,
         app_server: AppServerCommandOptions<'_>,
     ) -> String {
         let clone_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
         let head_sha_q = shell_quote(&ctx.head_sha);
+        let gitlab_token_q = shell_quote(gitlab_token);
         let auth_mount_path_q = shell_quote(auth_mount_path);
         let git_url_rewrite_script = git_url_rewrite_script(clone_url, &ctx.repo);
         let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
@@ -135,6 +135,7 @@ impl DockerCodexRunner {
         );
         format!(
             r#"set -eu
+GITLAB_TOKEN={gitlab_token_q}
 repo_dir='/work/repo'
 log_file="/tmp/codex-mention-git.log"
 mkdir -p /work
@@ -153,11 +154,11 @@ run_git() {{
   fi
 }}
 {git_url_rewrite_script}
-run_git clone git clone --depth 1 --recurse-submodules "{clone_url_dq}" "$repo_dir"
+run_git clone git_with_rewrites clone --depth 1 --recurse-submodules "{clone_url_dq}" "$repo_dir"
 cd "$repo_dir"
 run_git fetch git fetch --depth 1 origin {head_sha_q}
 run_git checkout git checkout {head_sha_q}
-run_git submodule_update git submodule update --init --recursive
+run_git submodule_update git_with_rewrites submodule update --init --recursive
 origin_url="$(git remote get-url origin || true)"
 if [ -n "$origin_url" ]; then
   sanitized_origin="$(printf '%s' "$origin_url" | sed -E 's#(https?://)oauth2:[^@]*@#\1#')"
@@ -188,6 +189,7 @@ fi
 {app_server_exec_cmd}
 "#,
             clone_url_dq = clone_url_dq,
+            gitlab_token_q = gitlab_token_q,
             head_sha_q = head_sha_q,
             auth_mount_path_q = auth_mount_path_q,
             git_url_rewrite_script = git_url_rewrite_script,
@@ -199,6 +201,7 @@ fi
 
     pub(crate) fn build_command_script(
         clone_url: &str,
+        gitlab_token: &str,
         repo: &str,
         head_sha: &str,
         auth_mount_path: &str,
@@ -317,6 +320,7 @@ export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
             ""
         };
         let git_url_rewrite_script = git_url_rewrite_script(clone_url, repo);
+        let gitlab_token_q = shell_quote(gitlab_token);
         let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
         let browser_wait_script = browser_wait_script(app_server.browser_mcp);
         let app_server_exec_cmd = codex_app_server_exec_command(
@@ -328,6 +332,7 @@ export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
         );
         format!(
             r#"set -eu
+GITLAB_TOKEN={gitlab_token_q}
 mkdir -p /work
 cd /work
 log_file="/tmp/codex-git.log"
@@ -345,11 +350,11 @@ run_git() {{
   fi
 }}
 {git_url_rewrite_script}
-run_git clone git clone --depth 1 --recurse-submodules "{clone_url}" repo
+run_git clone git_with_rewrites clone --depth 1 --recurse-submodules "{clone_url}" repo
 cd repo
 run_git fetch git fetch --depth 1 origin "{head_sha}"
 run_git checkout git checkout "{head_sha}"
-run_git submodule_update git submodule update --init --recursive
+run_git submodule_update git_with_rewrites submodule update --init --recursive
 {target_branch_script}{deps_prefetch_script}# Use the mounted auth directory directly so token refresh persists.
 mkdir -p "{auth_mount_path}"
 export CODEX_HOME="{auth_mount_path}"
@@ -374,8 +379,9 @@ fi
 {browser_prereq_script}
 {browser_wait_script}
 {app_server_exec_cmd}
-"#,
+        "#,
             clone_url = clone_url,
+            gitlab_token_q = gitlab_token_q,
             head_sha = head_sha,
             auth_mount_path = auth_mount_path,
             target_branch_script = target_branch_script,
@@ -486,13 +492,14 @@ pub(crate) fn git_url_rewrite_script(clone_url: &str, repo: &str) -> String {
         ));
     }
 
-    let mut script = format!("export GIT_CONFIG_COUNT=\"{}\"\n", rewrites.len());
-    for (index, (key, value)) in rewrites.into_iter().enumerate() {
-        let key = key.replace('\\', "\\\\").replace('"', "\\\"");
-        let value = value.replace('\\', "\\\\").replace('"', "\\\"");
-        script.push_str(&format!("export GIT_CONFIG_KEY_{index}=\"{key}\"\n"));
-        script.push_str(&format!("export GIT_CONFIG_VALUE_{index}=\"{value}\"\n"));
+    let mut script = "git_with_rewrites() {\n  git".to_string();
+    for (key, value) in rewrites {
+        let pair = format!("{key}={value}")
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        script.push_str(&format!(" -c \"{pair}\""));
     }
+    script.push_str(" \"$@\"\n}\n");
     script
 }
 
@@ -638,11 +645,6 @@ pub(crate) fn codex_app_server_exec_command(
                 "mcp_servers.{}.url={}",
                 gitlab_discovery_mcp.server_name,
                 toml_basic_string(&gitlab_discovery_mcp.advertise_url)
-            ),
-            format!(
-                "mcp_servers.{}.bearer_token_env_var={}",
-                gitlab_discovery_mcp.server_name,
-                toml_basic_string(&gitlab_discovery_mcp.bearer_token_env_var)
             ),
             format!(
                 "mcp_servers.{}.enabled=true",

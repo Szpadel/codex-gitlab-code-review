@@ -4,7 +4,7 @@ mod service;
 
 pub use registry::{
     GitLabDiscoverySessionBinding, GitLabDiscoverySessionRegistry,
-    ResolvedGitLabDiscoveryAllowList, generate_bearer_token, resolve_allow_list,
+    ResolvedGitLabDiscoveryAllowList, resolve_allow_list,
 };
 pub use service::GitLabDiscoveryMcpService;
 
