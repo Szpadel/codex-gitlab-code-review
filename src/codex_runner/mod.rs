@@ -43,6 +43,7 @@ use uuid::Uuid;
 mod app_server;
 mod auth;
 mod browser_mcp;
+mod composer;
 mod container;
 mod gitlab_discovery;
 mod mention_flow;
@@ -1710,6 +1711,9 @@ mod tests {
         let unset_token_pos = script
             .find("unset GITLAB_TOKEN")
             .expect("gitlab token cleanup");
+        let sanitize_remote_pos = script
+            .find("git remote set-url origin \"$sanitized_origin\"")
+            .expect("origin sanitization");
         let target_fetch_pos = script
             .find("git fetch --depth 1 origin \"main\"")
             .expect("target branch fetch");
@@ -1719,10 +1723,11 @@ mod tests {
         assert!(target_fetch_pos < unset_pos);
         assert!(unset_pos < exec_pos);
         assert!(unset_token_pos < exec_pos);
+        assert!(sanitize_remote_pos < exec_pos);
     }
 
     #[test]
-    fn build_command_script_includes_prefetch_when_enabled() {
+    fn build_command_script_includes_prefetch_when_enabled_without_composer_install() {
         let script = DockerCodexRunner::build_command_script(
             BuildCommandScriptInput {
                 clone_url: "https://example.com/repo.git",
@@ -1742,7 +1747,8 @@ mod tests {
             },
         );
         assert!(script.contains("prefetch_deps()"));
-        assert!(script.contains("composer install"));
+        assert!(!script.contains("composer install"));
+        assert!(script.contains("npm install"));
     }
 
     #[test]
@@ -1992,6 +1998,8 @@ mod tests {
     fn effective_feature_flags_require_injected_gitlab_discovery_mcp() {
         let requested = FeatureFlagSnapshot {
             gitlab_discovery_mcp: true,
+            composer_install: false,
+            composer_safe_install: false,
         };
 
         assert!(DockerCodexRunner::effective_feature_flags(&requested, true).gitlab_discovery_mcp);
@@ -2062,6 +2070,8 @@ mod tests {
             "",
             &FeatureFlagSnapshot {
                 gitlab_discovery_mcp: true,
+                composer_install: false,
+                composer_safe_install: false,
             },
             &BTreeMap::new(),
         );

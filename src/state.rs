@@ -2408,6 +2408,8 @@ mod tests {
 
         let overrides = RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
+            composer_install: Some(true),
+            composer_safe_install: Some(true),
         };
         store.set_runtime_feature_flag_overrides(&overrides).await?;
 
@@ -2434,6 +2436,8 @@ mod tests {
 
         let feature_flags = FeatureFlagSnapshot {
             gitlab_discovery_mcp: true,
+            composer_install: true,
+            composer_safe_install: true,
         };
         store
             .set_run_history_feature_flags(run_id, &feature_flags)

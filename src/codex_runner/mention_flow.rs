@@ -1,4 +1,25 @@
 use super::*;
+use crate::composer_install::DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS;
+use std::collections::BTreeSet;
+
+fn git_status_paths(status_output: &str) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for line in status_output.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let path = &line[3..];
+        let normalized = path
+            .rsplit_once(" -> ")
+            .map(|(_, target)| target)
+            .unwrap_or(path)
+            .trim();
+        if !normalized.is_empty() {
+            paths.insert(normalized.to_string());
+        }
+    }
+    paths
+}
 
 impl DockerCodexRunner {
     pub(crate) fn mention_developer_instructions(ctx: &MentionCommandContext) -> String {
@@ -135,8 +156,32 @@ impl DockerCodexRunner {
             },
         )
         .await;
+        let run_timeout = Duration::from_secs(self.codex.timeout_seconds);
+        let run_started_at = Instant::now();
+        let _composer_install = self
+            .run_composer_install_step(
+                &container_id,
+                repo_dir,
+                &ctx.project_path,
+                &ctx.feature_flags,
+                self.codex
+                    .timeout_seconds
+                    .min(DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS),
+                ctx.run_history_id,
+            )
+            .await;
+        let baseline_worktree_state = self
+            .exec_container_git_command(
+                &container_id,
+                &["status".to_string(), "--porcelain".to_string()],
+                Some(repo_dir),
+            )
+            .await?
+            .stdout;
+        let baseline_worktree_paths = git_status_paths(&baseline_worktree_state);
+        let remaining_timeout = run_timeout.saturating_sub(run_started_at.elapsed());
 
-        let mention_result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
+        let mention_result = timeout(remaining_timeout, async {
             client.initialize().await?;
             client.initialized().await?;
             let extra_writable_roots = gitlab_discovery_mcp
@@ -315,6 +360,36 @@ impl DockerCodexRunner {
                 if commit_count == 0 {
                     bail!("mention command moved HEAD without producing new commits");
                 }
+                if !baseline_worktree_paths.is_empty() {
+                    let committed_paths_output = self
+                        .exec_container_git_command(
+                            &container_id,
+                            &[
+                                "diff".to_string(),
+                                "--name-only".to_string(),
+                                format!("{before_sha}..{after_sha}"),
+                            ],
+                            Some(repo_dir),
+                        )
+                        .await?;
+                    let committed_paths = committed_paths_output
+                        .stdout
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .collect::<BTreeSet<_>>();
+                    let overlapping_baseline_paths = baseline_worktree_paths
+                        .iter()
+                        .filter(|path| committed_paths.contains(path.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !overlapping_baseline_paths.is_empty() {
+                        bail!(
+                            "mention command commit included baseline composer-install changes: {}",
+                            overlapping_baseline_paths.join(", ")
+                        );
+                    }
+                }
                 self.exec_container_command_with_env(
                     &container_id,
                     restore_push_remote_url_exec_command(&clone_url),
@@ -341,7 +416,7 @@ impl DockerCodexRunner {
                         Some(repo_dir),
                     )
                     .await?;
-                if !worktree_state.stdout.trim().is_empty() {
+                if worktree_state.stdout != baseline_worktree_state {
                     bail!("mention command left uncommitted changes without creating a commit");
                 }
                 (MentionCommandStatus::NoChanges, None)
@@ -462,6 +537,27 @@ impl DockerCodexRunner {
         bail!(
             "all codex auth accounts failed with usage-limit/auth errors for mention command: {}",
             auth_fallback_errors.join(" | ")
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::git_status_paths;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn git_status_paths_normalizes_plain_and_renamed_entries() {
+        let paths =
+            git_status_paths(" M composer.lock\n?? vendor/bin/tool\nR  old.php -> new.php\n");
+
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                "composer.lock".to_string(),
+                "new.php".to_string(),
+                "vendor/bin/tool".to_string(),
+            ])
         );
     }
 }

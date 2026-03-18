@@ -62,6 +62,13 @@ pub struct GitLabGroupSummary {
     pub full_path: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GitLabCiVariable {
+    pub key: String,
+    pub value: String,
+    pub environment_scope: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AwardEmoji {
     pub id: u64,
@@ -120,6 +127,26 @@ pub trait GitLabApi: Send + Sync {
     async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>>;
     async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest>;
     async fn get_project(&self, project: &str) -> Result<GitLabProject>;
+    async fn list_project_variables(&self, _project: &str) -> Result<Vec<GitLabCiVariable>> {
+        Err(anyhow!(
+            "list_project_variables not implemented for this gitlab client"
+        ))
+    }
+    async fn get_project_variable(&self, _project: &str, _key: &str) -> Result<GitLabCiVariable> {
+        Err(anyhow!(
+            "get_project_variable not implemented for this gitlab client"
+        ))
+    }
+    async fn list_group_variables(&self, _group: &str) -> Result<Vec<GitLabCiVariable>> {
+        Err(anyhow!(
+            "list_group_variables not implemented for this gitlab client"
+        ))
+    }
+    async fn get_group_variable(&self, _group: &str, _key: &str) -> Result<GitLabCiVariable> {
+        Err(anyhow!(
+            "get_group_variable not implemented for this gitlab client"
+        ))
+    }
     async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>>;
     async fn add_award(&self, project: &str, iid: u64, name: &str) -> Result<()>;
     async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()>;
@@ -217,6 +244,11 @@ impl GitLabClient {
     fn project_path(&self, project: &str) -> String {
         let encoded = urlencoding::encode(project);
         format!("{}/projects/{}", self.api_base, encoded)
+    }
+
+    fn group_path(&self, group: &str) -> String {
+        let encoded = urlencoding::encode(group);
+        format!("{}/groups/{}", self.api_base, encoded)
     }
 
     fn discussion_note_award_base_url(
@@ -401,6 +433,44 @@ impl GitLabApi for GitLabClient {
     async fn get_project(&self, project: &str) -> Result<GitLabProject> {
         let url = self.project_path(project);
         self.get_json(&url).await
+    }
+
+    async fn list_project_variables(&self, project: &str) -> Result<Vec<GitLabCiVariable>> {
+        let url = format!("{}/variables", self.project_path(project));
+        self.get_paginated(&url).await
+    }
+
+    async fn get_project_variable(&self, project: &str, key: &str) -> Result<GitLabCiVariable> {
+        let encoded_key = urlencoding::encode(key);
+        let mut url = Url::parse(&format!(
+            "{}/variables/{}",
+            self.project_path(project),
+            encoded_key
+        ))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("filter[environment_scope]", "*");
+        }
+        self.get_json(url.as_str()).await
+    }
+
+    async fn list_group_variables(&self, group: &str) -> Result<Vec<GitLabCiVariable>> {
+        let url = format!("{}/variables", self.group_path(group));
+        self.get_paginated(&url).await
+    }
+
+    async fn get_group_variable(&self, group: &str, key: &str) -> Result<GitLabCiVariable> {
+        let encoded_key = urlencoding::encode(key);
+        let mut url = Url::parse(&format!(
+            "{}/variables/{}",
+            self.group_path(group),
+            encoded_key
+        ))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("filter[environment_scope]", "*");
+        }
+        self.get_json(url.as_str()).await
     }
 
     async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>> {
@@ -992,6 +1062,72 @@ mod tests {
             project.last_activity_at,
             Some("2025-01-01T00:00:00Z".to_string())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_project_variable_requests_global_scope_filter() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "key": "COMPOSER_AUTH",
+            "value": "{\"http-basic\":{}}",
+            "environment_scope": "*",
+            "variable_type": "env_var",
+            "protected": false,
+            "masked": true,
+            "hidden": false,
+            "raw": false,
+            "description": null
+        }));
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/variables/COMPOSER_AUTH",
+            ))
+            .and(query_param("filter[environment_scope]", "*"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let variable = client
+            .get_project_variable("group/repo", "COMPOSER_AUTH")
+            .await?;
+        assert_eq!(variable.value, "{\"http-basic\":{}}");
+        assert_eq!(variable.environment_scope, "*");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_group_variable_requests_global_scope_filter() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "key": "COMPOSER_AUTH",
+            "value": "{\"http-basic\":{}}",
+            "environment_scope": "*",
+            "variable_type": "env_var",
+            "protected": false,
+            "masked": true,
+            "hidden": false,
+            "raw": false,
+            "description": null
+        }));
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/groups/group%2Fsubgroup/variables/COMPOSER_AUTH",
+            ))
+            .and(query_param("filter[environment_scope]", "*"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let variable = client
+            .get_group_variable("group/subgroup", "COMPOSER_AUTH")
+            .await?;
+        assert_eq!(variable.value, "{\"http-basic\":{}}");
+        assert_eq!(variable.environment_scope, "*");
         Ok(())
     }
 

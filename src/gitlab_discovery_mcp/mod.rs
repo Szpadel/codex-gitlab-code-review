@@ -2,6 +2,7 @@ mod registry;
 mod server;
 mod service;
 
+use crate::composer_install::ComposerInstallResult;
 pub use registry::{
     GitLabDiscoverySessionBinding, GitLabDiscoverySessionRegistry, GitLabPathListing,
     ResolvedGitLabDiscoveryAllowList, resolve_allow_list,
@@ -42,6 +43,8 @@ pub struct CloneGitLabRepoResponse {
     pub checked_out_kind: GitLabCheckoutKind,
     pub branches: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composer_install: Option<ComposerInstallResult>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]

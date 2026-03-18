@@ -307,12 +307,6 @@ prefetch_deps() (
     MAVEN_USER_HOME="$deps_dir/m2" run_prefetch "maven go-offline" mvn -q -DskipTests dependency:go-offline
   fi
 
-  if [ -f "composer.json" ] && command -v composer >/dev/null 2>&1; then
-    mkdir -p "$deps_dir/composer-cache"
-    COMPOSER_CACHE_DIR="$deps_dir/composer-cache" COMPOSER_ALLOW_SUPERUSER=1 run_prefetch "composer install" \
-      composer install --no-dev --no-scripts --no-plugins --prefer-dist --no-interaction --no-progress
-  fi
-
   if [ "$failures" -ne 0 ]; then
     return 1
   fi
@@ -328,7 +322,6 @@ export CARGO_HOME="/work/repo/.codex_deps/cargo"
 export GOMODCACHE="/work/repo/.codex_deps/go/mod"
 export GOCACHE="/work/repo/.codex_deps/go/cache"
 export MAVEN_USER_HOME="/work/repo/.codex_deps/m2"
-export COMPOSER_CACHE_DIR="/work/repo/.codex_deps/composer-cache"
 "#
         } else {
             ""
@@ -373,6 +366,11 @@ run_git fetch git fetch --depth 1 origin "{head_sha}"
 run_git checkout git checkout "{head_sha}"
 run_git submodule_update git submodule update --init --recursive
 {target_branch_script}{git_auth_cleanup_script}
+origin_url="$(git remote get-url origin || true)"
+if [ -n "$origin_url" ]; then
+  sanitized_origin="$(printf '%s' "$origin_url" | sed -E 's#(https?://)oauth2:[^@]*@#\1#')"
+  run_git set_url git remote set-url origin "$sanitized_origin"
+fi
 {deps_prefetch_script}# Use the mounted auth directory directly so token refresh persists.
 mkdir -p "{auth_mount_path}"
 export CODEX_HOME="{auth_mount_path}"

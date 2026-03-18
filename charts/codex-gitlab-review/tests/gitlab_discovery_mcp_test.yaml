@@ -16,7 +16,7 @@ tests:
           value: ConfigMap
       - matchRegex:
           path: data["config.yaml"]
-          pattern: "(?m)^feature_flags:\\n  gitlab_discovery_mcp: false$"
+          pattern: "(?ms)^feature_flags:\\n  gitlab_discovery_mcp: false\\n  composer_install: false\\n  composer_safe_install: false$"
       - matchRegex:
           path: data["config.yaml"]
           pattern: "(?m)^  gitlab_discovery_mcp:\\n    enabled: true$"

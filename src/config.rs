@@ -424,6 +424,8 @@ impl Config {
         FeatureFlagAvailability {
             gitlab_discovery_mcp: self.codex.gitlab_discovery_mcp.enabled
                 && !self.codex.gitlab_discovery_mcp.allow.is_empty(),
+            composer_install: true,
+            composer_safe_install: true,
         }
     }
 

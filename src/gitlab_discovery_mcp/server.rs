@@ -180,6 +180,10 @@ impl GitLabDiscoveryMcpServer {
                 .await
                 .map_err(mcp_internal_error)?
         };
+        let composer_install = self
+            .service
+            .run_composer_install(&binding, &path, repo_path)
+            .await;
         let head_sha = self
             .service
             .head_sha(&binding.container_id, &path)
@@ -194,6 +198,7 @@ impl GitLabDiscoveryMcpServer {
             checked_out_kind,
             branches,
             tags,
+            composer_install,
         }))
     }
 }

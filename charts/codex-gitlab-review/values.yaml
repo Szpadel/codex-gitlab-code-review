@@ -38,6 +38,8 @@ config:
     # Runtime feature flag snapshot default. The MCP server is configured below,
     # but agent access stays off until this flag is enabled at runtime.
     gitlabDiscoveryMcp: false
+    composerInstall: false
+    composerSafeInstall: false
   schedule:
     cron: "0 * * * * *"
     timezone: "UTC"

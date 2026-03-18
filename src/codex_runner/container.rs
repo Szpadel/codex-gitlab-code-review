@@ -128,6 +128,20 @@ impl DockerCodexRunner {
         cwd: Option<&str>,
         env: Option<Vec<String>>,
     ) -> Result<ContainerExecOutput> {
+        let command_for_validation = command.clone();
+        let output = self
+            .exec_container_command_with_env_allow_failure(container_id, command, cwd, env)
+            .await?;
+        validate_container_exec_result(&command_for_validation, cwd, output)
+    }
+
+    pub(crate) async fn exec_container_command_with_env_allow_failure(
+        &self,
+        container_id: &str,
+        command: Vec<String>,
+        cwd: Option<&str>,
+        env: Option<Vec<String>>,
+    ) -> Result<ContainerExecOutput> {
         let command_display = format_command_for_log(&command);
         let cwd_display = cwd.unwrap_or("<default>");
         info!(
@@ -207,15 +221,11 @@ impl DockerCodexRunner {
                 command_display, container_id
             )
         })?;
-        let output = validate_container_exec_result(
-            &command,
-            cwd,
-            ContainerExecOutput {
-                exit_code: inspect.exit_code.unwrap_or(-1),
-                stdout,
-                stderr,
-            },
-        )?;
+        let output = ContainerExecOutput {
+            exit_code: inspect.exit_code.unwrap_or(-1),
+            stdout,
+            stderr,
+        };
 
         info!(
             container_id,

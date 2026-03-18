@@ -20,6 +20,8 @@ data:
   config.yaml: |
     feature_flags:
       gitlab_discovery_mcp: {{ .Values.config.featureFlags.gitlabDiscoveryMcp }}
+      composer_install: {{ .Values.config.featureFlags.composerInstall }}
+      composer_safe_install: {{ .Values.config.featureFlags.composerSafeInstall }}
     gitlab:
       base_url: {{ .Values.gitlab.baseUrl | quote }}
       token: ""

@@ -3,6 +3,11 @@ use super::{
     GitLabCheckoutKind, GitLabDiscoverySessionBinding, GitLabDiscoverySessionRegistry,
     ResolvedGitLabDiscoveryAllowList, resolve_allow_list,
 };
+use crate::composer_install::{
+    ComposerInstallMode, ComposerInstallResult, DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
+    composer_install_exec_command, composer_install_result_from_exec_output,
+    redact_composer_related_output, resolve_composer_auth,
+};
 use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig};
 use crate::docker_utils::connect_docker;
 use crate::gitlab::GitLabClient;
@@ -354,6 +359,49 @@ printf '%s\n' "$dest"
         Ok(output.stdout.trim().to_string())
     }
 
+    pub(crate) async fn run_composer_install(
+        &self,
+        binding: &GitLabDiscoverySessionBinding,
+        repo_path: &str,
+        gitlab_repo_path: &str,
+    ) -> Option<ComposerInstallResult> {
+        let mode = ComposerInstallMode::for_flags(&binding.feature_flags)?;
+        let auth_lookup = resolve_composer_auth(&self.gitlab, gitlab_repo_path).await;
+        let composer_auth = auth_lookup.value.clone();
+        let env = composer_auth
+            .as_ref()
+            .map(|value| vec![format!("COMPOSER_AUTH={value}")]);
+        let command = composer_install_exec_command(mode, DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS);
+        match self
+            .exec_container_command_allow_failure(
+                &binding.container_id,
+                command,
+                Some(repo_path),
+                env,
+            )
+            .await
+        {
+            Ok(output) => Some(composer_install_result_from_exec_output(
+                mode,
+                auth_lookup.source,
+                output.exit_code,
+                &output.stdout,
+                &output.stderr,
+                Some(&self.gitlab_token),
+                composer_auth.as_deref(),
+            )),
+            Err(err) => Some(ComposerInstallResult::failed(
+                mode,
+                auth_lookup.source,
+                redact_composer_related_output(
+                    &err.to_string(),
+                    Some(&self.gitlab_token),
+                    composer_auth.as_deref(),
+                ),
+            )),
+        }
+    }
+
     async fn exec_container_command(
         &self,
         container_id: &str,
@@ -430,8 +478,8 @@ printf '%s\n' "$dest"
             .context("inspect docker exec result")?;
         let output = ContainerExecOutput {
             exit_code: inspect.exit_code.unwrap_or(-1),
-            stdout: self.redact_sensitive_output(&stdout),
-            stderr: self.redact_sensitive_output(&stderr),
+            stdout: self.redact_sensitive_output(&stdout, None),
+            stderr: self.redact_sensitive_output(&stderr, None),
         };
         Ok(output)
     }
@@ -533,28 +581,8 @@ printf '%s\n' "$dest"
         }
     }
 
-    fn redact_sensitive_output(&self, input: &str) -> String {
-        let mut redacted = if self.gitlab_token.is_empty() {
-            input.to_string()
-        } else {
-            input.replace(&self.gitlab_token, "[REDACTED_GITLAB_TOKEN]")
-        };
-
-        let mut sanitized = String::with_capacity(redacted.len());
-        while let Some(index) = redacted.find("oauth2:") {
-            sanitized.push_str(&redacted[..index]);
-            let suffix = &redacted[index + "oauth2:".len()..];
-            if let Some(at_index) = suffix.find('@') {
-                sanitized.push_str("oauth2:[REDACTED]@");
-                redacted = suffix[at_index + 1..].to_string();
-            } else {
-                sanitized.push_str(&redacted[index..]);
-                redacted.clear();
-                break;
-            }
-        }
-        sanitized.push_str(&redacted);
-        sanitized
+    fn redact_sensitive_output(&self, input: &str, composer_auth: Option<&str>) -> String {
+        redact_composer_related_output(input, Some(&self.gitlab_token), composer_auth)
     }
 }
 
@@ -666,7 +694,7 @@ mod tests {
         };
 
         let input = "fatal: could not read from https://oauth2:secret-token@gitlab.example.com/group/repo.git\nplain secret-token token";
-        let output = service.redact_sensitive_output(input);
+        let output = service.redact_sensitive_output(input, None);
 
         assert!(!output.contains("secret-token"));
         assert!(output.contains("oauth2:[REDACTED]@gitlab.example.com/group/repo.git"));

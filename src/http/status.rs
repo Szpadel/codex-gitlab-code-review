@@ -241,11 +241,18 @@ impl StatusService {
                     bail!("invalid feature flag request: {flag_name} is unavailable");
                 }
             }
+            "composer_install" => {}
+            "composer_safe_install" => {}
             other => bail!("invalid feature flag: {other}"),
         }
 
         let mut overrides = self.state.get_runtime_feature_flag_overrides().await?;
-        overrides.gitlab_discovery_mcp = enabled;
+        match flag_name {
+            "gitlab_discovery_mcp" => overrides.gitlab_discovery_mcp = enabled,
+            "composer_install" => overrides.composer_install = enabled,
+            "composer_safe_install" => overrides.composer_safe_install = enabled,
+            _ => unreachable!("validated feature flag name"),
+        }
         self.state
             .set_runtime_feature_flag_overrides(&overrides)
             .await?;
@@ -264,13 +271,29 @@ impl StatusService {
             &self.config.feature_flag_availability,
             overrides,
         );
-        vec![StatusFeatureFlagSnapshot {
-            name: "gitlab_discovery_mcp".to_string(),
-            available: self.config.feature_flag_availability.gitlab_discovery_mcp,
-            default_enabled: self.config.feature_flag_defaults.gitlab_discovery_mcp,
-            runtime_override: overrides.gitlab_discovery_mcp,
-            effective_enabled: effective.gitlab_discovery_mcp,
-        }]
+        vec![
+            StatusFeatureFlagSnapshot {
+                name: "gitlab_discovery_mcp".to_string(),
+                available: self.config.feature_flag_availability.gitlab_discovery_mcp,
+                default_enabled: self.config.feature_flag_defaults.gitlab_discovery_mcp,
+                runtime_override: overrides.gitlab_discovery_mcp,
+                effective_enabled: effective.gitlab_discovery_mcp,
+            },
+            StatusFeatureFlagSnapshot {
+                name: "composer_install".to_string(),
+                available: self.config.feature_flag_availability.composer_install,
+                default_enabled: self.config.feature_flag_defaults.composer_install,
+                runtime_override: overrides.composer_install,
+                effective_enabled: effective.composer_install,
+            },
+            StatusFeatureFlagSnapshot {
+                name: "composer_safe_install".to_string(),
+                available: self.config.feature_flag_availability.composer_safe_install,
+                default_enabled: self.config.feature_flag_defaults.composer_safe_install,
+                runtime_override: overrides.composer_safe_install,
+                effective_enabled: effective.composer_safe_install,
+            },
+        ]
     }
 
     pub async fn mark_scan_started(&self, mode: ScanMode) -> Result<()> {
@@ -1628,12 +1651,27 @@ mod tests {
 
         let snapshot = service.snapshot().await?;
 
-        assert_eq!(snapshot.config.feature_flags.len(), 1);
+        assert_eq!(snapshot.config.feature_flags.len(), 3);
         assert_eq!(
-            snapshot.config.feature_flags[0].name,
-            "gitlab_discovery_mcp"
+            snapshot
+                .config
+                .feature_flags
+                .iter()
+                .map(|flag| flag.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "gitlab_discovery_mcp",
+                "composer_install",
+                "composer_safe_install",
+            ]
         );
-        assert!(!snapshot.config.feature_flags[0].effective_enabled);
+        assert!(
+            snapshot
+                .config
+                .feature_flags
+                .iter()
+                .all(|flag| !flag.effective_enabled)
+        );
         Ok(())
     }
 
@@ -1687,6 +1725,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_runtime_feature_flag_persists_composer_overrides() -> anyhow::Result<()> {
+        let store = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+
+        let updated = service
+            .update_runtime_feature_flag("composer_install", Some(true))
+            .await?;
+        assert_eq!(updated.runtime_override, Some(true));
+        assert!(updated.effective_enabled);
+
+        let safe_updated = service
+            .update_runtime_feature_flag("composer_safe_install", Some(true))
+            .await?;
+        assert_eq!(safe_updated.runtime_override, Some(true));
+        assert!(safe_updated.effective_enabled);
+
+        let stored = store.get_runtime_feature_flag_overrides().await?;
+        assert_eq!(stored.composer_install, Some(true));
+        assert_eq!(stored.composer_safe_install, Some(true));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> anyhow::Result<()>
     {
         let store = Arc::new(ReviewStateStore::new(":memory:").await?);
@@ -1694,6 +1755,8 @@ mod tests {
             .set_runtime_feature_flag_overrides(
                 &crate::feature_flags::RuntimeFeatureFlagOverrides {
                     gitlab_discovery_mcp: Some(true),
+                    composer_install: None,
+                    composer_safe_install: None,
                 },
             )
             .await?;

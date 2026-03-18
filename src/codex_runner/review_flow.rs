@@ -1,4 +1,5 @@
 use super::*;
+use crate::composer_install::DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CodexOutput {
@@ -257,8 +258,23 @@ impl DockerCodexRunner {
             },
         )
         .await;
+        let run_timeout = Duration::from_secs(self.codex.timeout_seconds);
+        let run_started_at = Instant::now();
+        let _composer_install = self
+            .run_composer_install_step(
+                &container_id,
+                repo_path,
+                &ctx.project_path,
+                &ctx.feature_flags,
+                self.codex
+                    .timeout_seconds
+                    .min(DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS),
+                ctx.run_history_id,
+            )
+            .await;
+        let remaining_timeout = run_timeout.saturating_sub(run_started_at.elapsed());
 
-        let review_result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
+        let review_result = timeout(remaining_timeout, async {
             let review_target = Self::review_target_value(
                 self.resolve_review_target_request(ctx, &container_id, repo_path)
                     .await,

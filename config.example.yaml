@@ -43,6 +43,8 @@ feature_flags:
   # Optional. Runtime defaults for feature flags. Operators can override these
   # live from the status UI/API; changes apply only to newly started runs.
   gitlab_discovery_mcp: false
+  composer_install: false
+  composer_safe_install: false
 
 review:
   # Required. Max concurrent reviews.
