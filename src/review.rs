@@ -28,6 +28,13 @@ pub enum ScanRunStatus {
     Interrupted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepoScanStatus {
+    Complete,
+    PendingSameMrWork,
+    Interrupted,
+}
+
 #[derive(Default)]
 struct ScanCounters {
     total_mrs: usize,
@@ -138,18 +145,14 @@ impl ReviewService {
         head_sha: &str,
         counters: &mut ScanCounters,
         tasks: &mut Vec<tokio::task::JoinHandle<()>>,
-    ) -> Result<bool> {
-        let MentionScheduleOutcome {
-            scheduled,
-            skipped_processed,
-            blocks_review,
-        } = self
+    ) -> Result<MentionScheduleOutcome> {
+        let outcome = self
             .mention_flow
             .schedule_for_scan(repo, mr, head_sha, tasks)
             .await?;
-        counters.mention_scheduled += scheduled;
-        counters.mention_skipped_processed += skipped_processed;
-        Ok(blocks_review)
+        counters.mention_scheduled += outcome.scheduled;
+        counters.mention_skipped_processed += outcome.skipped_processed;
+        Ok(outcome)
     }
 
     async fn scan(&self, mode: ScanMode) -> Result<ScanRunStatus> {
@@ -200,21 +203,30 @@ impl ReviewService {
                 }
             }
             let mrs = self.gitlab.list_open_mrs(repo).await?;
-            let repo_scan_complete = self
+            match self
                 .scan_repo_mrs(repo, mrs, &mut counters, &mut tasks)
-                .await?;
-            if repo_scan_complete {
-                if let Some(marker) = activity_marker {
-                    self.state
-                        .set_project_last_mr_activity(repo, &marker)
-                        .await?;
+                .await?
+            {
+                RepoScanStatus::Complete => {
+                    if let Some(marker) = activity_marker {
+                        self.state
+                            .set_project_last_mr_activity(repo, &marker)
+                            .await?;
+                    }
                 }
-            } else {
-                interrupted = true;
-                debug!(
-                    repo = repo.as_str(),
-                    "skip: not advancing activity marker because scan was interrupted"
-                );
+                RepoScanStatus::PendingSameMrWork => {
+                    debug!(
+                        repo = repo.as_str(),
+                        "skip: not advancing activity marker because same-MR work is still pending"
+                    );
+                }
+                RepoScanStatus::Interrupted => {
+                    interrupted = true;
+                    debug!(
+                        repo = repo.as_str(),
+                        "skip: not advancing activity marker because scan was interrupted"
+                    );
+                }
             }
         }
         let _ = join_all(tasks).await;
@@ -430,13 +442,14 @@ impl ReviewService {
         mrs: Vec<MergeRequest>,
         counters: &mut ScanCounters,
         tasks: &mut Vec<tokio::task::JoinHandle<()>>,
-    ) -> Result<bool> {
+    ) -> Result<RepoScanStatus> {
+        let mut pending_same_mr_work = false;
         counters.total_mrs += mrs.len();
         info!(repo = repo, count = mrs.len(), "loaded open MRs");
         for mr in mrs {
             if self.shutdown_requested() {
                 info!(repo = repo, "stopping MR scheduling: shutdown requested");
-                return Ok(false);
+                return Ok(RepoScanStatus::Interrupted);
             }
             let mut mr = mr;
             if mr.head_sha().is_none() || mr.created_at.is_none() {
@@ -450,14 +463,17 @@ impl ReviewService {
                     continue;
                 }
             };
-            let mention_scheduled = self
+            let mention_outcome = self
                 .schedule_mention_commands_for_mr(repo, &mr, &head_sha, counters, tasks)
                 .await?;
-            if mention_scheduled {
+            if mention_outcome.blocked_pending_work {
+                pending_same_mr_work = true;
+            }
+            if mention_outcome.blocks_review {
                 debug!(
                     repo = repo,
                     iid = mr.iid,
-                    "skip review scheduling in this scan: mention command(s) scheduled"
+                    "skip review scheduling in this scan: same-MR mention work is active or pending"
                 );
                 continue;
             }
@@ -507,18 +523,23 @@ impl ReviewService {
                 }
                 ReviewScheduleOutcome::SkippedLocked => {
                     counters.skipped_locked += 1;
+                    pending_same_mr_work = true;
                     debug!(
                         repo = repo,
                         iid = mr_iid,
-                        "skip: review already in progress"
+                        "skip: same-MR work already in progress"
                     );
                 }
                 ReviewScheduleOutcome::Interrupted => {
-                    return Ok(false);
+                    return Ok(RepoScanStatus::Interrupted);
                 }
             }
         }
-        Ok(true)
+        Ok(if pending_same_mr_work {
+            RepoScanStatus::PendingSameMrWork
+        } else {
+            RepoScanStatus::Complete
+        })
     }
 
     pub async fn review_mr(&self, repo: &str, iid: u64) -> Result<()> {
@@ -537,7 +558,7 @@ impl ReviewService {
         };
         let mut mention_tasks = Vec::new();
         let mut counters = ScanCounters::default();
-        let mention_scheduled = self
+        let mention_outcome = self
             .schedule_mention_commands_for_mr(
                 repo,
                 &mr,
@@ -547,7 +568,15 @@ impl ReviewService {
             )
             .await?;
         let _ = join_all(mention_tasks).await;
-        if mention_scheduled {
+        if mention_outcome.blocks_review && mention_outcome.scheduled == 0 {
+            debug!(
+                repo = repo,
+                iid = iid,
+                "skip review scheduling in this request: same-MR mention work is already in progress"
+            );
+            return Ok(());
+        }
+        if mention_outcome.scheduled > 0 {
             mr = self.gitlab.get_mr(repo, iid).await?;
             head_sha = match mr.head_sha() {
                 Some(value) => value,
@@ -2103,6 +2132,277 @@ mod tests {
             .await?
             .expect("catalog");
         assert_eq!(loaded.projects, vec!["group/fresh".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_defers_same_mr_mentions_while_active_mention_blocks_review() -> Result<()>
+    {
+        let mut config = test_config();
+        config.review.mention_commands.enabled = true;
+        config.review.mention_commands.bot_username = Some("botuser".to_string());
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let requester = GitLabUser {
+            id: 7,
+            username: Some("alice".to_string()),
+            name: Some("Alice".to_string()),
+        };
+        let mut busy_mr = mr(41, "sha41");
+        busy_mr.updated_at = Some(default_created_at() + Duration::minutes(2));
+        let mut other_mr = mr(42, "sha42");
+        other_mr.updated_at = Some(default_created_at() + Duration::minutes(1));
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(vec![busy_mr, other_mr]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 41),
+                vec![MergeRequestDiscussion {
+                    id: "discussion-41".to_string(),
+                    notes: vec![
+                        DiscussionNote {
+                            id: 1040,
+                            body: "bot context".to_string(),
+                            author: bot_user.clone(),
+                            system: false,
+                            in_reply_to_id: None,
+                            created_at: None,
+                        },
+                        DiscussionNote {
+                            id: 1041,
+                            body: "@botuser first request".to_string(),
+                            author: requester.clone(),
+                            system: false,
+                            in_reply_to_id: Some(1040),
+                            created_at: None,
+                        },
+                        DiscussionNote {
+                            id: 1042,
+                            body: "@botuser second request".to_string(),
+                            author: requester,
+                            system: false,
+                            in_reply_to_id: Some(1040),
+                            created_at: None,
+                        },
+                    ],
+                }],
+            )])),
+            users: Mutex::new(HashMap::from([(
+                7,
+                GitLabUserDetail {
+                    id: 7,
+                    username: Some("alice".to_string()),
+                    name: Some("Alice".to_string()),
+                    public_email: Some("alice@example.com".to_string()),
+                },
+            )])),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(MentionAndReviewCounterRunner {
+            mention_calls: Mutex::new(0),
+            review_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let previous_marker = format!(
+            "{}|{}",
+            (default_created_at() - Duration::days(1)).to_rfc3339(),
+            41
+        );
+        state
+            .set_project_last_mr_activity("group/repo", &previous_marker)
+            .await?;
+        state
+            .begin_mention_command("group/repo", 41, "discussion-41", 1041, "sha41")
+            .await?;
+        let service = ReviewService::new(
+            config,
+            gitlab,
+            state.clone(),
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+
+        service.scan_once_incremental().await?;
+
+        assert_eq!(*runner.review_calls.lock().unwrap(), 1);
+        assert_eq!(*runner.mention_calls.lock().unwrap(), 0);
+        let review_iids: Vec<i64> =
+            sqlx::query_scalar("SELECT iid FROM run_history WHERE kind = 'review' ORDER BY iid")
+                .fetch_all(state.pool())
+                .await?;
+        assert_eq!(review_iids, vec![42]);
+        let mention_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM run_history WHERE kind = 'mention'")
+                .fetch_one(state.pool())
+                .await?;
+        assert_eq!(mention_rows, 0);
+        let stored = state.get_project_last_mr_activity("group/repo").await?;
+        assert_eq!(stored, Some(previous_marker.clone()));
+
+        state
+            .finish_mention_command(
+                "group/repo",
+                41,
+                "discussion-41",
+                1041,
+                "sha41",
+                "no_changes",
+            )
+            .await?;
+
+        service.scan_once_incremental().await?;
+
+        assert_eq!(*runner.mention_calls.lock().unwrap(), 1);
+        let blocked_review_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM run_history WHERE kind = 'review' AND iid = ?",
+        )
+        .bind(41i64)
+        .fetch_one(state.pool())
+        .await?;
+        assert_eq!(blocked_review_rows, 0);
+        let second_trigger_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
+        )
+        .bind("group/repo")
+        .bind(41i64)
+        .bind("discussion-41")
+        .bind(1042i64)
+        .fetch_one(state.pool())
+        .await?;
+        assert_eq!(second_trigger_rows, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_defers_new_mentions_while_same_mr_review_is_in_progress() -> Result<()> {
+        let mut config = test_config();
+        config.review.mention_commands.enabled = true;
+        config.review.mention_commands.bot_username = Some("botuser".to_string());
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let requester = GitLabUser {
+            id: 7,
+            username: Some("alice".to_string()),
+            name: Some("Alice".to_string()),
+        };
+        let mut active_review_mr = mr(51, "sha51");
+        active_review_mr.updated_at = Some(default_created_at() + Duration::minutes(3));
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user: bot_user.clone(),
+            mrs: Mutex::new(vec![active_review_mr]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::from([(
+                ("group/repo".to_string(), 51),
+                vec![MergeRequestDiscussion {
+                    id: "discussion-51".to_string(),
+                    notes: vec![
+                        DiscussionNote {
+                            id: 1050,
+                            body: "bot context".to_string(),
+                            author: bot_user.clone(),
+                            system: false,
+                            in_reply_to_id: None,
+                            created_at: None,
+                        },
+                        DiscussionNote {
+                            id: 1051,
+                            body: "@botuser please follow up".to_string(),
+                            author: requester,
+                            system: false,
+                            in_reply_to_id: Some(1050),
+                            created_at: None,
+                        },
+                    ],
+                }],
+            )])),
+            users: Mutex::new(HashMap::from([(
+                7,
+                GitLabUserDetail {
+                    id: 7,
+                    username: Some("alice".to_string()),
+                    name: Some("Alice".to_string()),
+                    public_email: Some("alice@example.com".to_string()),
+                },
+            )])),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let runner = Arc::new(MentionAndReviewCounterRunner {
+            mention_calls: Mutex::new(0),
+            review_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let previous_marker = format!(
+            "{}|{}",
+            (default_created_at() - Duration::days(1)).to_rfc3339(),
+            51
+        );
+        state
+            .set_project_last_mr_activity("group/repo", &previous_marker)
+            .await?;
+        state.begin_review("group/repo", 51, "sha51").await?;
+        let service = ReviewService::new(
+            config,
+            gitlab,
+            state.clone(),
+            runner.clone(),
+            1,
+            default_created_after(),
+        );
+
+        service.scan_once_incremental().await?;
+
+        assert_eq!(*runner.review_calls.lock().unwrap(), 0);
+        assert_eq!(*runner.mention_calls.lock().unwrap(), 0);
+        let mention_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM run_history WHERE kind = 'mention'")
+                .fetch_one(state.pool())
+                .await?;
+        assert_eq!(mention_rows, 0);
+        let stored = state.get_project_last_mr_activity("group/repo").await?;
+        assert_eq!(stored, Some(previous_marker.clone()));
+
+        state
+            .finish_review("group/repo", 51, "sha51", "pass")
+            .await?;
+
+        service.scan_once_incremental().await?;
+
+        assert_eq!(*runner.review_calls.lock().unwrap(), 0);
+        assert_eq!(*runner.mention_calls.lock().unwrap(), 1);
+        let scheduled_trigger_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
+        )
+        .bind("group/repo")
+        .bind(51i64)
+        .bind("discussion-51")
+        .bind(1051i64)
+        .fetch_one(state.pool())
+        .await?;
+        assert_eq!(scheduled_trigger_rows, 1);
         Ok(())
     }
 

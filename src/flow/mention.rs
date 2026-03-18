@@ -2,7 +2,7 @@ use crate::codex_runner::{MentionCommandContext, MentionCommandResult, MentionCo
 use crate::feature_flags::FeatureFlagSnapshot;
 use crate::flow::{FlowShared, MergeRequestFlow};
 use crate::gitlab::{DiscussionNote, GitLabApi, GitLabUser, MergeRequest, MergeRequestDiscussion};
-use crate::state::{NewRunHistory, RunHistoryFinish, RunHistoryKind};
+use crate::state::{MentionCommandScanState, NewRunHistory, RunHistoryFinish, RunHistoryKind};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -31,6 +31,7 @@ pub(crate) struct MentionScheduleOutcome {
     pub(crate) scheduled: usize,
     pub(crate) skipped_processed: usize,
     pub(crate) blocks_review: bool,
+    pub(crate) blocked_pending_work: bool,
 }
 
 pub(crate) struct MentionFlow {
@@ -413,6 +414,34 @@ impl MentionFlow {
                 break;
             }
             let trigger_note_id = trigger.trigger_note.id;
+            match self
+                .shared
+                .state
+                .mention_command_scan_state(repo, mr.iid, &trigger.discussion_id, trigger_note_id)
+                .await?
+            {
+                MentionCommandScanState::InProgress => {
+                    outcome.skipped_processed += 1;
+                    outcome.blocks_review = true;
+                    outcome.blocked_pending_work = true;
+                    continue;
+                }
+                MentionCommandScanState::Completed => {
+                    outcome.skipped_processed += 1;
+                    continue;
+                }
+                MentionCommandScanState::Ready => {}
+            }
+            if self
+                .shared
+                .state
+                .mr_has_in_progress_work(repo, mr.iid)
+                .await?
+            {
+                outcome.blocks_review = true;
+                outcome.blocked_pending_work = true;
+                continue;
+            }
             if !self
                 .shared
                 .state
@@ -521,6 +550,7 @@ impl MentionFlow {
                 .await;
             outcome.scheduled += 1;
             outcome.blocks_review = true;
+            outcome.blocked_pending_work = true;
             tasks.push(tokio::spawn(async move {
                 let _branch_guard = branch_lock.lock().await;
                 let Ok(_permit) = semaphore.acquire_owned().await else {

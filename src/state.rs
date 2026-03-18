@@ -153,6 +153,13 @@ pub struct InProgressMentionCommand {
     pub head_sha: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MentionCommandScanState {
+    Ready,
+    InProgress,
+    Completed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanState {
@@ -341,6 +348,24 @@ impl ReviewStateStore {
             .collect()
     }
 
+    pub(crate) async fn has_in_progress_review(&self, repo: &str, iid: u64) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM review_state
+                WHERE repo = ? AND iid = ? AND status = 'in_progress'
+            )
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .fetch_one(&self.pool)
+        .await
+        .context("check in-progress review")?;
+        Ok(exists != 0)
+    }
+
     pub async fn clear_stale_in_progress(&self, max_age_minutes: u64) -> Result<()> {
         let cutoff = Utc::now().timestamp() - (max_age_minutes as i64 * 60);
         let now = Utc::now().timestamp();
@@ -522,6 +547,75 @@ impl ReviewStateStore {
                 })
             })
             .collect()
+    }
+
+    pub(crate) async fn has_in_progress_mention_for_mr(
+        &self,
+        repo: &str,
+        iid: u64,
+    ) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM mention_command_state
+                WHERE repo = ? AND iid = ? AND status = 'in_progress'
+            )
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .fetch_one(&self.pool)
+        .await
+        .context("check in-progress mention command")?;
+        Ok(exists != 0)
+    }
+
+    pub(crate) async fn mr_has_in_progress_work(&self, repo: &str, iid: u64) -> Result<bool> {
+        Ok(self.has_in_progress_review(repo, iid).await?
+            || self.has_in_progress_mention_for_mr(repo, iid).await?)
+    }
+
+    pub(crate) async fn mention_command_scan_state(
+        &self,
+        repo: &str,
+        iid: u64,
+        discussion_id: &str,
+        trigger_note_id: u64,
+    ) -> Result<MentionCommandScanState> {
+        let row = sqlx::query(
+            r#"
+            SELECT status, result
+            FROM mention_command_state
+            WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(discussion_id)
+        .bind(trigger_note_id as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load mention command scan state")?;
+
+        let Some(row) = row else {
+            return Ok(MentionCommandScanState::Ready);
+        };
+
+        let status: String = row
+            .try_get("status")
+            .context("read mention command scan status")?;
+        let result: Option<String> = row
+            .try_get("result")
+            .context("read mention command scan result")?;
+
+        if status == "in_progress" {
+            return Ok(MentionCommandScanState::InProgress);
+        }
+        if matches!(result.as_deref(), None | Some("cancelled")) {
+            return Ok(MentionCommandScanState::Ready);
+        }
+        Ok(MentionCommandScanState::Completed)
     }
 
     pub async fn start_run_history(&self, new_run: NewRunHistory) -> Result<i64> {

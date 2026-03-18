@@ -214,6 +214,16 @@ impl ReviewFlow {
                 ReviewScheduleOutcome::SkippedMarker,
             ));
         }
+        if self
+            .shared
+            .state
+            .has_in_progress_mention_for_mr(repo, mr.iid)
+            .await?
+        {
+            return Ok(ReviewGateOutcome::Decision(
+                ReviewScheduleOutcome::SkippedLocked,
+            ));
+        }
         if !self
             .shared
             .state
