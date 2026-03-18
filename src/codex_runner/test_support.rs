@@ -135,6 +135,7 @@ pub(crate) trait RunnerHarness: Send + Sync {
 pub(crate) struct FakeRunnerHarness {
     state: Mutex<FakeRunnerHarnessState>,
     app_protocol_requests: Arc<Mutex<Vec<Value>>>,
+    operation_log: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Default)]
@@ -235,6 +236,10 @@ impl FakeRunnerHarness {
     pub(crate) fn app_protocol_requests(&self) -> Vec<Value> {
         self.app_protocol_requests.lock().unwrap().clone()
     }
+
+    pub(crate) fn operation_log(&self) -> Vec<String> {
+        self.operation_log.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -293,6 +298,7 @@ impl RunnerHarness for FakeRunnerHarness {
         let client = build_scripted_app_client(
             scripted,
             Arc::clone(&self.app_protocol_requests),
+            Arc::clone(&self.operation_log),
             request.log_all_json,
         );
 
@@ -313,6 +319,11 @@ impl RunnerHarness for FakeRunnerHarness {
             state.expected_execs.pop_front()
         }
         .ok_or_else(|| anyhow!("unexpected fake exec request: {:?}", request))?;
+
+        self.operation_log
+            .lock()
+            .unwrap()
+            .push(format!("exec:{}", format_command_for_log(&request.command)));
 
         anyhow::ensure!(
             expected.request == request,
@@ -463,12 +474,20 @@ impl GitLabDiscoveryHandle for FakeGitLabDiscoveryHandle {
 fn build_scripted_app_client(
     scripted: ScriptedAppServer,
     protocol_requests: Arc<Mutex<Vec<Value>>>,
+    operation_log: Arc<Mutex<Vec<String>>>,
     log_all_json: bool,
 ) -> AppServerClient {
     let (client_input, server_input) = duplex(16 * 1024);
     let (server_output, client_output) = duplex(16 * 1024);
     tokio::spawn(async move {
-        serve_scripted_app_server(scripted, protocol_requests, server_input, server_output).await;
+        serve_scripted_app_server(
+            scripted,
+            protocol_requests,
+            operation_log,
+            server_input,
+            server_output,
+        )
+        .await;
     });
     let output = ReaderStream::new(client_output).map(|chunk| match chunk {
         Ok(bytes) => Ok(LogOutput::StdOut { message: bytes }),
@@ -490,6 +509,7 @@ fn build_scripted_app_client(
 async fn serve_scripted_app_server(
     scripted: ScriptedAppServer,
     protocol_requests: Arc<Mutex<Vec<Value>>>,
+    operation_log: Arc<Mutex<Vec<String>>>,
     server_input: tokio::io::DuplexStream,
     mut server_output: tokio::io::DuplexStream,
 ) {
@@ -508,6 +528,7 @@ async fn serve_scripted_app_server(
             .get("method")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        operation_log.lock().unwrap().push(format!("app:{method}"));
         let Some(id) = message.get("id").cloned() else {
             if method == "initialized" {
                 continue;

@@ -496,6 +496,10 @@ mod tests {
         ManagedContainerSummary, ScriptedAppChunk, ScriptedAppRequest, ScriptedAppServer,
     };
     use super::*;
+    use crate::composer_install::{
+        COMPOSER_SKIP_MARKER, ComposerInstallMode, DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
+        composer_install_exec_command,
+    };
     use crate::config::{
         DepsConfig, FallbackAuthAccountConfig, GitLabTargets, McpServerOverridesConfig,
     };
@@ -2821,6 +2825,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_review_with_fake_runtime_initializes_before_composer_install() -> Result<()> {
+        let harness = Arc::new(FakeRunnerHarness::default());
+        harness.push_app_server(ScriptedAppServer::from_requests(vec![
+            ScriptedAppRequest::result("initialize", json!({})),
+            ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "thread-1" } })),
+            ScriptedAppRequest::result(
+                "review/start",
+                json!({
+                    "turn": { "id": "turn-1" },
+                    "reviewThreadId": "thread-1",
+                }),
+            )
+            .with_after_response(vec![
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/started",
+                    "params": { "threadId": "thread-1", "turnId": "turn-1" }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "review-item-1",
+                            "type": "exitedReviewMode",
+                            "review": "{\"verdict\":\"pass\",\"summary\":\"ok\",\"comment_markdown\":\"\"}"
+                        }
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "turn": { "status": "completed" }
+                    }
+                })),
+            ]),
+        ]));
+        let composer_command = composer_install_exec_command(
+            ComposerInstallMode::Full,
+            DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
+        );
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: composer_command.clone(),
+                cwd: Some("/work/repo".to_string()),
+                env: None,
+            },
+            ContainerExecOutput {
+                exit_code: 86,
+                stdout: format!("{COMPOSER_SKIP_MARKER}:missing-composer-json\n"),
+                stderr: String::new(),
+            },
+        );
+
+        let runner =
+            test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None)
+                .await;
+        let mut ctx = review_context_with_target_branch(Some("main"));
+        ctx.feature_flags = FeatureFlagSnapshot {
+            composer_install: true,
+            ..FeatureFlagSnapshot::default()
+        };
+
+        let result = runner.run_review(ctx).await?;
+        assert!(matches!(result, CodexResult::Pass { .. }));
+
+        let operations = harness.operation_log();
+        let initialize_index = operations
+            .iter()
+            .position(|entry| entry == "app:initialize")
+            .expect("initialize request");
+        let initialized_index = operations
+            .iter()
+            .position(|entry| entry == "app:initialized")
+            .expect("initialized notification");
+        let composer_index = operations
+            .iter()
+            .position(|entry| {
+                entry.starts_with("exec:")
+                    && entry.contains("composer install --no-interaction --no-progress")
+            })
+            .expect("composer exec");
+        assert!(initialize_index < composer_index);
+        assert!(initialized_index < composer_index);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn wait_for_browser_container_ready_with_fake_runtime_reports_exit() {
         let harness = Arc::new(FakeRunnerHarness::default());
         harness.set_browser_diagnostics(
@@ -3098,6 +3194,101 @@ mod tests {
             ])
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_mention_command_with_fake_runtime_initializes_before_composer_install() {
+        let harness = Arc::new(FakeRunnerHarness::default());
+        harness.push_app_server(ScriptedAppServer::from_requests(vec![
+            ScriptedAppRequest::result("initialize", json!({})),
+        ]));
+        let composer_command = composer_install_exec_command(
+            ComposerInstallMode::Full,
+            DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
+        );
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: composer_command.clone(),
+                cwd: Some("/work/repo".to_string()),
+                env: None,
+            },
+            ContainerExecOutput {
+                exit_code: 86,
+                stdout: format!("{COMPOSER_SKIP_MARKER}:missing-composer-json\n"),
+                stderr: String::new(),
+            },
+        );
+        harness.push_exec_error(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: auxiliary_git_exec_command(&[
+                    "status".to_string(),
+                    "--porcelain".to_string(),
+                ]),
+                cwd: Some("/work/repo".to_string()),
+                env: None,
+            },
+            "git status failed",
+        );
+
+        let runner =
+            test_runner_with_fake_runtime(test_codex_config(), true, Arc::clone(&harness), None)
+                .await;
+        let err = runner
+            .run_mention_command(MentionCommandContext {
+                repo: "group/repo".to_string(),
+                project_path: "group/repo".to_string(),
+                mr: MergeRequest {
+                    iid: 11,
+                    title: Some("Title".to_string()),
+                    web_url: None,
+                    created_at: None,
+                    updated_at: None,
+                    sha: Some("before-sha".to_string()),
+                    source_branch: Some("feature".to_string()),
+                    target_branch: Some("main".to_string()),
+                    author: None,
+                    source_project_id: Some(1),
+                    target_project_id: Some(1),
+                    diff_refs: None,
+                },
+                head_sha: "before-sha".to_string(),
+                discussion_id: "discussion-1".to_string(),
+                trigger_note_id: 77,
+                requester_name: "Requester".to_string(),
+                requester_email: "requester@example.com".to_string(),
+                additional_developer_instructions: None,
+                prompt: "Please fix it".to_string(),
+                feature_flags: FeatureFlagSnapshot {
+                    composer_install: true,
+                    ..FeatureFlagSnapshot::default()
+                },
+                run_history_id: None,
+            })
+            .await
+            .expect_err("mention command should fail after baseline git status");
+
+        assert!(format!("{err:#}").contains("git status failed"));
+
+        let operations = harness.operation_log();
+        let initialize_index = operations
+            .iter()
+            .position(|entry| entry == "app:initialize")
+            .expect("initialize request");
+        let initialized_index = operations
+            .iter()
+            .position(|entry| entry == "app:initialized")
+            .expect("initialized notification");
+        let composer_index = operations
+            .iter()
+            .position(|entry| {
+                entry.starts_with("exec:")
+                    && entry.contains("composer install --no-interaction --no-progress")
+            })
+            .expect("composer exec");
+        assert!(initialize_index < composer_index);
+        assert!(initialized_index < composer_index);
     }
 
     #[tokio::test]

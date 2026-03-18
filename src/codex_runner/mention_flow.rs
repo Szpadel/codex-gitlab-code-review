@@ -1,5 +1,5 @@
 use super::*;
-use crate::composer_install::DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS;
+use crate::composer_install::composer_install_timeout_seconds;
 use std::collections::BTreeSet;
 
 fn git_status_paths(status_output: &str) -> BTreeSet<String> {
@@ -160,32 +160,33 @@ impl DockerCodexRunner {
                 .await;
                 let run_timeout = Duration::from_secs(self.codex.timeout_seconds);
                 let run_started_at = Instant::now();
-                let _composer_install = self
-                    .run_composer_install_step(
-                        &container_id,
-                        repo_dir,
-                        &ctx.project_path,
-                        &ctx.feature_flags,
-                        self.codex
-                            .timeout_seconds
-                            .min(DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS),
-                        ctx.run_history_id,
-                    )
-                    .await;
-                let baseline_worktree_state = self
-                    .exec_container_git_command(
-                        &container_id,
-                        &["status".to_string(), "--porcelain".to_string()],
-                        Some(repo_dir),
-                    )
-                    .await?
-                    .stdout;
-                let baseline_worktree_paths = git_status_paths(&baseline_worktree_state);
-                let remaining_timeout = run_timeout.saturating_sub(run_started_at.elapsed());
-
-                let mention_result = timeout(remaining_timeout, async {
+                let mention_result = timeout(run_timeout.saturating_sub(run_started_at.elapsed()), async {
                     client.initialize().await?;
                     client.initialized().await?;
+                    let Some(composer_timeout_seconds) = composer_install_timeout_seconds(
+                        run_timeout.saturating_sub(run_started_at.elapsed()),
+                    ) else {
+                        bail!("codex mention command timed out");
+                    };
+                    let _composer_install = self
+                        .run_composer_install_step(
+                            &container_id,
+                            repo_dir,
+                            &ctx.project_path,
+                            &ctx.feature_flags,
+                            composer_timeout_seconds,
+                            ctx.run_history_id,
+                        )
+                        .await;
+                    let baseline_worktree_state = self
+                        .exec_container_git_command(
+                            &container_id,
+                            &["status".to_string(), "--porcelain".to_string()],
+                            Some(repo_dir),
+                        )
+                        .await?
+                        .stdout;
+                    let baseline_worktree_paths = git_status_paths(&baseline_worktree_state);
                     let extra_writable_roots = gitlab_discovery_mcp
                         .as_ref()
                         .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])

@@ -3,6 +3,7 @@ use crate::gitlab::{GitLabApi, GitLabCiVariable};
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
 pub const COMPOSER_AUTH_VARIABLE_KEY: &str = "COMPOSER_AUTH";
 pub const COMPOSER_SKIP_MARKER: &str = "CODEX_COMPOSER_SKIP";
@@ -155,6 +156,17 @@ tail -n 100 "$log_file"
         timeout_seconds = timeout_seconds,
     );
     vec!["bash".to_string(), "-lc".to_string(), script]
+}
+
+pub fn composer_install_timeout_seconds(remaining: Duration) -> Option<u64> {
+    if remaining.is_zero() {
+        return None;
+    }
+
+    let rounded_up = remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() > 0));
+    Some(rounded_up.min(DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS))
 }
 
 pub async fn resolve_composer_auth(gitlab: &dyn GitLabApi, repo_path: &str) -> ComposerAuthLookup {
@@ -584,5 +596,18 @@ mod tests {
         let excerpt = result.log_excerpt.expect("success excerpt");
         assert!(!excerpt.contains("s3cr3t"));
         assert!(!excerpt.contains("token@example.com"));
+    }
+
+    #[test]
+    fn composer_install_timeout_seconds_rounds_up_subsecond_budget() {
+        assert_eq!(
+            composer_install_timeout_seconds(Duration::from_millis(1)),
+            Some(1)
+        );
+        assert_eq!(
+            composer_install_timeout_seconds(Duration::from_millis(1500)),
+            Some(2)
+        );
+        assert_eq!(composer_install_timeout_seconds(Duration::ZERO), None);
     }
 }

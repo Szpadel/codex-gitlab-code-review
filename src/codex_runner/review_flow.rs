@@ -1,5 +1,5 @@
 use super::*;
-use crate::composer_install::DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS;
+use crate::composer_install::composer_install_timeout_seconds;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CodexOutput {
@@ -260,101 +260,105 @@ impl DockerCodexRunner {
         .await;
         let run_timeout = Duration::from_secs(self.codex.timeout_seconds);
         let run_started_at = Instant::now();
-        let _composer_install = self
-            .run_composer_install_step(
-                &container_id,
-                repo_path,
-                &ctx.project_path,
-                &ctx.feature_flags,
-                self.codex
-                    .timeout_seconds
-                    .min(DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS),
-                ctx.run_history_id,
-            )
-            .await;
-        let remaining_timeout = run_timeout.saturating_sub(run_started_at.elapsed());
-
-        let review_result = timeout(remaining_timeout, async {
-            let review_target = Self::review_target_value(
-                self.resolve_review_target_request(ctx, &container_id, repo_path)
-                    .await,
-            );
-            client.initialize().await?;
-            client.initialized().await?;
-            let extra_writable_roots = gitlab_discovery_mcp
-                .as_ref()
-                .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
-                .unwrap_or_default();
-            let thread_response = client
-                .request(
-                    "thread/start",
-                    self.thread_start_params(repo_path, None, &extra_writable_roots),
-                )
-                .await?;
-            let thread_id = thread_response
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(|id| id.as_str())
-                .ok_or_else(|| anyhow!("thread/start missing thread id"))?
-                .to_string();
-            self.update_run_history_session(
-                ctx.run_history_id,
-                RunHistorySessionUpdate {
-                    thread_id: Some(thread_id.clone()),
-                    auth_account_name: Some(account.name.clone()),
-                    ..RunHistorySessionUpdate::default()
-                },
-            )
-            .await;
-            let review_response = client
-                .request(
-                    "review/start",
-                    json!({
-                        "threadId": thread_id,
-                        "delivery": "inline",
-                        "target": review_target,
-                    }),
-                )
-                .await?;
-            let turn_id = review_response
-                .get("turn")
-                .and_then(|turn| turn.get("id"))
-                .and_then(|id| id.as_str())
-                .ok_or_else(|| anyhow!("review/start missing turn id"))?
-                .to_string();
-            let review_thread_id = review_response
-                .get("reviewThreadId")
-                .and_then(|id| id.as_str())
-                .unwrap_or(thread_id.as_str())
-                .to_string();
-            self.update_run_history_session(
-                ctx.run_history_id,
-                RunHistorySessionUpdate {
-                    thread_id: Some(thread_id.clone()),
-                    turn_id: Some(turn_id.clone()),
-                    review_thread_id: Some(review_thread_id.clone()),
-                    auth_account_name: Some(account.name.clone()),
-                },
-            )
-            .await;
-            client
-                .stream_review(
-                    &review_thread_id,
-                    &turn_id,
-                    gitlab_discovery_mcp
-                        .as_ref()
-                        .map(|prepared| prepared.runtime_config.server_name.as_str()),
-                    |events| async move {
-                        self.append_run_history_events(ctx.run_history_id, &events)
-                            .await;
-                    },
-                    || async move {
-                        self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
-                            .await;
+        let review_result = timeout(
+            run_timeout.saturating_sub(run_started_at.elapsed()),
+            async {
+                client.initialize().await?;
+                client.initialized().await?;
+                let Some(composer_timeout_seconds) = composer_install_timeout_seconds(
+                    run_timeout.saturating_sub(run_started_at.elapsed()),
+                ) else {
+                    bail!("codex review timed out");
+                };
+                let _composer_install = self
+                    .run_composer_install_step(
+                        &container_id,
+                        repo_path,
+                        &ctx.project_path,
+                        &ctx.feature_flags,
+                        composer_timeout_seconds,
+                        ctx.run_history_id,
+                    )
+                    .await;
+                let review_target = Self::review_target_value(
+                    self.resolve_review_target_request(ctx, &container_id, repo_path)
+                        .await,
+                );
+                let extra_writable_roots = gitlab_discovery_mcp
+                    .as_ref()
+                    .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
+                    .unwrap_or_default();
+                let thread_response = client
+                    .request(
+                        "thread/start",
+                        self.thread_start_params(repo_path, None, &extra_writable_roots),
+                    )
+                    .await?;
+                let thread_id = thread_response
+                    .get("thread")
+                    .and_then(|thread| thread.get("id"))
+                    .and_then(|id| id.as_str())
+                    .ok_or_else(|| anyhow!("thread/start missing thread id"))?
+                    .to_string();
+                self.update_run_history_session(
+                    ctx.run_history_id,
+                    RunHistorySessionUpdate {
+                        thread_id: Some(thread_id.clone()),
+                        auth_account_name: Some(account.name.clone()),
+                        ..RunHistorySessionUpdate::default()
                     },
                 )
-                .await
-        })
+                .await;
+                let review_response = client
+                    .request(
+                        "review/start",
+                        json!({
+                            "threadId": thread_id,
+                            "delivery": "inline",
+                            "target": review_target,
+                        }),
+                    )
+                    .await?;
+                let turn_id = review_response
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(|id| id.as_str())
+                    .ok_or_else(|| anyhow!("review/start missing turn id"))?
+                    .to_string();
+                let review_thread_id = review_response
+                    .get("reviewThreadId")
+                    .and_then(|id| id.as_str())
+                    .unwrap_or(thread_id.as_str())
+                    .to_string();
+                self.update_run_history_session(
+                    ctx.run_history_id,
+                    RunHistorySessionUpdate {
+                        thread_id: Some(thread_id.clone()),
+                        turn_id: Some(turn_id.clone()),
+                        review_thread_id: Some(review_thread_id.clone()),
+                        auth_account_name: Some(account.name.clone()),
+                    },
+                )
+                .await;
+                client
+                    .stream_review(
+                        &review_thread_id,
+                        &turn_id,
+                        gitlab_discovery_mcp
+                            .as_ref()
+                            .map(|prepared| prepared.runtime_config.server_name.as_str()),
+                        |events| async move {
+                            self.append_run_history_events(ctx.run_history_id, &events)
+                                .await;
+                        },
+                        || async move {
+                            self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
+                                .await;
+                        },
+                    )
+                    .await
+            },
+        )
         .await;
 
         let review_result = match review_result {
