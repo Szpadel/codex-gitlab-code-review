@@ -90,9 +90,12 @@ impl GitLabDiscoveryMcpService {
 
     pub async fn run(self: Arc<Self>, listener: TcpListener) {
         let app = build_router(Arc::clone(&self));
-        if let Err(err) = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .with_graceful_shutdown(async move { self.shutdown.cancelled().await })
-            .await
+        if let Err(err) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move { self.shutdown.cancelled().await })
+        .await
         {
             error!(error = %err, "gitlab discovery MCP server failed");
         }

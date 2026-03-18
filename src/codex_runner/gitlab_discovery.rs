@@ -110,22 +110,22 @@ impl DockerCodexRunner {
         let (Some(service), Some(prepared)) = (self.gitlab_discovery_mcp.as_ref(), prepared) else {
             return Ok(None);
         };
-        let peer_ips = self.collect_container_peer_ips(network_container_id).await?;
+        let peer_ips = self
+            .collect_container_peer_ips(network_container_id)
+            .await?;
         service
             .registry()
-            .register_binding(
-                GitLabDiscoverySessionBinding {
-                    run_history_id: run_history_id.unwrap_or_default(),
-                    container_id: container_id.to_string(),
-                    network_container_id: network_container_id.to_string(),
-                    peer_ips: peer_ips.clone(),
-                    source_repo: prepared.source_repo.clone(),
-                    clone_root: prepared.runtime_config.clone_root.clone(),
-                    feature_flags: prepared.feature_flags.clone(),
-                    allow: prepared.allow.clone(),
-                    created_at: Utc::now(),
-                },
-            )
+            .register_binding(GitLabDiscoverySessionBinding {
+                run_history_id: run_history_id.unwrap_or_default(),
+                container_id: container_id.to_string(),
+                network_container_id: network_container_id.to_string(),
+                peer_ips: peer_ips.clone(),
+                source_repo: prepared.source_repo.clone(),
+                clone_root: prepared.runtime_config.clone_root.clone(),
+                feature_flags: prepared.feature_flags.clone(),
+                allow: prepared.allow.clone(),
+                created_at: Utc::now(),
+            })
             .await;
         Ok(Some(RegisteredGitLabDiscoverySession {
             network_container_id: network_container_id.to_string(),
@@ -213,7 +213,12 @@ impl DockerCodexRunner {
                             .map(|binding| binding.network_container_id.as_str())
                             .unwrap_or("<unregistered>"),
                         peer_ips = registered
-                            .map(|binding| binding.peer_ips.iter().cloned().collect::<Vec<_>>().join(","))
+                            .map(|binding| binding
+                                .peer_ips
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(","))
                             .unwrap_or_default(),
                         url = prepared.runtime_config.advertise_url.as_str(),
                         detail = first_line,

@@ -49,10 +49,9 @@ impl GitLabDiscoverySessionRegistry {
         let mut state = self.state.write().await;
         remove_binding_locked(&mut state, &binding.network_container_id);
         for peer_ip in &binding.peer_ips {
-            state.network_containers_by_peer_ip.insert(
-                peer_ip.to_string(),
-                binding.network_container_id.clone(),
-            );
+            state
+                .network_containers_by_peer_ip
+                .insert(peer_ip.to_string(), binding.network_container_id.clone());
         }
         state
             .bindings_by_network_container
@@ -81,7 +80,9 @@ impl GitLabDiscoverySessionRegistry {
     pub async fn binding_for_peer(&self, peer_ip: &str) -> Option<GitLabDiscoverySessionBinding> {
         let state = self.state.read().await;
         let network_container_id = state.network_containers_by_peer_ip.get(peer_ip)?;
-        let binding = state.bindings_by_network_container.get(network_container_id)?;
+        let binding = state
+            .bindings_by_network_container
+            .get(network_container_id)?;
         Some(binding.clone())
     }
 
@@ -96,7 +97,9 @@ impl GitLabDiscoverySessionRegistry {
         if peer_binding != network_container_id {
             return None;
         }
-        let binding = state.bindings_by_network_container.get(network_container_id)?;
+        let binding = state
+            .bindings_by_network_container
+            .get(network_container_id)?;
         Some(binding.clone())
     }
 
@@ -129,14 +132,20 @@ impl GitLabDiscoverySessionRegistry {
 }
 
 fn remove_binding_locked(state: &mut RegistryState, network_container_id: &str) {
-    let Some(binding) = state.bindings_by_network_container.remove(network_container_id) else {
+    let Some(binding) = state
+        .bindings_by_network_container
+        .remove(network_container_id)
+    else {
         state
             .network_containers_by_session
             .retain(|_, current| current != network_container_id);
         return;
     };
     for peer_ip in binding.peer_ips {
-        if state.network_containers_by_peer_ip.get(&peer_ip).map(String::as_str)
+        if state
+            .network_containers_by_peer_ip
+            .get(&peer_ip)
+            .map(String::as_str)
             == Some(network_container_id)
         {
             state.network_containers_by_peer_ip.remove(&peer_ip);
@@ -314,29 +323,22 @@ mod tests {
     async fn registry_binds_sessions_to_network_container_and_peer_ip() -> anyhow::Result<()> {
         let registry = GitLabDiscoverySessionRegistry::default();
         registry
-            .register_binding(
-                GitLabDiscoverySessionBinding {
-                    run_history_id: 1,
-                    container_id: "container".to_string(),
-                    network_container_id: "network-container".to_string(),
-                    peer_ips: BTreeSet::from(["172.17.0.2".to_string()]),
-                    source_repo: "group/repo".to_string(),
-                    clone_root: "/work/mcp".to_string(),
-                    feature_flags: FeatureFlagSnapshot {
-                        gitlab_discovery_mcp: true,
-                    },
-                    allow: ResolvedGitLabDiscoveryAllowList::default(),
-                    created_at: Utc::now(),
+            .register_binding(GitLabDiscoverySessionBinding {
+                run_history_id: 1,
+                container_id: "container".to_string(),
+                network_container_id: "network-container".to_string(),
+                peer_ips: BTreeSet::from(["172.17.0.2".to_string()]),
+                source_repo: "group/repo".to_string(),
+                clone_root: "/work/mcp".to_string(),
+                feature_flags: FeatureFlagSnapshot {
+                    gitlab_discovery_mcp: true,
                 },
-            )
+                allow: ResolvedGitLabDiscoveryAllowList::default(),
+                created_at: Utc::now(),
+            })
             .await;
 
-        assert!(
-            registry
-                .binding_for_peer("172.17.0.2")
-                .await
-                .is_some()
-        );
+        assert!(registry.binding_for_peer("172.17.0.2").await.is_some());
         assert!(
             registry
                 .binding_for_session_and_peer("session-1", "172.17.0.2")

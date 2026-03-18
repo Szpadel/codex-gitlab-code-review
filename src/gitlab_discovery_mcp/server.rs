@@ -216,12 +216,13 @@ pub(crate) fn build_router(service: Arc<GitLabDiscoveryMcpService>) -> Router {
             StreamableHttpServerConfig::default(),
         );
 
-    let protected_mcp = Router::new()
-        .nest_service("/", rmcp_service)
-        .layer(middleware::from_fn_with_state(
-            service.registry(),
-            authenticate_mcp_request,
-        ));
+    let protected_mcp =
+        Router::new()
+            .nest_service("/", rmcp_service)
+            .layer(middleware::from_fn_with_state(
+                service.registry(),
+                authenticate_mcp_request,
+            ));
 
     Router::new()
         .route("/healthz", get(|| async { "OK" }))
@@ -273,7 +274,9 @@ async fn authenticate_mcp_request(
             .get("mcp-session-id")
             .and_then(|value| value.to_str().ok())
         {
-            if let Err(err) = registry.bind_session(&binding.network_container_id, session_id).await
+            if let Err(err) = registry
+                .bind_session(&binding.network_container_id, session_id)
+                .await
             {
                 warn!(
                     error = %err,

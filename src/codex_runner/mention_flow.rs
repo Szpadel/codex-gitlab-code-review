@@ -94,12 +94,12 @@ impl DockerCodexRunner {
             .await?;
         let gitlab_discovery_session = match self
             .register_gitlab_discovery_session(
-            gitlab_discovery_mcp.as_ref(),
-            &container_id,
-            browser_container_id.as_deref().unwrap_or(&container_id),
-            ctx.run_history_id,
-        )
-        .await
+                gitlab_discovery_mcp.as_ref(),
+                &container_id,
+                browser_container_id.as_deref().unwrap_or(&container_id),
+                ctx.run_history_id,
+            )
+            .await
         {
             Ok(session) => session,
             Err(err) => {

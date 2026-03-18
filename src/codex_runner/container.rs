@@ -352,7 +352,10 @@ impl DockerCodexRunner {
         let image_ref = Self::normalize_image_reference(&self.codex.image);
         self.ensure_image_available(&image_ref).await?;
         let browser_container_id = if let Some(browser_mcp) = browser_mcp {
-            Some(self.start_browser_container(browser_mcp, extra_hosts.clone()).await?)
+            Some(
+                self.start_browser_container(browser_mcp, extra_hosts.clone())
+                    .await?,
+            )
         } else {
             None
         };

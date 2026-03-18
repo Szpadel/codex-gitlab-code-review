@@ -2194,7 +2194,9 @@ server:
         config.codex.gitlab_discovery_mcp.advertise_url =
             "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp".to_string();
 
-        assert!(gitlab_discovery_mcp_uses_cluster_service_advertise_url(&config.codex));
+        assert!(gitlab_discovery_mcp_uses_cluster_service_advertise_url(
+            &config.codex
+        ));
     }
 
     #[test]

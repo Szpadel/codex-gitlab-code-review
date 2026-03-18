@@ -123,7 +123,8 @@ impl DockerCodexRunner {
         let head_sha_q = shell_quote(&ctx.head_sha);
         let gitlab_token_q = shell_quote(gitlab_token);
         let auth_mount_path_q = shell_quote(auth_mount_path);
-        let git_auth_setup_script = git_bootstrap_auth_setup_script(clone_url, &ctx.repo, gitlab_token);
+        let git_auth_setup_script =
+            git_bootstrap_auth_setup_script(clone_url, &ctx.repo, gitlab_token);
         let git_auth_cleanup_script = git_bootstrap_auth_cleanup_script();
         let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
         let browser_wait_script = browser_wait_script(app_server.browser_mcp);
@@ -487,7 +488,12 @@ fn git_url_rewrites(clone_url: &str, repo: &str) -> Vec<(String, String)> {
         ),
     ];
 
-    if !base_path.is_empty() {
+    if base_path.is_empty() {
+        rewrites.push((
+            format!("url.{base_url}.insteadOf"),
+            format!("{scheme}://{host_endpoint}/"),
+        ));
+    } else {
         let base_path = base_path.trim_start_matches('/');
         rewrites.push((
             format!("url.{base_url}.insteadOf"),
@@ -496,6 +502,10 @@ fn git_url_rewrites(clone_url: &str, repo: &str) -> Vec<(String, String)> {
         rewrites.push((
             format!("url.{base_url}.insteadOf"),
             format!("ssh://git@{host_endpoint}/{base_path}/"),
+        ));
+        rewrites.push((
+            format!("url.{base_url}.insteadOf"),
+            format!("{scheme}://{host_endpoint}/{base_path}/"),
         ));
     }
 
@@ -513,7 +523,10 @@ pub(crate) fn git_bootstrap_auth_setup_script(
         return String::new();
     }
 
-    let mut script = format!("export GIT_CONFIG_COUNT={}\n", shell_quote(&rewrites.len().to_string()));
+    let mut script = format!(
+        "export GIT_CONFIG_COUNT={}\n",
+        shell_quote(&rewrites.len().to_string())
+    );
     for (index, (key, value)) in rewrites.into_iter().enumerate() {
         script.push_str(&format!(
             "export GIT_CONFIG_KEY_{index}={}\nexport GIT_CONFIG_VALUE_{index}={}\n",
