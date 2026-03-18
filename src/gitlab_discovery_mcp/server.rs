@@ -218,7 +218,7 @@ pub(crate) fn build_router(service: Arc<GitLabDiscoveryMcpService>) -> Router {
 
     let protected_mcp =
         Router::new()
-            .nest_service("/", rmcp_service)
+            .fallback_service(rmcp_service)
             .layer(middleware::from_fn_with_state(
                 service.registry(),
                 authenticate_mcp_request,
@@ -298,5 +298,29 @@ fn canonical_peer_ip(ip: IpAddr) -> String {
             .to_ipv4_mapped()
             .map(|mapped| mapped.to_string())
             .unwrap_or_else(|| v6.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_router;
+    use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig, GitLabTargets};
+    use std::sync::Arc;
+
+    #[test]
+    fn build_router_does_not_panic() {
+        let service = crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService::new(
+            DockerConfig::default(),
+            &GitLabConfig {
+                base_url: "https://gitlab.example.com".to_string(),
+                token: "token".to_string(),
+                bot_user_id: None,
+                created_after: None,
+                targets: GitLabTargets::default(),
+            },
+            GitLabDiscoveryMcpConfig::default(),
+        )
+        .expect("service");
+        let _router = build_router(Arc::new(service));
     }
 }
