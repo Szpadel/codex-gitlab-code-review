@@ -384,6 +384,25 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    pub async fn touch_in_progress_review(&self, repo: &str, iid: u64, sha: &str) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            r#"
+            UPDATE review_state
+            SET updated_at = ?
+            WHERE repo = ? AND iid = ? AND head_sha = ? AND status = 'in_progress'
+            "#,
+        )
+        .bind(now)
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(sha)
+        .execute(&self.pool)
+        .await
+        .context("touch in-progress review")?;
+        Ok(())
+    }
+
     pub async fn clear_stale_in_progress_mentions(&self, max_age_minutes: u64) -> Result<()> {
         let cutoff = Utc::now().timestamp() - (max_age_minutes as i64 * 60);
         let now = Utc::now().timestamp();
@@ -399,6 +418,39 @@ impl ReviewStateStore {
         .execute(&self.pool)
         .await
         .context("mark stale mention commands")?;
+        Ok(())
+    }
+
+    pub async fn touch_in_progress_mention_command(
+        &self,
+        repo: &str,
+        iid: u64,
+        discussion_id: &str,
+        trigger_note_id: u64,
+        head_sha: &str,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            r#"
+            UPDATE mention_command_state
+            SET updated_at = ?
+            WHERE repo = ?
+              AND iid = ?
+              AND discussion_id = ?
+              AND trigger_note_id = ?
+              AND head_sha = ?
+              AND status = 'in_progress'
+            "#,
+        )
+        .bind(now)
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(discussion_id)
+        .bind(trigger_note_id as i64)
+        .bind(head_sha)
+        .execute(&self.pool)
+        .await
+        .context("touch in-progress mention command")?;
         Ok(())
     }
 

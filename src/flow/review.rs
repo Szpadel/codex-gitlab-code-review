@@ -1,7 +1,7 @@
 use crate::codex_runner::{CodexResult, ReviewContext};
 use crate::config::Config;
 use crate::feature_flags::FeatureFlagSnapshot;
-use crate::flow::{FlowShared, MergeRequestFlow};
+use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, Note};
 use crate::state::{NewRunHistory, ReviewStateStore, RunHistoryFinish, RunHistoryKind};
 use anyhow::{Error, Result};
@@ -298,16 +298,9 @@ impl ReviewFlow {
                 .await;
             return Err(err);
         }
-        let permit = match self.shared.semaphore.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(err) => {
-                let err = Error::from(err);
-                self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
-                    .await;
-                return Err(err);
-            }
-        };
         let repo_name = repo.to_string();
+        let semaphore = Arc::clone(&self.shared.semaphore);
+        let active_tasks = Arc::clone(&self.shared.active_tasks);
         let review_context = ReviewRunContext {
             config: self.shared.config.clone(),
             gitlab: Arc::clone(&self.shared.gitlab),
@@ -319,7 +312,18 @@ impl ReviewFlow {
         };
         let head_sha = head_sha.to_string();
         tasks.push(tokio::spawn(async move {
-            let _permit = permit;
+            let _active_review = active_tasks.track_review(ActiveReviewKey {
+                repo: repo_name.clone(),
+                iid: mr.iid,
+                head_sha: head_sha.clone(),
+            });
+            let Ok(_permit) = semaphore.acquire_owned().await else {
+                let err = Error::msg("review cancelled: semaphore closed");
+                review_context
+                    .finalize_setup_failure(&repo_name, mr.iid, &head_sha, run_history_id, &err)
+                    .await;
+                return;
+            };
             if let Err(err) = review_context
                 .run(&repo_name, mr, &head_sha, feature_flags, run_history_id)
                 .await
@@ -592,6 +596,46 @@ impl ReviewRunContext {
             .await?;
         info!(repo = repo, iid = iid, "review cancelled due to shutdown");
         Ok(())
+    }
+
+    async fn finalize_setup_failure(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        run_history_id: i64,
+        err: &anyhow::Error,
+    ) {
+        if let Err(recovery_err) = self.state.finish_review(repo, iid, head_sha, "error").await {
+            warn!(
+                repo = repo,
+                iid = iid,
+                head_sha = head_sha,
+                error = %recovery_err,
+                "failed to release review lock after queued review setup error"
+            );
+        }
+        if let Err(recovery_err) = self
+            .state
+            .finish_run_history(
+                run_history_id,
+                RunHistoryFinish {
+                    result: "error".to_string(),
+                    preview: Some(format!("Review {repo} !{iid}")),
+                    error: Some(format!("{err:#}")),
+                    ..RunHistoryFinish::default()
+                },
+            )
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                head_sha = head_sha,
+                error = %recovery_err,
+                "failed to finalize run history after queued review setup error"
+            );
+        }
     }
 
     pub(crate) async fn run(

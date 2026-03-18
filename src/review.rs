@@ -1,8 +1,9 @@
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
+use crate::flow::FlowShared;
 use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
 use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome};
-use crate::flow::{FlowShared, MergeRequestFlow};
+use crate::flow::{ActiveTaskRegistry, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest};
 use crate::state::ReviewStateStore;
 use anyhow::Result;
@@ -59,6 +60,7 @@ pub struct ReviewService {
     review_flow: ReviewFlow,
     mention_flow: MentionFlow,
     shutdown: Arc<AtomicBool>,
+    active_tasks: Arc<ActiveTaskRegistry>,
 }
 
 impl ReviewService {
@@ -74,6 +76,7 @@ impl ReviewService {
         let mention_branch_locks = Arc::new(Mutex::new(HashMap::new()));
         let retry_backoff = Arc::new(RetryBackoff::new(Duration::hours(1)));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let active_tasks = Arc::new(ActiveTaskRegistry::default());
         let flow_shared = FlowShared::new(
             config.clone(),
             Arc::clone(&gitlab),
@@ -82,6 +85,7 @@ impl ReviewService {
             bot_user_id,
             Arc::clone(&semaphore),
             Arc::clone(&shutdown),
+            Arc::clone(&active_tasks),
         );
         let mention_flow = MentionFlow::new(flow_shared.clone(), mention_branch_locks);
         let review_flow = ReviewFlow::new(flow_shared, retry_backoff);
@@ -94,6 +98,7 @@ impl ReviewService {
             review_flow,
             mention_flow,
             shutdown,
+            active_tasks,
         }
     }
 
@@ -131,9 +136,30 @@ impl ReviewService {
     }
 
     async fn clear_stale_flow_state(&self) -> Result<()> {
+        self.refresh_active_flow_state().await?;
         let flows: [&dyn MergeRequestFlow; 2] = [&self.review_flow, &self.mention_flow];
         for flow in flows {
             flow.clear_stale_in_progress().await?;
+        }
+        Ok(())
+    }
+
+    async fn refresh_active_flow_state(&self) -> Result<()> {
+        for review in self.active_tasks.active_reviews() {
+            self.state
+                .touch_in_progress_review(&review.repo, review.iid, &review.head_sha)
+                .await?;
+        }
+        for mention in self.active_tasks.active_mentions() {
+            self.state
+                .touch_in_progress_mention_command(
+                    &mention.repo,
+                    mention.iid,
+                    &mention.discussion_id,
+                    mention.trigger_note_id,
+                    &mention.head_sha,
+                )
+                .await?;
         }
         Ok(())
     }
@@ -229,7 +255,9 @@ impl ReviewService {
                 }
             }
         }
-        let _ = join_all(tasks).await;
+        if matches!(mode, ScanMode::Full) {
+            let _ = join_all(tasks).await;
+        }
         match mode {
             ScanMode::Full => {
                 info!(
@@ -2142,6 +2170,281 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_scan_returns_before_blocking_review_finishes() -> Result<()> {
+        let mut config = test_config();
+        config.review.max_concurrent = 1;
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let review_mr = mr(40, "sha40");
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user,
+            mrs: Mutex::new(vec![review_mr]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let runner = Arc::new(BlockingReviewRunner {
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+            review_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let previous_marker = format!(
+            "{}|{}",
+            (default_created_at() - Duration::days(1)).to_rfc3339(),
+            40
+        );
+        state
+            .set_project_last_mr_activity("group/repo", &previous_marker)
+            .await?;
+        let service = Arc::new(ReviewService::new(
+            config,
+            gitlab,
+            Arc::clone(&state),
+            runner.clone(),
+            1,
+            default_created_after(),
+        ));
+
+        let first_started_wait = first_started.notified();
+        let scan_task = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.scan_once_incremental().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_started_wait).await?;
+
+        let scan_status =
+            tokio::time::timeout(std::time::Duration::from_millis(200), scan_task).await???;
+        assert_eq!(scan_status, ScanRunStatus::Completed);
+
+        let in_progress = state.list_in_progress_reviews().await?;
+        assert_eq!(in_progress.len(), 1);
+        assert_eq!(in_progress[0].iid, 40);
+        assert_eq!(*runner.review_calls.lock().unwrap(), 1);
+
+        release_first.notify_waiters();
+        for _ in 0..50 {
+            if state.list_in_progress_reviews().await?.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(state.list_in_progress_reviews().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_incremental_scan_returns_while_first_review_holds_only_permit() -> Result<()> {
+        let mut config = test_config();
+        config.review.max_concurrent = 1;
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let mut first_mr = mr(70, "sha70");
+        first_mr.updated_at = Some(default_created_at() + Duration::minutes(1));
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user,
+            mrs: Mutex::new(vec![first_mr.clone()]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let runner = Arc::new(BlockingReviewRunner {
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+            review_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let previous_marker = format!(
+            "{}|{}",
+            (default_created_at() - Duration::days(1)).to_rfc3339(),
+            70
+        );
+        state
+            .set_project_last_mr_activity("group/repo", &previous_marker)
+            .await?;
+        let service = Arc::new(ReviewService::new(
+            config,
+            gitlab.clone(),
+            Arc::clone(&state),
+            runner.clone(),
+            1,
+            default_created_after(),
+        ));
+
+        let first_started_wait = first_started.notified();
+        let first_scan_task = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.scan_once_incremental().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_started_wait).await?;
+        let first_scan_status =
+            tokio::time::timeout(std::time::Duration::from_millis(200), first_scan_task)
+                .await???;
+        assert_eq!(first_scan_status, ScanRunStatus::Completed);
+
+        let mut second_mr = mr(71, "sha71");
+        second_mr.updated_at = Some(default_created_at() + Duration::minutes(2));
+        *gitlab.mrs.lock().unwrap() = vec![first_mr, second_mr];
+
+        let second_scan_status = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            service.scan_once_incremental(),
+        )
+        .await??;
+        assert_eq!(second_scan_status, ScanRunStatus::Completed);
+
+        assert_eq!(*runner.review_calls.lock().unwrap(), 1);
+        let review_iids: Vec<i64> =
+            sqlx::query_scalar("SELECT iid FROM run_history WHERE kind = 'review' ORDER BY iid")
+                .fetch_all(state.pool())
+                .await?;
+        assert_eq!(review_iids, vec![70, 71]);
+        let in_progress = state.list_in_progress_reviews().await?;
+        assert_eq!(in_progress.len(), 2);
+
+        release_first.notify_waiters();
+        for _ in 0..50 {
+            if *runner.review_calls.lock().unwrap() == 2
+                && state.list_in_progress_reviews().await?.is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(*runner.review_calls.lock().unwrap(), 2);
+        assert!(state.list_in_progress_reviews().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_reviews_are_heartbeated_across_incremental_scans() -> Result<()> {
+        let mut config = test_config();
+        config.review.max_concurrent = 1;
+        config.review.stale_in_progress_minutes = 0;
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot User".to_string()),
+        };
+        let mut first_mr = mr(80, "sha80");
+        first_mr.updated_at = Some(default_created_at() + Duration::minutes(1));
+        let mut second_mr = mr(81, "sha81");
+        second_mr.updated_at = Some(default_created_at() + Duration::minutes(2));
+        let gitlab = Arc::new(FakeGitLab {
+            bot_user,
+            mrs: Mutex::new(vec![first_mr.clone(), second_mr.clone()]),
+            awards: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
+            discussions: Mutex::new(HashMap::new()),
+            users: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
+            all_projects: Mutex::new(Vec::new()),
+            group_projects: Mutex::new(HashMap::new()),
+            calls: Mutex::new(Vec::new()),
+            list_open_calls: Mutex::new(0),
+            list_projects_calls: Mutex::new(0),
+            list_group_projects_calls: Mutex::new(0),
+            delete_award_fails: false,
+        });
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let runner = Arc::new(BlockingReviewRunner {
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+            review_calls: Mutex::new(0),
+        });
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let previous_marker = format!(
+            "{}|{}",
+            (default_created_at() - Duration::days(1)).to_rfc3339(),
+            80
+        );
+        state
+            .set_project_last_mr_activity("group/repo", &previous_marker)
+            .await?;
+        let service = Arc::new(ReviewService::new(
+            config,
+            gitlab.clone(),
+            Arc::clone(&state),
+            runner.clone(),
+            1,
+            default_created_after(),
+        ));
+
+        let first_started_wait = first_started.notified();
+        let first_scan_task = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.scan_once_incremental().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_started_wait).await?;
+        let first_scan_status =
+            tokio::time::timeout(std::time::Duration::from_millis(200), first_scan_task)
+                .await???;
+        assert_eq!(first_scan_status, ScanRunStatus::Completed);
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut third_mr = mr(82, "sha82");
+        third_mr.updated_at = Some(default_created_at() + Duration::minutes(3));
+        *gitlab.mrs.lock().unwrap() = vec![first_mr, second_mr, third_mr];
+
+        let second_scan_status = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            service.scan_once_incremental(),
+        )
+        .await??;
+        assert_eq!(second_scan_status, ScanRunStatus::Completed);
+
+        let run_counts: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT iid, COUNT(*) FROM run_history WHERE kind = 'review' GROUP BY iid ORDER BY iid",
+        )
+        .fetch_all(state.pool())
+        .await?;
+        assert_eq!(run_counts, vec![(80, 1), (81, 1), (82, 1)]);
+
+        release_first.notify_waiters();
+        for _ in 0..50 {
+            if *runner.review_calls.lock().unwrap() == 3
+                && state.list_in_progress_reviews().await?.is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(*runner.review_calls.lock().unwrap(), 3);
+        assert!(state.list_in_progress_reviews().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn incremental_defers_same_mr_mentions_while_active_mention_blocks_review() -> Result<()>
     {
         let mut config = test_config();
@@ -2243,6 +2546,12 @@ mod tests {
 
         service.scan_once_incremental().await?;
 
+        for _ in 0..50 {
+            if *runner.review_calls.lock().unwrap() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert_eq!(*runner.review_calls.lock().unwrap(), 1);
         assert_eq!(*runner.mention_calls.lock().unwrap(), 0);
         let review_iids: Vec<i64> =
@@ -2271,6 +2580,12 @@ mod tests {
 
         service.scan_once_incremental().await?;
 
+        for _ in 0..50 {
+            if *runner.mention_calls.lock().unwrap() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert_eq!(*runner.mention_calls.lock().unwrap(), 1);
         let blocked_review_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM run_history WHERE kind = 'review' AND iid = ?",
@@ -2398,6 +2713,12 @@ mod tests {
         service.scan_once_incremental().await?;
 
         assert_eq!(*runner.review_calls.lock().unwrap(), 0);
+        for _ in 0..50 {
+            if *runner.mention_calls.lock().unwrap() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert_eq!(*runner.mention_calls.lock().unwrap(), 1);
         let scheduled_trigger_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",

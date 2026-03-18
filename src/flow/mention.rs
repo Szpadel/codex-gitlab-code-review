@@ -1,6 +1,6 @@
 use crate::codex_runner::{MentionCommandContext, MentionCommandResult, MentionCommandStatus};
 use crate::feature_flags::FeatureFlagSnapshot;
-use crate::flow::{FlowShared, MergeRequestFlow};
+use crate::flow::{ActiveMentionKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{DiscussionNote, GitLabApi, GitLabUser, MergeRequest, MergeRequestDiscussion};
 use crate::state::{MentionCommandScanState, NewRunHistory, RunHistoryFinish, RunHistoryKind};
 use anyhow::{Context, Result, anyhow};
@@ -548,6 +548,7 @@ impl MentionFlow {
             }
             let branch_lock = self.mention_branch_lock(&command_repo, &source_branch_key);
             let semaphore = Arc::clone(&self.shared.semaphore);
+            let active_tasks = Arc::clone(&self.shared.active_tasks);
             let gitlab = Arc::clone(&self.shared.gitlab);
             let codex = Arc::clone(&self.shared.codex);
             let state = Arc::clone(&self.shared.state);
@@ -566,6 +567,13 @@ impl MentionFlow {
             outcome.blocks_review = true;
             outcome.blocked_pending_work = true;
             tasks.push(tokio::spawn(async move {
+                let _active_mention = active_tasks.track_mention(ActiveMentionKey {
+                    repo: repo_name.clone(),
+                    iid: mr_copy.iid,
+                    discussion_id: trigger.discussion_id.clone(),
+                    trigger_note_id: trigger.trigger_note.id,
+                    head_sha: head_sha_copy.clone(),
+                });
                 let _branch_guard = branch_lock.lock().await;
                 let Ok(_permit) = semaphore.acquire_owned().await else {
                     warn!(
