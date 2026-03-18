@@ -25,21 +25,44 @@ pub async fn wait_for_docker_ready(
     timeout: Duration,
     poll_interval: Duration,
 ) -> Result<()> {
-    let docker = connect_docker(docker_cfg)?;
+    let docker = match connect_docker(docker_cfg) {
+        Ok(docker) => Some(docker),
+        Err(err) if is_missing_unix_socket_error(&err) => None,
+        Err(err) => return Err(err),
+    };
+
+    let docker_cfg = docker_cfg.clone();
     let host = docker_cfg.host.clone();
-    wait_for_ready(timeout, poll_interval, || {
-        let host = host.clone();
-        let docker = docker.clone();
-        async move {
-            docker
-                .ping()
-                .await
-                .with_context(|| format!("ping docker host {host}"))?;
-            Ok(())
-        }
-    })
-    .await
-    .with_context(|| {
+    let probe_result = if let Some(docker) = docker {
+        wait_for_ready(timeout, poll_interval, || {
+            let host = host.clone();
+            let docker = docker.clone();
+            async move {
+                docker
+                    .ping()
+                    .await
+                    .with_context(|| format!("ping docker host {host}"))?;
+                Ok(())
+            }
+        })
+        .await
+    } else {
+        wait_for_ready(timeout, poll_interval, || {
+            let docker_cfg = docker_cfg.clone();
+            let host = host.clone();
+            async move {
+                let docker = connect_docker(&docker_cfg)?;
+                docker
+                    .ping()
+                    .await
+                    .with_context(|| format!("ping docker host {host}"))?;
+                Ok(())
+            }
+        })
+        .await
+    };
+
+    probe_result.with_context(|| {
         format!(
             "wait {} for docker host {} to become ready",
             format_duration(timeout),
@@ -145,15 +168,24 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+fn is_missing_unix_socket_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<BollardError>())
+        .any(|cause| matches!(cause, BollardError::SocketNotFoundError(_)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::wait_for_ready;
+    use super::{wait_for_docker_ready, wait_for_ready};
+    use crate::config::DockerConfig;
     use anyhow::{Result, anyhow};
+    use bollard::errors::Error as BollardError;
+    use std::path::PathBuf;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
     async fn wait_for_ready_returns_without_retry_when_probe_succeeds() -> Result<()> {
@@ -224,5 +256,54 @@ mod tests {
         .expect_err("probe should time out before late success");
 
         assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_docker_ready_retries_missing_unix_socket_until_timeout() {
+        let missing_socket = missing_socket_path();
+        let docker_cfg = DockerConfig {
+            host: format!("unix://{}", missing_socket.display()),
+        };
+
+        let started_at = Instant::now();
+        let err = wait_for_docker_ready(
+            &docker_cfg,
+            Duration::from_millis(25),
+            Duration::from_millis(5),
+        )
+        .await
+        .expect_err("missing socket should time out after retries");
+
+        assert!(
+            started_at.elapsed() >= Duration::from_millis(20),
+            "expected retries before timeout, got {:?}",
+            started_at.elapsed()
+        );
+        assert!(err.to_string().contains("wait 25ms for docker host"));
+        assert!(err.to_string().contains(&docker_cfg.host));
+    }
+
+    #[test]
+    fn is_missing_unix_socket_error_only_matches_socket_not_found() {
+        let missing_socket_err = anyhow!(BollardError::SocketNotFoundError(
+            "/var/run/docker.sock".to_string()
+        ));
+        let other_err = anyhow!(BollardError::RequestTimeoutError);
+
+        assert!(super::is_missing_unix_socket_error(&missing_socket_err));
+        assert!(!super::is_missing_unix_socket_error(&other_err));
+    }
+
+    fn missing_socket_path() -> PathBuf {
+        let nanos_since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let unique = format!(
+            "codex-gitlab-code-review-missing-{}-{}.sock",
+            std::process::id(),
+            nanos_since_epoch
+        );
+        std::env::temp_dir().join(unique)
     }
 }
