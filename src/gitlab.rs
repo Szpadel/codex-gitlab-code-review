@@ -38,6 +38,15 @@ pub struct GitLabProject {
     pub last_activity_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GitLabGroup {
+    pub full_path: String,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub marked_for_deletion_on: Option<String>,
+}
+
 impl MergeRequest {
     pub fn head_sha(&self) -> Option<String> {
         self.diff_refs
@@ -151,6 +160,11 @@ pub trait GitLabApi: Send + Sync {
     async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>>;
     async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest>;
     async fn get_project(&self, project: &str) -> Result<GitLabProject>;
+    async fn get_group(&self, group: &str) -> Result<GitLabGroup> {
+        Err(anyhow!(
+            "get_group not implemented for this gitlab client (group={group})"
+        ))
+    }
     async fn list_project_variables(&self, _project: &str) -> Result<Vec<GitLabCiVariable>> {
         Err(anyhow!(
             "list_project_variables not implemented for this gitlab client"
@@ -479,6 +493,11 @@ impl GitLabApi for GitLabClient {
         self.get_json(&url).await
     }
 
+    async fn get_group(&self, group: &str) -> Result<GitLabGroup> {
+        let url = self.group_path(group);
+        self.get_json(&url).await
+    }
+
     async fn list_project_variables(&self, project: &str) -> Result<Vec<GitLabCiVariable>> {
         let url = format!("{}/variables", self.project_path(project));
         self.get_paginated(&url).await
@@ -752,11 +771,14 @@ fn format_gitlab_error_body(body: &str) -> String {
 }
 
 fn should_fallback_to_merge_request_note_awards(err: &anyhow::Error) -> bool {
+    gitlab_error_has_status(err, &[404, 405, 400, 422])
+}
+
+pub(crate) fn gitlab_error_has_status(err: &anyhow::Error, statuses: &[u16]) -> bool {
     let text = format!("{err:#}");
-    text.contains("status=404")
-        || text.contains("status=405")
-        || text.contains("status=400")
-        || text.contains("status=422")
+    statuses
+        .iter()
+        .any(|status| text.contains(&format!("status={status}")))
 }
 
 fn normalize_api_base(base_url: &str) -> Result<String> {

@@ -2,9 +2,9 @@ use super::service::mcp_internal_error;
 use super::{
     CloneGitLabRepoRequest, CloneGitLabRepoResponse, GitLabDiscoveryMcpService,
     GitLabDiscoverySessionBinding, GitLabPathListing, ListGitLabPathsRequest,
-    ListGitLabPathsResponse,
+    ListGitLabPathsResponse, ResolvedGitLabDiscoveryAllowList,
 };
-use crate::gitlab::GitLabApi;
+use crate::gitlab::{GitLabApi, gitlab_error_has_status};
 use anyhow::Result;
 use axum::Router;
 use axum::body::Body;
@@ -57,48 +57,8 @@ impl GitLabDiscoveryMcpServer {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-
-        let listing = match current_path {
-            None => binding.allow.root_listing(),
-            Some(path) => {
-                if binding.allow.is_repo_allowed(path) {
-                    GitLabPathListing::default()
-                } else if binding.allow.can_browse_group(path) {
-                    let mut subgroups = Vec::new();
-                    for group in self
-                        .service
-                        .gitlab
-                        .list_group_subgroups(path)
-                        .await
-                        .map_err(mcp_internal_error)?
-                    {
-                        if binding.allow.can_browse_group(&group.full_path)
-                            || binding.allow.has_repo_within_group(&group.full_path)
-                        {
-                            subgroups.push(group.full_path);
-                        }
-                    }
-                    let mut repositories = Vec::new();
-                    for project in self
-                        .service
-                        .gitlab
-                        .list_direct_group_projects(path)
-                        .await
-                        .map_err(mcp_internal_error)?
-                    {
-                        if binding.allow.is_repo_allowed(&project.path_with_namespace) {
-                            repositories.push(project.path_with_namespace);
-                        }
-                    }
-                    GitLabPathListing::new(subgroups, repositories)
-                } else {
-                    return Err(McpError::resource_not_found(
-                        format!("GitLab path is not allowed for this run: {path}"),
-                        None,
-                    ));
-                }
-            }
-        };
+        let listing =
+            browse_listing_for_path(&self.service.gitlab, &binding.allow, current_path).await?;
 
         Ok(McpJson(ListGitLabPathsResponse {
             current_path: current_path.map(ToOwned::to_owned),
@@ -201,6 +161,63 @@ impl GitLabDiscoveryMcpServer {
             composer_install,
         }))
     }
+}
+
+async fn browse_listing_for_path(
+    gitlab: &impl GitLabApi,
+    allow: &ResolvedGitLabDiscoveryAllowList,
+    current_path: Option<&str>,
+) -> Result<GitLabPathListing, McpError> {
+    let Some(projected) = allow.listing_for_path(current_path) else {
+        let path = current_path.unwrap_or_default();
+        return Err(McpError::resource_not_found(
+            format!("GitLab path is not allowed for this run: {path}"),
+            None,
+        ));
+    };
+
+    let Some(path) = current_path else {
+        return Ok(projected);
+    };
+
+    let group = match gitlab.get_group(path).await {
+        Ok(group) => group,
+        Err(err) => {
+            if gitlab_error_has_status(&err, &[404]) {
+                return Ok(projected);
+            }
+            return Err(mcp_internal_error(err));
+        }
+    };
+    if group.archived || group.marked_for_deletion_on.is_some() {
+        return Ok(GitLabPathListing::default());
+    }
+
+    let mut subgroups = Vec::new();
+    for subgroup in gitlab
+        .list_group_subgroups(path)
+        .await
+        .map_err(mcp_internal_error)?
+    {
+        if allow.can_browse_group(&subgroup.full_path)
+            || allow.has_repo_within_group(&subgroup.full_path)
+        {
+            subgroups.push(subgroup.full_path);
+        }
+    }
+
+    let mut repositories = Vec::new();
+    for project in gitlab
+        .list_direct_group_projects(path)
+        .await
+        .map_err(mcp_internal_error)?
+    {
+        if allow.is_repo_allowed(&project.path_with_namespace) {
+            repositories.push(project.path_with_namespace);
+        }
+    }
+
+    Ok(GitLabPathListing::new(subgroups, repositories))
 }
 
 impl GitLabDiscoveryMcpServer {
@@ -312,8 +329,16 @@ fn canonical_peer_ip(ip: IpAddr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::build_router;
+    use super::{browse_listing_for_path, build_router};
     use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig, GitLabTargets};
+    use crate::gitlab::{
+        AwardEmoji, GitLabApi, GitLabGroup, GitLabGroupSummary, GitLabProject,
+        GitLabProjectSummary, GitLabUser, MergeRequest, Note,
+    };
+    use crate::gitlab_discovery_mcp::ResolvedGitLabDiscoveryAllowList;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     #[test]
@@ -331,5 +356,151 @@ mod tests {
         )
         .expect("service");
         let _router = build_router(Arc::new(service));
+    }
+
+    #[derive(Default)]
+    struct FakeGitLab {
+        groups: BTreeSet<String>,
+        subgroups: BTreeMap<String, Vec<GitLabGroupSummary>>,
+        projects: BTreeMap<String, Vec<GitLabProjectSummary>>,
+    }
+
+    #[async_trait]
+    impl GitLabApi for FakeGitLab {
+        async fn current_user(&self) -> Result<GitLabUser> {
+            unimplemented!()
+        }
+
+        async fn list_projects(&self) -> Result<Vec<GitLabProjectSummary>> {
+            unimplemented!()
+        }
+
+        async fn list_group_projects(&self, _group: &str) -> Result<Vec<GitLabProjectSummary>> {
+            unimplemented!()
+        }
+
+        async fn list_direct_group_projects(
+            &self,
+            group: &str,
+        ) -> Result<Vec<GitLabProjectSummary>> {
+            Ok(self.projects.get(group).cloned().unwrap_or_default())
+        }
+
+        async fn list_group_subgroups(&self, group: &str) -> Result<Vec<GitLabGroupSummary>> {
+            Ok(self.subgroups.get(group).cloned().unwrap_or_default())
+        }
+
+        async fn list_open_mrs(&self, _project: &str) -> Result<Vec<MergeRequest>> {
+            unimplemented!()
+        }
+
+        async fn get_latest_open_mr_activity(
+            &self,
+            _project: &str,
+        ) -> Result<Option<MergeRequest>> {
+            unimplemented!()
+        }
+
+        async fn get_mr(&self, _project: &str, _iid: u64) -> Result<MergeRequest> {
+            unimplemented!()
+        }
+
+        async fn get_project(&self, project: &str) -> Result<GitLabProject> {
+            if self.groups.contains(project) {
+                anyhow::bail!("gitlab GET fake response: status=404 Not Found body=not found");
+            }
+            Ok(GitLabProject {
+                path_with_namespace: Some(project.to_string()),
+                last_activity_at: None,
+            })
+        }
+
+        async fn get_group(&self, group: &str) -> Result<GitLabGroup> {
+            if !self.groups.contains(group) {
+                anyhow::bail!("gitlab GET fake response: status=404 Not Found body=not found");
+            }
+            Ok(GitLabGroup {
+                full_path: group.to_string(),
+                archived: false,
+                marked_for_deletion_on: None,
+            })
+        }
+
+        async fn list_awards(&self, _project: &str, _iid: u64) -> Result<Vec<AwardEmoji>> {
+            unimplemented!()
+        }
+
+        async fn add_award(&self, _project: &str, _iid: u64, _name: &str) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn delete_award(&self, _project: &str, _iid: u64, _award_id: u64) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn list_notes(&self, _project: &str, _iid: u64) -> Result<Vec<Note>> {
+            unimplemented!()
+        }
+
+        async fn create_note(&self, _project: &str, _iid: u64, _body: &str) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn browse_listing_returns_live_children_for_group_descendants() {
+        let allow = ResolvedGitLabDiscoveryAllowList {
+            target_repos: BTreeSet::new(),
+            target_groups: BTreeSet::from(["shopware".to_string()]),
+        };
+        let gitlab = FakeGitLab {
+            groups: BTreeSet::from([
+                "shopware".to_string(),
+                "shopware/infrastructure".to_string(),
+            ]),
+            projects: BTreeMap::from([(
+                "shopware/infrastructure".to_string(),
+                vec![GitLabProjectSummary {
+                    path_with_namespace: "shopware/infrastructure/shopware-chart".to_string(),
+                    archived: false,
+                    marked_for_deletion_on: None,
+                    marked_for_deletion_at: None,
+                }],
+            )]),
+            ..Default::default()
+        };
+
+        let listing = browse_listing_for_path(&gitlab, &allow, Some("shopware/infrastructure"))
+            .await
+            .expect("listing");
+
+        assert_eq!(
+            listing,
+            crate::gitlab_discovery_mcp::GitLabPathListing {
+                subgroups: Vec::new(),
+                repositories: vec!["shopware/infrastructure/shopware-chart".to_string()],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_listing_keeps_projected_children_when_parent_group_lookup_is_missing() {
+        let allow = ResolvedGitLabDiscoveryAllowList {
+            target_repos: BTreeSet::from(["alice/tooling".to_string()]),
+            target_groups: BTreeSet::new(),
+        };
+        let gitlab = FakeGitLab::default();
+
+        let listing = browse_listing_for_path(&gitlab, &allow, Some("alice"))
+            .await
+            .expect("listing");
+
+        assert_eq!(
+            listing,
+            crate::gitlab_discovery_mcp::GitLabPathListing {
+                subgroups: Vec::new(),
+                repositories: vec!["alice/tooling".to_string()],
+            }
+        );
     }
 }

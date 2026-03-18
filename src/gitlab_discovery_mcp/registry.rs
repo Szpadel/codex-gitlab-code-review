@@ -191,20 +191,48 @@ impl ResolvedGitLabDiscoveryAllowList {
                 .any(|group| repo_belongs_to_group(group, group_path))
     }
 
-    pub fn root_listing(&self) -> GitLabPathListing {
-        let mut subgroups = self.target_groups.clone();
-        let repositories = self.target_repos.clone();
+    pub fn listing_for_path(&self, path: Option<&str>) -> Option<GitLabPathListing> {
+        let current_path = path.map(str::trim).filter(|value| !value.is_empty());
+        match current_path {
+            None => Some(self.projected_children(None)),
+            Some(path) if self.target_repos.contains(path) => Some(GitLabPathListing::default()),
+            Some(path) if self.can_browse_group(path) => Some(self.projected_children(Some(path))),
+            Some(_) => None,
+        }
+    }
+
+    fn projected_children(&self, current_path: Option<&str>) -> GitLabPathListing {
+        let mut subgroups = BTreeSet::new();
+        let mut repositories = BTreeSet::new();
+
+        for group in &self.target_groups {
+            match current_path {
+                None => {
+                    subgroups.insert(group.to_string());
+                }
+                Some(_) => {
+                    if let Some(child) = immediate_child_path(current_path, group) {
+                        subgroups.insert(child);
+                    }
+                }
+            }
+        }
 
         for repo in &self.target_repos {
             if self
                 .target_groups
                 .iter()
-                .any(|group| repo_belongs_to_group(repo, group))
+                .any(|group| repo_within_group(repo, group))
             {
                 continue;
             }
-            if let Some((root_group, _)) = repo.split_once('/') {
-                subgroups.insert(root_group.to_string());
+            let Some(child) = immediate_child_path(current_path, repo) else {
+                continue;
+            };
+            if child == *repo {
+                repositories.insert(child);
+            } else {
+                subgroups.insert(child);
             }
         }
 
@@ -264,6 +292,23 @@ fn repo_within_group(path: &str, group: &str) -> bool {
     path.starts_with(&format!("{group}/"))
 }
 
+fn immediate_child_path(current_path: Option<&str>, target_path: &str) -> Option<String> {
+    match current_path {
+        None => target_path
+            .split_once('/')
+            .map(|(segment, _)| segment.to_string())
+            .or_else(|| Some(target_path.to_string())),
+        Some(path) => {
+            if target_path == path || !repo_within_group(target_path, path) {
+                return None;
+            }
+            let remainder = target_path.strip_prefix(&format!("{path}/"))?;
+            let next_segment = remainder.split('/').next()?;
+            Some(format!("{path}/{next_segment}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,11 +346,26 @@ mod tests {
         assert!(allow.can_browse_group("company/shared"));
         assert!(!allow.can_browse_group("company/other"));
         assert_eq!(
-            allow.root_listing(),
-            GitLabPathListing {
+            allow.listing_for_path(None),
+            Some(GitLabPathListing {
                 subgroups: vec!["company".to_string()],
+                repositories: Vec::new(),
+            })
+        );
+        assert_eq!(
+            allow.listing_for_path(Some("company")),
+            Some(GitLabPathListing {
+                subgroups: vec!["company/shared".to_string()],
+                repositories: Vec::new(),
+            })
+        );
+        assert_eq!(
+            allow.listing_for_path(Some("company/shared")),
+            GitLabPathListing {
+                subgroups: Vec::new(),
                 repositories: vec!["company/shared/contracts".to_string()],
             }
+            .into()
         );
     }
 
@@ -321,11 +381,12 @@ mod tests {
         assert!(allow.is_repo_allowed("company/platform/service"));
         assert!(!allow.is_repo_allowed("company/platform"));
         assert_eq!(
-            allow.root_listing(),
+            allow.listing_for_path(None),
             GitLabPathListing {
                 subgroups: vec!["company/platform".to_string()],
                 repositories: Vec::new(),
             }
+            .into()
         );
     }
 
@@ -343,18 +404,50 @@ mod tests {
         };
 
         assert_eq!(
-            allow.root_listing(),
+            allow.listing_for_path(None),
             GitLabPathListing {
                 subgroups: vec![
                     "company".to_string(),
                     "company/platform".to_string(),
                     "vendor/security".to_string(),
                 ],
-                repositories: vec![
-                    "company/apps/console".to_string(),
-                    "company/shared/contracts".to_string(),
-                ],
+                repositories: Vec::new(),
             }
+            .into()
+        );
+        assert_eq!(
+            allow.listing_for_path(Some("company")),
+            Some(GitLabPathListing {
+                subgroups: vec![
+                    "company/apps".to_string(),
+                    "company/platform".to_string(),
+                    "company/shared".to_string(),
+                ],
+                repositories: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn target_group_descendants_do_not_leak_repo_leaves_into_root_projection() {
+        let allow = ResolvedGitLabDiscoveryAllowList {
+            target_repos: BTreeSet::from([
+                "shopware/payment-costs-deleted-3058".to_string(),
+                "shopware/playwright-tests-deleted-3060".to_string(),
+            ]),
+            target_groups: BTreeSet::from(["shopware".to_string()]),
+        };
+
+        assert_eq!(
+            allow.listing_for_path(None),
+            Some(GitLabPathListing {
+                subgroups: vec!["shopware".to_string()],
+                repositories: Vec::new(),
+            })
+        );
+        assert_eq!(
+            allow.listing_for_path(Some("shopware")),
+            Some(GitLabPathListing::default())
         );
     }
 
