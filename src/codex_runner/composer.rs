@@ -160,7 +160,7 @@ mod tests {
         let result = ComposerInstallResult::failed(
             ComposerInstallMode::Safe,
             Some("group:team/platform".to_string()),
-            "install failed".to_string(),
+            "COMPOSER_AUTH detected from group team/platform\ninstall failed".to_string(),
         );
 
         let events = composer_install_events("composer install --no-dev --no-scripts", &result);
@@ -170,7 +170,10 @@ mod tests {
         assert_eq!(events[1].event_type, "item_completed");
         assert_eq!(events[1].payload["type"], "commandExecution");
         assert_eq!(events[1].payload["status"], "failed");
-        assert_eq!(events[1].payload["aggregatedOutput"], "install failed");
+        assert_eq!(
+            events[1].payload["aggregatedOutput"],
+            "COMPOSER_AUTH detected from group team/platform\ninstall failed"
+        );
         assert_eq!(
             events[1].payload["metadata"]["authSource"],
             "group:team/platform"
@@ -184,7 +187,10 @@ mod tests {
         let result = ComposerInstallResult::succeeded(
             ComposerInstallMode::Full,
             Some("project:group/repo".to_string()),
-            Some("Installing dependencies from lock file".to_string()),
+            Some(
+                "COMPOSER_AUTH detected from repository group/repo\nInstalling dependencies from lock file"
+                    .to_string(),
+            ),
         );
 
         let events =
@@ -195,7 +201,7 @@ mod tests {
         assert_eq!(events[1].payload["status"], "completed");
         assert_eq!(
             events[1].payload["aggregatedOutput"],
-            "Installing dependencies from lock file"
+            "COMPOSER_AUTH detected from repository group/repo\nInstalling dependencies from lock file"
         );
         assert_eq!(events[1].payload["metadata"]["success"], true);
         assert_eq!(

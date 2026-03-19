@@ -208,6 +208,7 @@ pub fn composer_install_result_from_exec_output(
     gitlab_token: Option<&str>,
     composer_auth: Option<&str>,
 ) -> ComposerInstallResult {
+    let auth_source_for_excerpt = auth_source.clone();
     let redacted_stdout = redact_composer_related_output(stdout, gitlab_token, composer_auth);
     let redacted_stderr = redact_composer_related_output(stderr, gitlab_token, composer_auth);
     if exit_code == COMPOSER_SKIP_EXIT_CODE && is_preflight_skip_output(&redacted_stdout) {
@@ -216,14 +217,22 @@ pub fn composer_install_result_from_exec_output(
     if exit_code == 0 {
         return ComposerInstallResult::succeeded(
             mode,
-            auth_source,
-            composer_success_log_excerpt(&redacted_stdout, &redacted_stderr),
+            auth_source.clone(),
+            composer_success_log_excerpt(
+                auth_source_for_excerpt.as_deref(),
+                &redacted_stdout,
+                &redacted_stderr,
+            ),
         );
     }
     ComposerInstallResult::failed(
         mode,
         auth_source,
-        composer_failure_log_excerpt(&redacted_stdout, &redacted_stderr),
+        composer_failure_log_excerpt(
+            auth_source_for_excerpt.as_deref(),
+            &redacted_stdout,
+            &redacted_stderr,
+        ),
     )
 }
 
@@ -291,7 +300,7 @@ fn redact_oauth2_credentials(input: &str) -> String {
     sanitized
 }
 
-fn composer_failure_log_excerpt(stdout: &str, stderr: &str) -> String {
+fn composer_failure_log_excerpt(auth_source: Option<&str>, stdout: &str, stderr: &str) -> String {
     let mut sections = Vec::new();
     if !stdout.trim().is_empty() {
         sections.push(stdout.trim());
@@ -304,10 +313,16 @@ fn composer_failure_log_excerpt(stdout: &str, stderr: &str) -> String {
     } else {
         sections.join("\n")
     };
-    truncate_excerpt(&combined, 8_000)
+    let excerpt = compose_excerpt_with_auth_notice(auth_source, Some(combined))
+        .expect("failure excerpts always include fallback output");
+    truncate_excerpt(&excerpt, 8_000)
 }
 
-fn composer_success_log_excerpt(stdout: &str, stderr: &str) -> Option<String> {
+fn composer_success_log_excerpt(
+    auth_source: Option<&str>,
+    stdout: &str,
+    stderr: &str,
+) -> Option<String> {
     let mut sections = Vec::new();
     if !stdout.trim().is_empty() {
         sections.push(stdout.trim());
@@ -315,7 +330,37 @@ fn composer_success_log_excerpt(stdout: &str, stderr: &str) -> Option<String> {
     if !stderr.trim().is_empty() {
         sections.push(stderr.trim());
     }
-    (!sections.is_empty()).then(|| truncate_excerpt(&sections.join("\n"), 8_000))
+    compose_excerpt_with_auth_notice(
+        auth_source,
+        (!sections.is_empty()).then(|| sections.join("\n")),
+    )
+    .map(|excerpt| truncate_excerpt(&excerpt, 8_000))
+}
+
+fn compose_excerpt_with_auth_notice(
+    auth_source: Option<&str>,
+    body: Option<String>,
+) -> Option<String> {
+    let notice = composer_auth_notice(auth_source);
+    match (notice, body) {
+        (Some(notice), Some(body)) => Some(format!("{notice}\n{body}")),
+        (Some(notice), None) => Some(notice),
+        (None, Some(body)) => Some(body),
+        (None, None) => None,
+    }
+}
+
+fn composer_auth_notice(auth_source: Option<&str>) -> Option<String> {
+    let auth_source = auth_source?;
+    if let Some(repo_path) = auth_source.strip_prefix("project:") {
+        return Some(format!(
+            "COMPOSER_AUTH detected from repository {repo_path}"
+        ));
+    }
+    if let Some(group_path) = auth_source.strip_prefix("group:") {
+        return Some(format!("COMPOSER_AUTH detected from group {group_path}"));
+    }
+    Some(format!("COMPOSER_AUTH detected from {auth_source}"))
 }
 
 fn truncate_excerpt(input: &str, max_chars: usize) -> String {
@@ -564,7 +609,7 @@ mod tests {
     fn composer_install_result_redacts_failure_excerpt() {
         let result = composer_install_result_from_exec_output(
             ComposerInstallMode::Safe,
-            Some("project:group/repo".to_string()),
+            Some("group:team/platform".to_string()),
             1,
             "install failed for s3cr3t",
             "https://oauth2:token@example.com/repo.git",
@@ -575,6 +620,7 @@ mod tests {
         assert!(result.attempted);
         assert!(!result.success);
         let excerpt = result.log_excerpt.expect("failure excerpt");
+        assert!(excerpt.contains("COMPOSER_AUTH detected from group team/platform"));
         assert!(!excerpt.contains("s3cr3t"));
         assert!(!excerpt.contains("token@example.com"));
     }
@@ -594,8 +640,47 @@ mod tests {
         assert!(result.attempted);
         assert!(result.success);
         let excerpt = result.log_excerpt.expect("success excerpt");
+        assert!(excerpt.contains("COMPOSER_AUTH detected from repository group/repo"));
         assert!(!excerpt.contains("s3cr3t"));
         assert!(!excerpt.contains("token@example.com"));
+    }
+
+    #[test]
+    fn composer_install_result_without_auth_source_omits_notice() {
+        let result = composer_install_result_from_exec_output(
+            ComposerInstallMode::Full,
+            None,
+            0,
+            "Installing dependencies from lock file",
+            "",
+            None,
+            None,
+        );
+
+        assert!(result.attempted);
+        assert!(result.success);
+        assert_eq!(
+            result.log_excerpt.as_deref(),
+            Some("Installing dependencies from lock file")
+        );
+    }
+
+    #[test]
+    fn composer_install_result_truncates_notice_and_output_together() {
+        let long_output = "x".repeat(8_100);
+        let result = composer_install_result_from_exec_output(
+            ComposerInstallMode::Full,
+            Some("group:team/platform".to_string()),
+            0,
+            &long_output,
+            "",
+            None,
+            None,
+        );
+
+        let excerpt = result.log_excerpt.expect("truncated excerpt");
+        assert!(excerpt.starts_with("COMPOSER_AUTH detected from group team/platform\n"));
+        assert!(excerpt.ends_with("[truncated]"));
     }
 
     #[test]
