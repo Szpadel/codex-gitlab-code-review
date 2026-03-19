@@ -111,6 +111,21 @@ pub struct RunHistoryListQuery {
     pub result: Option<String>,
     pub search: Option<String>,
     pub limit: usize,
+    pub page: usize,
+}
+
+impl RunHistoryListQuery {
+    pub fn normalized_limit(&self) -> usize {
+        if self.limit == 0 {
+            100
+        } else {
+            self.limit.min(500)
+        }
+    }
+
+    pub fn normalized_page(&self) -> usize {
+        self.page.max(1)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1146,62 +1161,18 @@ impl ReviewStateStore {
             FROM run_history
             "#,
         );
+        append_run_history_filters(&mut builder, query);
 
-        let mut has_where = false;
-        let mut push_where = |builder: &mut QueryBuilder<Sqlite>| {
-            if !has_where {
-                builder.push(" WHERE ");
-                has_where = true;
-            } else {
-                builder.push(" AND ");
-            }
-        };
-
-        if let Some(repo) = query.repo.as_deref() {
-            push_where(&mut builder);
-            builder.push("repo = ").push_bind(repo);
-        }
-        if let Some(iid) = query.iid {
-            push_where(&mut builder);
-            builder.push("iid = ").push_bind(iid as i64);
-        }
-        if let Some(kind) = query.kind {
-            push_where(&mut builder);
-            builder
-                .push("kind = ")
-                .push_bind(run_history_kind_label(kind));
-        }
-        if let Some(result) = query.result.as_deref() {
-            push_where(&mut builder);
-            builder.push("result = ").push_bind(result);
-        }
-        if let Some(search) = query
-            .search
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let pattern = format!("%{search}%");
-            push_where(&mut builder);
-            builder.push("(");
-            builder.push("repo LIKE ").push_bind(pattern.clone());
-            builder.push(" OR summary LIKE ").push_bind(pattern.clone());
-            builder.push(" OR preview LIKE ").push_bind(pattern.clone());
-            builder.push(" OR error LIKE ").push_bind(pattern.clone());
-            builder
-                .push(" OR trigger_note_body LIKE ")
-                .push_bind(pattern);
-            builder.push(")");
-        }
-
-        let limit = if query.limit == 0 {
-            50
-        } else {
-            query.limit.min(500)
-        };
+        let limit = query.normalized_limit();
+        let offset = query
+            .normalized_page()
+            .saturating_sub(1)
+            .saturating_mul(limit);
         builder
             .push(" ORDER BY started_at DESC, id DESC LIMIT ")
-            .push_bind(limit as i64);
+            .push_bind(limit as i64)
+            .push(" OFFSET ")
+            .push_bind(i64::try_from(offset).unwrap_or(i64::MAX));
 
         let rows = builder
             .build()
@@ -1209,6 +1180,23 @@ impl ReviewStateStore {
             .await
             .context("list run history")?;
         rows.into_iter().map(map_run_history_row).collect()
+    }
+
+    pub async fn count_run_history(&self, query: &RunHistoryListQuery) -> Result<usize> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT COUNT(*) AS count
+            FROM run_history
+            "#,
+        );
+        append_run_history_filters(&mut builder, query);
+        let row = builder
+            .build()
+            .fetch_one(&self.pool)
+            .await
+            .context("count run history")?;
+        let count: i64 = row.try_get("count").context("read run history count")?;
+        usize::try_from(count).context("convert run history count to usize")
     }
 
     pub async fn get_project_last_mr_activity(&self, repo: &str) -> Result<Option<String>> {
@@ -1566,6 +1554,58 @@ fn run_history_kind_label(kind: RunHistoryKind) -> &'static str {
     match kind {
         RunHistoryKind::Review => "review",
         RunHistoryKind::Mention => "mention",
+    }
+}
+
+fn append_run_history_filters<'args>(
+    builder: &mut QueryBuilder<'args, Sqlite>,
+    query: &'args RunHistoryListQuery,
+) {
+    let mut has_where = false;
+    let mut push_where = |builder: &mut QueryBuilder<'args, Sqlite>| {
+        if !has_where {
+            builder.push(" WHERE ");
+            has_where = true;
+        } else {
+            builder.push(" AND ");
+        }
+    };
+
+    if let Some(repo) = query.repo.as_deref() {
+        push_where(builder);
+        builder.push("repo = ").push_bind(repo);
+    }
+    if let Some(iid) = query.iid {
+        push_where(builder);
+        builder.push("iid = ").push_bind(iid as i64);
+    }
+    if let Some(kind) = query.kind {
+        push_where(builder);
+        builder
+            .push("kind = ")
+            .push_bind(run_history_kind_label(kind));
+    }
+    if let Some(result) = query.result.as_deref() {
+        push_where(builder);
+        builder.push("result = ").push_bind(result);
+    }
+    if let Some(search) = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let pattern = format!("%{search}%");
+        push_where(builder);
+        builder.push("(");
+        builder.push("repo LIKE ").push_bind(pattern.clone());
+        builder.push(" OR summary LIKE ").push_bind(pattern.clone());
+        builder.push(" OR preview LIKE ").push_bind(pattern.clone());
+        builder.push(" OR error LIKE ").push_bind(pattern.clone());
+        builder
+            .push(" OR trigger_note_body LIKE ")
+            .push_bind(pattern);
+        builder.push(")");
     }
 }
 
@@ -2611,6 +2651,93 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].repo, "group/repo".to_string());
         assert_eq!(records[0].iid, 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_run_history_paginates_and_counts_filtered_rows() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let mut run_ids = Vec::new();
+        for (iid, started_at) in [(21u64, 1_000i64), (22, 2_000), (23, 3_000)] {
+            let run_id = store
+                .start_run_history(NewRunHistory {
+                    kind: RunHistoryKind::Review,
+                    repo: "group/repo".to_string(),
+                    iid,
+                    head_sha: format!("sha-{iid}"),
+                    discussion_id: None,
+                    trigger_note_id: None,
+                    trigger_note_author_name: None,
+                    trigger_note_body: None,
+                    command_repo: None,
+                })
+                .await?;
+            store
+                .finish_run_history(
+                    run_id,
+                    RunHistoryFinish {
+                        result: "commented".to_string(),
+                        preview: Some(format!("Review group/repo !{iid}")),
+                        summary: Some("pagination target".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            sqlx::query("UPDATE run_history SET started_at = ?, updated_at = ? WHERE id = ?")
+                .bind(started_at)
+                .bind(started_at)
+                .bind(run_id)
+                .execute(store.pool())
+                .await?;
+            run_ids.push(run_id);
+        }
+        let unrelated_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/other".to_string(),
+                iid: 99,
+                head_sha: "sha-other".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .finish_run_history(
+                unrelated_id,
+                RunHistoryFinish {
+                    result: "pass".to_string(),
+                    preview: Some("Review group/other !99".to_string()),
+                    summary: Some("does not match".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let filtered = RunHistoryListQuery {
+            repo: Some("group/repo".to_string()),
+            search: Some("pagination".to_string()),
+            limit: 1,
+            page: 2,
+            ..Default::default()
+        };
+
+        assert_eq!(store.count_run_history(&filtered).await?, 3);
+
+        let records = store.list_run_history(&filtered).await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, run_ids[1]);
+
+        let first_page = store
+            .list_run_history(&RunHistoryListQuery {
+                page: 0,
+                ..filtered.clone()
+            })
+            .await?;
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(first_page[0].id, run_ids[2]);
         Ok(())
     }
 

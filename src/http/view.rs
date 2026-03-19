@@ -8,6 +8,7 @@ use crate::state::{
     RunHistoryKind, RunHistoryRecord,
 };
 use serde::Deserialize;
+use urlencoding::encode;
 
 pub(super) fn render_status_page(snapshot: &StatusSnapshot, csrf_token: Option<&str>) -> String {
     let scan = &snapshot.scan;
@@ -111,9 +112,11 @@ pub(super) fn render_history_page(snapshot: &HistorySnapshot, csrf_token: Option
     let body = format!(
         "<section class=\"hero\"><h1>Run history</h1><p class=\"muted\">Append-only review and mention sessions.</p></section>\
          {}\
+         {}\
          {}",
         render_history_filters(filters),
-        render_run_table("All runs", &snapshot.runs)
+        render_run_table("All runs", &snapshot.runs),
+        render_history_pagination(snapshot)
     );
     render_shell("History", NavItem::History, body, csrf_token)
 }
@@ -274,6 +277,8 @@ fn render_history_filters(filters: &HistorySnapshotFilters) -> String {
     format!(
         "<section class=\"card\"><h2>Filters</h2>\
          <form class=\"filters\" method=\"get\" action=\"/history\">\
+         <input type=\"hidden\" name=\"page\" value=\"1\">\
+         <input type=\"hidden\" name=\"limit\" value=\"{}\">\
          <label class=\"filter-field\"><span>Repo</span><input name=\"repo\" value=\"{}\"></label>\
          <label class=\"filter-field\"><span>MR IID</span><input name=\"iid\" value=\"{}\"></label>\
          <label class=\"filter-field\"><span>Kind</span><select name=\"kind\">{}</select></label>\
@@ -281,6 +286,7 @@ fn render_history_filters(filters: &HistorySnapshotFilters) -> String {
          <label class=\"filter-field filter-field-wide\"><span>Search</span><input name=\"q\" value=\"{}\"></label>\
          <div class=\"filter-actions\"><button type=\"submit\">Apply</button></div>\
          </form></section>",
+        filters.limit,
         escape_html(filters.repo.as_deref().unwrap_or("")),
         filters
             .iid
@@ -293,6 +299,63 @@ fn render_history_filters(filters: &HistorySnapshotFilters) -> String {
 }
 
 type HistorySnapshotFilters = super::status::HistoryQuery;
+
+fn render_history_pagination(snapshot: &HistorySnapshot) -> String {
+    let summary = if snapshot.total_runs == 0 {
+        "0 matching runs".to_string()
+    } else {
+        format!(
+            "Page {} of {} ({})",
+            snapshot.page,
+            snapshot.total_pages,
+            pluralize(snapshot.total_runs, "matching run", "matching runs")
+        )
+    };
+    let previous = if snapshot.has_previous {
+        let href = history_page_href(&snapshot.filters, snapshot.page.saturating_sub(1));
+        format!(
+            "<a class=\"pagination-link\" href=\"{}\">Previous</a>",
+            escape_html(&href)
+        )
+    } else {
+        "<span class=\"pagination-link pagination-link-disabled\">Previous</span>".to_string()
+    };
+    let next = if snapshot.has_next {
+        let href = history_page_href(&snapshot.filters, snapshot.page + 1);
+        format!(
+            "<a class=\"pagination-link\" href=\"{}\">Next</a>",
+            escape_html(&href)
+        )
+    } else {
+        "<span class=\"pagination-link pagination-link-disabled\">Next</span>".to_string()
+    };
+    format!(
+        "<section class=\"card\"><div class=\"pagination\"><p class=\"muted\">{}</p><div class=\"pagination-links\">{}{}</div></div></section>",
+        escape_html(&summary),
+        previous,
+        next
+    )
+}
+
+fn history_page_href(filters: &HistorySnapshotFilters, page: usize) -> String {
+    let mut params = vec![format!("page={page}"), format!("limit={}", filters.limit)];
+    if let Some(repo) = filters.repo.as_deref() {
+        params.push(format!("repo={}", encode(repo)));
+    }
+    if let Some(iid) = filters.iid {
+        params.push(format!("iid={iid}"));
+    }
+    if let Some(kind) = filters.kind {
+        params.push(format!("kind={}", run_kind_label(kind)));
+    }
+    if let Some(result) = filters.result.as_deref() {
+        params.push(format!("result={}", encode(result)));
+    }
+    if let Some(search) = filters.search.as_deref() {
+        params.push(format!("q={}", encode(search)));
+    }
+    format!("/history?{}", params.join("&"))
+}
 
 fn render_kind_options(selected: Option<RunHistoryKind>) -> String {
     let values = [
@@ -352,6 +415,11 @@ fn render_run_row(run: &RunHistoryRecord) -> String {
                 .unwrap_or("(no preview)")
         )
     )
+}
+
+fn pluralize(value: usize, singular: &str, plural: &str) -> String {
+    let noun = if value == 1 { singular } else { plural };
+    format!("{value} {noun}")
 }
 
 fn render_run_metadata(run: &RunHistoryRecord) -> String {
@@ -1521,6 +1589,10 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
 .filters input, .filters select { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--surface); font: inherit; color: var(--text-primary); }
 .filters button { border: 0; border-radius: 8px; padding: 10px 14px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
 .filters button:hover { background: #1D4ED8; }
+.pagination { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
+.pagination-links { display: flex; gap: 8px; align-items: center; }
+.pagination-link { display: inline-flex; align-items: center; justify-content: center; min-width: 88px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--accent); text-decoration: none; font-weight: 500; }
+.pagination-link-disabled { color: var(--text-disabled); background: var(--surface-subtle); border-color: var(--divider); pointer-events: none; }
 .simple-list { margin: 0; padding-left: 18px; }
 .codeblock { white-space: pre-wrap; word-break: break-word; background: var(--surface-subtle); border: 1px solid var(--divider); border-radius: 8px; padding: 12px; overflow-x: auto; font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12px; line-height: 18px; }
 
@@ -1615,6 +1687,9 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
   .filter-field, .filter-field-wide { flex-basis: 100%; }
   .filter-actions { width: 100%; }
   .filters button { width: 100%; }
+  .pagination { flex-direction: column; align-items: stretch; }
+  .pagination-links { width: 100%; }
+  .pagination-link { flex: 1 1 0; }
   .entry-header-shell, .entry-summary { grid-template-columns: 1fr; }
   .message-header { flex-direction: column; }
   .entry-summary::before { display: none; }

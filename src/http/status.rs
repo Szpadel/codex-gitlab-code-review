@@ -384,20 +384,47 @@ impl StatusService {
     }
 
     pub async fn history_snapshot(&self, query: HistoryQuery) -> Result<HistorySnapshot> {
+        let list_query = RunHistoryListQuery {
+            repo: query.repo.clone(),
+            iid: query.iid,
+            kind: query.kind,
+            result: query.result.clone(),
+            search: query.search.clone(),
+            limit: query.limit,
+            page: query.page,
+        };
+        let page_size = list_query.normalized_limit();
+        let requested_page = list_query.normalized_page();
+        let total_runs = self.state.count_run_history(&list_query).await?;
+        let total_pages = if total_runs == 0 {
+            0
+        } else {
+            total_runs.div_ceil(page_size)
+        };
+        let effective_page = if total_pages == 0 {
+            1
+        } else {
+            requested_page.min(total_pages)
+        };
         let runs = self
             .state
             .list_run_history(&RunHistoryListQuery {
-                repo: query.repo.clone(),
-                iid: query.iid,
-                kind: query.kind,
-                result: query.result.clone(),
-                search: query.search.clone(),
-                limit: query.limit,
+                page: effective_page,
+                ..list_query
             })
             .await?;
+        let mut filters = query;
+        filters.page = effective_page;
+        filters.limit = page_size;
         Ok(HistorySnapshot {
             generated_at: Utc::now().to_rfc3339(),
-            filters: query,
+            filters,
+            page: effective_page,
+            page_size,
+            total_runs,
+            total_pages,
+            has_previous: effective_page > 1,
+            has_next: total_pages > 0 && effective_page < total_pages,
             runs,
         })
     }
@@ -2851,12 +2878,19 @@ pub struct HistoryQuery {
     pub result: Option<String>,
     pub search: Option<String>,
     pub limit: usize,
+    pub page: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HistorySnapshot {
     pub generated_at: String,
     pub filters: HistoryQuery,
+    pub page: usize,
+    pub page_size: usize,
+    pub total_runs: usize,
+    pub total_pages: usize,
+    pub has_previous: bool,
+    pub has_next: bool,
     pub runs: Vec<RunHistoryRecord>,
 }
 

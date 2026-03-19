@@ -188,6 +188,7 @@ struct HistoryQueryParams {
     result: Option<String>,
     q: Option<String>,
     limit: Option<usize>,
+    page: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +231,7 @@ impl HistoryQueryParams {
             result: self.result.filter(|value| !value.trim().is_empty()),
             search: self.q.filter(|value| !value.trim().is_empty()),
             limit: self.limit.unwrap_or(100),
+            page: self.page.unwrap_or(1).max(1),
         })
     }
 }
@@ -770,6 +772,7 @@ mod tests {
                     result: None,
                     q: Some("failing pipeline".to_string()),
                     limit: None,
+                    page: None,
                 }
                 .into_query()?,
             )
@@ -843,6 +846,8 @@ mod tests {
         assert!(body.contains("class=\"filter-field\""));
         assert!(body.contains("class=\"filter-field filter-field-wide\""));
         assert!(body.contains("class=\"filter-actions\""));
+        assert!(body.contains("name=\"page\" value=\"1\""));
+        assert!(body.contains("name=\"limit\" value=\"100\""));
         assert!(body.contains("name=\"repo\" value=\"group/repo\""));
         assert!(body.contains("name=\"iid\" value=\"7\""));
         assert!(body.contains("class=\"localized-timestamp\""));
@@ -888,6 +893,7 @@ mod tests {
                     result: None,
                     q: Some("rename this helper".to_string()),
                     limit: None,
+                    page: None,
                 }
                 .into_query()?,
             )
@@ -907,10 +913,157 @@ mod tests {
             result: None,
             q: None,
             limit: None,
+            page: None,
         }
         .into_query()?;
 
         assert_eq!(query.kind, None);
+        Ok(())
+    }
+
+    #[test]
+    fn history_query_normalizes_page_zero_to_first_page() -> Result<()> {
+        let query = HistoryQueryParams {
+            repo: None,
+            iid: None,
+            kind: None,
+            result: None,
+            q: None,
+            limit: Some(25),
+            page: Some(0),
+        }
+        .into_query()?;
+
+        assert_eq!(query.page, 1);
+        assert_eq!(query.limit, 25);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_api_returns_pagination_metadata_and_clamps_page() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let mut run_ids = Vec::new();
+        for (iid, started_at) in [(41u64, 1_000i64), (42, 2_000), (43, 3_000)] {
+            let run_id = insert_run_history(
+                &state,
+                NewRunHistory {
+                    kind: RunHistoryKind::Review,
+                    repo: "group/repo".to_string(),
+                    iid,
+                    head_sha: format!("sha-{iid}"),
+                    discussion_id: None,
+                    trigger_note_id: None,
+                    trigger_note_author_name: None,
+                    trigger_note_body: None,
+                    command_repo: None,
+                },
+                RunHistorySessionUpdate::default(),
+                RunHistoryFinish {
+                    result: "commented".to_string(),
+                    preview: Some(format!("Review group/repo !{iid}")),
+                    summary: Some("pagination fixture".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            sqlx::query("UPDATE run_history SET started_at = ?, updated_at = ? WHERE id = ?")
+                .bind(started_at)
+                .bind(started_at)
+                .bind(run_id)
+                .execute(state.pool())
+                .await?;
+            run_ids.push(run_id);
+        }
+        let status_service = Arc::new(StatusService::new(
+            test_config(),
+            Arc::clone(&state),
+            false,
+            None,
+        ));
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!(
+            "http://{address}/api/history?repo=group%2Frepo&limit=1&page=9"
+        ))
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await?;
+        assert_eq!(body.get("page").and_then(Value::as_u64), Some(3));
+        assert_eq!(body.get("page_size").and_then(Value::as_u64), Some(1));
+        assert_eq!(body.get("total_runs").and_then(Value::as_u64), Some(3));
+        assert_eq!(body.get("total_pages").and_then(Value::as_u64), Some(3));
+        assert_eq!(
+            body.get("has_previous").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(body.get("has_next").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            body.get("filters")
+                .and_then(|filters| filters.get("page"))
+                .and_then(Value::as_u64),
+            Some(3)
+        );
+        let runs = body
+            .get("runs")
+            .and_then(Value::as_array)
+            .expect("runs array");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].get("id").and_then(Value::as_i64), Some(run_ids[0]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_page_renders_pagination_links_with_active_filters() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        for (iid, started_at) in [(51u64, 1_000i64), (52, 2_000)] {
+            let run_id = insert_run_history(
+                &state,
+                NewRunHistory {
+                    kind: RunHistoryKind::Review,
+                    repo: "group/repo".to_string(),
+                    iid,
+                    head_sha: format!("sha-{iid}"),
+                    discussion_id: None,
+                    trigger_note_id: None,
+                    trigger_note_author_name: None,
+                    trigger_note_body: None,
+                    command_repo: None,
+                },
+                RunHistorySessionUpdate::default(),
+                RunHistoryFinish {
+                    result: "commented".to_string(),
+                    preview: Some(format!("Review group/repo !{iid}")),
+                    summary: Some("findings".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            sqlx::query("UPDATE run_history SET started_at = ?, updated_at = ? WHERE id = ?")
+                .bind(started_at)
+                .bind(started_at)
+                .bind(run_id)
+                .execute(state.pool())
+                .await?;
+        }
+        let status_service = Arc::new(StatusService::new(
+            test_config(),
+            Arc::clone(&state),
+            false,
+            None,
+        ));
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::get(format!(
+            "http://{address}/history?repo=group%2Frepo&kind=review&q=findings&limit=1&page=1"
+        ))
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await?;
+        assert!(body.contains("Page 1 of 2 (2 matching runs)"));
+        assert!(body.contains("pagination-link pagination-link-disabled\">Previous</span>"));
+        assert!(body.contains(
+            "/history?page=2&amp;limit=1&amp;repo=group%2Frepo&amp;kind=review&amp;q=findings"
+        ));
         Ok(())
     }
 
