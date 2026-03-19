@@ -1,8 +1,9 @@
 use super::service::mcp_internal_error;
 use super::{
     CloneGitLabRepoRequest, CloneGitLabRepoResponse, GitLabDiscoveryMcpService,
-    GitLabDiscoverySessionBinding, GitLabPathListing, ListGitLabPathsRequest,
-    ListGitLabPathsResponse, ResolvedGitLabDiscoveryAllowList,
+    GitLabDiscoverySessionBinding, GitLabPathListing, InspectGitLabRepoRequest,
+    InspectGitLabRepoResponse, ListGitLabPathsRequest, ListGitLabPathsResponse,
+    ResolvedGitLabDiscoveryAllowList,
 };
 use crate::gitlab::{GitLabApi, gitlab_error_has_status};
 use anyhow::Result;
@@ -35,7 +36,7 @@ struct GitLabDiscoveryMcpServer {
 impl ServerHandler for GitLabDiscoveryMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Browse allowed GitLab paths. Call list_gitlab_paths without a path first to see top-level accessible groups, then call it again with a returned subgroup path to navigate deeper. Each response separates subgroup paths from repository paths. Use clone_gitlab_repo to clone an allowed repository into the current Codex container. Pass checkout_ref for branch or tag checkout, or commit_sha for a detached commit checkout.",
+            "Browse allowed GitLab paths. Call list_gitlab_paths without a path first to see top-level accessible groups, then call it again with a returned subgroup path to navigate deeper. Each response separates subgroup paths from repository paths. Use inspect_gitlab_repo to inspect an allowed repository and list its branches and tags without cloning. Use clone_gitlab_repo to clone an allowed repository into the current Codex container. Pass checkout_ref for branch or tag checkout, or commit_sha for a detached commit checkout.",
         )
     }
 }
@@ -68,6 +69,23 @@ impl GitLabDiscoveryMcpServer {
     }
 
     #[tool(
+        name = "inspect_gitlab_repo",
+        description = "Inspect an allowed GitLab repository without cloning it. Returns repository metadata plus all branch and tag names visible from GitLab."
+    )]
+    async fn inspect_gitlab_repo(
+        &self,
+        Parameters(request): Parameters<InspectGitLabRepoRequest>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<McpJson<InspectGitLabRepoResponse>, McpError> {
+        let binding = self.binding_from_parts(&parts).await?;
+        let repo_path = validated_repo_path(&request.repo_path)?;
+        let response =
+            inspect_repo_for_path(&self.service.gitlab, &binding.allow, repo_path).await?;
+
+        Ok(McpJson(response))
+    }
+
+    #[tool(
         name = "clone_gitlab_repo",
         description = "Clone an allowed GitLab repository into the current Codex container and return the local path plus available branches and tags. Use checkout_ref for a branch or tag, or commit_sha for a detached checkout by commit SHA."
     )]
@@ -77,19 +95,8 @@ impl GitLabDiscoveryMcpServer {
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<McpJson<CloneGitLabRepoResponse>, McpError> {
         let binding = self.binding_from_parts(&parts).await?;
-        let repo_path = request.repo_path.trim();
-        if repo_path.is_empty() {
-            return Err(McpError::invalid_params(
-                "repo_path must not be empty",
-                None,
-            ));
-        }
-        if !binding.allow.is_repo_allowed(repo_path) {
-            return Err(McpError::resource_not_found(
-                format!("GitLab repo is not allowed for this run: {repo_path}"),
-                None,
-            ));
-        }
+        let repo_path = validated_repo_path(&request.repo_path)?;
+        ensure_allowed_repo_path(&binding.allow, repo_path)?;
 
         let path = self
             .service
@@ -163,6 +170,65 @@ impl GitLabDiscoveryMcpServer {
     }
 }
 
+fn validated_repo_path(repo_path: &str) -> Result<&str, McpError> {
+    let repo_path = repo_path.trim();
+    if repo_path.is_empty() {
+        return Err(McpError::invalid_params(
+            "repo_path must not be empty",
+            None,
+        ));
+    }
+    Ok(repo_path)
+}
+
+fn ensure_allowed_repo_path(
+    allow: &ResolvedGitLabDiscoveryAllowList,
+    repo_path: &str,
+) -> Result<(), McpError> {
+    if allow.is_repo_allowed(repo_path) {
+        Ok(())
+    } else {
+        Err(McpError::resource_not_found(
+            format!("GitLab repo is not allowed for this run: {repo_path}"),
+            None,
+        ))
+    }
+}
+
+async fn inspect_repo_for_path(
+    gitlab: &impl GitLabApi,
+    allow: &ResolvedGitLabDiscoveryAllowList,
+    repo_path: &str,
+) -> Result<InspectGitLabRepoResponse, McpError> {
+    ensure_allowed_repo_path(allow, repo_path)?;
+
+    let project = gitlab
+        .get_project(repo_path)
+        .await
+        .map_err(|err| map_repo_lookup_error(repo_path, err))?;
+    let branches = gitlab
+        .list_repository_branches(repo_path)
+        .await
+        .map(sorted_unique_names)
+        .map_err(|err| map_repo_lookup_error(repo_path, err))?;
+    let tags = gitlab
+        .list_repository_tags(repo_path)
+        .await
+        .map(sorted_unique_names)
+        .map_err(|err| map_repo_lookup_error(repo_path, err))?;
+
+    Ok(InspectGitLabRepoResponse {
+        repo_path: project
+            .path_with_namespace
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| repo_path.to_string()),
+        web_url: project.web_url,
+        default_branch: project.default_branch,
+        branches,
+        tags,
+    })
+}
+
 async fn browse_listing_for_path(
     gitlab: &impl GitLabApi,
     allow: &ResolvedGitLabDiscoveryAllowList,
@@ -218,6 +284,25 @@ async fn browse_listing_for_path(
     }
 
     Ok(GitLabPathListing::new(subgroups, repositories))
+}
+
+fn sorted_unique_names(values: Vec<String>) -> Vec<String> {
+    let mut values = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn map_repo_lookup_error(repo_path: &str, err: anyhow::Error) -> McpError {
+    if gitlab_error_has_status(&err, &[404]) {
+        McpError::resource_not_found(format!("GitLab repo not found: {repo_path}"), None)
+    } else {
+        mcp_internal_error(err)
+    }
 }
 
 impl GitLabDiscoveryMcpServer {
@@ -329,15 +414,20 @@ fn canonical_peer_ip(ip: IpAddr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{browse_listing_for_path, build_router};
+    use super::{
+        GitLabDiscoveryMcpServer, browse_listing_for_path, build_router, inspect_repo_for_path,
+    };
     use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig, GitLabTargets};
     use crate::gitlab::{
         AwardEmoji, GitLabApi, GitLabGroup, GitLabGroupSummary, GitLabProject,
         GitLabProjectSummary, GitLabUser, MergeRequest, Note,
     };
-    use crate::gitlab_discovery_mcp::ResolvedGitLabDiscoveryAllowList;
+    use crate::gitlab_discovery_mcp::{
+        InspectGitLabRepoResponse, ResolvedGitLabDiscoveryAllowList,
+    };
     use anyhow::Result;
     use async_trait::async_trait;
+    use rmcp::model::ErrorCode;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
@@ -358,11 +448,25 @@ mod tests {
         let _router = build_router(Arc::new(service));
     }
 
+    #[test]
+    fn tool_router_includes_inspect_gitlab_repo() {
+        let tools = GitLabDiscoveryMcpServer::tool_router().list_all();
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"inspect_gitlab_repo"));
+    }
+
     #[derive(Default)]
     struct FakeGitLab {
         groups: BTreeSet<String>,
         subgroups: BTreeMap<String, Vec<GitLabGroupSummary>>,
         projects: BTreeMap<String, Vec<GitLabProjectSummary>>,
+        project_details: BTreeMap<String, GitLabProject>,
+        branches: BTreeMap<String, Vec<String>>,
+        tags: BTreeMap<String, Vec<String>>,
     }
 
     #[async_trait]
@@ -409,10 +513,16 @@ mod tests {
             if self.groups.contains(project) {
                 anyhow::bail!("gitlab GET fake response: status=404 Not Found body=not found");
             }
-            Ok(GitLabProject {
-                path_with_namespace: Some(project.to_string()),
-                last_activity_at: None,
-            })
+            Ok(self
+                .project_details
+                .get(project)
+                .cloned()
+                .unwrap_or(GitLabProject {
+                    path_with_namespace: Some(project.to_string()),
+                    web_url: None,
+                    default_branch: None,
+                    last_activity_at: None,
+                }))
         }
 
         async fn get_group(&self, group: &str) -> Result<GitLabGroup> {
@@ -444,6 +554,14 @@ mod tests {
 
         async fn create_note(&self, _project: &str, _iid: u64, _body: &str) -> Result<()> {
             unimplemented!()
+        }
+
+        async fn list_repository_branches(&self, project: &str) -> Result<Vec<String>> {
+            Ok(self.branches.get(project).cloned().unwrap_or_default())
+        }
+
+        async fn list_repository_tags(&self, project: &str) -> Result<Vec<String>> {
+            Ok(self.tags.get(project).cloned().unwrap_or_default())
         }
     }
 
@@ -502,5 +620,73 @@ mod tests {
                 repositories: vec!["alice/tooling".to_string()],
             }
         );
+    }
+
+    #[tokio::test]
+    async fn inspect_repo_returns_metadata_and_refs_for_allowed_repo() {
+        let allow = ResolvedGitLabDiscoveryAllowList {
+            target_repos: BTreeSet::from(["example-org/platform/placeholder-service".to_string()]),
+            target_groups: BTreeSet::new(),
+        };
+        let gitlab = FakeGitLab {
+            project_details: BTreeMap::from([(
+                "example-org/platform/placeholder-service".to_string(),
+                GitLabProject {
+                    path_with_namespace: Some(
+                        "example-org/platform/placeholder-service".to_string(),
+                    ),
+                    web_url: Some(
+                        "https://gitlab.example.com/example-org/platform/placeholder-service"
+                            .to_string(),
+                    ),
+                    default_branch: Some("main".to_string()),
+                    last_activity_at: Some("2025-01-01T00:00:00Z".to_string()),
+                },
+            )]),
+            branches: BTreeMap::from([(
+                "example-org/platform/placeholder-service".to_string(),
+                vec![
+                    "release".to_string(),
+                    "main".to_string(),
+                    "main".to_string(),
+                ],
+            )]),
+            tags: BTreeMap::from([(
+                "example-org/platform/placeholder-service".to_string(),
+                vec!["v2.0.0".to_string(), "v1.0.0".to_string()],
+            )]),
+            ..Default::default()
+        };
+
+        let inspection =
+            inspect_repo_for_path(&gitlab, &allow, "example-org/platform/placeholder-service")
+                .await
+                .expect("inspection");
+
+        assert_eq!(
+            inspection,
+            InspectGitLabRepoResponse {
+                repo_path: "example-org/platform/placeholder-service".to_string(),
+                web_url: Some(
+                    "https://gitlab.example.com/example-org/platform/placeholder-service"
+                        .to_string(),
+                ),
+                default_branch: Some("main".to_string()),
+                branches: vec!["main".to_string(), "release".to_string()],
+                tags: vec!["v1.0.0".to_string(), "v2.0.0".to_string()],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_repo_rejects_disallowed_repo() {
+        let allow = ResolvedGitLabDiscoveryAllowList::default();
+        let gitlab = FakeGitLab::default();
+
+        let err = inspect_repo_for_path(&gitlab, &allow, "example-org/private")
+            .await
+            .expect_err("disallowed repo must fail");
+
+        assert_eq!(err.code, ErrorCode::RESOURCE_NOT_FOUND);
     }
 }

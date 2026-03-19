@@ -1949,6 +1949,7 @@ mod tests {
         assert!(command[2].contains("\"method\":\"initialize\""));
         assert!(command[2].contains("\"method\":\"tools/list\""));
         assert!(command[2].contains("gitlab discovery MCP tools reachable"));
+        assert!(command[2].contains("inspect_gitlab_repo"));
     }
 
     #[test]

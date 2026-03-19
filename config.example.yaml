@@ -133,8 +133,8 @@ codex:
       - "chrome-devtools-mcp@latest"
   gitlab_discovery_mcp:
     # Optional. Serve an internal MCP endpoint that lets Codex browse allowed
-    # GitLab paths and request repository clones through docker exec without
-    # exposing GitLab credentials to the agent surface.
+    # GitLab paths, inspect repository refs, and request repository clones
+    # through docker exec without exposing GitLab credentials to the agent surface.
     enabled: false
     # Optional. MCP server name injected into the Codex runtime config.
     server_name: "gitlab-discovery"

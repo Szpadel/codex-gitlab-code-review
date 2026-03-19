@@ -35,7 +35,17 @@ pub struct MergeRequest {
 pub struct GitLabProject {
     #[serde(default)]
     pub path_with_namespace: Option<String>,
+    #[serde(default)]
+    pub web_url: Option<String>,
+    #[serde(default)]
+    pub default_branch: Option<String>,
+    #[serde(default)]
     pub last_activity_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitLabRepositoryRef {
+    name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -235,6 +245,16 @@ pub trait GitLabApi: Send + Sync {
         Ok(Vec::new())
     }
     async fn get_project(&self, project: &str) -> Result<GitLabProject>;
+    async fn list_repository_branches(&self, _project: &str) -> Result<Vec<String>> {
+        Err(anyhow!(
+            "list_repository_branches not implemented for this gitlab client"
+        ))
+    }
+    async fn list_repository_tags(&self, _project: &str) -> Result<Vec<String>> {
+        Err(anyhow!(
+            "list_repository_tags not implemented for this gitlab client"
+        ))
+    }
     async fn get_group(&self, group: &str) -> Result<GitLabGroup> {
         Err(anyhow!(
             "get_group not implemented for this gitlab client (group={group})"
@@ -492,6 +512,12 @@ impl GitLabClient {
         Ok(items)
     }
 
+    async fn list_repository_refs(&self, project: &str, ref_kind: &str) -> Result<Vec<String>> {
+        let url = format!("{}/repository/{}", self.project_path(project), ref_kind);
+        let refs = self.get_paginated::<GitLabRepositoryRef>(&url).await?;
+        Ok(sorted_unique(refs.into_iter().map(|item| item.name)))
+    }
+
     pub fn git_base_url(&self) -> Result<Url> {
         let mut url = Url::parse(&self.api_base)?;
         let path = url.path().trim_end_matches('/').to_string();
@@ -636,6 +662,14 @@ impl GitLabApi for GitLabClient {
     async fn get_project(&self, project: &str) -> Result<GitLabProject> {
         let url = self.project_path(project);
         self.get_json(&url).await
+    }
+
+    async fn list_repository_branches(&self, project: &str) -> Result<Vec<String>> {
+        self.list_repository_refs(project, "branches").await
+    }
+
+    async fn list_repository_tags(&self, project: &str) -> Result<Vec<String>> {
+        self.list_repository_refs(project, "tags").await
     }
 
     async fn get_group(&self, group: &str) -> Result<GitLabGroup> {
@@ -945,6 +979,13 @@ fn format_gitlab_http_error(
         "gitlab {method} {url} response: status={status} body={}",
         format_gitlab_error_body(body)
     )
+}
+
+fn sorted_unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
 }
 
 fn format_gitlab_error_body(body: &str) -> String {
@@ -1421,6 +1462,8 @@ mod tests {
     async fn get_project_reads_last_activity() -> Result<()> {
         let server = MockServer::start().await;
         let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "web_url": "https://gitlab.example.com/group/repo",
+            "default_branch": "main",
             "last_activity_at": "2025-01-01T00:00:00Z"
         }));
         Mock::given(method("GET"))
@@ -1433,9 +1476,96 @@ mod tests {
         let client = GitLabClient::new(&server.uri(), "token")?;
         let project = client.get_project("group/repo").await?;
         assert_eq!(
+            project.web_url,
+            Some("https://gitlab.example.com/group/repo".to_string())
+        );
+        assert_eq!(project.default_branch, Some("main".to_string()));
+        assert_eq!(
             project.last_activity_at,
             Some("2025-01-01T00:00:00Z".to_string())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_repository_branches_paginates_and_sorts_names() -> Result<()> {
+        let server = MockServer::start().await;
+        let page1 = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "2")
+            .set_body_json(vec![
+                serde_json::json!({ "name": "release" }),
+                serde_json::json!({ "name": "main" }),
+            ]);
+        let page2 = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "")
+            .set_body_json(vec![
+                serde_json::json!({ "name": "develop" }),
+                serde_json::json!({ "name": "main" }),
+            ]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/repository/branches"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(page1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/repository/branches"))
+            .and(query_param("page", "2"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(page2)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let branches = client.list_repository_branches("group/repo").await?;
+
+        assert_eq!(branches, vec!["develop", "main", "release"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_repository_tags_paginates_and_sorts_names() -> Result<()> {
+        let server = MockServer::start().await;
+        let page1 = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "2")
+            .set_body_json(vec![
+                serde_json::json!({ "name": "v2.0.0" }),
+                serde_json::json!({ "name": "v1.0.0" }),
+            ]);
+        let page2 = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "")
+            .set_body_json(vec![
+                serde_json::json!({ "name": "v1.5.0" }),
+                serde_json::json!({ "name": "v1.0.0" }),
+            ]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/repository/tags"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(page1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/repository/tags"))
+            .and(query_param("page", "2"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(page2)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let tags = client.list_repository_tags("group/repo").await?;
+
+        assert_eq!(tags, vec!["v1.0.0", "v1.5.0", "v2.0.0"]);
         Ok(())
     }
 

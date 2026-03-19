@@ -18,6 +18,22 @@ pub struct ListGitLabPathsRequest {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct InspectGitLabRepoRequest {
+    pub repo_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct InspectGitLabRepoResponse {
+    pub repo_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    pub branches: Vec<String>,
+    pub tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ListGitLabPathsResponse {
     pub current_path: Option<String>,

@@ -780,6 +780,8 @@ mod tests {
                     .filter(|value| value.contains('/'))
                     .map(ToOwned::to_owned)
                     .or_else(|| Some(project.to_string())),
+                web_url: None,
+                default_branch: None,
                 last_activity_at: mapped.filter(|value| !value.contains('/')),
             })
         }

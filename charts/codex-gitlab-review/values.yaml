@@ -120,16 +120,16 @@ config:
       # Empty by default: the server starts, but exposes no repositories until
       # explicit allow rules are configured.
       #
-      # Example 1: allow reviews from one source group to browse and clone repos
-      # from a shared platform group.
+      # Example 1: allow reviews from one source group to browse, inspect, and
+      # clone repos from a shared platform group.
       # allow:
       #   - sourceGroupPrefixes:
       #       - "company/product"
       #     targetGroups:
       #       - "company/platform"
       #
-      # Example 2: allow a specific source repo to clone one fixed repo plus
-      # browse a release-tools group.
+      # Example 2: allow a specific source repo to inspect/clone one fixed repo
+      # plus browse a release-tools group.
       # allow:
       #   - sourceRepos:
       #       - "company/product/backend"

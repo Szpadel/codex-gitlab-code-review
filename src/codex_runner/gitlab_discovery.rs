@@ -543,7 +543,7 @@ if command -v curl >/dev/null 2>&1; then
     if [ "$tools_curl_status" -ne 0 ]; then
       last_line="$(tail -n 1 "$curl_err_file" | tr -d '\r')"
       probe_result="ERROR tools/list request failed: $last_line"
-    elif grep -Eq '"name"[[:space:]]*:[[:space:]]*"list_gitlab_paths"' "$tools_body_file" && grep -Eq '"name"[[:space:]]*:[[:space:]]*"clone_gitlab_repo"' "$tools_body_file"; then
+    elif grep -Eq '"name"[[:space:]]*:[[:space:]]*"list_gitlab_paths"' "$tools_body_file" && grep -Eq '"name"[[:space:]]*:[[:space:]]*"inspect_gitlab_repo"' "$tools_body_file" && grep -Eq '"name"[[:space:]]*:[[:space:]]*"clone_gitlab_repo"' "$tools_body_file"; then
       probe_result='OK gitlab discovery MCP tools reachable'
     else
       probe_result="ERROR tools/list response missing GitLab discovery tools (http $tools_status)"
@@ -651,7 +651,7 @@ try:
                 for tool in payload.get("result", {{}}).get("tools", [])
                 if isinstance(tool, dict)
             }}
-            if {{"list_gitlab_paths", "clone_gitlab_repo"}}.issubset(tools):
+            if {{"list_gitlab_paths", "inspect_gitlab_repo", "clone_gitlab_repo"}}.issubset(tools):
                 print("OK gitlab discovery MCP tools reachable")
             else:
                 print("ERROR tools/list response missing GitLab discovery tools")
