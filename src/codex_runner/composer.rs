@@ -1,7 +1,7 @@
 use super::*;
 use crate::composer_install::{
     COMPOSER_INSTALL_TURN_ID, ComposerAuthLookup, ComposerInstallMode, ComposerInstallResult,
-    composer_install_exec_command, composer_install_result_from_exec_output,
+    composer_install_exec_command, composer_install_result_from_exec_output, prepare_composer_auth,
     redact_composer_related_output, resolve_composer_auth,
 };
 use crate::gitlab::GitLabClient;
@@ -19,10 +19,19 @@ impl DockerCodexRunner {
         let mode = ComposerInstallMode::for_flags(feature_flags)?;
         let auth_lookup = self.resolve_composer_auth_lookup(project_path).await;
         let composer_auth = auth_lookup.value.clone();
-        let env = composer_auth
+        let prepared_auth = prepare_composer_auth(
+            composer_auth.as_deref(),
+            feature_flags.composer_auto_repositories,
+        );
+        let env = prepared_auth
+            .env_value
             .as_ref()
             .map(|value| vec![format!("COMPOSER_AUTH={value}")]);
-        let command = composer_install_exec_command(mode, timeout_seconds);
+        let command = composer_install_exec_command(
+            mode,
+            timeout_seconds,
+            prepared_auth.repository_config_json.as_deref(),
+        );
         let command_label = mode.command_label();
 
         let result = match self

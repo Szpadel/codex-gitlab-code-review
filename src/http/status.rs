@@ -243,6 +243,7 @@ impl StatusService {
             }
             "gitlab_inline_review_comments" => {}
             "composer_install" => {}
+            "composer_auto_repositories" => {}
             "composer_safe_install" => {}
             other => bail!("invalid feature flag: {other}"),
         }
@@ -252,6 +253,7 @@ impl StatusService {
             "gitlab_discovery_mcp" => overrides.gitlab_discovery_mcp = enabled,
             "gitlab_inline_review_comments" => overrides.gitlab_inline_review_comments = enabled,
             "composer_install" => overrides.composer_install = enabled,
+            "composer_auto_repositories" => overrides.composer_auto_repositories = enabled,
             "composer_safe_install" => overrides.composer_safe_install = enabled,
             _ => unreachable!("validated feature flag name"),
         }
@@ -300,6 +302,16 @@ impl StatusService {
                 default_enabled: self.config.feature_flag_defaults.composer_install,
                 runtime_override: overrides.composer_install,
                 effective_enabled: effective.composer_install,
+            },
+            StatusFeatureFlagSnapshot {
+                name: "composer_auto_repositories".to_string(),
+                available: self
+                    .config
+                    .feature_flag_availability
+                    .composer_auto_repositories,
+                default_enabled: self.config.feature_flag_defaults.composer_auto_repositories,
+                runtime_override: overrides.composer_auto_repositories,
+                effective_enabled: effective.composer_auto_repositories,
             },
             StatusFeatureFlagSnapshot {
                 name: "composer_safe_install".to_string(),
@@ -1823,7 +1835,7 @@ mod tests {
 
         let snapshot = service.snapshot().await?;
 
-        assert_eq!(snapshot.config.feature_flags.len(), 4);
+        assert_eq!(snapshot.config.feature_flags.len(), 5);
         assert_eq!(
             snapshot
                 .config
@@ -1835,6 +1847,7 @@ mod tests {
                 "gitlab_discovery_mcp",
                 "gitlab_inline_review_comments",
                 "composer_install",
+                "composer_auto_repositories",
                 "composer_safe_install",
             ]
         );
@@ -1908,6 +1921,12 @@ mod tests {
         assert_eq!(updated.runtime_override, Some(true));
         assert!(updated.effective_enabled);
 
+        let auto_repo_updated = service
+            .update_runtime_feature_flag("composer_auto_repositories", Some(true))
+            .await?;
+        assert_eq!(auto_repo_updated.runtime_override, Some(true));
+        assert!(auto_repo_updated.effective_enabled);
+
         let safe_updated = service
             .update_runtime_feature_flag("composer_safe_install", Some(true))
             .await?;
@@ -1916,6 +1935,7 @@ mod tests {
 
         let stored = store.get_runtime_feature_flag_overrides().await?;
         assert_eq!(stored.composer_install, Some(true));
+        assert_eq!(stored.composer_auto_repositories, Some(true));
         assert_eq!(stored.composer_safe_install, Some(true));
         Ok(())
     }
@@ -1930,6 +1950,7 @@ mod tests {
                     gitlab_discovery_mcp: Some(true),
                     gitlab_inline_review_comments: None,
                     composer_install: None,
+                    composer_auto_repositories: None,
                     composer_safe_install: None,
                 },
             )

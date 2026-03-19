@@ -2,8 +2,10 @@ use crate::feature_flags::FeatureFlagSnapshot;
 use crate::gitlab::{GitLabApi, GitLabCiVariable};
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::time::Duration;
+use url::{Host, Url};
 
 pub const COMPOSER_AUTH_VARIABLE_KEY: &str = "COMPOSER_AUTH";
 pub const COMPOSER_SKIP_MARKER: &str = "CODEX_COMPOSER_SKIP";
@@ -34,6 +36,12 @@ pub struct ComposerInstallResult {
 pub struct ComposerAuthLookup {
     pub value: Option<String>,
     pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedComposerAuth {
+    pub env_value: Option<String>,
+    pub repository_config_json: Option<String>,
 }
 
 impl ComposerInstallMode {
@@ -102,11 +110,29 @@ impl ComposerInstallResult {
 pub fn composer_install_exec_command(
     mode: ComposerInstallMode,
     timeout_seconds: u64,
+    repository_config_json: Option<&str>,
 ) -> Vec<String> {
     let composer_command = mode.command_label();
     let skip_line = composer_skip_line();
+    let composer_home_setup = repository_config_json
+        .map(|config| {
+            let config_q = shell_quote(config);
+            format!(
+                "composer_home=\"$(mktemp -d /tmp/codex-composer-home.XXXXXX)\" || {{\n\
+  echo \"failed to create temporary COMPOSER_HOME\" >&2\n\
+  exit 1\n\
+}}\n\
+printf '%s' {config_q} >\"$composer_home/config.json\" || {{\n\
+  echo \"failed to write temporary Composer config\" >&2\n\
+  exit 1\n\
+}}\n\
+export COMPOSER_HOME=\"$composer_home\"\n"
+            )
+        })
+        .unwrap_or_default();
     let script = format!(
         r#"set +e
+composer_home=""
 if [ ! -f composer.json ]; then
   printf '{skip_line}\n'
   exit {skip_exit_code}
@@ -120,8 +146,12 @@ timeout_marker="$(mktemp /tmp/codex-composer-timeout.XXXXXX)"
 cleanup() {{
   rm -f "$log_file"
   rm -f "$timeout_marker"
+  if [ -n "$composer_home" ]; then
+    rm -rf "$composer_home"
+  fi
 }}
 trap cleanup EXIT
+{composer_home_setup}\
 COMPOSER_ALLOW_SUPERUSER=1 {composer_command} >"$log_file" 2>&1 &
 run_pid="$!"
 (
@@ -152,6 +182,7 @@ tail -n 100 "$log_file"
 "#,
         skip_line = skip_line,
         skip_exit_code = COMPOSER_SKIP_EXIT_CODE,
+        composer_home_setup = composer_home_setup,
         composer_command = composer_command,
         timeout_seconds = timeout_seconds,
     );
@@ -196,6 +227,22 @@ pub async fn resolve_composer_auth(gitlab: &dyn GitLabApi, repo_path: &str) -> C
     ComposerAuthLookup {
         value: None,
         source: None,
+    }
+}
+
+pub fn prepare_composer_auth(
+    composer_auth: Option<&str>,
+    auto_repositories_enabled: bool,
+) -> PreparedComposerAuth {
+    let env_value = composer_auth.map(ToOwned::to_owned);
+    let repository_config_json = if auto_repositories_enabled {
+        composer_auth.and_then(derived_composer_repository_config_json)
+    } else {
+        None
+    };
+    PreparedComposerAuth {
+        env_value,
+        repository_config_json,
     }
 }
 
@@ -279,6 +326,70 @@ fn composer_secret_strings(composer_auth: Option<&str>) -> Vec<String> {
     secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
     secrets.dedup();
     secrets
+}
+
+fn derived_composer_repository_config_json(composer_auth: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(composer_auth).ok()?;
+    let hosts = supported_http_auth_hosts(&parsed);
+    if hosts.is_empty() {
+        return None;
+    }
+    let repositories = hosts
+        .into_iter()
+        .map(|host| {
+            json!({
+                "type": "composer",
+                "url": format!("https://{host}"),
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(json!({ "repositories": repositories }).to_string())
+}
+
+fn supported_http_auth_hosts(value: &Value) -> BTreeSet<String> {
+    let mut hosts = BTreeSet::new();
+    let Some(map) = value.as_object() else {
+        return hosts;
+    };
+    for section in ["http-basic", "bearer", "custom-headers"] {
+        let Some(section_value) = map.get(section) else {
+            continue;
+        };
+        let Some(section_map) = section_value.as_object() else {
+            continue;
+        };
+        for raw_host in section_map.keys() {
+            if let Some(host) = normalized_composer_auth_host(raw_host) {
+                hosts.insert(host);
+            }
+        }
+    }
+    hosts
+}
+
+fn normalized_composer_auth_host(host: &str) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let parsed = Url::parse(&format!("https://{host}")).ok()?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let host = match parsed.host()? {
+        Host::Domain(domain) => domain.to_string(),
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => format!("[{ip}]"),
+    };
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
 }
 
 fn redact_oauth2_credentials(input: &str) -> String {
@@ -388,6 +499,10 @@ fn collect_string_leaves(value: &Value, output: &mut Vec<String>) {
     }
 }
 
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
 async fn resolve_project_variable(
     gitlab: &dyn GitLabApi,
     repo_path: &str,
@@ -479,7 +594,7 @@ mod tests {
 
     #[test]
     fn composer_install_exec_command_cleans_up_temporary_log_file() {
-        let command = composer_install_exec_command(ComposerInstallMode::Full, 42);
+        let command = composer_install_exec_command(ComposerInstallMode::Full, 42, None);
         let script = command.last().expect("bash script");
 
         assert!(script.contains("mktemp /tmp/codex-composer-install."));
@@ -487,12 +602,30 @@ mod tests {
         assert!(script.contains("trap cleanup EXIT"));
         assert!(script.contains("rm -f \"$log_file\""));
         assert!(script.contains("rm -f \"$timeout_marker\""));
+        assert!(!script.contains("mktemp -d /tmp/codex-composer-home."));
         assert!(script.contains("composer install timed out after 42s"));
         let run_pid_pos = script.find("run_pid=\"$!\"").expect("run pid assignment");
         let watchdog_pos = script
             .find("watchdog_pid=\"$!\"")
             .expect("watchdog assignment");
         assert!(run_pid_pos < watchdog_pos);
+    }
+
+    #[test]
+    fn composer_install_exec_command_configures_temporary_composer_home_when_requested() {
+        let command = composer_install_exec_command(
+            ComposerInstallMode::Full,
+            42,
+            Some(r#"{"repositories":[{"type":"composer","url":"https://example.com"}]}"#),
+        );
+        let script = command.last().expect("bash script");
+
+        assert!(script.contains("composer_home=\"$(mktemp -d /tmp/codex-composer-home."));
+        assert!(script.contains("failed to create temporary COMPOSER_HOME"));
+        assert!(script.contains("failed to write temporary Composer config"));
+        assert!(script.contains("export COMPOSER_HOME=\"$composer_home\""));
+        assert!(script.contains("config.json"));
+        assert!(script.contains("rm -rf \"$composer_home\""));
     }
 
     #[test]
@@ -535,6 +668,100 @@ mod tests {
             redact_composer_related_output("abc123", None, Some(r#"{"one":"abc","two":"abc123"}"#));
 
         assert_eq!(output, "[REDACTED_COMPOSER_SECRET]");
+    }
+
+    #[test]
+    fn prepare_composer_auth_leaves_env_unchanged_when_auto_repositories_disabled() {
+        let raw = r#"{"http-basic":{"example.com":{"username":"bot","password":"s3cr3t"}}}"#;
+
+        let prepared = prepare_composer_auth(Some(raw), false);
+
+        assert_eq!(prepared.env_value.as_deref(), Some(raw));
+        assert_eq!(prepared.repository_config_json, None);
+    }
+
+    #[test]
+    fn prepare_composer_auth_derives_supported_http_auth_hosts() {
+        let raw = r#"{
+          "http-basic":{"repo.example.com":{"username":"bot","password":"s3cr3t"}},
+          "bearer":{"cache.example.com":"token"},
+          "custom-headers":{"mirror.example.com":["Authorization: token value"]},
+          "gitlab-token":{"gitlab.example.com":"token"},
+          "github-oauth":{"github.com":"token"}
+        }"#;
+
+        let prepared = prepare_composer_auth(Some(raw), true);
+        let config = serde_json::from_str::<Value>(
+            prepared
+                .repository_config_json
+                .as_deref()
+                .expect("repository config"),
+        )
+        .expect("valid repository config");
+
+        assert_eq!(prepared.env_value.as_deref(), Some(raw));
+        assert_eq!(
+            config,
+            json!({
+                "repositories": [
+                    { "type": "composer", "url": "https://cache.example.com" },
+                    { "type": "composer", "url": "https://mirror.example.com" },
+                    { "type": "composer", "url": "https://repo.example.com" }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn prepare_composer_auth_preserves_ipv6_host_format() {
+        let raw = r#"{
+          "http-basic":{
+            "[2001:db8::1]":{"username":"bot","password":"s3cr3t"},
+            "[2001:db8::2]:8443":{"username":"bot","password":"s3cr3t"}
+          }
+        }"#;
+
+        let prepared = prepare_composer_auth(Some(raw), true);
+        let config = serde_json::from_str::<Value>(
+            prepared
+                .repository_config_json
+                .as_deref()
+                .expect("repository config"),
+        )
+        .expect("valid repository config");
+
+        assert_eq!(
+            config,
+            json!({
+                "repositories": [
+                    { "type": "composer", "url": "https://[2001:db8::1]" },
+                    { "type": "composer", "url": "https://[2001:db8::2]:8443" }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn prepare_composer_auth_ignores_invalid_or_unsupported_hosts() {
+        let raw = r#"{
+          "http-basic":{"":"bad","https://scheme.example.com":"bad","path/example.com":"bad","oauth2:token@example.com":"bad"},
+          "gitlab-token":{"gitlab.example.com":"token"}
+        }"#;
+
+        let prepared = prepare_composer_auth(Some(raw), true);
+
+        assert_eq!(prepared.env_value.as_deref(), Some(raw));
+        assert_eq!(prepared.repository_config_json, None);
+    }
+
+    #[test]
+    fn prepare_composer_auth_ignores_invalid_json() {
+        let raw = "{not-json";
+
+        let prepared = prepare_composer_auth(Some(raw), true);
+
+        assert_eq!(prepared.env_value.as_deref(), Some(raw));
+        assert_eq!(prepared.repository_config_json, None);
     }
 
     #[test]

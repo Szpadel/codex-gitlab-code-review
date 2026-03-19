@@ -2516,6 +2516,7 @@ mod tests {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: Some(false),
             composer_install: Some(true),
+            composer_auto_repositories: Some(true),
             composer_safe_install: Some(true),
         };
         store.set_runtime_feature_flag_overrides(&overrides).await?;
@@ -2545,6 +2546,7 @@ mod tests {
             gitlab_discovery_mcp: true,
             gitlab_inline_review_comments: true,
             composer_install: true,
+            composer_auto_repositories: true,
             composer_safe_install: true,
         };
         store

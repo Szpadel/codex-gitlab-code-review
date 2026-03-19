@@ -418,6 +418,10 @@ fn render_run_feature_flags(run: &RunHistoryRecord) -> String {
             bool_label(run.feature_flags.composer_install)
         ),
         format!(
+            "composer_auto_repositories={}",
+            bool_label(run.feature_flags.composer_auto_repositories)
+        ),
+        format!(
             "composer_safe_install={}",
             bool_label(run.feature_flags.composer_safe_install)
         ),

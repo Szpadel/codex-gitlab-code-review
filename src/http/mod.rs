@@ -463,6 +463,7 @@ mod tests {
                     gitlab_discovery_mcp: Some(true),
                     gitlab_inline_review_comments: None,
                     composer_install: None,
+                    composer_auto_repositories: None,
                     composer_safe_install: None,
                 },
             )
@@ -521,6 +522,38 @@ mod tests {
                 .get_runtime_feature_flag_overrides()
                 .await?
                 .composer_install,
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feature_flag_update_endpoint_persists_composer_auto_repositories_override()
+    -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let status_service = Arc::new(StatusService::new(
+            test_config(),
+            Arc::clone(&state),
+            false,
+            None,
+        ));
+        let csrf_token = status_service.feature_flag_csrf_token().to_string();
+        let address = spawn_test_server(app_router(status_service)).await?;
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/api/feature-flags/composer_auto_repositories"
+            ))
+            .header("x-codex-status-csrf", csrf_token)
+            .json(&json!({ "enabled": true }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .get_runtime_feature_flag_overrides()
+                .await?
+                .composer_auto_repositories,
             Some(true)
         );
         Ok(())

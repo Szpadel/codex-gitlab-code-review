@@ -2154,6 +2154,7 @@ mod tests {
             gitlab_discovery_mcp: true,
             gitlab_inline_review_comments: false,
             composer_install: false,
+            composer_auto_repositories: false,
             composer_safe_install: false,
         };
 
@@ -2227,6 +2228,7 @@ mod tests {
                 gitlab_discovery_mcp: true,
                 gitlab_inline_review_comments: false,
                 composer_install: false,
+                composer_auto_repositories: false,
                 composer_safe_install: false,
             },
             &BTreeMap::new(),
@@ -2973,6 +2975,7 @@ mod tests {
         let composer_command = composer_install_exec_command(
             ComposerInstallMode::Full,
             DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
+            None,
         );
         harness.push_exec_output(
             ExecContainerCommandRequest {
@@ -3311,6 +3314,7 @@ mod tests {
         let composer_command = composer_install_exec_command(
             ComposerInstallMode::Full,
             DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
+            None,
         );
         harness.push_exec_output(
             ExecContainerCommandRequest {
@@ -3597,6 +3601,7 @@ mod tests {
                     gitlab_discovery_mcp: true,
                     gitlab_inline_review_comments: false,
                     composer_install: false,
+                    composer_auto_repositories: false,
                     composer_safe_install: false,
                 },
                 ..review_context_with_target_branch(Some("main"))

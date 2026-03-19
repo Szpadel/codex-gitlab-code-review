@@ -40,6 +40,9 @@ config:
     gitlabDiscoveryMcp: false
     gitlabInlineReviewComments: false
     composerInstall: false
+    # Derive temporary Composer repository entries from COMPOSER_AUTH HTTP auth hosts.
+    # Only takes effect when composerInstall is enabled for a run.
+    composerAutoRepositories: false
     composerSafeInstall: false
   schedule:
     cron: "0 * * * * *"

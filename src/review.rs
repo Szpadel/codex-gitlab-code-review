@@ -4691,6 +4691,7 @@ mod tests {
                     gitlab_discovery_mcp: Some(true),
                     gitlab_inline_review_comments: None,
                     composer_install: None,
+                    composer_auto_repositories: None,
                     composer_safe_install: None,
                 },
             )
@@ -4729,6 +4730,7 @@ mod tests {
                     gitlab_discovery_mcp: Some(false),
                     gitlab_inline_review_comments: None,
                     composer_install: None,
+                    composer_auto_repositories: None,
                     composer_safe_install: None,
                 },
             )
@@ -5299,6 +5301,7 @@ mod tests {
                     gitlab_discovery_mcp: Some(true),
                     gitlab_inline_review_comments: None,
                     composer_install: None,
+                    composer_auto_repositories: None,
                     composer_safe_install: None,
                 },
             )
@@ -5337,6 +5340,7 @@ mod tests {
                     gitlab_discovery_mcp: Some(false),
                     gitlab_inline_review_comments: None,
                     composer_install: None,
+                    composer_auto_repositories: None,
                     composer_safe_install: None,
                 },
             )

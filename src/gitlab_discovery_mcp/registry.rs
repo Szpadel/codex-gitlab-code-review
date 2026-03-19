@@ -466,6 +466,7 @@ mod tests {
                     gitlab_discovery_mcp: true,
                     gitlab_inline_review_comments: false,
                     composer_install: false,
+                    composer_auto_repositories: false,
                     composer_safe_install: false,
                 },
                 allow: ResolvedGitLabDiscoveryAllowList::default(),

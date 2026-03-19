@@ -22,6 +22,7 @@ data:
       gitlab_discovery_mcp: {{ .Values.config.featureFlags.gitlabDiscoveryMcp }}
       gitlab_inline_review_comments: {{ .Values.config.featureFlags.gitlabInlineReviewComments }}
       composer_install: {{ .Values.config.featureFlags.composerInstall }}
+      composer_auto_repositories: {{ .Values.config.featureFlags.composerAutoRepositories }}
       composer_safe_install: {{ .Values.config.featureFlags.composerSafeInstall }}
     gitlab:
       base_url: {{ .Values.gitlab.baseUrl | quote }}

@@ -9,6 +9,8 @@ pub struct FeatureFlagSnapshot {
     #[serde(default)]
     pub composer_install: bool,
     #[serde(default)]
+    pub composer_auto_repositories: bool,
+    #[serde(default)]
     pub composer_safe_install: bool,
 }
 
@@ -20,6 +22,8 @@ pub struct RuntimeFeatureFlagOverrides {
     pub gitlab_inline_review_comments: Option<bool>,
     #[serde(default)]
     pub composer_install: Option<bool>,
+    #[serde(default)]
+    pub composer_auto_repositories: Option<bool>,
     #[serde(default)]
     pub composer_safe_install: Option<bool>,
 }
@@ -33,6 +37,8 @@ pub struct FeatureFlagDefaults {
     #[serde(default)]
     pub composer_install: bool,
     #[serde(default)]
+    pub composer_auto_repositories: bool,
+    #[serde(default)]
     pub composer_safe_install: bool,
 }
 
@@ -41,6 +47,7 @@ pub struct FeatureFlagAvailability {
     pub gitlab_discovery_mcp: bool,
     pub gitlab_inline_review_comments: bool,
     pub composer_install: bool,
+    pub composer_auto_repositories: bool,
     pub composer_safe_install: bool,
 }
 
@@ -65,6 +72,11 @@ impl FeatureFlagSnapshot {
                 defaults.composer_install,
                 availability.composer_install,
                 overrides.composer_install,
+            ),
+            composer_auto_repositories: resolve_flag(
+                defaults.composer_auto_repositories,
+                availability.composer_auto_repositories,
+                overrides.composer_auto_repositories,
             ),
             composer_safe_install: resolve_flag(
                 defaults.composer_safe_install,
@@ -94,18 +106,21 @@ mod tests {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: false,
                 composer_install: false,
+                composer_auto_repositories: false,
                 composer_safe_install: false,
             },
             &FeatureFlagAvailability {
                 gitlab_discovery_mcp: true,
                 gitlab_inline_review_comments: true,
                 composer_install: true,
+                composer_auto_repositories: true,
                 composer_safe_install: true,
             },
             &RuntimeFeatureFlagOverrides {
                 gitlab_discovery_mcp: Some(true),
                 gitlab_inline_review_comments: None,
                 composer_install: None,
+                composer_auto_repositories: None,
                 composer_safe_install: None,
             },
         );
@@ -120,18 +135,21 @@ mod tests {
                 gitlab_discovery_mcp: true,
                 gitlab_inline_review_comments: true,
                 composer_install: false,
+                composer_auto_repositories: false,
                 composer_safe_install: false,
             },
             &FeatureFlagAvailability {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: false,
                 composer_install: true,
+                composer_auto_repositories: true,
                 composer_safe_install: true,
             },
             &RuntimeFeatureFlagOverrides {
                 gitlab_discovery_mcp: Some(true),
                 gitlab_inline_review_comments: Some(true),
                 composer_install: None,
+                composer_auto_repositories: None,
                 composer_safe_install: None,
             },
         );
@@ -147,24 +165,28 @@ mod tests {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: false,
                 composer_install: false,
+                composer_auto_repositories: false,
                 composer_safe_install: false,
             },
             &FeatureFlagAvailability {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: true,
                 composer_install: true,
+                composer_auto_repositories: true,
                 composer_safe_install: true,
             },
             &RuntimeFeatureFlagOverrides {
                 gitlab_discovery_mcp: None,
                 gitlab_inline_review_comments: Some(true),
                 composer_install: Some(true),
+                composer_auto_repositories: Some(true),
                 composer_safe_install: Some(true),
             },
         );
 
         assert!(snapshot.gitlab_inline_review_comments);
         assert!(snapshot.composer_install);
+        assert!(snapshot.composer_auto_repositories);
         assert!(snapshot.composer_safe_install);
     }
 }

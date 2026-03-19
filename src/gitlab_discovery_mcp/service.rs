@@ -5,7 +5,7 @@ use super::{
 };
 use crate::composer_install::{
     ComposerInstallMode, ComposerInstallResult, DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
-    composer_install_exec_command, composer_install_result_from_exec_output,
+    composer_install_exec_command, composer_install_result_from_exec_output, prepare_composer_auth,
     redact_composer_related_output, resolve_composer_auth,
 };
 use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig};
@@ -368,10 +368,19 @@ printf '%s\n' "$dest"
         let mode = ComposerInstallMode::for_flags(&binding.feature_flags)?;
         let auth_lookup = resolve_composer_auth(&self.gitlab, gitlab_repo_path).await;
         let composer_auth = auth_lookup.value.clone();
-        let env = composer_auth
+        let prepared_auth = prepare_composer_auth(
+            composer_auth.as_deref(),
+            binding.feature_flags.composer_auto_repositories,
+        );
+        let env = prepared_auth
+            .env_value
             .as_ref()
             .map(|value| vec![format!("COMPOSER_AUTH={value}")]);
-        let command = composer_install_exec_command(mode, DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS);
+        let command = composer_install_exec_command(
+            mode,
+            DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
+            prepared_auth.repository_config_json.as_deref(),
+        );
         match self
             .exec_container_command_allow_failure(
                 &binding.container_id,
