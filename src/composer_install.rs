@@ -13,6 +13,7 @@ pub const COMPOSER_INSTALL_TURN_ID: &str = "composer-install";
 pub const DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS: u64 = 300;
 const COMPOSER_SKIP_EXIT_CODE: i64 = 86;
 const COMPOSER_SKIP_REASON_MISSING_JSON: &str = "missing-composer-json";
+const COMPOSER_DEBUG_PREAMBLE_MAX_CHARS: usize = 1_200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -36,12 +37,23 @@ pub struct ComposerInstallResult {
 pub struct ComposerAuthLookup {
     pub value: Option<String>,
     pub source: Option<String>,
+    pub attempts: Vec<ComposerAuthLookupAttempt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerAuthLookupAttempt {
+    pub scope: String,
+    pub found: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedComposerAuth {
     pub env_value: Option<String>,
     pub repository_config_json: Option<String>,
+    pub supported_sections: Vec<String>,
+    pub repository_urls: Vec<String>,
+    pub ignored_repository_entries: Vec<String>,
+    pub parse_failed: bool,
 }
 
 impl ComposerInstallMode {
@@ -59,9 +71,7 @@ impl ComposerInstallMode {
 
     pub fn command_label(self) -> &'static str {
         match self {
-            Self::Full => {
-                "composer install --no-interaction --no-progress --ignore-platform-reqs"
-            }
+            Self::Full => "composer install --no-interaction --no-progress --ignore-platform-reqs",
             Self::Safe => {
                 "composer install --no-dev --no-scripts --no-plugins --prefer-dist --no-interaction --no-progress --ignore-platform-reqs"
             }
@@ -207,28 +217,49 @@ pub async fn resolve_composer_auth(gitlab: &dyn GitLabApi, repo_path: &str) -> C
         return ComposerAuthLookup {
             value: None,
             source: None,
+            attempts: Vec::new(),
         };
     }
 
+    let mut attempts = Vec::new();
     if let Some(variable) = resolve_project_variable(gitlab, repo_path).await {
+        attempts.push(ComposerAuthLookupAttempt {
+            scope: format!("project:{repo_path}"),
+            found: true,
+        });
         return ComposerAuthLookup {
             value: Some(variable.value),
             source: Some(format!("project:{repo_path}")),
+            attempts,
         };
     }
+    attempts.push(ComposerAuthLookupAttempt {
+        scope: format!("project:{repo_path}"),
+        found: false,
+    });
 
     for group in repo_parent_groups(repo_path) {
         if let Some(variable) = resolve_group_variable(gitlab, &group).await {
+            attempts.push(ComposerAuthLookupAttempt {
+                scope: format!("group:{group}"),
+                found: true,
+            });
             return ComposerAuthLookup {
                 value: Some(variable.value),
                 source: Some(format!("group:{group}")),
+                attempts,
             };
         }
+        attempts.push(ComposerAuthLookupAttempt {
+            scope: format!("group:{group}"),
+            found: false,
+        });
     }
 
     ComposerAuthLookup {
         value: None,
         source: None,
+        attempts,
     }
 }
 
@@ -237,14 +268,28 @@ pub fn prepare_composer_auth(
     auto_repositories_enabled: bool,
 ) -> PreparedComposerAuth {
     let env_value = composer_auth.map(ToOwned::to_owned);
-    let repository_config_json = if auto_repositories_enabled {
-        composer_auth.and_then(derived_composer_repository_config_json)
-    } else {
-        None
-    };
+    let analysis = analyze_composer_auth(composer_auth);
+    let repository_config_json =
+        (auto_repositories_enabled && !analysis.repository_urls.is_empty()).then(|| {
+            json!({
+                "repositories": analysis
+                    .repository_urls
+                    .iter()
+                    .map(|url| json!({
+                        "type": "composer",
+                        "url": url,
+                    }))
+                    .collect::<Vec<_>>()
+            })
+            .to_string()
+        });
     PreparedComposerAuth {
         env_value,
         repository_config_json,
+        supported_sections: analysis.supported_sections,
+        repository_urls: analysis.repository_urls,
+        ignored_repository_entries: analysis.ignored_repository_entries,
+        parse_failed: analysis.parse_failed,
     }
 }
 
@@ -256,10 +301,15 @@ pub fn composer_install_result_from_exec_output(
     stderr: &str,
     gitlab_token: Option<&str>,
     composer_auth: Option<&str>,
+    debug_lines: &[String],
 ) -> ComposerInstallResult {
     let auth_source_for_excerpt = auth_source.clone();
     let redacted_stdout = redact_composer_related_output(stdout, gitlab_token, composer_auth);
     let redacted_stderr = redact_composer_related_output(stderr, gitlab_token, composer_auth);
+    let redacted_debug_lines = debug_lines
+        .iter()
+        .map(|line| redact_composer_related_output(line, gitlab_token, composer_auth))
+        .collect::<Vec<_>>();
     if exit_code == COMPOSER_SKIP_EXIT_CODE && is_preflight_skip_output(&redacted_stdout) {
         return ComposerInstallResult::skipped(mode, auth_source);
     }
@@ -269,6 +319,7 @@ pub fn composer_install_result_from_exec_output(
             auth_source.clone(),
             composer_success_log_excerpt(
                 auth_source_for_excerpt.as_deref(),
+                &redacted_debug_lines,
                 &redacted_stdout,
                 &redacted_stderr,
             ),
@@ -279,6 +330,7 @@ pub fn composer_install_result_from_exec_output(
         auth_source,
         composer_failure_log_excerpt(
             auth_source_for_excerpt.as_deref(),
+            &redacted_debug_lines,
             &redacted_stdout,
             &redacted_stderr,
         ),
@@ -330,28 +382,33 @@ fn composer_secret_strings(composer_auth: Option<&str>) -> Vec<String> {
     secrets
 }
 
-fn derived_composer_repository_config_json(composer_auth: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<Value>(composer_auth).ok()?;
-    let hosts = supported_http_auth_hosts(&parsed);
-    if hosts.is_empty() {
-        return None;
-    }
-    let repositories = hosts
-        .into_iter()
-        .map(|host| {
-            json!({
-                "type": "composer",
-                "url": format!("https://{host}"),
-            })
-        })
-        .collect::<Vec<_>>();
-    Some(json!({ "repositories": repositories }).to_string())
+#[derive(Default)]
+struct ComposerAuthAnalysis {
+    supported_sections: Vec<String>,
+    repository_urls: Vec<String>,
+    ignored_repository_entries: Vec<String>,
+    parse_failed: bool,
 }
 
-fn supported_http_auth_hosts(value: &Value) -> BTreeSet<String> {
-    let mut hosts = BTreeSet::new();
+fn analyze_composer_auth(composer_auth: Option<&str>) -> ComposerAuthAnalysis {
+    let Some(composer_auth) = composer_auth else {
+        return ComposerAuthAnalysis::default();
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(composer_auth) else {
+        return ComposerAuthAnalysis {
+            parse_failed: true,
+            ..ComposerAuthAnalysis::default()
+        };
+    };
+    supported_repository_urls(&parsed)
+}
+
+fn supported_repository_urls(value: &Value) -> ComposerAuthAnalysis {
+    let mut supported_sections = BTreeSet::new();
+    let mut repository_urls = BTreeSet::new();
+    let mut ignored_entries = BTreeSet::new();
     let Some(map) = value.as_object() else {
-        return hosts;
+        return ComposerAuthAnalysis::default();
     };
     for section in ["http-basic", "bearer", "custom-headers"] {
         let Some(section_value) = map.get(section) else {
@@ -360,27 +417,53 @@ fn supported_http_auth_hosts(value: &Value) -> BTreeSet<String> {
         let Some(section_map) = section_value.as_object() else {
             continue;
         };
+        supported_sections.insert(section.to_string());
         for raw_host in section_map.keys() {
-            if let Some(host) = normalized_composer_auth_host(raw_host) {
-                hosts.insert(host);
+            if let Some(url) = normalized_composer_repository_url(raw_host) {
+                repository_urls.insert(url);
+            } else {
+                ignored_entries.insert(raw_host.to_string());
             }
         }
     }
-    hosts
+    ComposerAuthAnalysis {
+        supported_sections: supported_sections.into_iter().collect(),
+        repository_urls: repository_urls.into_iter().collect(),
+        ignored_repository_entries: ignored_entries.into_iter().collect(),
+        parse_failed: false,
+    }
 }
 
-fn normalized_composer_auth_host(host: &str) -> Option<String> {
-    let host = host.trim();
-    if host.is_empty() {
+fn normalized_composer_repository_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
         return None;
     }
-    let parsed = Url::parse(&format!("https://{host}")).ok()?;
+    if raw.contains("://") {
+        let parsed = Url::parse(raw).ok()?;
+        return normalized_repository_url_from_parsed(&parsed, Some(parsed.scheme()), true);
+    }
+    let parsed = Url::parse(&format!("https://{raw}")).ok()?;
+    normalized_repository_url_from_parsed(&parsed, Some("https"), false)
+}
+
+fn normalized_repository_url_from_parsed(
+    parsed: &Url,
+    forced_scheme: Option<&str>,
+    allow_path: bool,
+) -> Option<String> {
     if !parsed.username().is_empty()
         || parsed.password().is_some()
-        || parsed.path() != "/"
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
+        return None;
+    }
+    if !allow_path && parsed.path() != "/" {
+        return None;
+    }
+    let scheme = forced_scheme.unwrap_or(parsed.scheme());
+    if scheme != "http" && scheme != "https" {
         return None;
     }
     let host = match parsed.host()? {
@@ -388,10 +471,15 @@ fn normalized_composer_auth_host(host: &str) -> Option<String> {
         Host::Ipv4(ip) => ip.to_string(),
         Host::Ipv6(ip) => format!("[{ip}]"),
     };
-    Some(match parsed.port() {
+    let host_port = match parsed.port() {
         Some(port) => format!("{host}:{port}"),
         None => host,
-    })
+    };
+    let path = match parsed.path() {
+        "/" => "",
+        other => other,
+    };
+    Some(format!("{scheme}://{host_port}{path}"))
 }
 
 fn redact_oauth2_credentials(input: &str) -> String {
@@ -413,7 +501,12 @@ fn redact_oauth2_credentials(input: &str) -> String {
     sanitized
 }
 
-fn composer_failure_log_excerpt(auth_source: Option<&str>, stdout: &str, stderr: &str) -> String {
+fn composer_failure_log_excerpt(
+    auth_source: Option<&str>,
+    debug_lines: &[String],
+    stdout: &str,
+    stderr: &str,
+) -> String {
     let mut sections = Vec::new();
     if !stdout.trim().is_empty() {
         sections.push(stdout.trim());
@@ -426,13 +519,14 @@ fn composer_failure_log_excerpt(auth_source: Option<&str>, stdout: &str, stderr:
     } else {
         sections.join("\n")
     };
-    let excerpt = compose_excerpt_with_auth_notice(auth_source, Some(combined))
+    let excerpt = compose_excerpt_with_debug_notice(auth_source, debug_lines, Some(combined))
         .expect("failure excerpts always include fallback output");
     truncate_excerpt(&excerpt, 8_000)
 }
 
 fn composer_success_log_excerpt(
     auth_source: Option<&str>,
+    debug_lines: &[String],
     stdout: &str,
     stderr: &str,
 ) -> Option<String> {
@@ -443,19 +537,28 @@ fn composer_success_log_excerpt(
     if !stderr.trim().is_empty() {
         sections.push(stderr.trim());
     }
-    compose_excerpt_with_auth_notice(
+    compose_excerpt_with_debug_notice(
         auth_source,
+        debug_lines,
         (!sections.is_empty()).then(|| sections.join("\n")),
     )
     .map(|excerpt| truncate_excerpt(&excerpt, 8_000))
 }
 
-fn compose_excerpt_with_auth_notice(
+fn compose_excerpt_with_debug_notice(
     auth_source: Option<&str>,
+    debug_lines: &[String],
     body: Option<String>,
 ) -> Option<String> {
-    let notice = composer_auth_notice(auth_source);
-    match (notice, body) {
+    let mut notices = debug_lines.to_vec();
+    if let Some(notice) = composer_auth_notice(auth_source)
+        && !notices.iter().any(|line| line == &notice)
+    {
+        notices.push(notice);
+    }
+    let notices = (!notices.is_empty())
+        .then(|| truncate_excerpt(&notices.join("\n"), COMPOSER_DEBUG_PREAMBLE_MAX_CHARS));
+    match (notices, body) {
         (Some(notice), Some(body)) => Some(format!("{notice}\n{body}")),
         (Some(notice), None) => Some(notice),
         (None, Some(body)) => Some(body),
@@ -476,12 +579,108 @@ fn composer_auth_notice(auth_source: Option<&str>) -> Option<String> {
     Some(format!("COMPOSER_AUTH detected from {auth_source}"))
 }
 
+pub fn composer_debug_lines(
+    auth_lookup: &ComposerAuthLookup,
+    prepared_auth: &PreparedComposerAuth,
+    auto_repositories_enabled: bool,
+) -> Vec<String> {
+    let mut lines = auth_lookup
+        .attempts
+        .iter()
+        .map(|attempt| {
+            format!(
+                "checked {} -> {}",
+                attempt.scope,
+                if attempt.found { "found" } else { "not found" }
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(notice) = composer_auth_notice(auth_lookup.source.as_deref()) {
+        lines.push(notice);
+    } else {
+        lines.push("COMPOSER_AUTH detected: none".to_string());
+    }
+
+    lines.push(format!(
+        "composer_auto_repositories: {}",
+        if auto_repositories_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    ));
+
+    if prepared_auth.parse_failed {
+        lines.push("COMPOSER_AUTH JSON parse: failed".to_string());
+    } else {
+        lines.push(format!(
+            "supported COMPOSER_AUTH sections: {}",
+            if prepared_auth.supported_sections.is_empty() {
+                "none".to_string()
+            } else {
+                prepared_auth.supported_sections.join(", ")
+            }
+        ));
+    }
+
+    lines.push(format!(
+        "derived Composer repository hosts: {}",
+        if prepared_auth.repository_urls.is_empty() {
+            "none".to_string()
+        } else {
+            repository_debug_labels(&prepared_auth.repository_urls).join(", ")
+        }
+    ));
+
+    if !prepared_auth.ignored_repository_entries.is_empty() {
+        lines.push(format!(
+            "ignored COMPOSER_AUTH repository entries: {}",
+            prepared_auth.ignored_repository_entries.len()
+        ));
+    }
+
+    lines.push(format!(
+        "temporary COMPOSER_HOME config: {}",
+        if prepared_auth.repository_config_json.is_some() {
+            "written"
+        } else {
+            "skipped"
+        }
+    ));
+    lines.push(format!(
+        "COMPOSER_AUTH exported to composer: {}",
+        if prepared_auth.env_value.is_some() {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+
+    lines
+}
+
 fn truncate_excerpt(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
     }
     let truncated = input.chars().take(max_chars).collect::<String>();
     format!("{truncated}\n[truncated]")
+}
+
+fn repository_debug_labels(urls: &[String]) -> Vec<String> {
+    urls.iter()
+        .filter_map(|url| {
+            let parsed = Url::parse(url).ok()?;
+            let host = parsed.host_str()?;
+            Some(match parsed.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            })
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn collect_string_leaves(value: &Value, output: &mut Vec<String>) {
@@ -569,6 +768,128 @@ fn repo_parent_groups(repo_path: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::feature_flags::FeatureFlagSnapshot;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct FakeVariableGitLab {
+        project_variables: BTreeMap<String, GitLabCiVariable>,
+        group_variables: BTreeMap<String, GitLabCiVariable>,
+    }
+
+    #[async_trait]
+    impl GitLabApi for FakeVariableGitLab {
+        async fn current_user(&self) -> Result<crate::gitlab::GitLabUser> {
+            unimplemented!()
+        }
+
+        async fn list_projects(&self) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+            unimplemented!()
+        }
+
+        async fn list_group_projects(
+            &self,
+            _group: &str,
+        ) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+            unimplemented!()
+        }
+
+        async fn list_open_mrs(&self, _project: &str) -> Result<Vec<crate::gitlab::MergeRequest>> {
+            unimplemented!()
+        }
+
+        async fn get_latest_open_mr_activity(
+            &self,
+            _project: &str,
+        ) -> Result<Option<crate::gitlab::MergeRequest>> {
+            unimplemented!()
+        }
+
+        async fn get_mr(&self, _project: &str, _iid: u64) -> Result<crate::gitlab::MergeRequest> {
+            unimplemented!()
+        }
+
+        async fn get_project(&self, _project: &str) -> Result<crate::gitlab::GitLabProject> {
+            unimplemented!()
+        }
+
+        async fn get_group(&self, _group: &str) -> Result<crate::gitlab::GitLabGroup> {
+            unimplemented!()
+        }
+
+        async fn list_awards(
+            &self,
+            _project: &str,
+            _iid: u64,
+        ) -> Result<Vec<crate::gitlab::AwardEmoji>> {
+            unimplemented!()
+        }
+
+        async fn add_award(&self, _project: &str, _iid: u64, _name: &str) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn delete_award(&self, _project: &str, _iid: u64, _award_id: u64) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn list_notes(&self, _project: &str, _iid: u64) -> Result<Vec<crate::gitlab::Note>> {
+            unimplemented!()
+        }
+
+        async fn list_discussions(
+            &self,
+            _project: &str,
+            _iid: u64,
+        ) -> Result<Vec<crate::gitlab::MergeRequestDiscussion>> {
+            unimplemented!()
+        }
+
+        async fn create_note(&self, _project: &str, _iid: u64, _body: &str) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn get_project_variable(&self, project: &str, key: &str) -> Result<GitLabCiVariable> {
+            self.project_variables
+                .get(&format!("{project}:{key}"))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("not found"))
+        }
+
+        async fn list_project_variables(&self, project: &str) -> Result<Vec<GitLabCiVariable>> {
+            Ok(self
+                .project_variables
+                .iter()
+                .filter_map(|(composite_key, variable)| {
+                    composite_key
+                        .strip_suffix(&format!(":{COMPOSER_AUTH_VARIABLE_KEY}"))
+                        .filter(|candidate| *candidate == project)
+                        .map(|_| variable.clone())
+                })
+                .collect())
+        }
+
+        async fn get_group_variable(&self, group: &str, key: &str) -> Result<GitLabCiVariable> {
+            self.group_variables
+                .get(&format!("{group}:{key}"))
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("not found"))
+        }
+
+        async fn list_group_variables(&self, group: &str) -> Result<Vec<GitLabCiVariable>> {
+            Ok(self
+                .group_variables
+                .iter()
+                .filter_map(|(composite_key, variable)| {
+                    composite_key
+                        .strip_suffix(&format!(":{COMPOSER_AUTH_VARIABLE_KEY}"))
+                        .filter(|candidate| *candidate == group)
+                        .map(|_| variable.clone())
+                })
+                .collect())
+        }
+    }
 
     #[test]
     fn mode_defaults_to_full_when_safe_flag_is_disabled() {
@@ -591,6 +912,68 @@ mod tests {
                 ..FeatureFlagSnapshot::default()
             }),
             Some(ComposerInstallMode::Safe)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_composer_auth_prefers_project_variable_and_records_attempts() {
+        let mut gitlab = FakeVariableGitLab::default();
+        gitlab.project_variables.insert(
+            "group/sub/repo:COMPOSER_AUTH".to_string(),
+            GitLabCiVariable {
+                key: COMPOSER_AUTH_VARIABLE_KEY.to_string(),
+                value: r#"{"http-basic":{"repo.example.com":{"password":"s3cr3t"}}}"#.to_string(),
+                environment_scope: "*".to_string(),
+            },
+        );
+
+        let lookup = resolve_composer_auth(&gitlab, "group/sub/repo").await;
+
+        assert_eq!(lookup.source.as_deref(), Some("project:group/sub/repo"));
+        assert_eq!(
+            lookup.attempts,
+            vec![ComposerAuthLookupAttempt {
+                scope: "project:group/sub/repo".to_string(),
+                found: true,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_composer_auth_falls_back_to_nearest_parent_group_and_records_attempts() {
+        let mut gitlab = FakeVariableGitLab::default();
+        gitlab.group_variables.insert(
+            "group/sub:COMPOSER_AUTH".to_string(),
+            GitLabCiVariable {
+                key: COMPOSER_AUTH_VARIABLE_KEY.to_string(),
+                value: r#"{"bearer":{"cache.example.com":"token"}}"#.to_string(),
+                environment_scope: "*".to_string(),
+            },
+        );
+        gitlab.group_variables.insert(
+            "group:COMPOSER_AUTH".to_string(),
+            GitLabCiVariable {
+                key: COMPOSER_AUTH_VARIABLE_KEY.to_string(),
+                value: r#"{"http-basic":{"repo.example.com":{"password":"s3cr3t"}}}"#.to_string(),
+                environment_scope: "*".to_string(),
+            },
+        );
+
+        let lookup = resolve_composer_auth(&gitlab, "group/sub/repo").await;
+
+        assert_eq!(lookup.source.as_deref(), Some("group:group/sub"));
+        assert_eq!(
+            lookup.attempts,
+            vec![
+                ComposerAuthLookupAttempt {
+                    scope: "project:group/sub/repo".to_string(),
+                    found: false,
+                },
+                ComposerAuthLookupAttempt {
+                    scope: "group:group/sub".to_string(),
+                    found: true,
+                },
+            ]
         );
     }
 
@@ -680,6 +1063,13 @@ mod tests {
 
         assert_eq!(prepared.env_value.as_deref(), Some(raw));
         assert_eq!(prepared.repository_config_json, None);
+        assert_eq!(prepared.supported_sections, vec!["http-basic".to_string()]);
+        assert_eq!(
+            prepared.repository_urls,
+            vec!["https://example.com".to_string()]
+        );
+        assert!(prepared.ignored_repository_entries.is_empty());
+        assert!(!prepared.parse_failed);
     }
 
     #[test]
@@ -687,7 +1077,7 @@ mod tests {
         let raw = r#"{
           "http-basic":{"repo.example.com":{"username":"bot","password":"s3cr3t"}},
           "bearer":{"cache.example.com":"token"},
-          "custom-headers":{"mirror.example.com":["Authorization: token value"]},
+          "custom-headers":{"https://mirror.example.com/packages.json":["Authorization: token value"]},
           "gitlab-token":{"gitlab.example.com":"token"},
           "github-oauth":{"github.com":"token"}
         }"#;
@@ -703,11 +1093,27 @@ mod tests {
 
         assert_eq!(prepared.env_value.as_deref(), Some(raw));
         assert_eq!(
+            prepared.supported_sections,
+            vec![
+                "bearer".to_string(),
+                "custom-headers".to_string(),
+                "http-basic".to_string()
+            ]
+        );
+        assert_eq!(
+            prepared.repository_urls,
+            vec![
+                "https://cache.example.com".to_string(),
+                "https://mirror.example.com/packages.json".to_string(),
+                "https://repo.example.com".to_string()
+            ]
+        );
+        assert_eq!(
             config,
             json!({
                 "repositories": [
                     { "type": "composer", "url": "https://cache.example.com" },
-                    { "type": "composer", "url": "https://mirror.example.com" },
+                    { "type": "composer", "url": "https://mirror.example.com/packages.json" },
                     { "type": "composer", "url": "https://repo.example.com" }
                 ]
             })
@@ -753,7 +1159,18 @@ mod tests {
         let prepared = prepare_composer_auth(Some(raw), true);
 
         assert_eq!(prepared.env_value.as_deref(), Some(raw));
-        assert_eq!(prepared.repository_config_json, None);
+        assert_eq!(
+            prepared.repository_urls,
+            vec!["https://scheme.example.com".to_string()]
+        );
+        assert_eq!(
+            prepared.ignored_repository_entries,
+            vec![
+                "".to_string(),
+                "oauth2:token@example.com".to_string(),
+                "path/example.com".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -764,6 +1181,53 @@ mod tests {
 
         assert_eq!(prepared.env_value.as_deref(), Some(raw));
         assert_eq!(prepared.repository_config_json, None);
+        assert!(prepared.parse_failed);
+    }
+
+    #[test]
+    fn composer_debug_lines_report_lookup_and_repository_derivation_steps() {
+        let lookup = ComposerAuthLookup {
+            value: Some("secret".to_string()),
+            source: Some("group:team/platform".to_string()),
+            attempts: vec![
+                ComposerAuthLookupAttempt {
+                    scope: "project:team/platform/app".to_string(),
+                    found: false,
+                },
+                ComposerAuthLookupAttempt {
+                    scope: "group:team/platform".to_string(),
+                    found: true,
+                },
+            ],
+        };
+        let prepared = PreparedComposerAuth {
+            env_value: Some("secret".to_string()),
+            repository_config_json: Some(
+                r#"{"repositories":[{"type":"composer","url":"https://repo.example.com"}]}"#
+                    .to_string(),
+            ),
+            supported_sections: vec!["http-basic".to_string()],
+            repository_urls: vec!["https://repo.example.com".to_string()],
+            ignored_repository_entries: vec!["path/example.com".to_string()],
+            parse_failed: false,
+        };
+
+        let lines = composer_debug_lines(&lookup, &prepared, true);
+
+        assert_eq!(
+            lines,
+            vec![
+                "checked project:team/platform/app -> not found".to_string(),
+                "checked group:team/platform -> found".to_string(),
+                "COMPOSER_AUTH detected from group team/platform".to_string(),
+                "composer_auto_repositories: enabled".to_string(),
+                "supported COMPOSER_AUTH sections: http-basic".to_string(),
+                "derived Composer repository hosts: repo.example.com".to_string(),
+                "ignored COMPOSER_AUTH repository entries: 1".to_string(),
+                "temporary COMPOSER_HOME config: written".to_string(),
+                "COMPOSER_AUTH exported to composer: yes".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -776,6 +1240,7 @@ mod tests {
             "",
             None,
             None,
+            &[],
         );
 
         assert_eq!(
@@ -794,6 +1259,7 @@ mod tests {
             "",
             None,
             None,
+            &[],
         );
 
         assert!(result.attempted);
@@ -810,6 +1276,7 @@ mod tests {
             "",
             None,
             None,
+            &[],
         );
 
         assert!(result.attempted);
@@ -826,6 +1293,7 @@ mod tests {
             "",
             None,
             None,
+            &[],
         );
 
         assert_eq!(
@@ -844,14 +1312,40 @@ mod tests {
             "https://oauth2:token@example.com/repo.git",
             Some("token"),
             Some(r#"{"http-basic":{"example.com":{"password":"s3cr3t"}}}"#),
+            &[
+                "checked group:team/platform -> found".to_string(),
+                "derived Composer repository hosts: example.com".to_string(),
+            ],
         );
 
         assert!(result.attempted);
         assert!(!result.success);
         let excerpt = result.log_excerpt.expect("failure excerpt");
+        assert!(excerpt.contains("checked group:team/platform -> found"));
         assert!(excerpt.contains("COMPOSER_AUTH detected from group team/platform"));
+        assert!(excerpt.contains("derived Composer repository hosts: example.com"));
         assert!(!excerpt.contains("s3cr3t"));
         assert!(!excerpt.contains("token@example.com"));
+    }
+
+    #[test]
+    fn composer_install_result_redacts_debug_lines_before_logging() {
+        let result = composer_install_result_from_exec_output(
+            ComposerInstallMode::Safe,
+            Some("group:team/platform".to_string()),
+            1,
+            "install failed",
+            "",
+            Some("token"),
+            Some(r#"{"http-basic":{"example.com":{"password":"s3cr3t"}}}"#),
+            &[
+                "ignored COMPOSER_AUTH repository entries: 1".to_string(),
+                "derived Composer repository hosts: example.com".to_string(),
+            ],
+        );
+
+        let excerpt = result.log_excerpt.expect("failure excerpt");
+        assert!(excerpt.contains("ignored COMPOSER_AUTH repository entries: 1"));
     }
 
     #[test]
@@ -864,18 +1358,24 @@ mod tests {
             "https://oauth2:token@example.com/repo.git",
             Some("token"),
             Some(r#"{"http-basic":{"example.com":{"password":"s3cr3t"}}}"#),
+            &[
+                "checked project:group/repo -> found".to_string(),
+                "temporary COMPOSER_HOME config: written".to_string(),
+            ],
         );
 
         assert!(result.attempted);
         assert!(result.success);
         let excerpt = result.log_excerpt.expect("success excerpt");
+        assert!(excerpt.contains("checked project:group/repo -> found"));
         assert!(excerpt.contains("COMPOSER_AUTH detected from repository group/repo"));
+        assert!(excerpt.contains("temporary COMPOSER_HOME config: written"));
         assert!(!excerpt.contains("s3cr3t"));
         assert!(!excerpt.contains("token@example.com"));
     }
 
     #[test]
-    fn composer_install_result_without_auth_source_omits_notice() {
+    fn composer_install_result_without_auth_source_keeps_debug_preamble() {
         let result = composer_install_result_from_exec_output(
             ComposerInstallMode::Full,
             None,
@@ -884,14 +1384,20 @@ mod tests {
             "",
             None,
             None,
+            &[
+                "checked project:group/repo -> not found".to_string(),
+                "COMPOSER_AUTH detected: none".to_string(),
+                "COMPOSER_AUTH exported to composer: no".to_string(),
+            ],
         );
 
         assert!(result.attempted);
         assert!(result.success);
-        assert_eq!(
-            result.log_excerpt.as_deref(),
-            Some("Installing dependencies from lock file")
-        );
+        let excerpt = result.log_excerpt.expect("success excerpt");
+        assert!(excerpt.contains("checked project:group/repo -> not found"));
+        assert!(excerpt.contains("COMPOSER_AUTH detected: none"));
+        assert!(excerpt.contains("COMPOSER_AUTH exported to composer: no"));
+        assert!(excerpt.contains("Installing dependencies from lock file"));
     }
 
     #[test]
@@ -905,10 +1411,12 @@ mod tests {
             "",
             None,
             None,
+            &["checked group:team/platform -> found".to_string()],
         );
 
         let excerpt = result.log_excerpt.expect("truncated excerpt");
-        assert!(excerpt.starts_with("COMPOSER_AUTH detected from group team/platform\n"));
+        assert!(excerpt.starts_with("checked group:team/platform -> found\n"));
+        assert!(excerpt.contains(&"x".repeat(128)));
         assert!(excerpt.ends_with("[truncated]"));
     }
 

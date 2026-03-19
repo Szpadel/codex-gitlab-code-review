@@ -1,8 +1,8 @@
 use super::*;
 use crate::composer_install::{
     COMPOSER_INSTALL_TURN_ID, ComposerAuthLookup, ComposerInstallMode, ComposerInstallResult,
-    composer_install_exec_command, composer_install_result_from_exec_output, prepare_composer_auth,
-    redact_composer_related_output, resolve_composer_auth,
+    composer_debug_lines, composer_install_exec_command, composer_install_result_from_exec_output,
+    prepare_composer_auth, resolve_composer_auth,
 };
 use crate::gitlab::GitLabClient;
 
@@ -21,6 +21,11 @@ impl DockerCodexRunner {
         let composer_auth = auth_lookup.value.clone();
         let prepared_auth = prepare_composer_auth(
             composer_auth.as_deref(),
+            feature_flags.composer_auto_repositories,
+        );
+        let debug_lines = composer_debug_lines(
+            &auth_lookup,
+            &prepared_auth,
             feature_flags.composer_auto_repositories,
         );
         let env = prepared_auth
@@ -51,15 +56,17 @@ impl DockerCodexRunner {
                 &output.stderr,
                 Some(&self.gitlab_token),
                 composer_auth.as_deref(),
+                &debug_lines,
             ),
-            Err(err) => ComposerInstallResult::failed(
+            Err(err) => composer_install_result_from_exec_output(
                 mode,
                 auth_lookup.source,
-                redact_composer_related_output(
-                    &err.to_string(),
-                    Some(&self.gitlab_token),
-                    composer_auth.as_deref(),
-                ),
+                1,
+                "",
+                &err.to_string(),
+                Some(&self.gitlab_token),
+                composer_auth.as_deref(),
+                &debug_lines,
             ),
         };
 
@@ -93,6 +100,7 @@ impl DockerCodexRunner {
                 ComposerAuthLookup {
                     value: None,
                     source: None,
+                    attempts: Vec::new(),
                 }
             }
         }

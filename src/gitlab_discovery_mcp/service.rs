@@ -5,8 +5,8 @@ use super::{
 };
 use crate::composer_install::{
     ComposerInstallMode, ComposerInstallResult, DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
-    composer_install_exec_command, composer_install_result_from_exec_output, prepare_composer_auth,
-    redact_composer_related_output, resolve_composer_auth,
+    composer_debug_lines, composer_install_exec_command, composer_install_result_from_exec_output,
+    prepare_composer_auth, redact_composer_related_output, resolve_composer_auth,
 };
 use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig};
 use crate::docker_utils::connect_docker;
@@ -372,6 +372,11 @@ printf '%s\n' "$dest"
             composer_auth.as_deref(),
             binding.feature_flags.composer_auto_repositories,
         );
+        let debug_lines = composer_debug_lines(
+            &auth_lookup,
+            &prepared_auth,
+            binding.feature_flags.composer_auto_repositories,
+        );
         let env = prepared_auth
             .env_value
             .as_ref()
@@ -398,15 +403,17 @@ printf '%s\n' "$dest"
                 &output.stderr,
                 Some(&self.gitlab_token),
                 composer_auth.as_deref(),
+                &debug_lines,
             )),
-            Err(err) => Some(ComposerInstallResult::failed(
+            Err(err) => Some(composer_install_result_from_exec_output(
                 mode,
                 auth_lookup.source,
-                redact_composer_related_output(
-                    &err.to_string(),
-                    Some(&self.gitlab_token),
-                    composer_auth.as_deref(),
-                ),
+                1,
+                "",
+                &err.to_string(),
+                Some(&self.gitlab_token),
+                composer_auth.as_deref(),
+                &debug_lines,
             )),
         }
     }
