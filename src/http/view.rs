@@ -410,6 +410,10 @@ fn render_run_feature_flags(run: &RunHistoryRecord) -> String {
             bool_label(run.feature_flags.gitlab_discovery_mcp)
         ),
         format!(
+            "gitlab_inline_review_comments={}",
+            bool_label(run.feature_flags.gitlab_inline_review_comments)
+        ),
+        format!(
             "composer_install={}",
             bool_label(run.feature_flags.composer_install)
         ),

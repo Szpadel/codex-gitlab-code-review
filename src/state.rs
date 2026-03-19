@@ -320,6 +320,60 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    pub async fn has_completed_inline_review(
+        &self,
+        repo: &str,
+        iid: u64,
+        sha: &str,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+            SELECT 1
+            FROM run_history
+            WHERE kind = 'review'
+              AND repo = ?
+              AND iid = ?
+              AND head_sha = ?
+              AND status = 'done'
+              AND result = 'comment'
+              AND feature_flags_json LIKE '%"gitlab_inline_review_comments":true%'
+            LIMIT 1
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(sha)
+        .fetch_optional(&self.pool)
+        .await;
+        let row = match row {
+            Ok(row) => row,
+            Err(err) if err.to_string().contains("no such table: run_history") => return Ok(false),
+            Err(err) => return Err(err).context("load completed inline review state"),
+        };
+        Ok(row.is_some())
+    }
+
+    pub async fn review_result(&self, repo: &str, iid: u64, sha: &str) -> Result<Option<String>> {
+        let row = sqlx::query(
+            r#"
+            SELECT result
+            FROM review_state
+            WHERE repo = ?
+              AND iid = ?
+              AND head_sha = ?
+              AND status = 'done'
+            LIMIT 1
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(sha)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load review result")?;
+        Ok(row.map(|row| row.get::<String, _>(0)))
+    }
+
     pub async fn list_in_progress_reviews(&self) -> Result<Vec<InProgressReview>> {
         let rows = sqlx::query(
             r#"
@@ -2460,6 +2514,7 @@ mod tests {
 
         let overrides = RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
+            gitlab_inline_review_comments: Some(false),
             composer_install: Some(true),
             composer_safe_install: Some(true),
         };
@@ -2488,6 +2543,7 @@ mod tests {
 
         let feature_flags = FeatureFlagSnapshot {
             gitlab_discovery_mcp: true,
+            gitlab_inline_review_comments: true,
             composer_install: true,
             composer_safe_install: true,
         };

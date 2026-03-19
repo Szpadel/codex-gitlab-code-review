@@ -1,8 +1,9 @@
 use crate::codex_runner::{CodexResult, ReviewContext};
 use crate::config::Config;
 use crate::feature_flags::FeatureFlagSnapshot;
+use crate::flow::review_comments::post_review_comment;
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
-use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, Note};
+use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
 use crate::state::{NewRunHistory, ReviewStateStore, RunHistoryFinish, RunHistoryKind};
 use anyhow::{Error, Result};
 use async_trait::async_trait;
@@ -12,6 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+
+const INLINE_REVIEW_MARKER_PREFIX: &str = "<!-- codex-review-finding:sha=";
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct RetryKey {
@@ -213,6 +216,50 @@ impl ReviewFlow {
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::SkippedMarker,
             ));
+        }
+        let inline_review_comments_enabled = self
+            .resolve_feature_flags()
+            .await?
+            .gitlab_inline_review_comments;
+        let completed_inline_review = self
+            .shared
+            .state
+            .has_completed_inline_review(repo, mr.iid, head_sha)
+            .await?;
+        let review_result = self
+            .shared
+            .state
+            .review_result(repo, mr.iid, head_sha)
+            .await?;
+        let should_check_inline_markers =
+            inline_review_comments_enabled || completed_inline_review || review_result.is_some();
+        if should_check_inline_markers {
+            match self.shared.gitlab.list_discussions(repo, mr.iid).await {
+                Ok(discussions) => {
+                    if has_inline_review_marker(&discussions, self.shared.bot_user_id, head_sha)
+                        && review_result.as_deref() != Some("error")
+                        && (completed_inline_review || review_result.as_deref() == Some("comment"))
+                    {
+                        return Ok(ReviewGateOutcome::Decision(
+                            ReviewScheduleOutcome::SkippedMarker,
+                        ));
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        repo,
+                        iid = mr.iid,
+                        head_sha,
+                        error = %err,
+                        "failed to load MR discussions while checking inline review markers"
+                    );
+                    if completed_inline_review {
+                        return Ok(ReviewGateOutcome::Decision(
+                            ReviewScheduleOutcome::SkippedMarker,
+                        ));
+                    }
+                }
+            }
         }
         if self
             .shared
@@ -647,6 +694,7 @@ impl ReviewRunContext {
         run_history_id: i64,
     ) -> Result<()> {
         let retry_key = RetryKey::new(repo, mr.iid, head_sha);
+        let inline_review_comments_enabled = feature_flags.gitlab_inline_review_comments;
         if self.shutdown_requested() {
             self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                 .await?;
@@ -706,14 +754,19 @@ impl ReviewRunContext {
                         .await?;
                 }
                 self.retry_backoff.clear(&retry_key);
+                let review_result = if self.config.review.dry_run {
+                    "dry_run_pass"
+                } else {
+                    "pass"
+                };
                 self.state
-                    .finish_review(repo, mr.iid, head_sha, "pass")
+                    .finish_review(repo, mr.iid, head_sha, review_result)
                     .await?;
                 self.state
                     .finish_run_history(
                         run_history_id,
                         RunHistoryFinish {
-                            result: "pass".to_string(),
+                            result: review_result.to_string(),
                             preview: Some(format!("Review {repo} !{}", mr.iid)),
                             summary: Some(summary.clone()),
                             ..RunHistoryFinish::default()
@@ -727,33 +780,44 @@ impl ReviewRunContext {
                     "review pass"
                 );
             }
-            Ok(CodexResult::Comment { summary, body }) => {
+            Ok(CodexResult::Comment(comment)) => {
                 if self.shutdown_requested() {
                     self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                         .await?;
                     return Ok(());
                 }
-                let full_body = format!(
-                    "{}\n\n{}{} -->",
-                    body, self.config.review.comment_marker_prefix, head_sha
-                );
                 if self.config.review.dry_run {
                     info!(repo = repo, iid = mr.iid, "dry run: skipping comment");
                 } else {
-                    self.gitlab.create_note(repo, mr.iid, &full_body).await?;
+                    post_review_comment(
+                        inline_review_comments_enabled,
+                        &self.config,
+                        self.gitlab.as_ref(),
+                        self.bot_user_id,
+                        repo,
+                        &mr,
+                        head_sha,
+                        &comment,
+                    )
+                    .await?;
                 }
                 self.retry_backoff.clear(&retry_key);
+                let review_result = if self.config.review.dry_run {
+                    "dry_run_comment"
+                } else {
+                    "comment"
+                };
                 self.state
-                    .finish_review(repo, mr.iid, head_sha, "comment")
+                    .finish_review(repo, mr.iid, head_sha, review_result)
                     .await?;
                 self.state
                     .finish_run_history(
                         run_history_id,
                         RunHistoryFinish {
-                            result: "comment".to_string(),
+                            result: review_result.to_string(),
                             preview: Some(format!("Review {repo} !{}", mr.iid)),
-                            summary: Some(summary.clone()),
-                            error: Some(body),
+                            summary: Some(comment.summary.clone()),
+                            error: Some(comment.body.clone()),
                             ..RunHistoryFinish::default()
                         },
                     )
@@ -761,7 +825,7 @@ impl ReviewRunContext {
                 info!(
                     repo = repo,
                     iid = mr.iid,
-                    summary = summary.as_str(),
+                    summary = comment.summary.as_str(),
                     "review comment"
                 );
             }
@@ -819,6 +883,21 @@ pub(crate) fn has_review_marker(notes: &[Note], bot_user_id: u64, prefix: &str, 
     notes
         .iter()
         .any(|note| note.author.id == bot_user_id && note.body.contains(&marker))
+}
+
+pub(crate) fn has_inline_review_marker(
+    discussions: &[MergeRequestDiscussion],
+    bot_user_id: u64,
+    sha: &str,
+) -> bool {
+    if bot_user_id == 0 {
+        return false;
+    }
+    let marker_prefix = format!("{INLINE_REVIEW_MARKER_PREFIX}{sha} ");
+    discussions
+        .iter()
+        .flat_map(|discussion| &discussion.notes)
+        .any(|note| note.author.id == bot_user_id && note.body.contains(&marker_prefix))
 }
 
 pub(crate) async fn remove_eyes(

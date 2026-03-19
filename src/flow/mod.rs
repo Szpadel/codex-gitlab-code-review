@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 
 pub(crate) mod mention;
 pub(crate) mod review;
+pub(crate) mod review_comments;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ActiveReviewKey {

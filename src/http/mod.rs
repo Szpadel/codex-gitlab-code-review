@@ -461,6 +461,7 @@ mod tests {
             .set_runtime_feature_flag_overrides(
                 &crate::feature_flags::RuntimeFeatureFlagOverrides {
                     gitlab_discovery_mcp: Some(true),
+                    gitlab_inline_review_comments: None,
                     composer_install: None,
                     composer_safe_install: None,
                 },

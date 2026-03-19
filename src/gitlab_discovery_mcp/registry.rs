@@ -464,6 +464,7 @@ mod tests {
                 clone_root: "/work/mcp".to_string(),
                 feature_flags: FeatureFlagSnapshot {
                     gitlab_discovery_mcp: true,
+                    gitlab_inline_review_comments: false,
                     composer_install: false,
                     composer_safe_install: false,
                 },

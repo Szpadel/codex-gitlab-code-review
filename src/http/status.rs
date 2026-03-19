@@ -241,6 +241,7 @@ impl StatusService {
                     bail!("invalid feature flag request: {flag_name} is unavailable");
                 }
             }
+            "gitlab_inline_review_comments" => {}
             "composer_install" => {}
             "composer_safe_install" => {}
             other => bail!("invalid feature flag: {other}"),
@@ -249,6 +250,7 @@ impl StatusService {
         let mut overrides = self.state.get_runtime_feature_flag_overrides().await?;
         match flag_name {
             "gitlab_discovery_mcp" => overrides.gitlab_discovery_mcp = enabled,
+            "gitlab_inline_review_comments" => overrides.gitlab_inline_review_comments = enabled,
             "composer_install" => overrides.composer_install = enabled,
             "composer_safe_install" => overrides.composer_safe_install = enabled,
             _ => unreachable!("validated feature flag name"),
@@ -278,6 +280,19 @@ impl StatusService {
                 default_enabled: self.config.feature_flag_defaults.gitlab_discovery_mcp,
                 runtime_override: overrides.gitlab_discovery_mcp,
                 effective_enabled: effective.gitlab_discovery_mcp,
+            },
+            StatusFeatureFlagSnapshot {
+                name: "gitlab_inline_review_comments".to_string(),
+                available: self
+                    .config
+                    .feature_flag_availability
+                    .gitlab_inline_review_comments,
+                default_enabled: self
+                    .config
+                    .feature_flag_defaults
+                    .gitlab_inline_review_comments,
+                runtime_override: overrides.gitlab_inline_review_comments,
+                effective_enabled: effective.gitlab_inline_review_comments,
             },
             StatusFeatureFlagSnapshot {
                 name: "composer_install".to_string(),
@@ -1808,7 +1823,7 @@ mod tests {
 
         let snapshot = service.snapshot().await?;
 
-        assert_eq!(snapshot.config.feature_flags.len(), 3);
+        assert_eq!(snapshot.config.feature_flags.len(), 4);
         assert_eq!(
             snapshot
                 .config
@@ -1818,6 +1833,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "gitlab_discovery_mcp",
+                "gitlab_inline_review_comments",
                 "composer_install",
                 "composer_safe_install",
             ]
@@ -1912,6 +1928,7 @@ mod tests {
             .set_runtime_feature_flag_overrides(
                 &crate::feature_flags::RuntimeFeatureFlagOverrides {
                     gitlab_discovery_mcp: Some(true),
+                    gitlab_inline_review_comments: None,
                     composer_install: None,
                     composer_safe_install: None,
                 },

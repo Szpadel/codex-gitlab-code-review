@@ -83,10 +83,37 @@ pub struct MentionCommandContext {
     pub run_history_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLineRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCodeLocation {
+    pub absolute_file_path: String,
+    pub line_range: ReviewLineRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFinding {
+    pub title: String,
+    pub body: String,
+    pub code_location: ReviewCodeLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub summary: String,
+    pub overall_explanation: Option<String>,
+    pub findings: Vec<ReviewFinding>,
+    pub body: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum CodexResult {
     Pass { summary: String },
-    Comment { summary: String, body: String },
+    Comment(ReviewComment),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,9 +567,10 @@ mod tests {
         let text = r#"{"verdict":"comment","summary":"needs changes","comment_markdown":"- fix"}"#;
         let result = parse_review_output(text)?;
         match result {
-            CodexResult::Comment { summary, body } => {
-                assert_eq!(summary, "needs changes");
-                assert_eq!(body, "- fix");
+            CodexResult::Comment(comment) => {
+                assert_eq!(comment.summary, "needs changes");
+                assert_eq!(comment.body, "- fix");
+                assert!(comment.findings.is_empty());
                 Ok(())
             }
             _ => bail!("expected comment"),
@@ -554,9 +582,85 @@ mod tests {
         let text = "Looks good overall\n\n- minor nit";
         let result = parse_review_output(text)?;
         match result {
-            CodexResult::Comment { summary, body } => {
-                assert_eq!(summary, "Looks good overall");
-                assert_eq!(body, text);
+            CodexResult::Comment(comment) => {
+                assert_eq!(comment.summary, "Looks good overall");
+                assert_eq!(comment.body, text);
+                assert!(comment.findings.is_empty());
+                Ok(())
+            }
+            _ => bail!("expected comment"),
+        }
+    }
+
+    #[test]
+    fn parse_review_output_structured_findings_json() -> Result<()> {
+        let text = r#"{
+          "findings": [
+            {
+              "title": "[P1] Use safer cache invalidation",
+              "body": "This can leave stale entries in the process cache.",
+              "confidence_score": 0.91,
+              "priority": 1,
+              "code_location": {
+                "absolute_file_path": "/work/repo/src/cache.rs",
+                "line_range": { "start": 14, "end": 16 }
+              }
+            }
+          ],
+          "overall_correctness": "patch is incorrect",
+          "overall_explanation": "The patch has one correctness issue.",
+          "overall_confidence_score": 0.88
+        }"#;
+        let result = parse_review_output(text)?;
+        match result {
+            CodexResult::Comment(comment) => {
+                assert_eq!(comment.summary, "The patch has one correctness issue.");
+                assert_eq!(
+                    comment.overall_explanation.as_deref(),
+                    Some("The patch has one correctness issue.")
+                );
+                assert_eq!(comment.findings.len(), 1);
+                assert_eq!(
+                    comment.findings[0].title,
+                    "[P1] Use safer cache invalidation"
+                );
+                assert_eq!(
+                    comment.findings[0].code_location.absolute_file_path,
+                    "/work/repo/src/cache.rs"
+                );
+                assert_eq!(comment.findings[0].code_location.line_range.start, 14);
+                assert_eq!(comment.findings[0].code_location.line_range.end, 16);
+                assert!(comment.body.contains("Review comment:"));
+                Ok(())
+            }
+            _ => bail!("expected comment"),
+        }
+    }
+
+    #[test]
+    fn parse_review_output_upstream_rendered_review_text() -> Result<()> {
+        let text = "The patch has one correctness issue.\n\nReview comment:\n\n- [P1] Use safer cache invalidation — /work/repo/src/cache.rs:14-16\n  This can leave stale entries in the process cache.";
+        let result = parse_review_output(text)?;
+        match result {
+            CodexResult::Comment(comment) => {
+                assert_eq!(comment.summary, "The patch has one correctness issue.");
+                assert_eq!(
+                    comment.overall_explanation.as_deref(),
+                    Some("The patch has one correctness issue.")
+                );
+                assert_eq!(comment.findings.len(), 1);
+                assert_eq!(
+                    comment.findings[0].title,
+                    "[P1] Use safer cache invalidation"
+                );
+                assert_eq!(
+                    comment.findings[0].body,
+                    "This can leave stale entries in the process cache."
+                );
+                assert_eq!(
+                    comment.findings[0].code_location.absolute_file_path,
+                    "/work/repo/src/cache.rs"
+                );
                 Ok(())
             }
             _ => bail!("expected comment"),
@@ -2048,6 +2152,7 @@ mod tests {
     fn effective_feature_flags_require_injected_gitlab_discovery_mcp() {
         let requested = FeatureFlagSnapshot {
             gitlab_discovery_mcp: true,
+            gitlab_inline_review_comments: false,
             composer_install: false,
             composer_safe_install: false,
         };
@@ -2120,6 +2225,7 @@ mod tests {
             "",
             &FeatureFlagSnapshot {
                 gitlab_discovery_mcp: true,
+                gitlab_inline_review_comments: false,
                 composer_install: false,
                 composer_safe_install: false,
             },
@@ -2771,9 +2877,9 @@ mod tests {
             .await?;
 
         match result {
-            CodexResult::Comment { summary, body } => {
-                assert_eq!(summary, "needs changes");
-                assert_eq!(body, "- fix it");
+            CodexResult::Comment(comment) => {
+                assert_eq!(comment.summary, "needs changes");
+                assert_eq!(comment.body, "- fix it");
             }
             _ => bail!("expected comment result"),
         }
@@ -3294,7 +3400,9 @@ mod tests {
     #[tokio::test]
     async fn run_mention_command_with_fake_runtime_surfaces_exec_failures() {
         let harness = Arc::new(FakeRunnerHarness::default());
-        harness.push_app_server(ScriptedAppServer::from_requests(Vec::new()));
+        harness.push_app_server(ScriptedAppServer::from_requests(vec![
+            ScriptedAppRequest::result("initialize", json!({})),
+        ]));
         harness.push_exec_error(
             ExecContainerCommandRequest {
                 container_id: "app-1".to_string(),
@@ -3487,6 +3595,7 @@ mod tests {
                 run_history_id: Some(run_history_id),
                 feature_flags: FeatureFlagSnapshot {
                     gitlab_discovery_mcp: true,
+                    gitlab_inline_review_comments: false,
                     composer_install: false,
                     composer_safe_install: false,
                 },

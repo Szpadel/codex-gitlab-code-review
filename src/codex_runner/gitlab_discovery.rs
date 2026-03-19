@@ -99,6 +99,7 @@ impl DockerCodexRunner {
     ) -> FeatureFlagSnapshot {
         FeatureFlagSnapshot {
             gitlab_discovery_mcp: requested.gitlab_discovery_mcp && gitlab_discovery_enabled,
+            gitlab_inline_review_comments: requested.gitlab_inline_review_comments,
             composer_install: requested.composer_install,
             composer_safe_install: requested.composer_safe_install,
         }

@@ -58,7 +58,34 @@ impl MergeRequest {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiffRefs {
+    pub base_sha: Option<String>,
     pub head_sha: Option<String>,
+    pub start_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MergeRequestDiffVersion {
+    pub id: u64,
+    pub head_commit_sha: String,
+    pub base_commit_sha: String,
+    pub start_commit_sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct MergeRequestDiff {
+    pub old_path: String,
+    pub new_path: String,
+    pub diff: String,
+    #[serde(default)]
+    pub new_file: bool,
+    #[serde(default)]
+    pub deleted_file: bool,
+    #[serde(default)]
+    pub renamed_file: bool,
+    #[serde(default)]
+    pub collapsed: bool,
+    #[serde(default)]
+    pub too_large: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -145,6 +172,44 @@ pub struct GitLabUserDetail {
     pub public_email: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeRequestDiffDiscussion {
+    pub body: String,
+    pub position: DiffDiscussionPosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffDiscussionPosition {
+    pub base_sha: String,
+    pub head_sha: String,
+    pub start_sha: String,
+    pub old_path: String,
+    pub new_path: String,
+    pub old_line: Option<usize>,
+    pub new_line: Option<usize>,
+    pub line_range: Option<DiffDiscussionLineRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffDiscussionLineRange {
+    pub start: DiffDiscussionLineEndpoint,
+    pub end: DiffDiscussionLineEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffDiscussionLineEndpoint {
+    pub line_code: String,
+    pub line_type: DiffDiscussionLineType,
+    pub old_line: Option<usize>,
+    pub new_line: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffDiscussionLineType {
+    Old,
+    New,
+}
+
 #[async_trait]
 pub trait GitLabApi: Send + Sync {
     async fn current_user(&self) -> Result<GitLabUser>;
@@ -159,6 +224,16 @@ pub trait GitLabApi: Send + Sync {
     async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>>;
     async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>>;
     async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest>;
+    async fn list_mr_diff_versions(
+        &self,
+        _project: &str,
+        _iid: u64,
+    ) -> Result<Vec<MergeRequestDiffVersion>> {
+        Ok(Vec::new())
+    }
+    async fn list_mr_diffs(&self, _project: &str, _iid: u64) -> Result<Vec<MergeRequestDiff>> {
+        Ok(Vec::new())
+    }
     async fn get_project(&self, project: &str) -> Result<GitLabProject>;
     async fn get_group(&self, group: &str) -> Result<GitLabGroup> {
         Err(anyhow!(
@@ -190,6 +265,14 @@ pub trait GitLabApi: Send + Sync {
     async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()>;
     async fn list_notes(&self, project: &str, iid: u64) -> Result<Vec<Note>>;
     async fn create_note(&self, project: &str, iid: u64, body: &str) -> Result<()>;
+    async fn create_diff_discussion(
+        &self,
+        project: &str,
+        iid: u64,
+        request: &MergeRequestDiffDiscussion,
+    ) -> Result<()> {
+        self.create_note(project, iid, &request.body).await
+    }
     async fn list_discussions(
         &self,
         _project: &str,
@@ -357,6 +440,18 @@ impl GitLabClient {
         Ok(())
     }
 
+    async fn post_form(&self, url: &str, form: &[(String, String)]) -> Result<()> {
+        let response = self
+            .client
+            .post(url)
+            .form(form)
+            .send()
+            .await
+            .with_context(|| format!("gitlab POST {}", url))?;
+        ensure_success::<serde_json::Value>(response, "POST", url).await?;
+        Ok(())
+    }
+
     async fn get_paginated<T: for<'de> Deserialize<'de>>(&self, base_url: &str) -> Result<Vec<T>> {
         let base = Url::parse(base_url)?;
         let mut items = Vec::new();
@@ -407,6 +502,34 @@ impl GitLabClient {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+}
+
+impl DiffDiscussionLineType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Old => "old",
+            Self::New => "new",
+        }
+    }
+}
+
+fn append_line_range_form_fields(
+    form: &mut Vec<(String, String)>,
+    endpoint_name: &str,
+    endpoint: &DiffDiscussionLineEndpoint,
+) {
+    let prefix = format!("position[line_range][{endpoint_name}]");
+    form.push((format!("{prefix}[line_code]"), endpoint.line_code.clone()));
+    form.push((
+        format!("{prefix}[type]"),
+        endpoint.line_type.as_str().to_string(),
+    ));
+    if let Some(old_line) = endpoint.old_line {
+        form.push((format!("{prefix}[old_line]"), old_line.to_string()));
+    }
+    if let Some(new_line) = endpoint.new_line {
+        form.push((format!("{prefix}[new_line]"), new_line.to_string()));
     }
 }
 
@@ -486,6 +609,28 @@ impl GitLabApi for GitLabClient {
     async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest> {
         let url = format!("{}/merge_requests/{}", self.project_path(project), iid);
         self.get_json(&url).await
+    }
+
+    async fn list_mr_diff_versions(
+        &self,
+        project: &str,
+        iid: u64,
+    ) -> Result<Vec<MergeRequestDiffVersion>> {
+        let url = format!(
+            "{}/merge_requests/{}/versions",
+            self.project_path(project),
+            iid
+        );
+        self.get_paginated(&url).await
+    }
+
+    async fn list_mr_diffs(&self, project: &str, iid: u64) -> Result<Vec<MergeRequestDiff>> {
+        let url = format!(
+            "{}/merge_requests/{}/diffs",
+            self.project_path(project),
+            iid
+        );
+        self.get_paginated(&url).await
     }
 
     async fn get_project(&self, project: &str) -> Result<GitLabProject> {
@@ -581,6 +726,54 @@ impl GitLabApi for GitLabClient {
             iid
         );
         self.post_note(&url, body).await
+    }
+
+    async fn create_diff_discussion(
+        &self,
+        project: &str,
+        iid: u64,
+        request: &MergeRequestDiffDiscussion,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/merge_requests/{}/discussions",
+            self.project_path(project),
+            iid
+        );
+        let mut form = vec![
+            ("body".to_string(), request.body.clone()),
+            ("position[position_type]".to_string(), "text".to_string()),
+            (
+                "position[base_sha]".to_string(),
+                request.position.base_sha.clone(),
+            ),
+            (
+                "position[head_sha]".to_string(),
+                request.position.head_sha.clone(),
+            ),
+            (
+                "position[start_sha]".to_string(),
+                request.position.start_sha.clone(),
+            ),
+            (
+                "position[old_path]".to_string(),
+                request.position.old_path.clone(),
+            ),
+            (
+                "position[new_path]".to_string(),
+                request.position.new_path.clone(),
+            ),
+        ];
+        if let Some(old_line) = request.position.old_line {
+            form.push(("position[old_line]".to_string(), old_line.to_string()));
+        }
+        if let Some(new_line) = request.position.new_line {
+            form.push(("position[new_line]".to_string(), new_line.to_string()));
+        }
+        if let Some(line_range) = &request.position.line_range {
+            append_line_range_form_fields(&mut form, "start", &line_range.start);
+            append_line_range_form_fields(&mut form, "end", &line_range.end);
+        }
+        self.post_form(&url, &form).await
     }
 
     async fn list_discussions(
@@ -802,7 +995,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header_exists, method, path, query_param},
+        matchers::{body_string_contains, header_exists, method, path, query_param},
     };
 
     #[tokio::test]
@@ -1350,6 +1543,160 @@ mod tests {
         assert_eq!(discussions[0].id, "discussion-1");
         assert_eq!(discussions[0].notes.len(), 2);
         assert_eq!(discussions[0].notes[1].in_reply_to_id, Some(101));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_mr_diff_versions_reads_latest_version_metadata() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "")
+            .set_body_json(vec![serde_json::json!({
+                "id": 110,
+                "head_commit_sha": "head-1",
+                "base_commit_sha": "base-1",
+                "start_commit_sha": "start-1"
+            })]);
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/merge_requests/3/versions",
+            ))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let versions = client.list_mr_diff_versions("group/repo", 3).await?;
+        assert_eq!(
+            versions,
+            vec![MergeRequestDiffVersion {
+                id: 110,
+                head_commit_sha: "head-1".to_string(),
+                base_commit_sha: "base-1".to_string(),
+                start_commit_sha: "start-1".to_string(),
+            }]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_mr_diffs_reads_all_pages() -> Result<()> {
+        let server = MockServer::start().await;
+        let page1 = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "2")
+            .set_body_json(vec![serde_json::json!({
+                "old_path": "src/old.rs",
+                "new_path": "src/new.rs",
+                "diff": "@@ -1 +1 @@\n-old\n+new\n",
+                "renamed_file": true,
+                "new_file": false,
+                "deleted_file": false,
+                "collapsed": false,
+                "too_large": false
+            })]);
+        let page2 = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "")
+            .set_body_json(vec![serde_json::json!({
+                "old_path": "src/lib.rs",
+                "new_path": "src/lib.rs",
+                "diff": "@@ -4 +4 @@\n-old\n+new\n",
+                "renamed_file": false,
+                "new_file": false,
+                "deleted_file": false,
+                "collapsed": false,
+                "too_large": false
+            })]);
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests/8/diffs"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(page1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests/8/diffs"))
+            .and(query_param("page", "2"))
+            .and(query_param("per_page", "100"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(page2)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let diffs = client.list_mr_diffs("group/repo", 8).await?;
+        assert_eq!(diffs.len(), 2);
+        assert_eq!(diffs[0].new_path, "src/new.rs");
+        assert!(diffs[0].renamed_file);
+        assert_eq!(diffs[1].new_path, "src/lib.rs");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_diff_discussion_posts_position_form_fields() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": "discussion-77"
+        }));
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/merge_requests/4/discussions",
+            ))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .and(body_string_contains("body=inline+review"))
+            .and(body_string_contains("position%5Bposition_type%5D=text"))
+            .and(body_string_contains("position%5Bbase_sha%5D=base"))
+            .and(body_string_contains("position%5Bhead_sha%5D=head"))
+            .and(body_string_contains("position%5Bstart_sha%5D=start"))
+            .and(body_string_contains("position%5Bold_path%5D=src%2Flib.rs"))
+            .and(body_string_contains("position%5Bnew_path%5D=src%2Flib.rs"))
+            .and(body_string_contains("position%5Bnew_line%5D=14"))
+            .and(body_string_contains(
+                "position%5Bline_range%5D%5Bstart%5D%5Bline_code%5D=hash_14_14",
+            ))
+            .and(body_string_contains(
+                "position%5Bline_range%5D%5Bend%5D%5Bline_code%5D=hash_16_16",
+            ))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        client
+            .create_diff_discussion(
+                "group/repo",
+                4,
+                &MergeRequestDiffDiscussion {
+                    body: "inline review".to_string(),
+                    position: DiffDiscussionPosition {
+                        base_sha: "base".to_string(),
+                        head_sha: "head".to_string(),
+                        start_sha: "start".to_string(),
+                        old_path: "src/lib.rs".to_string(),
+                        new_path: "src/lib.rs".to_string(),
+                        old_line: Some(14),
+                        new_line: Some(14),
+                        line_range: Some(DiffDiscussionLineRange {
+                            start: DiffDiscussionLineEndpoint {
+                                line_code: "hash_14_14".to_string(),
+                                line_type: DiffDiscussionLineType::New,
+                                old_line: Some(14),
+                                new_line: Some(14),
+                            },
+                            end: DiffDiscussionLineEndpoint {
+                                line_code: "hash_16_16".to_string(),
+                                line_type: DiffDiscussionLineType::New,
+                                old_line: Some(16),
+                                new_line: Some(16),
+                            },
+                        }),
+                    },
+                },
+            )
+            .await?;
         Ok(())
     }
 

@@ -20,6 +20,7 @@ data:
   config.yaml: |
     feature_flags:
       gitlab_discovery_mcp: {{ .Values.config.featureFlags.gitlabDiscoveryMcp }}
+      gitlab_inline_review_comments: {{ .Values.config.featureFlags.gitlabInlineReviewComments }}
       composer_install: {{ .Values.config.featureFlags.composerInstall }}
       composer_safe_install: {{ .Values.config.featureFlags.composerSafeInstall }}
     gitlab:
