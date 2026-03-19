@@ -172,7 +172,10 @@ mod tests {
             "COMPOSER_AUTH detected from group team/platform\ninstall failed".to_string(),
         );
 
-        let events = composer_install_events("composer install --no-dev --no-scripts", &result);
+        let events = composer_install_events(
+            "composer install --no-dev --no-scripts --no-plugins --prefer-dist --no-interaction --no-progress --ignore-platform-reqs",
+            &result,
+        );
 
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].event_type, "turn_started");
@@ -202,8 +205,10 @@ mod tests {
             ),
         );
 
-        let events =
-            composer_install_events("composer install --no-interaction --no-progress", &result);
+        let events = composer_install_events(
+            "composer install --no-interaction --no-progress --ignore-platform-reqs",
+            &result,
+        );
 
         assert_eq!(events.len(), 3);
         assert_eq!(events[1].payload["type"], "commandExecution");

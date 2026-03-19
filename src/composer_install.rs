@@ -59,9 +59,11 @@ impl ComposerInstallMode {
 
     pub fn command_label(self) -> &'static str {
         match self {
-            Self::Full => "composer install --no-interaction --no-progress",
+            Self::Full => {
+                "composer install --no-interaction --no-progress --ignore-platform-reqs"
+            }
             Self::Safe => {
-                "composer install --no-dev --no-scripts --no-plugins --prefer-dist --no-interaction --no-progress"
+                "composer install --no-dev --no-scripts --no-plugins --prefer-dist --no-interaction --no-progress --ignore-platform-reqs"
             }
         }
     }

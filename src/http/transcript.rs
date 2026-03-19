@@ -1045,7 +1045,7 @@ mod tests {
                     event_type: "item_completed".to_string(),
                     payload: json!({
                         "type": "commandExecution",
-                        "command": "composer install --no-interaction --no-progress",
+                        "command": "composer install --no-interaction --no-progress --ignore-platform-reqs",
                         "aggregatedOutput": "Installing dependencies",
                         "status": "completed"
                     }),

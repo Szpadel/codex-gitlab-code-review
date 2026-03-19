@@ -3016,7 +3016,9 @@ mod tests {
             .iter()
             .position(|entry| {
                 entry.starts_with("exec:")
-                    && entry.contains("composer install --no-interaction --no-progress")
+                    && entry.contains(
+                        "composer install --no-interaction --no-progress --ignore-platform-reqs",
+                    )
             })
             .expect("composer exec");
         assert!(initialize_index < composer_index);
@@ -3394,7 +3396,9 @@ mod tests {
             .iter()
             .position(|entry| {
                 entry.starts_with("exec:")
-                    && entry.contains("composer install --no-interaction --no-progress")
+                    && entry.contains(
+                        "composer install --no-interaction --no-progress --ignore-platform-reqs",
+                    )
             })
             .expect("composer exec");
         assert!(initialize_index < composer_index);
