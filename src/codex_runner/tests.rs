@@ -18,6 +18,11 @@ use crate::state::{NewRunHistory, RunHistoryKind};
 use anyhow::Context;
 use chrono::TimeZone;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::process::{Command, Output};
+use std::thread;
+use std::time::Duration;
 
 fn empty_app_server_client() -> AppServerClient {
     AppServerClient {
@@ -31,6 +36,34 @@ fn empty_app_server_client() -> AppServerClient {
         recent_runner_errors: VecDeque::new(),
         log_all_json: false,
     }
+}
+
+fn run_bash_script(script: &str) -> Result<Output> {
+    Ok(Command::new("bash").arg("-lc").arg(script).output()?)
+}
+
+fn test_browser_mcp_config(command: &str) -> BrowserMcpConfig {
+    BrowserMcpConfig {
+        enabled: true,
+        server_name: "chrome-devtools".to_string(),
+        browser_image: "chromedp/headless-shell:latest".to_string(),
+        remote_debugging_port: BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+        mcp_command: command.to_string(),
+        browser_args: vec![],
+        ..BrowserMcpConfig::default()
+    }
+}
+
+fn render_browser_wait_script_for_port(port: u16) -> String {
+    browser_wait_script(Some(&test_browser_mcp_config("npx")))
+        .replace(
+            &format!("/{}", BROWSER_MCP_REMOTE_DEBUGGING_PORT),
+            &format!("/{port}"),
+        )
+        .replace(
+            &format!(":{}", BROWSER_MCP_REMOTE_DEBUGGING_PORT),
+            &format!(":{port}"),
+        )
 }
 
 #[test]
@@ -1564,40 +1597,6 @@ fn build_command_script_includes_reasoning_summary_override() {
 }
 
 #[test]
-fn build_command_script_waits_for_browser_when_enabled() {
-    let script = DockerCodexRunner::build_command_script(
-        BuildCommandScriptInput {
-            clone_url: "https://example.com/repo.git",
-            gitlab_token: "token",
-            repo: "repo",
-            project_path: "repo",
-            head_sha: "abc",
-            auth_mount_path: "/root/.codex",
-            target_branch: None,
-            deps_enabled: false,
-        },
-        AppServerCommandOptions {
-            browser_mcp: Some(&BrowserMcpConfig {
-                enabled: true,
-                server_name: "chrome-devtools".to_string(),
-                browser_image: "chromedp/headless-shell:latest".to_string(),
-                remote_debugging_port: 9222,
-                browser_args: vec!["--no-sandbox".to_string()],
-                ..BrowserMcpConfig::default()
-            }),
-            gitlab_discovery_mcp: None,
-            mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: None,
-            reasoning_effort: None,
-        },
-    );
-    assert!(script.contains("browser_mcp_command='npx'"));
-    assert!(script.contains("browser MCP requires $browser_mcp_command"));
-    assert!(script.contains("127.0.0.1:9222/json/version"));
-    assert!(script.contains("browser MCP endpoint did not become ready"));
-}
-
-#[test]
 fn thread_start_params_include_extra_workspace_write_roots() {
     let mut codex = test_codex_config();
     codex.exec_sandbox = "workspace-write".to_string();
@@ -1717,23 +1716,85 @@ fn prepare_gitlab_discovery_mcp_rejects_empty_source_repo() {
 }
 
 #[test]
-fn browser_mcp_prereq_script_requires_npx_when_enabled() {
-    let script = browser_mcp_prereq_script(Some(&BrowserMcpConfig {
-        enabled: true,
-        server_name: "chrome-devtools".to_string(),
-        browser_image: "chromedp/headless-shell:latest".to_string(),
-        remote_debugging_port: 9222,
-        browser_args: vec![],
-        ..BrowserMcpConfig::default()
-    }));
-    assert!(script.contains("browser_mcp_command='npx'"));
-    assert!(script.contains("browser MCP requires $browser_mcp_command"));
+fn browser_mcp_prereq_script_fails_when_command_is_missing() -> Result<()> {
+    let script = browser_mcp_prereq_script(Some(&test_browser_mcp_config(
+        "definitely-not-installed-browser-mcp",
+    )));
+    let output = run_bash_script(&script)?;
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("browser MCP requires"));
+    Ok(())
+}
+
+#[test]
+fn browser_mcp_prereq_script_succeeds_when_command_exists() -> Result<()> {
+    let script = browser_mcp_prereq_script(Some(&test_browser_mcp_config("sh")));
+    let output = run_bash_script(&script)?;
+    assert!(output.status.success());
+    Ok(())
 }
 
 #[test]
 fn browser_mcp_prereq_script_is_empty_when_disabled() {
     let script = browser_mcp_prereq_script(None);
     assert!(script.is_empty());
+}
+
+#[test]
+fn browser_wait_script_probes_endpoint_until_ready() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let server = thread::spawn(move || -> Result<Vec<u8>> {
+        let (mut stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 256];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    request.extend_from_slice(&buf[..n]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        if request
+            == b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        {
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
+        }
+
+        Ok(request)
+    });
+
+    let output = run_bash_script(&render_browser_wait_script_for_port(port))?;
+    let request = server.join().expect("server thread panicked")?;
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        request,
+        b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1930,61 +1991,6 @@ fn mention_command_script_includes_reasoning_summary_override() {
         },
     );
     assert!(script.contains("exec codex -c 'model_reasoning_summary=\"detailed\"' app-server"));
-}
-
-#[test]
-fn mention_command_script_waits_for_browser_when_enabled() {
-    let ctx = MentionCommandContext {
-        repo: "group/repo".to_string(),
-        project_path: "group/repo".to_string(),
-        mr: MergeRequest {
-            iid: 11,
-            title: Some("Title".to_string()),
-            web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/11".to_string()),
-            created_at: None,
-            updated_at: None,
-            sha: Some("abc123".to_string()),
-            source_branch: None,
-            target_branch: Some("main".to_string()),
-            author: None,
-            source_project_id: None,
-            target_project_id: None,
-            diff_refs: None,
-        },
-        head_sha: "abc123".to_string(),
-        discussion_id: "discussion-1".to_string(),
-        trigger_note_id: 77,
-        requester_name: "Alice Example".to_string(),
-        requester_email: "alice@example.com".to_string(),
-        additional_developer_instructions: None,
-        prompt: "Do the change".to_string(),
-        feature_flags: FeatureFlagSnapshot::default(),
-        run_history_id: None,
-    };
-    let script = DockerCodexRunner::build_mention_command_script(
-        &ctx,
-        "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
-        "token",
-        "/root/.codex",
-        AppServerCommandOptions {
-            browser_mcp: Some(&BrowserMcpConfig {
-                enabled: true,
-                server_name: "chrome-devtools".to_string(),
-                browser_image: "chromedp/headless-shell:latest".to_string(),
-                remote_debugging_port: 9222,
-                browser_args: vec![],
-                ..BrowserMcpConfig::default()
-            }),
-            gitlab_discovery_mcp: None,
-            mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: None,
-            reasoning_effort: None,
-        },
-    );
-    assert!(script.contains("browser_mcp_command='npx'"));
-    assert!(script.contains("browser MCP requires $browser_mcp_command"));
-    assert!(script.contains("127.0.0.1:9222/json/version"));
-    assert!(script.contains("browser MCP endpoint did not become ready"));
 }
 
 #[test]
