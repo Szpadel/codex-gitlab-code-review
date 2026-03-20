@@ -719,6 +719,7 @@ impl ReviewRunContext {
             feature_flags,
             run_history_id: Some(run_history_id),
         };
+        let review_project_path = review_ctx.project_path.clone();
 
         if self.shutdown_requested() {
             self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
@@ -794,6 +795,7 @@ impl ReviewRunContext {
                         &self.config,
                         self.gitlab.as_ref(),
                         self.bot_user_id,
+                        &review_project_path,
                         repo,
                         &mr,
                         head_sha,

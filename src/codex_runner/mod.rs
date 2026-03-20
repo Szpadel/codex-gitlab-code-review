@@ -138,6 +138,16 @@ const BROWSER_CONTAINER_RUNNING_GRACE_PERIOD: Duration = Duration::from_secs(10)
 const BROWSER_CONTAINER_LOG_FETCH_TAIL: &str = "50";
 const BROWSER_CONTAINER_LOG_LINE_LIMIT: usize = 12;
 const BROWSER_CONTAINER_LOG_LINE_MAX_CHARS: usize = 240;
+pub(crate) const PRIMARY_REPO_ROOT: &str = "/work/repo";
+
+pub(crate) fn repo_checkout_root(project_path: &str) -> String {
+    let trimmed = project_path.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        PRIMARY_REPO_ROOT.to_string()
+    } else {
+        format!("{PRIMARY_REPO_ROOT}/{trimmed}")
+    }
+}
 
 pub(crate) struct StartedAppServer {
     container_id: String,
@@ -1714,6 +1724,7 @@ mod tests {
                 clone_url: "https://example.com/repo.git",
                 gitlab_token: "token",
                 repo: "repo",
+                project_path: "repo",
                 head_sha: "abc",
                 auth_mount_path: "/root/.codex",
                 target_branch: None,
@@ -1729,6 +1740,7 @@ mod tests {
         );
         assert!(script.contains("export CODEX_HOME=\"/root/.codex\""));
         assert!(script.contains("mkdir -p \"/root/.codex\""));
+        assert!(script.contains("repo_dir='/work/repo/repo'"));
     }
 
     #[test]
@@ -1738,6 +1750,7 @@ mod tests {
                 clone_url: "https://example.com/repo.git",
                 gitlab_token: "token",
                 repo: "repo",
+                project_path: "repo",
                 head_sha: "abc",
                 auth_mount_path: "/root/.codex",
                 target_branch: Some("main"),
@@ -1763,6 +1776,7 @@ mod tests {
                 clone_url: "https://example.com/repo.git",
                 gitlab_token: "token",
                 repo: "repo",
+                project_path: "repo",
                 head_sha: "abc",
                 auth_mount_path: "/root/.codex",
                 target_branch: None,
@@ -1845,6 +1859,7 @@ mod tests {
                 clone_url: "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
                 gitlab_token: "token",
                 repo: "repo",
+                project_path: "repo",
                 head_sha: "abc",
                 auth_mount_path: "/root/.codex",
                 target_branch: Some("main"),
@@ -1887,6 +1902,7 @@ mod tests {
                 clone_url: "https://example.com/repo.git",
                 gitlab_token: "token",
                 repo: "repo",
+                project_path: "repo",
                 head_sha: "abc",
                 auth_mount_path: "/root/.codex",
                 target_branch: None,
@@ -1913,6 +1929,7 @@ mod tests {
                 clone_url: "https://example.com/repo.git",
                 gitlab_token: "token",
                 repo: "repo",
+                project_path: "repo",
                 head_sha: "abc",
                 auth_mount_path: "/root/.codex",
                 target_branch: None,
@@ -2046,6 +2063,7 @@ mod tests {
                 clone_url: "https://example.com/repo.git",
                 gitlab_token: "token",
                 repo: "repo",
+                project_path: "repo",
                 head_sha: "abc",
                 auth_mount_path: "/root/.codex",
                 target_branch: None,
@@ -2069,6 +2087,7 @@ mod tests {
                 clone_url: "https://example.com/repo.git",
                 gitlab_token: "token",
                 repo: "repo",
+                project_path: "repo",
                 head_sha: "abc",
                 auth_mount_path: "/root/.codex",
                 target_branch: None,
@@ -2092,6 +2111,7 @@ mod tests {
                 clone_url: "https://example.com/repo.git",
                 gitlab_token: "token",
                 repo: "repo",
+                project_path: "repo",
                 head_sha: "abc",
                 auth_mount_path: "/root/.codex",
                 target_branch: None,
@@ -2124,12 +2144,13 @@ mod tests {
         codex.exec_sandbox = "workspace-write".to_string();
         let runner = test_runner_with_codex(codex);
 
-        let params = runner.thread_start_params("/work/repo", None, &["/work/mcp".to_string()]);
+        let params =
+            runner.thread_start_params("/work/repo/group/repo", None, &["/work/mcp".to_string()]);
 
         assert_eq!(params["sandbox"], "workspace-write");
         assert_eq!(
             params["config"]["sandbox_workspace_write"]["writable_roots"],
-            serde_json::json!(["/work/mcp", "/work/repo"])
+            serde_json::json!(["/work/mcp", "/work/repo/group/repo"])
         );
         assert_eq!(
             params["config"]["sandbox_workspace_write"]["network_access"],
@@ -2143,7 +2164,7 @@ mod tests {
         codex.exec_sandbox = "workspace-write".to_string();
         let runner = test_runner_with_codex(codex);
 
-        let params = runner.thread_start_params("/work/repo", None, &[]);
+        let params = runner.thread_start_params("/work/repo/group/repo", None, &[]);
 
         assert_eq!(params["sandbox"], "workspace-write");
         assert!(params.get("config").is_none());
@@ -2305,6 +2326,7 @@ mod tests {
         assert!(
             script.contains("run_git clone git clone --depth 1 --recurse-submodules \"https://oauth2:${GITLAB_TOKEN}@example.com/repo.git\"")
         );
+        assert!(script.contains("repo_dir='/work/repo/group/repo'"));
         assert!(script.contains("export GITLAB_TOKEN='token'"));
         assert!(
             script.contains(
@@ -3073,6 +3095,7 @@ mod tests {
     #[tokio::test]
     async fn run_mention_command_with_fake_runtime_executes_git_helpers_and_returns_commit()
     -> Result<()> {
+        let repo_dir = repo_checkout_root("group/repo");
         let harness = Arc::new(FakeRunnerHarness::default());
         harness.push_app_server(ScriptedAppServer::from_requests(vec![
             ScriptedAppRequest::result("initialize", json!({})),
@@ -3122,7 +3145,7 @@ mod tests {
                     "status".to_string(),
                     "--porcelain".to_string(),
                 ]),
-                cwd: Some("/work/repo".to_string()),
+                cwd: Some(repo_dir.clone()),
                 env: None,
             },
             ContainerExecOutput {
@@ -3154,7 +3177,7 @@ mod tests {
                 ExecContainerCommandRequest {
                     container_id: "app-1".to_string(),
                     command: auxiliary_git_exec_command(&command),
-                    cwd: Some("/work/repo".to_string()),
+                    cwd: Some(repo_dir.clone()),
                     env: None,
                 },
                 ContainerExecOutput {
@@ -3168,7 +3191,7 @@ mod tests {
             ExecContainerCommandRequest {
                 container_id: "app-1".to_string(),
                 command: auxiliary_git_exec_command(&["rev-parse".to_string(), "HEAD".to_string()]),
-                cwd: Some("/work/repo".to_string()),
+                cwd: Some(repo_dir.clone()),
                 env: None,
             },
             ContainerExecOutput {
@@ -3181,7 +3204,7 @@ mod tests {
             ExecContainerCommandRequest {
                 container_id: "app-1".to_string(),
                 command: auxiliary_git_exec_command(&["rev-parse".to_string(), "HEAD".to_string()]),
-                cwd: Some("/work/repo".to_string()),
+                cwd: Some(repo_dir.clone()),
                 env: None,
             },
             ContainerExecOutput {
@@ -3199,7 +3222,7 @@ mod tests {
                     "before-sha".to_string(),
                     "after-sha".to_string(),
                 ]),
-                cwd: Some("/work/repo".to_string()),
+                cwd: Some(repo_dir.clone()),
                 env: None,
             },
             ContainerExecOutput {
@@ -3216,7 +3239,7 @@ mod tests {
                     "--count".to_string(),
                     "before-sha..after-sha".to_string(),
                 ]),
-                cwd: Some("/work/repo".to_string()),
+                cwd: Some(repo_dir.clone()),
                 env: None,
             },
             ContainerExecOutput {
@@ -3231,7 +3254,7 @@ mod tests {
                 command: restore_push_remote_url_exec_command(
                     "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git",
                 ),
-                cwd: Some("/work/repo".to_string()),
+                cwd: Some(repo_dir.clone()),
                 env: Some(vec!["GITLAB_TOKEN=token".to_string()]),
             },
             ContainerExecOutput {
@@ -3248,7 +3271,7 @@ mod tests {
                     "origin".to_string(),
                     "HEAD:feature".to_string(),
                 ]),
-                cwd: Some("/work/repo".to_string()),
+                cwd: Some(repo_dir.clone()),
                 env: None,
             },
             ContainerExecOutput {
@@ -3310,6 +3333,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_mention_command_with_fake_runtime_initializes_before_composer_install() {
+        let repo_dir = repo_checkout_root("group/repo");
         let harness = Arc::new(FakeRunnerHarness::default());
         harness.push_app_server(ScriptedAppServer::from_requests(vec![
             ScriptedAppRequest::result("initialize", json!({})),
@@ -3323,7 +3347,7 @@ mod tests {
             ExecContainerCommandRequest {
                 container_id: "app-1".to_string(),
                 command: composer_command.clone(),
-                cwd: Some("/work/repo".to_string()),
+                cwd: Some(repo_dir.clone()),
                 env: None,
             },
             ContainerExecOutput {
@@ -3339,7 +3363,7 @@ mod tests {
                     "status".to_string(),
                     "--porcelain".to_string(),
                 ]),
-                cwd: Some("/work/repo".to_string()),
+                cwd: Some(repo_dir.clone()),
                 env: None,
             },
             "git status failed",
@@ -3408,6 +3432,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_mention_command_with_fake_runtime_surfaces_exec_failures() {
+        let repo_dir = repo_checkout_root("group/repo");
         let harness = Arc::new(FakeRunnerHarness::default());
         harness.push_app_server(ScriptedAppServer::from_requests(vec![
             ScriptedAppRequest::result("initialize", json!({})),
@@ -3419,7 +3444,7 @@ mod tests {
                     "status".to_string(),
                     "--porcelain".to_string(),
                 ]),
-                cwd: Some("/work/repo".to_string()),
+                cwd: Some(repo_dir.clone()),
                 env: None,
             },
             "git status failed",

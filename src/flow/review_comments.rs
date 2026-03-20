@@ -1,4 +1,4 @@
-use crate::codex_runner::{ReviewComment, ReviewFinding};
+use crate::codex_runner::{ReviewComment, ReviewFinding, repo_checkout_root};
 use crate::config::Config;
 use crate::gitlab::{
     DiffDiscussionPosition, GitLabApi, MergeRequest, MergeRequestDiff, MergeRequestDiffDiscussion,
@@ -10,7 +10,6 @@ use tracing::warn;
 use url::Url;
 
 const REVIEW_FINDING_MARKER_PREFIX: &str = "<!-- codex-review-finding:sha=";
-const WORKTREE_PREFIX: &str = "/work/repo/";
 const MAX_INLINE_FINDING_LINE_SPAN: usize = 500;
 
 #[derive(Debug, Clone)]
@@ -31,12 +30,14 @@ pub(crate) async fn post_review_comment(
     config: &Config,
     gitlab: &dyn GitLabApi,
     bot_user_id: u64,
+    project_path: &str,
     repo: &str,
     mr: &MergeRequest,
     head_sha: &str,
     comment: &ReviewComment,
 ) -> Result<()> {
     let project_web_base = resolve_project_web_base(config, gitlab, repo, mr).await;
+    let worktree_root = repo_checkout_root(project_path);
     if !inline_review_comments_enabled || comment.findings.is_empty() {
         let full_body = legacy_note_body(config, head_sha, &comment.body);
         gitlab.create_note(repo, mr.iid, &full_body).await?;
@@ -63,6 +64,7 @@ pub(crate) async fn post_review_comment(
                     comment,
                     &comment.findings,
                     project_web_base.as_str(),
+                    worktree_root.as_str(),
                 )
                 .await?;
                 return Ok(());
@@ -98,6 +100,7 @@ pub(crate) async fn post_review_comment(
             &anchors_by_path,
             head_sha,
             project_web_base.as_str(),
+            worktree_root.as_str(),
         ) else {
             fallback_findings.push(finding.clone());
             continue;
@@ -131,6 +134,7 @@ pub(crate) async fn post_review_comment(
             comment,
             &fallback_findings,
             project_web_base.as_str(),
+            worktree_root.as_str(),
         )
         .await?;
     }
@@ -166,9 +170,13 @@ fn build_inline_discussion(
     anchors_by_path: &HashMap<String, DiffFileAnchors>,
     head_sha: &str,
     project_web_base: &str,
+    worktree_root: &str,
 ) -> Option<MergeRequestDiffDiscussion> {
     let latest_version = latest_version?;
-    let relative_path = normalize_repo_path(finding.code_location.absolute_file_path.as_str())?;
+    let relative_path = normalize_repo_path(
+        finding.code_location.absolute_file_path.as_str(),
+        worktree_root,
+    )?;
     let anchors = anchors_by_path.get(relative_path.as_str())?;
     let anchor = select_anchor(anchors, finding)?;
 
@@ -180,6 +188,7 @@ fn build_inline_discussion(
             relative_path.as_str(),
             project_web_base,
             head_sha,
+            worktree_root,
         ),
         finding_marker(head_sha, finding)
     );
@@ -304,6 +313,7 @@ fn build_fallback_note_body(
     comment: &ReviewComment,
     fallback_findings: &[ReviewFinding],
     project_web_base: &str,
+    worktree_root: &str,
 ) -> Option<String> {
     if fallback_findings.is_empty() && comment.overall_explanation.is_none() {
         return None;
@@ -316,6 +326,7 @@ fn build_fallback_note_body(
             "",
             project_web_base,
             head_sha,
+            worktree_root,
         ));
     }
     if !fallback_findings.is_empty() {
@@ -323,6 +334,7 @@ fn build_fallback_note_body(
             head_sha,
             fallback_findings,
             project_web_base,
+            worktree_root,
         ));
     }
 
@@ -350,6 +362,7 @@ async fn create_fallback_note(
     comment: &ReviewComment,
     fallback_findings: &[ReviewFinding],
     project_web_base: &str,
+    worktree_root: &str,
 ) -> Result<()> {
     let body = build_fallback_note_body(
         config,
@@ -357,6 +370,7 @@ async fn create_fallback_note(
         comment,
         fallback_findings,
         project_web_base,
+        worktree_root,
     )
     .unwrap_or_else(|| legacy_note_body(config, head_sha, &comment.body));
     gitlab.create_note(repo, iid, &body).await
@@ -373,6 +387,7 @@ fn render_fallback_findings(
     head_sha: &str,
     findings: &[ReviewFinding],
     project_web_base: &str,
+    worktree_root: &str,
 ) -> String {
     let mut lines = vec![if findings.len() > 1 {
         "Full review comments:".to_string()
@@ -385,9 +400,10 @@ fn render_fallback_findings(
         lines.push(format!(
             "- {} — {}",
             finding.title,
-            markdown_reference(head_sha, finding, project_web_base)
+            markdown_reference(head_sha, finding, project_web_base, worktree_root)
         ));
-        let rewritten_body = rewrite_code_references(&finding.body, "", project_web_base, head_sha);
+        let rewritten_body =
+            rewrite_code_references(&finding.body, "", project_web_base, head_sha, worktree_root);
         for body_line in rewritten_body.lines() {
             lines.push(format!("  {body_line}"));
         }
@@ -396,20 +412,23 @@ fn render_fallback_findings(
     lines.join("\n")
 }
 
-fn markdown_reference(head_sha: &str, finding: &ReviewFinding, project_web_base: &str) -> String {
-    let location = format_location(finding);
-    match finding
-        .code_location
-        .absolute_file_path
-        .as_str()
-        .strip_prefix(WORKTREE_PREFIX)
-    {
+fn markdown_reference(
+    head_sha: &str,
+    finding: &ReviewFinding,
+    project_web_base: &str,
+    worktree_root: &str,
+) -> String {
+    let location = format_location(finding, worktree_root);
+    match normalize_repo_path(
+        finding.code_location.absolute_file_path.as_str(),
+        worktree_root,
+    ) {
         Some(relative_path) => format!(
             "[{location}]({})",
             blob_url(
                 project_web_base,
                 head_sha,
-                relative_path,
+                relative_path.as_str(),
                 finding.code_location.line_range.start,
             )
         ),
@@ -417,12 +436,12 @@ fn markdown_reference(head_sha: &str, finding: &ReviewFinding, project_web_base:
     }
 }
 
-fn format_location(finding: &ReviewFinding) -> String {
-    let path = finding
-        .code_location
-        .absolute_file_path
-        .strip_prefix(WORKTREE_PREFIX)
-        .unwrap_or(finding.code_location.absolute_file_path.as_str());
+fn format_location(finding: &ReviewFinding, worktree_root: &str) -> String {
+    let path = normalize_repo_path(
+        finding.code_location.absolute_file_path.as_str(),
+        worktree_root,
+    )
+    .unwrap_or_else(|| finding.code_location.absolute_file_path.clone());
     format!(
         "{path}:{}-{}",
         finding.code_location.line_range.start, finding.code_location.line_range.end
@@ -489,8 +508,10 @@ fn canonical_finding_key(finding: &ReviewFinding) -> String {
     )
 }
 
-fn normalize_repo_path(path: &str) -> Option<String> {
-    path.strip_prefix(WORKTREE_PREFIX).map(ToOwned::to_owned)
+fn normalize_repo_path(path: &str, worktree_root: &str) -> Option<String> {
+    path.strip_prefix(worktree_root)?
+        .strip_prefix('/')
+        .map(ToOwned::to_owned)
 }
 
 fn rewrite_code_references(
@@ -498,6 +519,7 @@ fn rewrite_code_references(
     default_relative_path: &str,
     project_web_base: &str,
     head_sha: &str,
+    worktree_root: &str,
 ) -> String {
     let mut rewritten = String::with_capacity(text.len());
     let mut token_start = None;
@@ -510,6 +532,7 @@ fn rewrite_code_references(
                     default_relative_path,
                     project_web_base,
                     head_sha,
+                    worktree_root,
                 ));
             }
             rewritten.push(ch);
@@ -524,6 +547,7 @@ fn rewrite_code_references(
             default_relative_path,
             project_web_base,
             head_sha,
+            worktree_root,
         ));
     }
 
@@ -535,10 +559,11 @@ fn rewrite_reference_token(
     default_relative_path: &str,
     project_web_base: &str,
     head_sha: &str,
+    worktree_root: &str,
 ) -> String {
     let (trimmed, suffix) = trim_token_suffix(token);
     let Some((relative_path, start_line, end_line)) =
-        parse_reference_token(trimmed, default_relative_path)
+        parse_reference_token(trimmed, default_relative_path, worktree_root)
     else {
         return token.to_string();
     };
@@ -561,10 +586,11 @@ fn rewrite_reference_token(
 fn parse_reference_token(
     token: &str,
     default_relative_path: &str,
+    worktree_root: &str,
 ) -> Option<(String, usize, usize)> {
     let (path, line_range) = token.rsplit_once(':')?;
-    let relative_path = if let Some(relative_path) = path.strip_prefix(WORKTREE_PREFIX) {
-        relative_path.to_string()
+    let relative_path = if let Some(relative_path) = normalize_repo_path(path, worktree_root) {
+        relative_path
     } else if !default_relative_path.is_empty() && path.is_empty() {
         default_relative_path.to_string()
     } else {
@@ -692,11 +718,12 @@ mod tests {
 
     #[test]
     fn finding_markers_round_trip_from_text() {
+        let worktree_root = repo_checkout_root("group/repo");
         let finding = ReviewFinding {
             title: "Title".to_string(),
             body: "Body".to_string(),
             code_location: crate::codex_runner::ReviewCodeLocation {
-                absolute_file_path: "/work/repo/src/lib.rs".to_string(),
+                absolute_file_path: format!("{worktree_root}/src/lib.rs"),
                 line_range: crate::codex_runner::ReviewLineRange { start: 3, end: 4 },
             },
         };
@@ -707,11 +734,13 @@ mod tests {
 
     #[test]
     fn rewrite_code_references_preserves_whitespace_layout() {
+        let worktree_root = repo_checkout_root("group/repo");
         let rewritten = rewrite_code_references(
-            "Paragraph one.\n\n- /work/repo/src/lib.rs:10\n- keep",
+            format!("Paragraph one.\n\n- {worktree_root}/src/lib.rs:10\n- keep").as_str(),
             "",
             "https://gitlab.example.com/group/repo",
             "sha1",
+            worktree_root.as_str(),
         );
         assert!(rewritten.contains("\n\n- [src/lib.rs:10]"));
         assert!(rewritten.ends_with("\n- keep"));
@@ -719,15 +748,40 @@ mod tests {
 
     #[test]
     fn rewrite_code_references_does_not_link_arbitrary_word_number_tokens() {
+        let worktree_root = repo_checkout_root("group/repo");
         let rewritten = rewrite_code_references(
             "RFC:2119 and step:3 stay plain, but :10 links.",
             "src/lib.rs",
             "https://gitlab.example.com/group/repo",
             "sha1",
+            worktree_root.as_str(),
         );
         assert!(rewritten.contains("RFC:2119"));
         assert!(rewritten.contains("step:3"));
         assert!(rewritten.contains("[src/lib.rs:10]"));
+    }
+
+    #[test]
+    fn normalize_repo_path_strips_nested_project_prefix() {
+        let worktree_root = repo_checkout_root("group/repo");
+        assert_eq!(
+            normalize_repo_path("/work/repo/group/repo/src/lib.rs", worktree_root.as_str()),
+            Some("src/lib.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_code_references_strips_nested_project_prefix() {
+        let worktree_root = repo_checkout_root("group/repo");
+        let rewritten = rewrite_code_references(
+            "Paragraph one.\n\n- /work/repo/group/repo/src/lib.rs:10\n- keep",
+            "",
+            "https://gitlab.example.com/group/repo",
+            "sha1",
+            worktree_root.as_str(),
+        );
+        assert!(rewritten.contains("\n\n- [src/lib.rs:10]"));
+        assert!(rewritten.ends_with("\n- keep"));
     }
 
     #[test]
@@ -740,6 +794,7 @@ mod tests {
 
     #[test]
     fn select_anchor_rejects_excessive_line_ranges() {
+        let worktree_root = repo_checkout_root("group/repo");
         let anchors = DiffFileAnchors {
             old_path: "src/lib.rs".to_string(),
             new_path: "src/lib.rs".to_string(),
@@ -755,7 +810,7 @@ mod tests {
             title: "Too wide".to_string(),
             body: "Body".to_string(),
             code_location: crate::codex_runner::ReviewCodeLocation {
-                absolute_file_path: "/work/repo/src/lib.rs".to_string(),
+                absolute_file_path: format!("{worktree_root}/src/lib.rs"),
                 line_range: crate::codex_runner::ReviewLineRange {
                     start: 1,
                     end: MAX_INLINE_FINDING_LINE_SPAN + 2,

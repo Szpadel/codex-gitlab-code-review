@@ -281,7 +281,7 @@ impl DockerCodexRunner {
             ctx.run_history_id,
         )
         .await;
-        let repo_path = "/work/repo";
+        let repo_path = repo_checkout_root(&ctx.project_path);
         self.update_run_history_session(
             ctx.run_history_id,
             RunHistorySessionUpdate {
@@ -305,7 +305,7 @@ impl DockerCodexRunner {
                 let _composer_install = self
                     .run_composer_install_step(
                         &container_id,
-                        repo_path,
+                        repo_path.as_str(),
                         &ctx.project_path,
                         &ctx.feature_flags,
                         composer_timeout_seconds,
@@ -313,7 +313,7 @@ impl DockerCodexRunner {
                     )
                     .await;
                 let review_target = Self::review_target_value(
-                    self.resolve_review_target_request(ctx, &container_id, repo_path)
+                    self.resolve_review_target_request(ctx, &container_id, repo_path.as_str())
                         .await,
                 );
                 let extra_writable_roots = gitlab_discovery_mcp
@@ -323,7 +323,7 @@ impl DockerCodexRunner {
                 let thread_response = client
                     .request(
                         "thread/start",
-                        self.thread_start_params(repo_path, None, &extra_writable_roots),
+                        self.thread_start_params(repo_path.as_str(), None, &extra_writable_roots),
                     )
                     .await?;
                 let thread_id = thread_response

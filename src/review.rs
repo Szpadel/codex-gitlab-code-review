@@ -1879,14 +1879,16 @@ mod tests {
                 crate::codex_runner::ReviewComment {
                     summary: "needs changes".to_string(),
                     overall_explanation: Some(
-                        "Overall see /work/repo/src/other.rs:8 for fallback context.".to_string(),
+                        "Overall see /work/repo/group/repo/src/other.rs:8 for fallback context."
+                            .to_string(),
                     ),
                     findings: vec![
                         crate::codex_runner::ReviewFinding {
                             title: "Inline finding".to_string(),
-                            body: "Please fix /work/repo/src/lib.rs:10 before merging.".to_string(),
+                            body: "Please fix /work/repo/group/repo/src/lib.rs:10 before merging."
+                                .to_string(),
                             code_location: crate::codex_runner::ReviewCodeLocation {
-                                absolute_file_path: "/work/repo/src/lib.rs".to_string(),
+                                absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                                 line_range: crate::codex_runner::ReviewLineRange {
                                     start: 10,
                                     end: 10,
@@ -1895,10 +1897,12 @@ mod tests {
                         },
                         crate::codex_runner::ReviewFinding {
                             title: "Fallback finding".to_string(),
-                            body: "This remains unresolved near /work/repo/src/other.rs:8."
-                                .to_string(),
+                            body:
+                                "This remains unresolved near /work/repo/group/repo/src/other.rs:8."
+                                    .to_string(),
                             code_location: crate::codex_runner::ReviewCodeLocation {
-                                absolute_file_path: "/work/repo/src/other.rs".to_string(),
+                                absolute_file_path: "/work/repo/group/repo/src/other.rs"
+                                    .to_string(),
                                 line_range: crate::codex_runner::ReviewLineRange {
                                     start: 8,
                                     end: 8,
@@ -1991,9 +1995,10 @@ mod tests {
                     overall_explanation: None,
                     findings: vec![crate::codex_runner::ReviewFinding {
                         title: "Fallback only".to_string(),
-                        body: "See /work/repo/src/lib.rs:30 for the broken call.".to_string(),
+                        body: "See /work/repo/group/repo/src/lib.rs:30 for the broken call."
+                            .to_string(),
                         code_location: crate::codex_runner::ReviewCodeLocation {
-                            absolute_file_path: "/work/repo/src/lib.rs".to_string(),
+                            absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                             line_range: crate::codex_runner::ReviewLineRange { start: 30, end: 30 },
                         },
                     }],
@@ -2338,9 +2343,9 @@ mod tests {
                     overall_explanation: None,
                     findings: vec![crate::codex_runner::ReviewFinding {
                         title: "Head moved".to_string(),
-                        body: "See /work/repo/src/lib.rs:10 before merging.".to_string(),
+                        body: "See /work/repo/group/repo/src/lib.rs:10 before merging.".to_string(),
                         code_location: crate::codex_runner::ReviewCodeLocation {
-                            absolute_file_path: "/work/repo/src/lib.rs".to_string(),
+                            absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                             line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
                         },
                     }],
@@ -2414,9 +2419,9 @@ mod tests {
                     overall_explanation: None,
                     findings: vec![crate::codex_runner::ReviewFinding {
                         title: "Inline finding".to_string(),
-                        body: "Fix /work/repo/src/lib.rs:10.".to_string(),
+                        body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
                         code_location: crate::codex_runner::ReviewCodeLocation {
-                            absolute_file_path: "/work/repo/src/lib.rs".to_string(),
+                            absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                             line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
                         },
                     }],
@@ -2480,9 +2485,9 @@ mod tests {
                     overall_explanation: None,
                     findings: vec![crate::codex_runner::ReviewFinding {
                         title: "Fallback finding".to_string(),
-                        body: "Fix /work/repo/src/lib.rs:10.".to_string(),
+                        body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
                         code_location: crate::codex_runner::ReviewCodeLocation {
-                            absolute_file_path: "/work/repo/src/lib.rs".to_string(),
+                            absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                             line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
                         },
                     }],
@@ -2552,9 +2557,9 @@ mod tests {
                     overall_explanation: Some("Overall context.".to_string()),
                     findings: vec![crate::codex_runner::ReviewFinding {
                         title: "Fallback finding".to_string(),
-                        body: "Fix /work/repo/src/lib.rs:10.".to_string(),
+                        body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
                         code_location: crate::codex_runner::ReviewCodeLocation {
-                            absolute_file_path: "/work/repo/src/lib.rs".to_string(),
+                            absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                             line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
                         },
                     }],
@@ -2622,12 +2627,14 @@ mod tests {
             result: Mutex::new(Some(CodexResult::Comment(
                 crate::codex_runner::ReviewComment {
                     summary: "needs changes".to_string(),
-                    overall_explanation: Some("See /work/repo/src/lib.rs:10.".to_string()),
+                    overall_explanation: Some(
+                        "See /work/repo/fork/source/src/lib.rs:10.".to_string(),
+                    ),
                     findings: vec![crate::codex_runner::ReviewFinding {
                         title: "Fork fallback".to_string(),
-                        body: "Fix /work/repo/src/lib.rs:10.".to_string(),
+                        body: "Fix /work/repo/fork/source/src/lib.rs:10.".to_string(),
                         code_location: crate::codex_runner::ReviewCodeLocation {
-                            absolute_file_path: "/work/repo/src/lib.rs".to_string(),
+                            absolute_file_path: "/work/repo/fork/source/src/lib.rs".to_string(),
                             line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
                         },
                     }],
@@ -2944,9 +2951,9 @@ mod tests {
         ));
         let finding = crate::codex_runner::ReviewFinding {
             title: "Duplicate".to_string(),
-            body: "See /work/repo/src/lib.rs:10.".to_string(),
+            body: "See /work/repo/group/repo/src/lib.rs:10.".to_string(),
             code_location: crate::codex_runner::ReviewCodeLocation {
-                absolute_file_path: "/work/repo/src/lib.rs".to_string(),
+                absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                 line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
             },
         };

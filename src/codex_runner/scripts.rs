@@ -14,6 +14,7 @@ pub(crate) struct BuildCommandScriptInput<'a> {
     pub(crate) clone_url: &'a str,
     pub(crate) gitlab_token: &'a str,
     pub(crate) repo: &'a str,
+    pub(crate) project_path: &'a str,
     pub(crate) head_sha: &'a str,
     pub(crate) auth_mount_path: &'a str,
     pub(crate) target_branch: Option<&'a str>,
@@ -93,6 +94,7 @@ impl DockerCodexRunner {
                 clone_url: &clone_url,
                 gitlab_token: &self.gitlab_token,
                 repo: &ctx.repo,
+                project_path: &ctx.project_path,
                 head_sha: ctx.head_sha.as_str(),
                 auth_mount_path: &self.codex.auth_mount_path,
                 target_branch: ctx
@@ -137,6 +139,7 @@ impl DockerCodexRunner {
         let head_sha_q = shell_quote(&ctx.head_sha);
         let gitlab_token_q = shell_quote(gitlab_token);
         let auth_mount_path_q = shell_quote(auth_mount_path);
+        let repo_dir_q = shell_quote(&repo_checkout_root(&ctx.project_path));
         let git_auth_setup_script =
             git_bootstrap_auth_setup_script(clone_url, &ctx.repo, gitlab_token);
         let git_auth_cleanup_script = git_bootstrap_auth_cleanup_script();
@@ -152,10 +155,10 @@ impl DockerCodexRunner {
         format!(
             r#"set -eu
 GITLAB_TOKEN={gitlab_token_q}
-repo_dir='/work/repo'
+repo_dir={repo_dir_q}
 log_file="/tmp/codex-mention-git.log"
 mkdir -p /work
-cd /work
+mkdir -p "$(dirname "$repo_dir")"
 run_git() {{
   action="$1"
   shift
@@ -210,6 +213,7 @@ fi
             gitlab_token_q = gitlab_token_q,
             head_sha_q = head_sha_q,
             auth_mount_path_q = auth_mount_path_q,
+            repo_dir_q = repo_dir_q,
             git_auth_setup_script = git_auth_setup_script,
             git_auth_cleanup_script = git_auth_cleanup_script,
             browser_prereq_script = browser_prereq_script,
@@ -237,7 +241,7 @@ run_git fetch git fetch --unshallow\n"
             r#"
 prefetch_deps() (
   set +e
-  deps_dir="/work/repo/.codex_deps"
+  deps_dir="$repo_dir/.codex_deps"
   log_file="/tmp/codex-deps.log"
   mkdir -p "$deps_dir"
   failures=0
@@ -318,10 +322,10 @@ if ! HOME="$prefetch_home" XDG_CONFIG_HOME="$prefetch_home/.config" XDG_CACHE_HO
   XDG_STATE_HOME="$prefetch_home/.state" GITLAB_TOKEN="" CODEX_HOME="" prefetch_deps; then
   echo "codex-runner-warn: dependency prefetch had failures; continuing"
 fi
-export CARGO_HOME="/work/repo/.codex_deps/cargo"
-export GOMODCACHE="/work/repo/.codex_deps/go/mod"
-export GOCACHE="/work/repo/.codex_deps/go/cache"
-export MAVEN_USER_HOME="/work/repo/.codex_deps/m2"
+export CARGO_HOME="$repo_dir/.codex_deps/cargo"
+export GOMODCACHE="$repo_dir/.codex_deps/go/mod"
+export GOCACHE="$repo_dir/.codex_deps/go/cache"
+export MAVEN_USER_HOME="$repo_dir/.codex_deps/m2"
 "#
         } else {
             ""
@@ -330,6 +334,7 @@ export MAVEN_USER_HOME="/work/repo/.codex_deps/m2"
             git_bootstrap_auth_setup_script(input.clone_url, input.repo, input.gitlab_token);
         let git_auth_cleanup_script = git_bootstrap_auth_cleanup_script();
         let gitlab_token_q = shell_quote(input.gitlab_token);
+        let repo_dir_q = shell_quote(&repo_checkout_root(input.project_path));
         let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
         let browser_wait_script = browser_wait_script(app_server.browser_mcp);
         let app_server_exec_cmd = codex_app_server_exec_command(
@@ -342,8 +347,9 @@ export MAVEN_USER_HOME="/work/repo/.codex_deps/m2"
         format!(
             r#"set -eu
 GITLAB_TOKEN={gitlab_token_q}
+repo_dir={repo_dir_q}
 mkdir -p /work
-cd /work
+mkdir -p "$(dirname "$repo_dir")"
 log_file="/tmp/codex-git.log"
 run_git() {{
   action="$1"
@@ -360,8 +366,8 @@ run_git() {{
 }}
 export GITLAB_TOKEN={gitlab_token_q}
 {git_auth_setup_script}
-run_git clone git clone --depth 1 --recurse-submodules "{clone_url}" repo
-cd repo
+run_git clone git clone --depth 1 --recurse-submodules "{clone_url}" "$repo_dir"
+cd "$repo_dir"
 run_git fetch git fetch --depth 1 origin "{head_sha}"
 run_git checkout git checkout "{head_sha}"
 run_git submodule_update git submodule update --init --recursive
@@ -398,6 +404,7 @@ fi
         "#,
             clone_url = input.clone_url,
             gitlab_token_q = gitlab_token_q,
+            repo_dir_q = repo_dir_q,
             head_sha = input.head_sha,
             auth_mount_path = input.auth_mount_path,
             target_branch_script = target_branch_script,

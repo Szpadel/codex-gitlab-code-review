@@ -59,7 +59,7 @@ impl DockerCodexRunner {
     ) -> Result<MentionCommandResult> {
         debug_assert_eq!(sandbox_mode, self.sandbox_mode_value());
         let clone_url = self.clone_url(&ctx.repo)?;
-        let repo_dir = "/work/repo";
+        let repo_dir = repo_checkout_root(&ctx.project_path);
         let browser_mcp = self.effective_browser_mcp(&self.codex.mcp_server_overrides.mention);
         let gitlab_discovery_mcp = self.prepare_gitlab_discovery_mcp(
             &ctx.project_path,
@@ -171,7 +171,7 @@ impl DockerCodexRunner {
                     let _composer_install = self
                         .run_composer_install_step(
                             &container_id,
-                            repo_dir,
+                            repo_dir.as_str(),
                             &ctx.project_path,
                             &ctx.feature_flags,
                             composer_timeout_seconds,
@@ -182,7 +182,7 @@ impl DockerCodexRunner {
                         .exec_container_git_command(
                             &container_id,
                             &["status".to_string(), "--porcelain".to_string()],
-                            Some(repo_dir),
+                            Some(repo_dir.as_str()),
                         )
                         .await?
                         .stdout;
@@ -195,7 +195,7 @@ impl DockerCodexRunner {
                         .request(
                             "thread/start",
                             self.thread_start_params(
-                                repo_dir,
+                                repo_dir.as_str(),
                                 Some(Self::mention_developer_instructions(ctx)),
                                 &extra_writable_roots,
                             ),
@@ -224,7 +224,7 @@ impl DockerCodexRunner {
                             "user.name".to_string(),
                             ctx.requester_name.clone(),
                         ],
-                        Some(repo_dir),
+                        Some(repo_dir.as_str()),
                     )
                     .await?;
                     self.exec_container_git_command(
@@ -234,7 +234,7 @@ impl DockerCodexRunner {
                             "user.email".to_string(),
                             ctx.requester_email.clone(),
                         ],
-                        Some(repo_dir),
+                        Some(repo_dir.as_str()),
                     )
                     .await?;
                     self.exec_container_git_command(
@@ -246,14 +246,14 @@ impl DockerCodexRunner {
                             "origin".to_string(),
                             "no_push://disabled".to_string(),
                         ],
-                        Some(repo_dir),
+                        Some(repo_dir.as_str()),
                     )
                     .await?;
                     let before_sha = self
                         .exec_container_git_command(
                             &container_id,
                             &["rev-parse".to_string(), "HEAD".to_string()],
-                            Some(repo_dir),
+                            Some(repo_dir.as_str()),
                         )
                         .await?
                         .stdout
@@ -265,7 +265,7 @@ impl DockerCodexRunner {
                             "turn/start",
                             json!({
                                 "threadId": thread_id.as_str(),
-                                "cwd": repo_dir,
+                                "cwd": repo_dir.as_str(),
                                 "input": [{ "type": "text", "text": ctx.prompt.as_str() }],
                             }),
                         )
@@ -311,7 +311,7 @@ impl DockerCodexRunner {
                         .exec_container_git_command(
                             &container_id,
                             &["rev-parse".to_string(), "HEAD".to_string()],
-                            Some(repo_dir),
+                            Some(repo_dir.as_str()),
                         )
                         .await?
                         .stdout
@@ -333,7 +333,7 @@ impl DockerCodexRunner {
                                     before_sha.clone(),
                                     after_sha.clone(),
                                 ],
-                                Some(repo_dir),
+                                Some(repo_dir.as_str()),
                             )
                             .await
                         {
@@ -347,7 +347,7 @@ impl DockerCodexRunner {
                                     "--count".to_string(),
                                     format!("{before_sha}..{after_sha}"),
                                 ],
-                                Some(repo_dir),
+                                Some(repo_dir.as_str()),
                             )
                             .await?;
                         let commit_count = commit_count_output
@@ -372,7 +372,7 @@ impl DockerCodexRunner {
                                         "--name-only".to_string(),
                                         format!("{before_sha}..{after_sha}"),
                                     ],
-                                    Some(repo_dir),
+                                    Some(repo_dir.as_str()),
                                 )
                                 .await?;
                             let committed_paths = committed_paths_output
@@ -396,7 +396,7 @@ impl DockerCodexRunner {
                         self.exec_container_command_with_env(
                             &container_id,
                             restore_push_remote_url_exec_command(&clone_url),
-                            Some(repo_dir),
+                            Some(repo_dir.as_str()),
                             Some(vec![format!("GITLAB_TOKEN={}", self.gitlab_token)]),
                         )
                         .await?;
@@ -407,7 +407,7 @@ impl DockerCodexRunner {
                                 "origin".to_string(),
                                 format!("HEAD:{source_branch}"),
                             ],
-                            Some(repo_dir),
+                            Some(repo_dir.as_str()),
                         )
                         .await?;
                         (MentionCommandStatus::Committed, Some(after_sha))
@@ -416,7 +416,7 @@ impl DockerCodexRunner {
                             .exec_container_git_command(
                                 &container_id,
                                 &["status".to_string(), "--porcelain".to_string()],
-                                Some(repo_dir),
+                                Some(repo_dir.as_str()),
                             )
                             .await?;
                         if worktree_state.stdout != baseline_worktree_state {
