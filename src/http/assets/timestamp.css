@@ -1,0 +1,4 @@
+.localized-timestamp { display: inline-flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.localized-timestamp time { white-space: nowrap; }
+.timestamp-relative { color: var(--text-disabled); white-space: nowrap; }
+.timestamp-relative:empty { display: none; }

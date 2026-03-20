@@ -14,6 +14,7 @@ pub const DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS: u64 = 300;
 const COMPOSER_SKIP_EXIT_CODE: i64 = 86;
 const COMPOSER_SKIP_REASON_MISSING_JSON: &str = "missing-composer-json";
 const COMPOSER_DEBUG_PREAMBLE_MAX_CHARS: usize = 1_200;
+const COMPOSER_INSTALL_SCRIPT_TEMPLATE: &str = include_str!("composer_install/assets/install.sh");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -124,8 +125,10 @@ pub fn composer_install_exec_command(
     timeout_seconds: u64,
     repository_config_json: Option<&str>,
 ) -> Vec<String> {
-    let composer_command = mode.command_label();
+    let composer_command = format!("COMPOSER_ALLOW_SUPERUSER=1 {}", mode.command_label());
     let skip_line = composer_skip_line();
+    let skip_exit_code = COMPOSER_SKIP_EXIT_CODE.to_string();
+    let timeout_seconds_text = timeout_seconds.to_string();
     let composer_home_setup = repository_config_json
         .map(|config| {
             let config_q = shell_quote(config);
@@ -142,62 +145,12 @@ export COMPOSER_HOME=\"$composer_home\"\n"
             )
         })
         .unwrap_or_default();
-    let script = format!(
-        r#"set +e
-composer_home=""
-if [ ! -f composer.json ]; then
-  printf '{skip_line}\n'
-  exit {skip_exit_code}
-fi
-if ! command -v composer >/dev/null 2>&1; then
-  echo "composer not found in PATH" >&2
-  exit 127
-fi
-log_file="$(mktemp /tmp/codex-composer-install.XXXXXX)"
-timeout_marker="$(mktemp /tmp/codex-composer-timeout.XXXXXX)"
-cleanup() {{
-  rm -f "$log_file"
-  rm -f "$timeout_marker"
-  if [ -n "$composer_home" ]; then
-    rm -rf "$composer_home"
-  fi
-}}
-trap cleanup EXIT
-{composer_home_setup}\
-COMPOSER_ALLOW_SUPERUSER=1 {composer_command} >"$log_file" 2>&1 &
-run_pid="$!"
-(
-  sleep "{timeout_seconds}"
-  if kill -0 "$run_pid" 2>/dev/null; then
-    printf 'composer install timed out after {timeout_seconds}s\n' >"$timeout_marker"
-    kill "$run_pid" 2>/dev/null || true
-    sleep 1
-    kill -9 "$run_pid" 2>/dev/null || true
-  fi
-) &
-watchdog_pid="$!"
-wait "$run_pid"
-status="$?"
-kill "$watchdog_pid" 2>/dev/null || true
-wait "$watchdog_pid" 2>/dev/null || true
-if [ "$status" -eq 0 ]; then
-  tail -n 100 "$log_file"
-  exit 0
-fi
-if [ -s "$timeout_marker" ]; then
-  cat "$timeout_marker"
-  tail -n 100 "$log_file"
-  exit 124
-fi
-tail -n 100 "$log_file"
-    exit "$status"
-"#,
-        skip_line = skip_line,
-        skip_exit_code = COMPOSER_SKIP_EXIT_CODE,
-        composer_home_setup = composer_home_setup,
-        composer_command = composer_command,
-        timeout_seconds = timeout_seconds,
-    );
+    let script = COMPOSER_INSTALL_SCRIPT_TEMPLATE
+        .replace("@@SKIP_LINE@@", &skip_line)
+        .replace("@@SKIP_EXIT_CODE@@", &skip_exit_code)
+        .replace("@@COMPOSER_HOME_SETUP@@", &composer_home_setup)
+        .replace("@@COMPOSER_COMMAND@@", &composer_command)
+        .replace("@@TIMEOUT_SECONDS@@", &timeout_seconds_text);
     vec!["bash".to_string(), "-lc".to_string(), script]
 }
 

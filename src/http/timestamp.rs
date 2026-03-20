@@ -1,6 +1,13 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 
+const TIMESTAMP_SCRIPT_TAG: &str = concat!(
+    "<script>\n",
+    include_str!("assets/timestamp.js"),
+    "</script>"
+);
+const TIMESTAMP_STYLE_FRAGMENT: &str = include_str!("assets/timestamp.css");
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UiTimestamp {
     pub(crate) iso_value: String,
@@ -48,81 +55,11 @@ pub(crate) fn render(timestamp: &UiTimestamp, extra_classes: &[&str]) -> String 
 }
 
 pub(crate) fn script_tag() -> &'static str {
-    r#"<script>
-(() => {
-  const absoluteFormatter = new Intl.DateTimeFormat(undefined, {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    timeZoneName: 'short',
-  });
-  const relativeFormatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
-  const relativeUnits = [
-    ['year', 365 * 24 * 60 * 60],
-    ['month', 30 * 24 * 60 * 60],
-    ['week', 7 * 24 * 60 * 60],
-    ['day', 24 * 60 * 60],
-    ['hour', 60 * 60],
-    ['minute', 60],
-    ['second', 1],
-  ];
-
-  function formatRelative(date) {
-    const diffSeconds = Math.round((date.getTime() - Date.now()) / 1000);
-    const absoluteSeconds = Math.abs(diffSeconds);
-    for (const [unit, unitSeconds] of relativeUnits) {
-      if (absoluteSeconds >= unitSeconds || unit === 'second') {
-        return relativeFormatter.format(Math.round(diffSeconds / unitSeconds), unit);
-      }
-    }
-    return '';
-  }
-
-  function localizeTimestamp(node) {
-    const rawTimestamp = node.getAttribute('data-timestamp');
-    if (!rawTimestamp) {
-      return;
-    }
-    const date = new Date(rawTimestamp);
-    if (Number.isNaN(date.getTime())) {
-      return;
-    }
-    const timeNode = node.querySelector('time');
-    if (timeNode) {
-      timeNode.textContent = absoluteFormatter.format(date);
-      timeNode.setAttribute('datetime', rawTimestamp);
-    }
-    const relativeNode = node.querySelector('.timestamp-relative');
-    if (relativeNode) {
-      const relativeText = formatRelative(date);
-      relativeNode.textContent = relativeText ? `(${relativeText})` : '';
-    }
-  }
-
-  function applyLocalizedTimestamps() {
-    document
-      .querySelectorAll('.localized-timestamp[data-timestamp]')
-      .forEach(localizeTimestamp);
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', applyLocalizedTimestamps, { once: true });
-  } else {
-    applyLocalizedTimestamps();
-  }
-})();
-</script>"#
+    TIMESTAMP_SCRIPT_TAG
 }
 
 pub(crate) fn style_fragment() -> &'static str {
-    r#"
-.localized-timestamp { display: inline-flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
-.localized-timestamp time { white-space: nowrap; }
-.timestamp-relative { color: var(--text-disabled); white-space: nowrap; }
-.timestamp-relative:empty { display: none; }
-"#
+    TIMESTAMP_STYLE_FRAGMENT
 }
 
 fn normalize_unix_timestamp(timestamp: i64) -> i64 {

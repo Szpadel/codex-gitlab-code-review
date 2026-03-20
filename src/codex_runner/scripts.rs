@@ -1,5 +1,14 @@
 use super::*;
 
+const MENTION_COMMAND_TEMPLATE: &str = include_str!("assets/mention_command.sh");
+const REVIEW_COMMAND_TEMPLATE: &str = include_str!("assets/review_command.sh");
+const DEPS_PREFETCH_TEMPLATE: &str = include_str!("assets/deps_prefetch.sh");
+const HISTORY_READER_TEMPLATE: &str = include_str!("assets/history_reader.sh");
+const GIT_BOOTSTRAP_AUTH_CLEANUP_TEMPLATE: &str =
+    include_str!("assets/git_bootstrap_auth_cleanup.sh");
+const BROWSER_MCP_PREREQ_TEMPLATE: &str = include_str!("assets/browser_mcp_prereq.sh");
+const BROWSER_WAIT_TEMPLATE: &str = include_str!("assets/browser_wait.sh");
+
 #[derive(Clone, Copy)]
 pub(crate) struct AppServerCommandOptions<'a> {
     pub(crate) browser_mcp: Option<&'a BrowserMcpConfig>,
@@ -19,6 +28,14 @@ pub(crate) struct BuildCommandScriptInput<'a> {
     pub(crate) auth_mount_path: &'a str,
     pub(crate) target_branch: Option<&'a str>,
     pub(crate) deps_enabled: bool,
+}
+
+fn render_template(template: &str, replacements: &[(&str, &str)]) -> String {
+    let mut rendered = template.to_string();
+    for (needle, replacement) in replacements {
+        rendered = rendered.replace(needle, replacement);
+    }
+    rendered
 }
 
 impl DockerCodexRunner {
@@ -152,73 +169,20 @@ impl DockerCodexRunner {
             app_server.reasoning_summary,
             app_server.reasoning_effort,
         );
-        format!(
-            r#"set -eu
-GITLAB_TOKEN={gitlab_token_q}
-repo_dir={repo_dir_q}
-log_file="/tmp/codex-mention-git.log"
-mkdir -p /work
-mkdir -p "$(dirname "$repo_dir")"
-run_git() {{
-  action="$1"
-  shift
-  if [ "${{CODEX_RUNNER_DEBUG:-}}" = "1" ]; then
-    "$@" || {{ echo "codex-runner-error: git ${{action}} failed"; exit 1; }}
-  else
-    if ! "$@" >"$log_file" 2>&1; then
-      echo "codex-runner-error: git ${{action}} failed"
-      tail -n 50 "$log_file" | sed 's/^/codex-runner-error: /'
-      exit 1
-    fi
-  fi
-}}
-export GITLAB_TOKEN={gitlab_token_q}
-{git_auth_setup_script}
-run_git clone git clone --depth 1 --recurse-submodules "{clone_url_dq}" "$repo_dir"
-cd "$repo_dir"
-run_git fetch git fetch --depth 1 origin {head_sha_q}
-run_git checkout git checkout {head_sha_q}
-run_git submodule_update git submodule update --init --recursive
-{git_auth_cleanup_script}
-origin_url="$(git remote get-url origin || true)"
-if [ -n "$origin_url" ]; then
-  sanitized_origin="$(printf '%s' "$origin_url" | sed -E 's#(https?://)oauth2:[^@]*@#\1#')"
-  run_git set_url git remote set-url origin "$sanitized_origin"
-fi
-run_git set_pushurl git remote set-url --push origin "no_push://disabled"
-mkdir -p {auth_mount_path_q}
-export CODEX_HOME={auth_mount_path_q}
-if ! command -v codex >/dev/null 2>&1; then
-  echo "codex-runner: codex not found, installing"
-  if command -v npm >/dev/null 2>&1; then
-    if [ "${{CODEX_RUNNER_DEBUG:-}}" = "1" ]; then
-      npm install -g @openai/codex
-    else
-      if ! npm install -g @openai/codex >/tmp/codex-install.log 2>&1; then
-        echo "codex-runner-error: codex install failed"
-        tail -n 50 /tmp/codex-install.log | sed 's/^/codex-runner-error: /'
-        exit 1
-      fi
-    fi
-  else
-    echo "codex-runner-error: npm not found; provide a base image with node/npm or preinstall codex"
-    exit 1
-  fi
-fi
-{browser_prereq_script}
-{browser_wait_script}
-{app_server_exec_cmd}
-"#,
-            clone_url_dq = clone_url_dq,
-            gitlab_token_q = gitlab_token_q,
-            head_sha_q = head_sha_q,
-            auth_mount_path_q = auth_mount_path_q,
-            repo_dir_q = repo_dir_q,
-            git_auth_setup_script = git_auth_setup_script,
-            git_auth_cleanup_script = git_auth_cleanup_script,
-            browser_prereq_script = browser_prereq_script,
-            browser_wait_script = browser_wait_script,
-            app_server_exec_cmd = app_server_exec_cmd,
+        render_template(
+            MENTION_COMMAND_TEMPLATE,
+            &[
+                ("@@CLONE_URL_DQ@@", &clone_url_dq),
+                ("@@GITLAB_TOKEN_Q@@", &gitlab_token_q),
+                ("@@HEAD_SHA_Q@@", &head_sha_q),
+                ("@@AUTH_MOUNT_PATH_Q@@", &auth_mount_path_q),
+                ("@@REPO_DIR_Q@@", &repo_dir_q),
+                ("@@GIT_AUTH_SETUP_SCRIPT@@", &git_auth_setup_script),
+                ("@@GIT_AUTH_CLEANUP_SCRIPT@@", git_auth_cleanup_script),
+                ("@@BROWSER_PREREQ_SCRIPT@@", &browser_prereq_script),
+                ("@@BROWSER_WAIT_SCRIPT@@", &browser_wait_script),
+                ("@@APP_SERVER_EXEC_CMD@@", &app_server_exec_cmd),
+            ],
         )
     }
 
@@ -238,95 +202,7 @@ run_git fetch git fetch --unshallow\n"
             })
             .unwrap_or_default();
         let deps_prefetch_script = if input.deps_enabled {
-            r#"
-prefetch_deps() (
-  set +e
-  deps_dir="$repo_dir/.codex_deps"
-  log_file="/tmp/codex-deps.log"
-  mkdir -p "$deps_dir"
-  failures=0
-  run_prefetch() {
-    action="$1"
-    shift
-    if [ "${CODEX_RUNNER_DEBUG:-}" = "1" ]; then
-      "$@" || { echo "codex-runner-warn: $action failed"; failures=$((failures+1)); }
-    else
-      if ! "$@" >"$log_file" 2>&1; then
-        echo "codex-runner-warn: $action failed"
-        tail -n 50 "$log_file" | sed 's/^/codex-runner-warn: /'
-        failures=$((failures+1))
-      fi
-    fi
-  }
-
-  if [ -f "package.json" ]; then
-    if [ -f "pnpm-lock.yaml" ] && command -v pnpm >/dev/null 2>&1; then
-      run_prefetch "pnpm install" pnpm install --ignore-scripts
-    elif [ -f "yarn.lock" ] && command -v yarn >/dev/null 2>&1; then
-      run_prefetch "yarn install" yarn install --ignore-scripts
-    elif [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
-      run_prefetch "npm ci" npm ci --ignore-scripts --no-audit --no-fund
-    else
-      run_prefetch "npm install" npm install --ignore-scripts --no-audit --no-fund
-    fi
-  fi
-
-  if [ -f "Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
-    mkdir -p "$deps_dir/cargo"
-    if [ -f "Cargo.lock" ]; then
-      CARGO_HOME="$deps_dir/cargo" run_prefetch "cargo fetch" cargo fetch --locked
-    else
-      echo "codex-runner-warn: Cargo.lock missing; skipping cargo fetch"
-    fi
-  fi
-
-  if [ -f "go.mod" ] && command -v go >/dev/null 2>&1; then
-    mkdir -p "$deps_dir/go/mod" "$deps_dir/go/cache"
-    GOMODCACHE="$deps_dir/go/mod" GOCACHE="$deps_dir/go/cache" GOFLAGS="-mod=readonly" run_prefetch "go mod download" go mod download
-  fi
-
-  if [ -f "requirements.txt" ] && command -v pip >/dev/null 2>&1; then
-    mkdir -p "$deps_dir/pip"
-    run_prefetch "pip download requirements.txt" pip download -r requirements.txt -d "$deps_dir/pip"
-  fi
-
-  if [ -f "pyproject.toml" ] && [ -f "poetry.lock" ] && command -v poetry >/dev/null 2>&1 && command -v pip >/dev/null 2>&1; then
-    if [ "${CODEX_RUNNER_DEBUG:-}" = "1" ]; then
-      poetry export -f requirements.txt --without-hashes -o /tmp/poetry-reqs.txt || failures=$((failures+1))
-    else
-      if ! poetry export -f requirements.txt --without-hashes -o /tmp/poetry-reqs.txt >"$log_file" 2>&1; then
-        echo "codex-runner-warn: poetry export failed"
-        tail -n 50 "$log_file" | sed 's/^/codex-runner-warn: /'
-        failures=$((failures+1))
-      fi
-    fi
-    if [ -f /tmp/poetry-reqs.txt ]; then
-      mkdir -p "$deps_dir/pip"
-      run_prefetch "pip download poetry export" pip download -r /tmp/poetry-reqs.txt -d "$deps_dir/pip"
-    fi
-  fi
-
-  if [ -f "pom.xml" ] && command -v mvn >/dev/null 2>&1; then
-    mkdir -p "$deps_dir/m2"
-    MAVEN_USER_HOME="$deps_dir/m2" run_prefetch "maven go-offline" mvn -q -DskipTests dependency:go-offline
-  fi
-
-  if [ "$failures" -ne 0 ]; then
-    return 1
-  fi
-  return 0
-)
-prefetch_home="/tmp/codex-prefetch"
-mkdir -p "$prefetch_home/.config" "$prefetch_home/.cache" "$prefetch_home/.state"
-if ! HOME="$prefetch_home" XDG_CONFIG_HOME="$prefetch_home/.config" XDG_CACHE_HOME="$prefetch_home/.cache" \
-  XDG_STATE_HOME="$prefetch_home/.state" GITLAB_TOKEN="" CODEX_HOME="" prefetch_deps; then
-  echo "codex-runner-warn: dependency prefetch had failures; continuing"
-fi
-export CARGO_HOME="$repo_dir/.codex_deps/cargo"
-export GOMODCACHE="$repo_dir/.codex_deps/go/mod"
-export GOCACHE="$repo_dir/.codex_deps/go/cache"
-export MAVEN_USER_HOME="$repo_dir/.codex_deps/m2"
-"#
+            DEPS_PREFETCH_TEMPLATE
         } else {
             ""
         };
@@ -344,76 +220,22 @@ export MAVEN_USER_HOME="$repo_dir/.codex_deps/m2"
             app_server.reasoning_summary,
             app_server.reasoning_effort,
         );
-        format!(
-            r#"set -eu
-GITLAB_TOKEN={gitlab_token_q}
-repo_dir={repo_dir_q}
-mkdir -p /work
-mkdir -p "$(dirname "$repo_dir")"
-log_file="/tmp/codex-git.log"
-run_git() {{
-  action="$1"
-  shift
-  if [ "${{CODEX_RUNNER_DEBUG:-}}" = "1" ]; then
-    "$@" || {{ echo "codex-runner-error: git ${{action}} failed"; exit 1; }}
-  else
-    if ! "$@" >"$log_file" 2>&1; then
-      echo "codex-runner-error: git ${{action}} failed"
-      tail -n 50 "$log_file" | sed 's/^/codex-runner-error: /'
-      exit 1
-    fi
-  fi
-}}
-export GITLAB_TOKEN={gitlab_token_q}
-{git_auth_setup_script}
-run_git clone git clone --depth 1 --recurse-submodules "{clone_url}" "$repo_dir"
-cd "$repo_dir"
-run_git fetch git fetch --depth 1 origin "{head_sha}"
-run_git checkout git checkout "{head_sha}"
-run_git submodule_update git submodule update --init --recursive
-{target_branch_script}{git_auth_cleanup_script}
-origin_url="$(git remote get-url origin || true)"
-if [ -n "$origin_url" ]; then
-  sanitized_origin="$(printf '%s' "$origin_url" | sed -E 's#(https?://)oauth2:[^@]*@#\1#')"
-  run_git set_url git remote set-url origin "$sanitized_origin"
-fi
-{deps_prefetch_script}# Use the mounted auth directory directly so token refresh persists.
-mkdir -p "{auth_mount_path}"
-export CODEX_HOME="{auth_mount_path}"
-# Ensure Codex CLI is available for app-server mode
-if ! command -v codex >/dev/null 2>&1; then
-  echo "codex-runner: codex not found, installing"
-  if command -v npm >/dev/null 2>&1; then
-    if [ "${{CODEX_RUNNER_DEBUG:-}}" = "1" ]; then
-      npm install -g @openai/codex
-    else
-      if ! npm install -g @openai/codex >/tmp/codex-install.log 2>&1; then
-        echo "codex-runner-error: codex install failed"
-        tail -n 50 /tmp/codex-install.log | sed 's/^/codex-runner-error: /'
-        exit 1
-      fi
-    fi
-  else
-    echo "codex-runner-error: npm not found; provide a base image with node/npm or preinstall codex"
-    exit 1
-  fi
-fi
-{browser_prereq_script}
-{browser_wait_script}
-	{app_server_exec_cmd}
-        "#,
-            clone_url = input.clone_url,
-            gitlab_token_q = gitlab_token_q,
-            repo_dir_q = repo_dir_q,
-            head_sha = input.head_sha,
-            auth_mount_path = input.auth_mount_path,
-            target_branch_script = target_branch_script,
-            deps_prefetch_script = deps_prefetch_script,
-            git_auth_setup_script = git_auth_setup_script,
-            git_auth_cleanup_script = git_auth_cleanup_script,
-            browser_prereq_script = browser_prereq_script,
-            browser_wait_script = browser_wait_script,
-            app_server_exec_cmd = app_server_exec_cmd
+        render_template(
+            REVIEW_COMMAND_TEMPLATE,
+            &[
+                ("@@CLONE_URL@@", input.clone_url),
+                ("@@GITLAB_TOKEN_Q@@", &gitlab_token_q),
+                ("@@REPO_DIR_Q@@", &repo_dir_q),
+                ("@@HEAD_SHA@@", input.head_sha),
+                ("@@AUTH_MOUNT_PATH@@", input.auth_mount_path),
+                ("@@TARGET_BRANCH_SCRIPT@@", &target_branch_script),
+                ("@@DEPS_PREFETCH_SCRIPT@@", deps_prefetch_script),
+                ("@@GIT_AUTH_SETUP_SCRIPT@@", &git_auth_setup_script),
+                ("@@GIT_AUTH_CLEANUP_SCRIPT@@", git_auth_cleanup_script),
+                ("@@BROWSER_PREREQ_SCRIPT@@", &browser_prereq_script),
+                ("@@BROWSER_WAIT_SCRIPT@@", &browser_wait_script),
+                ("@@APP_SERVER_EXEC_CMD@@", &app_server_exec_cmd),
+            ],
         )
     }
 
@@ -423,30 +245,9 @@ fi
     }
 
     pub(crate) fn build_history_reader_script(auth_mount_path: &str) -> String {
-        format!(
-            r#"set -eu
-mkdir -p "{auth_mount_path}"
-export CODEX_HOME="{auth_mount_path}"
-if ! command -v codex >/dev/null 2>&1; then
-  echo "codex-runner: codex not found, installing"
-  if command -v npm >/dev/null 2>&1; then
-    if [ "${{CODEX_RUNNER_DEBUG:-}}" = "1" ]; then
-      npm install -g @openai/codex
-    else
-      if ! npm install -g @openai/codex >/tmp/codex-install.log 2>&1; then
-        echo "codex-runner-error: codex install failed"
-        tail -n 50 /tmp/codex-install.log | sed 's/^/codex-runner-error: /'
-        exit 1
-      fi
-    fi
-  else
-    echo "codex-runner-error: npm not found; provide a base image with node/npm or preinstall codex"
-    exit 1
-  fi
-fi
-exec codex app-server --listen stdio://
-"#,
-            auth_mount_path = auth_mount_path
+        render_template(
+            HISTORY_READER_TEMPLATE,
+            &[("@@AUTH_MOUNT_PATH@@", auth_mount_path)],
         )
     }
 }
@@ -553,17 +354,7 @@ pub(crate) fn git_bootstrap_auth_setup_script(
 }
 
 pub(crate) fn git_bootstrap_auth_cleanup_script() -> &'static str {
-    r#"if [ -n "${GIT_CONFIG_COUNT:-}" ]; then
-  git_config_count="$GIT_CONFIG_COUNT"
-  unset GIT_CONFIG_COUNT
-  i=0
-  while [ "$i" -lt "$git_config_count" ]; do
-    unset "GIT_CONFIG_KEY_$i" "GIT_CONFIG_VALUE_$i"
-    i=$((i + 1))
-  done
-fi
-unset GITLAB_TOKEN
-"#
+    GIT_BOOTSTRAP_AUTH_CLEANUP_TEMPLATE
 }
 
 pub(crate) fn escape_toml_basic_string(value: &str) -> String {
@@ -579,13 +370,9 @@ pub(crate) fn browser_mcp_prereq_script(browser_mcp: Option<&BrowserMcpConfig>) 
         return String::new();
     };
     let command_q = shell_quote(&browser_mcp.mcp_command);
-    format!(
-        r#"browser_mcp_command={command_q}
-if ! command -v "$browser_mcp_command" >/dev/null 2>&1; then
-  echo "codex-runner-error: browser MCP requires $browser_mcp_command in the Codex image"
-  exit 1
-fi
-"#,
+    render_template(
+        BROWSER_MCP_PREREQ_TEMPLATE,
+        &[("@@COMMAND_Q@@", &command_q)],
     )
 }
 
@@ -607,29 +394,8 @@ pub(crate) fn browser_wait_script(browser_mcp: Option<&BrowserMcpConfig>) -> Str
     if browser_mcp.is_none() {
         return String::new();
     }
-    format!(
-        r#"wait_for_browser_mcp() {{
-  deadline=$((SECONDS + 30))
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    if exec 3<>/dev/tcp/127.0.0.1/{port} 2>/dev/null; then
-      printf 'GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3
-      if IFS= read -r status_line <&3 && printf '%s' "$status_line" | grep -q ' 200 '; then
-        exec 3<&-
-        exec 3>&-
-        return 0
-      fi
-      exec 3<&-
-      exec 3>&-
-    fi
-    sleep 1
-  done
-  echo "codex-runner-error: browser MCP endpoint did not become ready at http://127.0.0.1:{port}/json/version"
-  exit 1
-}}
-wait_for_browser_mcp
-"#,
-        port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
-    )
+    let port = BROWSER_MCP_REMOTE_DEBUGGING_PORT.to_string();
+    render_template(BROWSER_WAIT_TEMPLATE, &[("@@PORT@@", &port)])
 }
 
 pub(crate) fn configured_reasoning_effort(value: Option<&str>) -> Option<&str> {

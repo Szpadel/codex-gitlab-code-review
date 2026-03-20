@@ -24,6 +24,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 use url::Url;
 
+const CLONE_REPOSITORY_SCRIPT_TEMPLATE: &str = include_str!("assets/clone_repository.sh");
+
 #[derive(Clone)]
 pub struct GitLabDiscoveryMcpService {
     config: GitLabDiscoveryMcpConfig,
@@ -185,39 +187,10 @@ impl GitLabDiscoveryMcpService {
             .clone_url_template(repo_path)?
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
-        let script = format!(
-            r#"set -eu
-clone_root={clone_root}
-repo_path={repo_path}
-clone_url="{clone_url}"
-mkdir -p "$clone_root"
-safe_repo="$(printf '%s' "$repo_path" | tr '/:@' '____')"
-dest="$(mktemp -d "$clone_root/${{safe_repo}}-XXXXXX")"
-git clone "$clone_url" "$dest" >/tmp/gitlab-discovery-clone.log 2>&1 || {{
-  tail -n 100 /tmp/gitlab-discovery-clone.log >&2
-  exit 1
-}}
-cd "$dest"
-git fetch --prune origin '+refs/heads/*:refs/remotes/origin/*' >/tmp/gitlab-discovery-fetch.log 2>&1 || {{
-  tail -n 100 /tmp/gitlab-discovery-fetch.log >&2
-  exit 1
-}}
-git fetch --tags origin >/tmp/gitlab-discovery-tags.log 2>&1 || {{
-  tail -n 100 /tmp/gitlab-discovery-tags.log >&2
-  exit 1
-}}
-origin_url="$(git remote get-url origin || true)"
-if [ -n "$origin_url" ]; then
-  sanitized_origin="$(printf '%s' "$origin_url" | sed -E 's#(https?://)oauth2:[^@]*@#\1#')"
-  git remote set-url origin "$sanitized_origin"
-fi
-git remote set-url --push origin "no_push://disabled"
-printf '%s\n' "$dest"
-"#,
-            clone_root = shell_quote(&binding.clone_root),
-            repo_path = shell_quote(repo_path),
-            clone_url = clone_url,
-        );
+        let script = CLONE_REPOSITORY_SCRIPT_TEMPLATE
+            .replace("@@CLONE_ROOT@@", &shell_quote(&binding.clone_root))
+            .replace("@@REPO_PATH@@", &shell_quote(repo_path))
+            .replace("@@CLONE_URL@@", &clone_url);
         let output = self
             .exec_container_command(
                 &binding.container_id,

@@ -13,6 +13,8 @@ use std::io::Write;
 use std::pin::Pin;
 use uuid::Uuid;
 
+const AUTH_SCRIPT_TEMPLATE: &str = include_str!("auth_cli/assets/auth.sh");
+
 #[derive(Debug, Clone, Copy)]
 pub enum AuthAction {
     Login,
@@ -158,33 +160,9 @@ fn build_auth_script(auth_mount_path: &str, action: AuthAction) -> String {
         AuthAction::Login => "login --device-auth",
         AuthAction::Status => "login status",
     };
-    format!(
-        r#"set -eu
-mkdir -p "{auth_mount_path}"
-export CODEX_HOME="{auth_mount_path}"
-# Ensure Codex CLI is available for auth flows.
-if ! command -v codex >/dev/null 2>&1; then
-  echo "codex-auth: codex not found, installing"
-  if command -v npm >/dev/null 2>&1; then
-    if [ "${{CODEX_RUNNER_DEBUG:-}}" = "1" ]; then
-      npm install -g @openai/codex
-    else
-      if ! npm install -g @openai/codex >/tmp/codex-auth-install.log 2>&1; then
-        echo "codex-auth-error: codex install failed"
-        tail -n 50 /tmp/codex-auth-install.log | sed 's/^/codex-auth-error: /'
-        exit 1
-      fi
-    fi
-  else
-    echo "codex-auth-error: npm not found; provide a base image with node/npm or preinstall codex"
-    exit 1
-  fi
-fi
-exec codex -c cli_auth_credentials_store="file" {action_args}
-"#,
-        auth_mount_path = auth_mount_path,
-        action_args = action_args,
-    )
+    AUTH_SCRIPT_TEMPLATE
+        .replace("@@AUTH_MOUNT_PATH@@", auth_mount_path)
+        .replace("@@ACTION_ARGS@@", action_args)
 }
 
 async fn stream_output(
