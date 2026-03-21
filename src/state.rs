@@ -3,9 +3,16 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{
+    QueryBuilder, Row, Sqlite, SqlitePool,
+    sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+    },
+};
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
+use std::str::FromStr;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -103,6 +110,55 @@ pub struct RunHistoryRecord {
     pub transcript_backfill_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunHistoryListItem {
+    pub id: i64,
+    pub kind: RunHistoryKind,
+    pub repo: String,
+    pub iid: u64,
+    pub status: String,
+    pub result: Option<String>,
+    pub started_at: i64,
+    pub preview: Option<String>,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunHistoryCursor {
+    pub started_at: i64,
+    pub id: i64,
+}
+
+impl RunHistoryCursor {
+    pub fn encode(self) -> String {
+        let raw = format!("{}:{}", self.started_at, self.id);
+        encode_hex(raw.as_bytes())
+    }
+
+    pub fn decode(raw: &str) -> Result<Self> {
+        let bytes = decode_hex(raw).context("decode run history cursor hex")?;
+        let decoded = String::from_utf8(bytes).context("decode run history cursor utf-8")?;
+        let (started_at, id) = decoded
+            .split_once(':')
+            .context("split run history cursor parts")?;
+        Ok(Self {
+            started_at: started_at
+                .parse()
+                .context("parse run history cursor started_at")?,
+            id: id.parse().context("parse run history cursor id")?,
+        })
+    }
+}
+
+impl From<&RunHistoryListItem> for RunHistoryCursor {
+    fn from(value: &RunHistoryListItem) -> Self {
+        Self {
+            started_at: value.started_at,
+            id: value.id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunHistoryListQuery {
     pub repo: Option<String>,
@@ -111,7 +167,8 @@ pub struct RunHistoryListQuery {
     pub result: Option<String>,
     pub search: Option<String>,
     pub limit: usize,
-    pub page: usize,
+    pub after: Option<RunHistoryCursor>,
+    pub before: Option<RunHistoryCursor>,
 }
 
 impl RunHistoryListQuery {
@@ -122,10 +179,15 @@ impl RunHistoryListQuery {
             self.limit.min(500)
         }
     }
+}
 
-    pub fn normalized_page(&self) -> usize {
-        self.page.max(1)
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunHistoryListPage {
+    pub runs: Vec<RunHistoryListItem>,
+    pub has_previous: bool,
+    pub has_next: bool,
+    pub previous_cursor: Option<RunHistoryCursor>,
+    pub next_cursor: Option<RunHistoryCursor>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -258,9 +320,10 @@ impl ReviewStateStore {
         }
         let url = sqlite_url(path);
         let max_connections = if path == ":memory:" { 1 } else { 5 };
+        let connect_options = sqlite_connect_options(path, &url)?;
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
-            .connect(&url)
+            .connect_with(connect_options)
             .await
             .with_context(|| format!("connect sqlite database at {}", path))?;
         sqlx::migrate!()
@@ -1150,53 +1213,90 @@ impl ReviewStateStore {
     pub async fn list_run_history(
         &self,
         query: &RunHistoryListQuery,
-    ) -> Result<Vec<RunHistoryRecord>> {
+    ) -> Result<RunHistoryListPage> {
+        if query.after.is_some() && query.before.is_some() {
+            bail!("run history query cannot include both after and before cursors");
+        }
+
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
-            SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
-                   thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
-                   discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
-                   command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
-                   transcript_backfill_state, transcript_backfill_error
+            SELECT id, kind, repo, iid, status, result, started_at, preview, summary
             FROM run_history
             "#,
         );
-        append_run_history_filters(&mut builder, query);
+        let mut has_where = append_run_history_filters(&mut builder, query);
 
         let limit = query.normalized_limit();
-        let offset = query
-            .normalized_page()
-            .saturating_sub(1)
-            .saturating_mul(limit);
-        builder
-            .push(" ORDER BY started_at DESC, id DESC LIMIT ")
-            .push_bind(limit as i64)
-            .push(" OFFSET ")
-            .push_bind(i64::try_from(offset).unwrap_or(i64::MAX));
+        if let Some(cursor) = query.after {
+            append_run_history_cursor_clause(
+                &mut builder,
+                &mut has_where,
+                cursor,
+                CursorDirection::After,
+            );
+        } else if let Some(cursor) = query.before {
+            append_run_history_cursor_clause(
+                &mut builder,
+                &mut has_where,
+                cursor,
+                CursorDirection::Before,
+            );
+        }
 
-        let rows = builder
+        let ordered_before = query.before.is_some();
+        if ordered_before {
+            builder.push(" ORDER BY started_at ASC, id ASC");
+        } else {
+            builder.push(" ORDER BY started_at DESC, id DESC");
+        }
+        builder
+            .push(" LIMIT ")
+            .push_bind(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX));
+
+        let mut runs = builder
             .build()
             .fetch_all(&self.pool)
             .await
             .context("list run history")?;
-        rows.into_iter().map(map_run_history_row).collect()
-    }
+        let has_extra = runs.len() > limit;
+        if has_extra {
+            runs.pop();
+        }
 
-    pub async fn count_run_history(&self, query: &RunHistoryListQuery) -> Result<usize> {
-        let mut builder = QueryBuilder::<Sqlite>::new(
-            r#"
-            SELECT COUNT(*) AS count
-            FROM run_history
-            "#,
-        );
-        append_run_history_filters(&mut builder, query);
-        let row = builder
-            .build()
-            .fetch_one(&self.pool)
-            .await
-            .context("count run history")?;
-        let count: i64 = row.try_get("count").context("read run history count")?;
-        usize::try_from(count).context("convert run history count to usize")
+        let mut runs = runs
+            .into_iter()
+            .map(map_run_history_list_item_row)
+            .collect::<Result<Vec<_>>>()?;
+        if ordered_before {
+            runs.reverse();
+        }
+
+        let has_previous = match (query.after, query.before) {
+            (_, Some(_)) => has_extra,
+            (Some(_), None) => !runs.is_empty(),
+            (None, None) => false,
+        };
+        let has_next = match (query.after, query.before) {
+            (Some(_), _) => has_extra,
+            (None, Some(_)) => !runs.is_empty(),
+            (None, None) => has_extra,
+        };
+
+        Ok(RunHistoryListPage {
+            previous_cursor: if has_previous {
+                runs.first().map(RunHistoryCursor::from)
+            } else {
+                None
+            },
+            next_cursor: if has_next {
+                runs.last().map(RunHistoryCursor::from)
+            } else {
+                None
+            },
+            has_previous,
+            has_next,
+            runs,
+        })
     }
 
     pub async fn get_project_last_mr_activity(&self, repo: &str) -> Result<Option<String>> {
@@ -1560,7 +1660,7 @@ fn run_history_kind_label(kind: RunHistoryKind) -> &'static str {
 fn append_run_history_filters<'args>(
     builder: &mut QueryBuilder<'args, Sqlite>,
     query: &'args RunHistoryListQuery,
-) {
+) -> bool {
     let mut has_where = false;
     let mut push_where = |builder: &mut QueryBuilder<'args, Sqlite>| {
         if !has_where {
@@ -1607,6 +1707,48 @@ fn append_run_history_filters<'args>(
             .push_bind(pattern);
         builder.push(")");
     }
+
+    has_where
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorDirection {
+    After,
+    Before,
+}
+
+fn append_run_history_cursor_clause<'args>(
+    builder: &mut QueryBuilder<'args, Sqlite>,
+    has_where: &mut bool,
+    cursor: RunHistoryCursor,
+    direction: CursorDirection,
+) {
+    if !*has_where {
+        builder.push(" WHERE ");
+        *has_where = true;
+    } else {
+        builder.push(" AND ");
+    }
+    builder.push("(");
+    match direction {
+        CursorDirection::After => builder
+            .push("started_at < ")
+            .push_bind(cursor.started_at)
+            .push(" OR (started_at = ")
+            .push_bind(cursor.started_at)
+            .push(" AND id < ")
+            .push_bind(cursor.id)
+            .push(")"),
+        CursorDirection::Before => builder
+            .push("started_at > ")
+            .push_bind(cursor.started_at)
+            .push(" OR (started_at = ")
+            .push_bind(cursor.started_at)
+            .push(" AND id > ")
+            .push_bind(cursor.id)
+            .push(")"),
+    };
+    builder.push(")");
 }
 
 fn parse_run_history_kind(value: &str) -> Result<RunHistoryKind> {
@@ -1741,6 +1883,37 @@ fn map_run_history_event_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryE
     })
 }
 
+fn map_run_history_list_item_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryListItem> {
+    let iid_raw: i64 = row.try_get("iid").context("read run history list iid")?;
+    Ok(RunHistoryListItem {
+        id: row.try_get("id").context("read run history list id")?,
+        kind: parse_run_history_kind(
+            row.try_get::<String, _>("kind")
+                .context("read run history list kind")?
+                .as_str(),
+        )?,
+        repo: row
+            .try_get("repo")
+            .context("read run history list repo")?,
+        iid: u64::try_from(iid_raw).context("convert run history list iid to u64")?,
+        status: row
+            .try_get("status")
+            .context("read run history list status")?,
+        result: row
+            .try_get("result")
+            .context("read run history list result")?,
+        started_at: row
+            .try_get("started_at")
+            .context("read run history list started_at")?,
+        preview: row
+            .try_get("preview")
+            .context("read run history list preview")?,
+        summary: row
+            .try_get("summary")
+            .context("read run history list summary")?,
+    })
+}
+
 fn sqlite_url(path: &str) -> String {
     if path == ":memory:" {
         "sqlite::memory:".to_string()
@@ -1748,6 +1921,47 @@ fn sqlite_url(path: &str) -> String {
         format!("sqlite:///{}", path.trim_start_matches('/'))
     } else {
         format!("sqlite://{}", path)
+    }
+}
+
+fn sqlite_connect_options(path: &str, url: &str) -> Result<SqliteConnectOptions> {
+    let mut options =
+        SqliteConnectOptions::from_str(url).with_context(|| format!("parse sqlite url {url}"))?;
+    if path != ":memory:" {
+        options = options
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal);
+    }
+    Ok(options)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn decode_hex(input: &str) -> Result<Vec<u8>> {
+    if !input.len().is_multiple_of(2) {
+        bail!("hex input must have an even length");
+    }
+    let mut bytes = Vec::with_capacity(input.len() / 2);
+    for chunk in input.as_bytes().chunks_exact(2) {
+        let high = decode_hex_nibble(chunk[0]).context("decode high hex nibble")?;
+        let low = decode_hex_nibble(chunk[1]).context("decode low hex nibble")?;
+        bytes.push((high << 4) | low);
+    }
+    Ok(bytes)
+}
+
+fn decode_hex_nibble(value: u8) -> Result<u8> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => bail!("invalid hex nibble"),
     }
 }
 

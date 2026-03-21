@@ -5,7 +5,7 @@ use super::status::{
 use super::timestamp::{self, UiTimestamp};
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, ProjectCatalogSummary,
-    RunHistoryKind, RunHistoryRecord,
+    RunHistoryKind, RunHistoryListItem, RunHistoryRecord,
 };
 use serde::Deserialize;
 use urlencoding::encode;
@@ -118,7 +118,7 @@ pub(super) fn render_history_page(snapshot: &HistorySnapshot, csrf_token: Option
          {}\
          {}",
         render_history_filters(filters),
-        render_run_table("All runs", &snapshot.runs),
+        render_history_run_table("All runs", &snapshot.runs),
         render_history_pagination(snapshot)
     );
     render_shell("History", NavItem::History, body, csrf_token)
@@ -133,7 +133,7 @@ pub(super) fn render_mr_history_page(
         escape_html(&snapshot.repo),
         snapshot.iid,
         snapshot.runs.len(),
-        render_run_table("Sessions for this MR", &snapshot.runs)
+        render_record_run_table("Sessions for this MR", &snapshot.runs)
     );
     render_shell("MR History", NavItem::History, body, csrf_token)
 }
@@ -280,7 +280,6 @@ fn render_history_filters(filters: &HistorySnapshotFilters) -> String {
     format!(
         "<section class=\"card\"><h2>Filters</h2>\
          <form class=\"filters\" method=\"get\" action=\"/history\">\
-         <input type=\"hidden\" name=\"page\" value=\"1\">\
          <input type=\"hidden\" name=\"limit\" value=\"{}\">\
          <label class=\"filter-field\"><span>Repo</span><input name=\"repo\" value=\"{}\"></label>\
          <label class=\"filter-field\"><span>MR IID</span><input name=\"iid\" value=\"{}\"></label>\
@@ -304,18 +303,13 @@ fn render_history_filters(filters: &HistorySnapshotFilters) -> String {
 type HistorySnapshotFilters = super::status::HistoryQuery;
 
 fn render_history_pagination(snapshot: &HistorySnapshot) -> String {
-    let summary = if snapshot.total_runs == 0 {
+    let summary = if snapshot.runs.is_empty() {
         "0 matching runs".to_string()
     } else {
-        format!(
-            "Page {} of {} ({})",
-            snapshot.page,
-            snapshot.total_pages,
-            pluralize(snapshot.total_runs, "matching run", "matching runs")
-        )
+        format!("Showing up to {} matching runs", snapshot.limit)
     };
-    let previous = if snapshot.has_previous {
-        let href = history_page_href(&snapshot.filters, snapshot.page.saturating_sub(1));
+    let previous = if let Some(cursor) = snapshot.previous_cursor.as_deref() {
+        let href = history_page_href(&snapshot.filters, Some(cursor), None);
         format!(
             "<a class=\"pagination-link\" href=\"{}\">Previous</a>",
             escape_html(&href)
@@ -323,8 +317,8 @@ fn render_history_pagination(snapshot: &HistorySnapshot) -> String {
     } else {
         "<span class=\"pagination-link pagination-link-disabled\">Previous</span>".to_string()
     };
-    let next = if snapshot.has_next {
-        let href = history_page_href(&snapshot.filters, snapshot.page + 1);
+    let next = if let Some(cursor) = snapshot.next_cursor.as_deref() {
+        let href = history_page_href(&snapshot.filters, None, Some(cursor));
         format!(
             "<a class=\"pagination-link\" href=\"{}\">Next</a>",
             escape_html(&href)
@@ -340,8 +334,12 @@ fn render_history_pagination(snapshot: &HistorySnapshot) -> String {
     )
 }
 
-fn history_page_href(filters: &HistorySnapshotFilters, page: usize) -> String {
-    let mut params = vec![format!("page={page}"), format!("limit={}", filters.limit)];
+fn history_page_href(
+    filters: &HistorySnapshotFilters,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> String {
+    let mut params = vec![format!("limit={}", filters.limit)];
     if let Some(repo) = filters.repo.as_deref() {
         params.push(format!("repo={}", encode(repo)));
     }
@@ -356,6 +354,12 @@ fn history_page_href(filters: &HistorySnapshotFilters, page: usize) -> String {
     }
     if let Some(search) = filters.search.as_deref() {
         params.push(format!("q={}", encode(search)));
+    }
+    if let Some(before) = before {
+        params.push(format!("before={}", encode(before)));
+    }
+    if let Some(after) = after {
+        params.push(format!("after={}", encode(after)));
     }
     format!("/history?{}", params.join("&"))
 }
@@ -379,13 +383,17 @@ fn render_kind_options(selected: Option<RunHistoryKind>) -> String {
         .join("")
 }
 
-fn render_run_table(title: &str, runs: &[RunHistoryRecord]) -> String {
+fn render_history_run_table(title: &str, runs: &[RunHistoryListItem]) -> String {
     render_table_section(
         title,
         if runs.is_empty() {
             "<p class=\"empty\">No recorded sessions matched this view.</p>".to_string()
         } else {
-            let rows = runs.iter().map(render_run_row).collect::<Vec<_>>().join("");
+            let rows = runs
+                .iter()
+                .map(render_history_run_row)
+                .collect::<Vec<_>>()
+                .join("");
             format!(
                 "<table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Result</th><th>Started</th><th>Preview</th></tr></thead><tbody>{rows}</tbody></table>"
             )
@@ -393,7 +401,7 @@ fn render_run_table(title: &str, runs: &[RunHistoryRecord]) -> String {
     )
 }
 
-fn render_run_row(run: &RunHistoryRecord) -> String {
+fn render_history_run_row(run: &RunHistoryListItem) -> String {
     format!(
         "<tr>\
          <td><span class=\"badge badge-{}\">{}</span></td>\
@@ -420,9 +428,49 @@ fn render_run_row(run: &RunHistoryRecord) -> String {
     )
 }
 
-fn pluralize(value: usize, singular: &str, plural: &str) -> String {
-    let noun = if value == 1 { singular } else { plural };
-    format!("{value} {noun}")
+fn render_record_run_table(title: &str, runs: &[RunHistoryRecord]) -> String {
+    render_table_section(
+        title,
+        if runs.is_empty() {
+            "<p class=\"empty\">No recorded sessions matched this view.</p>".to_string()
+        } else {
+            let rows = runs
+                .iter()
+                .map(render_record_run_row)
+                .collect::<Vec<_>>()
+                .join("");
+            format!(
+                "<table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Result</th><th>Started</th><th>Preview</th></tr></thead><tbody>{rows}</tbody></table>"
+            )
+        },
+    )
+}
+
+fn render_record_run_row(run: &RunHistoryRecord) -> String {
+    format!(
+        "<tr>\
+         <td><span class=\"badge badge-{}\">{}</span></td>\
+         <td>{}</td>\
+         <td><a href=\"{}\">!{}</a></td>\
+         <td><span class=\"badge badge-result\">{}</span></td>\
+         <td>{}</td>\
+         <td><a href=\"/history/{}\">{}</a></td>\
+         </tr>",
+        escape_html(run_kind_label(run.kind)),
+        escape_html(run_kind_label(run.kind)),
+        escape_html(&run.repo),
+        mr_history_href(&run.repo, run.iid),
+        run.iid,
+        escape_html(run.result.as_deref().unwrap_or(&run.status)),
+        render_unix_timestamp(run.started_at),
+        run.id,
+        escape_html(
+            run.preview
+                .as_deref()
+                .or(run.summary.as_deref())
+                .unwrap_or("(no preview)")
+        )
+    )
 }
 
 fn render_run_metadata(run: &RunHistoryRecord) -> String {

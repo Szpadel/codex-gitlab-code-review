@@ -453,7 +453,7 @@ async fn startup_recovery_clears_stale_scanning_state() -> Result<()> {
 }
 
 #[tokio::test]
-async fn history_snapshot_filters_runs_and_includes_trigger_message() -> Result<()> {
+async fn history_snapshot_filters_runs_and_returns_summary_rows() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let matching_id = insert_run_history(
         &state,
@@ -516,6 +516,8 @@ async fn history_snapshot_filters_runs_and_includes_trigger_message() -> Result<
                 q: Some("failing pipeline".to_string()),
                 limit: None,
                 page: None,
+                after: None,
+                before: None,
             }
             .into_query()?,
         )
@@ -528,13 +530,14 @@ async fn history_snapshot_filters_runs_and_includes_trigger_message() -> Result<
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].get("id").and_then(Value::as_i64), Some(matching_id));
     assert_eq!(
-        runs[0].get("trigger_note_id").and_then(Value::as_u64),
-        Some(99)
+        runs[0].get("preview").and_then(Value::as_str),
+        Some("Mention group/repo !7")
     );
     assert_eq!(
-        runs[0].get("trigger_note_body").and_then(Value::as_str),
-        Some("please inspect failing pipeline")
+        runs[0].get("summary").and_then(Value::as_str),
+        Some("Committed a fix")
     );
+    assert_eq!(runs[0].get("trigger_note_body"), None);
     Ok(())
 }
 
@@ -589,7 +592,6 @@ async fn history_page_renders_field_based_filters_layout() -> Result<()> {
     assert!(body.contains("class=\"filter-field\""));
     assert!(body.contains("class=\"filter-field filter-field-wide\""));
     assert!(body.contains("class=\"filter-actions\""));
-    assert!(body.contains("name=\"page\" value=\"1\""));
     assert!(body.contains("name=\"limit\" value=\"100\""));
     assert!(body.contains("name=\"repo\" value=\"group/repo\""));
     assert!(body.contains("name=\"iid\" value=\"7\""));
@@ -637,6 +639,8 @@ async fn history_snapshot_searches_review_comment_body() -> Result<()> {
                 q: Some("rename this helper".to_string()),
                 limit: None,
                 page: None,
+                after: None,
+                before: None,
             }
             .into_query()?,
         )
@@ -657,6 +661,8 @@ fn history_query_accepts_all_kind_as_unfiltered() -> Result<()> {
         q: None,
         limit: None,
         page: None,
+        after: None,
+        before: None,
     }
     .into_query()?;
 
@@ -665,25 +671,45 @@ fn history_query_accepts_all_kind_as_unfiltered() -> Result<()> {
 }
 
 #[test]
-fn history_query_normalizes_page_zero_to_first_page() -> Result<()> {
-    let query = HistoryQueryParams {
+fn history_query_rejects_page_based_pagination() {
+    let error = HistoryQueryParams {
         repo: None,
         iid: None,
         kind: None,
         result: None,
         q: None,
         limit: Some(25),
-        page: Some(0),
+        page: Some(1),
+        after: None,
+        before: None,
     }
-    .into_query()?;
+    .into_query()
+    .expect_err("page-based history query should be rejected");
 
-    assert_eq!(query.page, 1);
-    assert_eq!(query.limit, 25);
-    Ok(())
+    assert!(error.to_string().contains("invalid"));
+}
+
+#[test]
+fn history_query_rejects_simultaneous_after_and_before() {
+    let error = HistoryQueryParams {
+        repo: None,
+        iid: None,
+        kind: None,
+        result: None,
+        q: None,
+        limit: None,
+        page: None,
+        after: Some("abc".to_string()),
+        before: Some("def".to_string()),
+    }
+    .into_query()
+    .expect_err("cursor query should reject simultaneous after and before");
+
+    assert!(error.to_string().contains("invalid"));
 }
 
 #[tokio::test]
-async fn history_api_returns_pagination_metadata_and_clamps_page() -> Result<()> {
+async fn history_api_returns_cursor_metadata() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut run_ids = Vec::new();
     for (iid, started_at) in [(41u64, 1_000i64), (42, 2_000), (43, 3_000)] {
@@ -725,33 +751,53 @@ async fn history_api_returns_pagination_metadata_and_clamps_page() -> Result<()>
     ));
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response = reqwest::get(format!(
-        "http://{address}/api/history?repo=group%2Frepo&limit=1&page=9"
-    ))
-    .await?;
+    let response =
+        reqwest::get(format!("http://{address}/api/history?repo=group%2Frepo&limit=1")).await?;
     assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await?;
-    assert_eq!(body.get("page").and_then(Value::as_u64), Some(3));
-    assert_eq!(body.get("page_size").and_then(Value::as_u64), Some(1));
-    assert_eq!(body.get("total_runs").and_then(Value::as_u64), Some(3));
-    assert_eq!(body.get("total_pages").and_then(Value::as_u64), Some(3));
+    let first_body: Value = response.json().await?;
+    assert_eq!(first_body.get("limit").and_then(Value::as_u64), Some(1));
     assert_eq!(
-        body.get("has_previous").and_then(Value::as_bool),
-        Some(true)
+        first_body.get("has_previous").and_then(Value::as_bool),
+        Some(false)
     );
-    assert_eq!(body.get("has_next").and_then(Value::as_bool), Some(false));
+    assert_eq!(first_body.get("has_next").and_then(Value::as_bool), Some(true));
+    assert_eq!(first_body.get("previous_cursor"), Some(&Value::Null));
     assert_eq!(
-        body.get("filters")
-            .and_then(|filters| filters.get("page"))
-            .and_then(Value::as_u64),
-        Some(3)
+        first_body
+            .get("filters")
+            .and_then(|filters| filters.get("after")),
+        Some(&Value::Null)
     );
-    let runs = body
+    let runs = first_body
         .get("runs")
         .and_then(Value::as_array)
         .expect("runs array");
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].get("id").and_then(Value::as_i64), Some(run_ids[0]));
+    assert_eq!(runs[0].get("id").and_then(Value::as_i64), Some(run_ids[2]));
+    assert_eq!(runs[0].get("head_sha"), None);
+
+    let next_cursor = first_body
+        .get("next_cursor")
+        .and_then(Value::as_str)
+        .expect("next cursor")
+        .to_string();
+    let response = reqwest::get(format!(
+        "http://{address}/api/history?repo=group%2Frepo&limit=1&after={next_cursor}"
+    ))
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let second_body: Value = response.json().await?;
+    assert_eq!(
+        second_body.get("has_previous").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(second_body.get("has_next").and_then(Value::as_bool), Some(true));
+    let second_runs = second_body
+        .get("runs")
+        .and_then(Value::as_array)
+        .expect("runs array");
+    assert_eq!(second_runs.len(), 1);
+    assert_eq!(second_runs[0].get("id").and_then(Value::as_i64), Some(run_ids[1]));
     Ok(())
 }
 
@@ -797,15 +843,15 @@ async fn history_page_renders_pagination_links_with_active_filters() -> Result<(
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let response = reqwest::get(format!(
-        "http://{address}/history?repo=group%2Frepo&kind=review&q=findings&limit=1&page=1"
+        "http://{address}/history?repo=group%2Frepo&kind=review&q=findings&limit=1"
     ))
     .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
-    assert!(body.contains("Page 1 of 2 (2 matching runs)"));
+    assert!(body.contains("Showing up to 1 matching runs"));
     assert!(body.contains("pagination-link pagination-link-disabled\">Previous</span>"));
     assert!(body.contains(
-        "/history?page=2&amp;limit=1&amp;repo=group%2Frepo&amp;kind=review&amp;q=findings"
+        "/history?limit=1&amp;repo=group%2Frepo&amp;kind=review&amp;q=findings&amp;after="
     ));
     Ok(())
 }

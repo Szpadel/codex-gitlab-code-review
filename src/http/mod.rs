@@ -189,6 +189,8 @@ struct HistoryQueryParams {
     q: Option<String>,
     limit: Option<usize>,
     page: Option<usize>,
+    after: Option<String>,
+    before: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +215,12 @@ fn require_feature_flag_csrf_header(
 
 impl HistoryQueryParams {
     fn into_query(self) -> anyhow::Result<status::HistoryQuery> {
+        if self.page.is_some() {
+            anyhow::bail!("invalid history query: page-based pagination is no longer supported");
+        }
+        if self.after.is_some() && self.before.is_some() {
+            anyhow::bail!("invalid history query: cannot include both after and before cursors");
+        }
         Ok(status::HistoryQuery {
             repo: self.repo,
             iid: self.iid,
@@ -231,7 +239,8 @@ impl HistoryQueryParams {
             result: self.result.filter(|value| !value.trim().is_empty()),
             search: self.q.filter(|value| !value.trim().is_empty()),
             limit: self.limit.unwrap_or(100),
-            page: self.page.unwrap_or(1).max(1),
+            after: self.after.filter(|value| !value.trim().is_empty()),
+            before: self.before.filter(|value| !value.trim().is_empty()),
         })
     }
 }

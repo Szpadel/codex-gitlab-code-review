@@ -9,16 +9,16 @@ use crate::feature_flags::{
 };
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
-    ProjectCatalogSummary, ReviewStateStore, RunHistoryEventRecord, RunHistoryKind,
-    RunHistoryListQuery, RunHistoryRecord, ScanMode, ScanOutcome, ScanState,
-    TranscriptBackfillState, merge_rewritten_turn_events,
+    ProjectCatalogSummary, ReviewStateStore, RunHistoryCursor, RunHistoryEventRecord,
+    RunHistoryKind, RunHistoryListItem, RunHistoryListQuery, RunHistoryRecord, ScanMode,
+    ScanOutcome, ScanState, TranscriptBackfillState, merge_rewritten_turn_events,
 };
 use crate::transcript_backfill::{
     REVIEW_MISSING_CHILD_TURN_IDS_KEY, SessionHistoryBackfillSource,
     TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR, TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR,
     TranscriptBackfillSource,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -391,41 +391,30 @@ impl StatusService {
             result: query.result.clone(),
             search: query.search.clone(),
             limit: query.limit,
-            page: query.page,
+            after: query
+                .after
+                .as_deref()
+                .map(|cursor| RunHistoryCursor::decode(cursor).context("invalid history after cursor"))
+                .transpose()?,
+            before: query
+                .before
+                .as_deref()
+                .map(|cursor| RunHistoryCursor::decode(cursor).context("invalid history before cursor"))
+                .transpose()?,
         };
-        let page_size = list_query.normalized_limit();
-        let requested_page = list_query.normalized_page();
-        let total_runs = self.state.count_run_history(&list_query).await?;
-        let total_pages = if total_runs == 0 {
-            0
-        } else {
-            total_runs.div_ceil(page_size)
-        };
-        let effective_page = if total_pages == 0 {
-            1
-        } else {
-            requested_page.min(total_pages)
-        };
-        let runs = self
-            .state
-            .list_run_history(&RunHistoryListQuery {
-                page: effective_page,
-                ..list_query
-            })
-            .await?;
+        let limit = list_query.normalized_limit();
+        let page = self.state.list_run_history(&list_query).await?;
         let mut filters = query;
-        filters.page = effective_page;
-        filters.limit = page_size;
+        filters.limit = limit;
         Ok(HistorySnapshot {
             generated_at: Utc::now().to_rfc3339(),
             filters,
-            page: effective_page,
-            page_size,
-            total_runs,
-            total_pages,
-            has_previous: effective_page > 1,
-            has_next: total_pages > 0 && effective_page < total_pages,
-            runs,
+            limit,
+            has_previous: page.has_previous,
+            has_next: page.has_next,
+            previous_cursor: page.previous_cursor.map(RunHistoryCursor::encode),
+            next_cursor: page.next_cursor.map(RunHistoryCursor::encode),
+            runs: page.runs,
         })
     }
 
@@ -1478,20 +1467,20 @@ pub struct HistoryQuery {
     pub result: Option<String>,
     pub search: Option<String>,
     pub limit: usize,
-    pub page: usize,
+    pub after: Option<String>,
+    pub before: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct HistorySnapshot {
     pub generated_at: String,
     pub filters: HistoryQuery,
-    pub page: usize,
-    pub page_size: usize,
-    pub total_runs: usize,
-    pub total_pages: usize,
+    pub limit: usize,
     pub has_previous: bool,
     pub has_next: bool,
-    pub runs: Vec<RunHistoryRecord>,
+    pub previous_cursor: Option<String>,
+    pub next_cursor: Option<String>,
+    pub runs: Vec<RunHistoryListItem>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

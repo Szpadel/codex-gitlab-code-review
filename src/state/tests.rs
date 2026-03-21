@@ -839,7 +839,7 @@ async fn run_history_filters_by_mr() -> Result<()> {
 }
 
 #[tokio::test]
-async fn list_run_history_paginates_and_counts_filtered_rows() -> Result<()> {
+async fn list_run_history_pages_with_cursors_and_preserves_filtering() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let mut run_ids = Vec::new();
     for (iid, started_at) in [(21u64, 1_000i64), (22, 2_000), (23, 3_000)] {
@@ -904,24 +904,113 @@ async fn list_run_history_paginates_and_counts_filtered_rows() -> Result<()> {
         repo: Some("group/repo".to_string()),
         search: Some("pagination".to_string()),
         limit: 1,
-        page: 2,
         ..Default::default()
     };
 
-    assert_eq!(store.count_run_history(&filtered).await?, 3);
+    let first_page = store.list_run_history(&filtered).await?;
+    assert_eq!(first_page.runs.len(), 1);
+    assert_eq!(first_page.runs[0].id, run_ids[2]);
+    assert_eq!(first_page.has_previous, false);
+    assert_eq!(first_page.has_next, true);
 
-    let records = store.list_run_history(&filtered).await?;
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].id, run_ids[1]);
-
-    let first_page = store
+    let second_page = store
         .list_run_history(&RunHistoryListQuery {
-            page: 0,
+            after: first_page.next_cursor,
             ..filtered.clone()
         })
         .await?;
-    assert_eq!(first_page.len(), 1);
-    assert_eq!(first_page[0].id, run_ids[2]);
+    assert_eq!(second_page.runs.len(), 1);
+    assert_eq!(second_page.runs[0].id, run_ids[1]);
+    assert_eq!(second_page.has_previous, true);
+    assert_eq!(second_page.has_next, true);
+
+    let previous_page = store
+        .list_run_history(&RunHistoryListQuery {
+            before: second_page.previous_cursor,
+            ..filtered.clone()
+        })
+        .await?;
+    assert_eq!(previous_page.runs.len(), 1);
+    assert_eq!(previous_page.runs[0].id, run_ids[2]);
+    assert_eq!(previous_page.has_previous, false);
+    assert_eq!(previous_page.has_next, true);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_run_history_cursor_uses_id_as_tie_breaker() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let mut run_ids = Vec::new();
+    for iid in [31u64, 32, 33] {
+        let run_id = store
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid,
+                head_sha: format!("sha-{iid}"),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        store
+            .finish_run_history(
+                run_id,
+                RunHistoryFinish {
+                    result: "commented".to_string(),
+                    preview: Some(format!("Review group/repo !{iid}")),
+                    summary: Some("same timestamp".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        sqlx::query("UPDATE run_history SET started_at = 5_000, updated_at = 5_000 WHERE id = ?")
+            .bind(run_id)
+            .execute(store.pool())
+            .await?;
+        run_ids.push(run_id);
+    }
+
+    let first_page = store
+        .list_run_history(&RunHistoryListQuery {
+            limit: 2,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(first_page.runs.iter().map(|run| run.id).collect::<Vec<_>>(), vec![run_ids[2], run_ids[1]]);
+
+    let second_page = store
+        .list_run_history(&RunHistoryListQuery {
+            limit: 2,
+            after: first_page.next_cursor,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(second_page.runs.iter().map(|run| run.id).collect::<Vec<_>>(), vec![run_ids[0]]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_backed_sqlite_uses_wal_and_normal_synchronous() -> Result<()> {
+    let temp_dir = env::temp_dir().join(format!("codex-review-state-{}", Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir)?;
+    let db_path = temp_dir.join("state.sqlite");
+    let store = ReviewStateStore::new(db_path.to_str().context("db path utf-8")?).await?;
+
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(store.pool())
+        .await?;
+    let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+        .fetch_one(store.pool())
+        .await?;
+
+    assert_eq!(journal_mode.to_lowercase(), "wal");
+    assert_eq!(synchronous, 1);
+
+    drop(store);
+    fs::remove_dir_all(temp_dir)?;
     Ok(())
 }
 
