@@ -12,5 +12,6 @@ pub mod gitlab_discovery_mcp;
 pub mod http;
 pub mod review;
 pub mod review_prompt_templates;
+pub mod skills;
 pub mod state;
 pub mod transcript_backfill;

@@ -1,8 +1,8 @@
 use super::*;
 use crate::codex_runner::{CodexResult, CodexRunner, ReviewContext};
 use crate::config::{
-    BrowserMcpConfig, CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig,
-    GitLabTargets, McpServerOverridesConfig, ReasoningEffortOverridesConfig,
+    BrowserMcpConfig, CodexConfig, Config, DatabaseConfig, DockerConfig, FallbackAuthAccountConfig,
+    GitLabConfig, GitLabTargets, McpServerOverridesConfig, ReasoningEffortOverridesConfig,
     ReasoningSummaryOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
     ServerConfig, TargetSelector,
 };
@@ -17,11 +17,15 @@ use crate::transcript_backfill::{
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use reqwest::StatusCode;
+use reqwest::{StatusCode, multipart};
 use serde_json::{Value, json};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, sleep};
+use zip::write::SimpleFileOptions;
 
 #[tokio::test]
 async fn api_status_returns_scan_and_in_progress_state() -> Result<()> {
@@ -751,8 +755,10 @@ async fn history_api_returns_cursor_metadata() -> Result<()> {
     ));
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response =
-        reqwest::get(format!("http://{address}/api/history?repo=group%2Frepo&limit=1")).await?;
+    let response = reqwest::get(format!(
+        "http://{address}/api/history?repo=group%2Frepo&limit=1"
+    ))
+    .await?;
     assert_eq!(response.status(), StatusCode::OK);
     let first_body: Value = response.json().await?;
     assert_eq!(first_body.get("limit").and_then(Value::as_u64), Some(1));
@@ -760,7 +766,10 @@ async fn history_api_returns_cursor_metadata() -> Result<()> {
         first_body.get("has_previous").and_then(Value::as_bool),
         Some(false)
     );
-    assert_eq!(first_body.get("has_next").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        first_body.get("has_next").and_then(Value::as_bool),
+        Some(true)
+    );
     assert_eq!(first_body.get("previous_cursor"), Some(&Value::Null));
     assert_eq!(
         first_body
@@ -791,13 +800,19 @@ async fn history_api_returns_cursor_metadata() -> Result<()> {
         second_body.get("has_previous").and_then(Value::as_bool),
         Some(true)
     );
-    assert_eq!(second_body.get("has_next").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        second_body.get("has_next").and_then(Value::as_bool),
+        Some(true)
+    );
     let second_runs = second_body
         .get("runs")
         .and_then(Value::as_array)
         .expect("runs array");
     assert_eq!(second_runs.len(), 1);
-    assert_eq!(second_runs[0].get("id").and_then(Value::as_i64), Some(run_ids[1]));
+    assert_eq!(
+        second_runs[0].get("id").and_then(Value::as_i64),
+        Some(run_ids[1])
+    );
     Ok(())
 }
 
@@ -6610,6 +6625,226 @@ async fn run_detail_retries_when_session_history_directory_appears_later() -> Re
     }
     assert_eq!(backfill_calls.load(Ordering::SeqCst), 2);
     Ok(())
+}
+
+#[tokio::test]
+async fn skills_page_renders_upload_form_and_installed_skill_list() -> Result<()> {
+    let auth_home = TestAuthDir::new("http-skills-page");
+    write_skill(
+        auth_home.path(),
+        "web-skill",
+        "---\nname: web-skill\ndescription: Web skill\n---\n",
+        &[("scripts/run.sh", b"echo web")],
+    )?;
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let mut config = test_config();
+    config.codex.auth_host_path = auth_home.path().display().to_string();
+    let status_service = Arc::new(StatusService::new(config, state, false, None));
+    let address = spawn_test_server(app_router(status_service)).await?;
+
+    let response = reqwest::get(format!("http://{address}/skills")).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await?;
+    assert!(body.contains("Upload skill archive"));
+    assert!(body.contains("name=\"archive\""));
+    assert!(body.contains("web-skill"));
+    assert!(body.contains("/skills/web-skill"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn skill_preview_page_renders_account_status_and_delete_form() -> Result<()> {
+    let primary = TestAuthDir::new("http-skill-preview-primary");
+    let backup = TestAuthDir::new("http-skill-preview-backup");
+    write_skill(
+        primary.path(),
+        "preview-skill",
+        "---\nname: preview-skill\ndescription: Preview me\n---\n",
+        &[("scripts/run.sh", b"echo primary")],
+    )?;
+    write_skill(
+        backup.path(),
+        "preview-skill",
+        "---\nname: preview-skill\ndescription: Preview me\n---\n",
+        &[("scripts/run.sh", b"echo primary")],
+    )?;
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let mut config = test_config();
+    config.codex.auth_host_path = primary.path().display().to_string();
+    config.codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
+        name: "backup".to_string(),
+        auth_host_path: backup.path().display().to_string(),
+    }];
+    let status_service = Arc::new(StatusService::new(config, state, false, None));
+    let address = spawn_test_server(app_router(status_service)).await?;
+
+    let response = reqwest::get(format!("http://{address}/skills/preview-skill")).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await?;
+    assert!(body.contains("Skill preview"));
+    assert!(body.contains("preview-skill"));
+    assert!(body.contains("primary"));
+    assert!(body.contains("backup"));
+    assert!(body.contains("/skills/preview-skill/delete"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_skill_endpoint_installs_into_primary_and_fallback_auth_homes() -> Result<()> {
+    let primary = TestAuthDir::new("http-upload-primary");
+    let backup = TestAuthDir::new("http-upload-backup");
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let mut config = test_config();
+    config.codex.auth_host_path = primary.path().display().to_string();
+    config.codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
+        name: "backup".to_string(),
+        auth_host_path: backup.path().display().to_string(),
+    }];
+    let status_service = Arc::new(StatusService::new(config, state, false, None));
+    let csrf_token = status_service.admin_csrf_token().to_string();
+    let address = spawn_test_server(app_router(Arc::clone(&status_service))).await?;
+    let archive = build_skill_zip(&[
+        (
+            "wrapped/web-skill/SKILL.md",
+            b"---\nname: web-skill\ndescription: Upload me\n---\n",
+        ),
+        ("wrapped/web-skill/scripts/run.sh", b"echo upload\n"),
+    ]);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{address}/skills/upload"))
+        .multipart(multipart::Form::new().text("csrf_token", csrf_token).part(
+            "archive",
+            multipart::Part::bytes(archive).file_name("web-skill.zip"),
+        ))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(primary.path().join("skills/web-skill/SKILL.md").is_file());
+    assert!(
+        backup
+            .path()
+            .join("skills/web-skill/scripts/run.sh")
+            .is_file()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_skill_endpoint_rejects_unsupported_archive_type() -> Result<()> {
+    let auth_home = TestAuthDir::new("http-upload-invalid");
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let mut config = test_config();
+    config.codex.auth_host_path = auth_home.path().display().to_string();
+    let status_service = Arc::new(StatusService::new(config, state, false, None));
+    let csrf_token = status_service.admin_csrf_token().to_string();
+    let address = spawn_test_server(app_router(status_service)).await?;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("http://{address}/skills/upload"))
+        .multipart(multipart::Form::new().text("csrf_token", csrf_token).part(
+            "archive",
+            multipart::Part::bytes(b"not-an-archive".to_vec()).file_name("bad.rar"),
+        ))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_skill_endpoint_requires_csrf_and_removes_skill() -> Result<()> {
+    let auth_home = TestAuthDir::new("http-delete-primary");
+    write_skill(
+        auth_home.path(),
+        "delete-skill",
+        "---\nname: delete-skill\n---\n",
+        &[("scripts/run.sh", b"echo delete")],
+    )?;
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let mut config = test_config();
+    config.codex.auth_host_path = auth_home.path().display().to_string();
+    let status_service = Arc::new(StatusService::new(config, state, false, None));
+    let csrf_token = status_service.admin_csrf_token().to_string();
+    let address = spawn_test_server(app_router(Arc::clone(&status_service))).await?;
+    let client = reqwest::Client::new();
+
+    let forbidden = client
+        .post(format!("http://{address}/skills/delete-skill/delete"))
+        .form(&[("csrf_token", "wrong")])
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), StatusCode::BAD_REQUEST);
+    assert!(auth_home.path().join("skills/delete-skill").exists());
+
+    let deleted = client
+        .post(format!("http://{address}/skills/delete-skill/delete"))
+        .form(&[("csrf_token", csrf_token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert!(!auth_home.path().join("skills/delete-skill").exists());
+    Ok(())
+}
+
+struct TestAuthDir {
+    path: PathBuf,
+}
+
+impl TestAuthDir {
+    fn new(prefix: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "codex-gitlab-review-{prefix}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&path).expect("create auth dir");
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestAuthDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn write_skill(
+    auth_home: &Path,
+    name: &str,
+    markdown: &str,
+    extra_files: &[(&str, &[u8])],
+) -> Result<()> {
+    let skill_root = auth_home.join("skills").join(name);
+    fs::create_dir_all(&skill_root)?;
+    fs::write(skill_root.join("SKILL.md"), markdown)?;
+    for (path, contents) in extra_files {
+        let full_path = skill_root.join(path);
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(full_path, contents)?;
+    }
+    Ok(())
+}
+
+fn build_skill_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(cursor);
+    for (path, bytes) in entries {
+        writer
+            .start_file(path, SimpleFileOptions::default())
+            .expect("start skill zip entry");
+        writer.write_all(bytes).expect("write skill zip entry");
+    }
+    writer.finish().expect("finish skill zip").into_inner()
 }
 
 fn test_config() -> Config {

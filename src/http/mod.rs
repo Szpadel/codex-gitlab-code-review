@@ -4,10 +4,10 @@ mod transcript;
 mod view;
 
 use axum::{
-    Json, Router,
-    extract::{Path, Query, State},
+    Form, Json, Router,
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::HeaderMap,
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Redirect},
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -17,21 +17,31 @@ use tracing::error;
 
 pub use status::StatusService;
 use view::{
-    render_history_page, render_mr_history_page, render_run_detail_page, render_status_page,
+    render_history_page, render_mr_history_page, render_run_detail_page, render_skill_detail_page,
+    render_skills_page, render_status_page,
 };
+
+const MAX_SKILL_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn app_router(status_service: Arc<StatusService>) -> Router {
     let mut router = Router::new().route("/healthz", get(healthcheck));
     if status_service.status_ui_enabled() {
+        let skill_upload_router = Router::new()
+            .route("/skills/upload", post(upload_skill))
+            .layer(DefaultBodyLimit::max(MAX_SKILL_ARCHIVE_BYTES));
         // The status UI is expected to sit behind an admin-only trusted auth
         // proxy when enabled. Server-side CSRF enforcement protects the
         // runtime feature-flag write path within that authenticated surface.
         router = router
+            .merge(skill_upload_router)
             .route("/", get(status_page))
             .route("/status", get(status_page))
             .route("/history", get(history_page))
             .route("/history/{run_id}", get(run_detail_page))
             .route("/mr/{repo_key}/{iid}/history", get(mr_history_page))
+            .route("/skills", get(skills_page))
+            .route("/skills/{skill_name}", get(skill_detail_page))
+            .route("/skills/{skill_name}/delete", post(delete_skill))
             .route("/api/status", get(status_json))
             .route(
                 "/api/feature-flags/{flag_name}",
@@ -157,6 +167,74 @@ async fn update_feature_flag_json(
     ))
 }
 
+async fn skills_page(
+    State(status_service): State<Arc<StatusService>>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    let snapshot = status_service.skills_snapshot().await?;
+    Ok(Html(render_skills_page(
+        &snapshot,
+        Some(status_service.admin_csrf_token()),
+    )))
+}
+
+async fn skill_detail_page(
+    State(status_service): State<Arc<StatusService>>,
+    Path(skill_name): Path<String>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    let Some(snapshot) = status_service.skill_preview_snapshot(&skill_name).await? else {
+        return Err(StatusHandlerError(anyhow::anyhow!("skill not found")));
+    };
+    Ok(Html(render_skill_detail_page(
+        &snapshot,
+        Some(status_service.admin_csrf_token()),
+    )))
+}
+
+async fn upload_skill(
+    State(status_service): State<Arc<StatusService>>,
+    mut multipart: Multipart,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    let mut csrf_token = None;
+    let mut archive_name = None;
+    let mut archive_bytes = None;
+    while let Some(field) = multipart.next_field().await.map_err(anyhow::Error::from)? {
+        match field.name() {
+            Some("csrf_token") => {
+                csrf_token = Some(field.text().await.map_err(anyhow::Error::from)?)
+            }
+            Some("archive") => {
+                archive_name = field.file_name().map(ToOwned::to_owned);
+                archive_bytes = Some(field.bytes().await.map_err(anyhow::Error::from)?.to_vec());
+            }
+            _ => {}
+        }
+    }
+    require_admin_csrf_form_token(csrf_token.as_deref(), status_service.admin_csrf_token())?;
+    let archive_name = archive_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("upload.zip");
+    let archive_bytes = archive_bytes
+        .ok_or_else(|| anyhow::anyhow!("invalid skill archive: missing upload file"))?;
+    let skill_name = status_service
+        .install_skill_archive(archive_name, archive_bytes)
+        .await?;
+    Ok(Redirect::to(&format!(
+        "/skills/{}",
+        urlencoding::encode(&skill_name)
+    )))
+}
+
+async fn delete_skill(
+    State(status_service): State<Arc<StatusService>>,
+    Path(skill_name): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    require_admin_csrf_form_token(Some(&form.csrf_token), status_service.admin_csrf_token())?;
+    status_service.delete_skill(&skill_name).await?;
+    Ok(Redirect::to("/skills"))
+}
+
 #[derive(Debug)]
 struct StatusHandlerError(anyhow::Error);
 
@@ -171,6 +249,10 @@ impl IntoResponse for StatusHandlerError {
         let message = self.0.to_string();
         let status = if message.contains("not found") {
             axum::http::StatusCode::NOT_FOUND
+        } else if message.contains("already exists") {
+            axum::http::StatusCode::CONFLICT
+        } else if message.contains("unsupported archive type") {
+            axum::http::StatusCode::BAD_REQUEST
         } else if message.contains("invalid") {
             axum::http::StatusCode::BAD_REQUEST
         } else {
@@ -198,6 +280,11 @@ struct FeatureFlagUpdateJson {
     enabled: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CsrfForm {
+    csrf_token: String,
+}
+
 fn require_feature_flag_csrf_header(
     headers: &HeaderMap,
     expected_token: &str,
@@ -210,6 +297,18 @@ fn require_feature_flag_csrf_header(
         Ok(())
     } else {
         anyhow::bail!("invalid feature flag csrf token")
+    }
+}
+
+fn require_admin_csrf_form_token(
+    actual_token: Option<&str>,
+    expected_token: &str,
+) -> anyhow::Result<()> {
+    let matches_expected = actual_token.is_some_and(|value| value == expected_token);
+    if matches_expected {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid csrf token")
     }
 }
 

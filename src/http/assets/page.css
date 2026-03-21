@@ -57,13 +57,17 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
 .filter-field-wide { flex: 2 1 260px; }
 .filter-actions { display: flex; align-items: flex-end; flex: 0 0 auto; }
 .filters input, .filters select { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--surface); font: inherit; color: var(--text-primary); }
+.filters input[type="file"] { padding: 7px 10px; }
 .filters button { border: 0; border-radius: 8px; padding: 10px 14px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
 .filters button:hover { background: #1D4ED8; }
+.danger-button { border: 0; border-radius: 8px; padding: 10px 14px; background: var(--danger); color: #fff; font: inherit; cursor: pointer; }
+.danger-button:hover { background: #991B1B; }
 .pagination { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
 .pagination-links { display: flex; gap: 8px; align-items: center; }
 .pagination-link { display: inline-flex; align-items: center; justify-content: center; min-width: 88px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--accent); text-decoration: none; font-weight: 500; }
 .pagination-link-disabled { color: var(--text-disabled); background: var(--surface-subtle); border-color: var(--divider); pointer-events: none; }
 .simple-list { margin: 0; padding-left: 18px; }
+.monospace-list li { margin-bottom: 6px; }
 .codeblock { white-space: pre-wrap; word-break: break-word; background: var(--surface-subtle); border: 1px solid var(--divider); border-radius: 8px; padding: 12px; overflow-x: auto; font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12px; line-height: 18px; }
 
 .transcript-panel { padding: 0; overflow: hidden; }

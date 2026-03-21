@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::feature_flags::{
     FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
 };
+use crate::skills::{SkillListSnapshot, SkillPreviewSnapshot, SkillsManager};
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
     ProjectCatalogSummary, ReviewStateStore, RunHistoryCursor, RunHistoryEventRecord,
@@ -96,7 +97,8 @@ pub struct StatusScanSnapshot {
 pub struct StatusService {
     config: StatusConfig,
     state: Arc<ReviewStateStore>,
-    feature_flag_csrf_token: String,
+    admin_csrf_token: String,
+    skills_manager: SkillsManager,
     default_transcript_backfill_source: Option<Arc<dyn TranscriptBackfillSource>>,
     account_transcript_backfill_sources: HashMap<String, Arc<dyn TranscriptBackfillSource>>,
     active_backfills: Arc<Mutex<HashSet<i64>>>,
@@ -134,6 +136,7 @@ impl StatusService {
         _runner: Option<Arc<dyn CodexRunner>>,
     ) -> Self {
         let feature_flag_availability = config.feature_flag_availability();
+        let skills_manager = SkillsManager::new(&config);
         let default_transcript_backfill_source = Arc::new(SessionHistoryBackfillSource::new(
             primary_session_history_path(
                 &config.codex.auth_host_path,
@@ -169,7 +172,8 @@ impl StatusService {
                 feature_flag_availability,
             },
             state,
-            feature_flag_csrf_token: Uuid::new_v4().to_string(),
+            admin_csrf_token: Uuid::new_v4().to_string(),
+            skills_manager,
             default_transcript_backfill_source: Some(default_transcript_backfill_source),
             account_transcript_backfill_sources,
             active_backfills: Arc::new(Mutex::new(HashSet::new())),
@@ -194,7 +198,11 @@ impl StatusService {
     }
 
     pub(crate) fn feature_flag_csrf_token(&self) -> &str {
-        &self.feature_flag_csrf_token
+        &self.admin_csrf_token
+    }
+
+    pub(crate) fn admin_csrf_token(&self) -> &str {
+        &self.admin_csrf_token
     }
 
     pub async fn snapshot(&self) -> Result<StatusSnapshot> {
@@ -264,6 +272,28 @@ impl StatusService {
             .into_iter()
             .find(|flag| flag.name == flag_name)
             .ok_or_else(|| anyhow::anyhow!("missing feature flag after update: {flag_name}"))
+    }
+
+    pub async fn skills_snapshot(&self) -> Result<SkillListSnapshot> {
+        self.skills_manager.list_skills().await
+    }
+
+    pub async fn skill_preview_snapshot(&self, name: &str) -> Result<Option<SkillPreviewSnapshot>> {
+        self.skills_manager.skill_preview(name).await
+    }
+
+    pub async fn install_skill_archive(
+        &self,
+        archive_name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String> {
+        self.skills_manager
+            .install_archive(archive_name, bytes)
+            .await
+    }
+
+    pub async fn delete_skill(&self, name: &str) -> Result<()> {
+        self.skills_manager.delete_skill(name).await
     }
 
     fn feature_flag_snapshots(
@@ -394,12 +424,16 @@ impl StatusService {
             after: query
                 .after
                 .as_deref()
-                .map(|cursor| RunHistoryCursor::decode(cursor).context("invalid history after cursor"))
+                .map(|cursor| {
+                    RunHistoryCursor::decode(cursor).context("invalid history after cursor")
+                })
                 .transpose()?,
             before: query
                 .before
                 .as_deref()
-                .map(|cursor| RunHistoryCursor::decode(cursor).context("invalid history before cursor"))
+                .map(|cursor| {
+                    RunHistoryCursor::decode(cursor).context("invalid history before cursor")
+                })
                 .transpose()?,
         };
         let limit = list_query.normalized_limit();
