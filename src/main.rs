@@ -751,6 +751,7 @@ mod tests {
                 stale_in_progress_minutes: 120,
                 dry_run: true,
                 additional_developer_instructions: None,
+                security: codex_gitlab_code_review::config::ReviewSecurityConfig::default(),
                 mention_commands: ReviewMentionCommandsConfig {
                     enabled: false,
                     bot_username: None,

@@ -216,6 +216,7 @@ async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,
+            security_review: None,
         })
         .await?;
     let status_service = Arc::new(StatusService::new(
@@ -6875,6 +6876,7 @@ fn test_config() -> Config {
             stale_in_progress_minutes: 120,
             dry_run: true,
             additional_developer_instructions: None,
+            security: crate::config::ReviewSecurityConfig::default(),
             mention_commands: ReviewMentionCommandsConfig {
                 enabled: true,
                 bot_username: Some("codex".to_string()),

@@ -1,5 +1,6 @@
 use super::*;
 use crate::composer_install::composer_install_timeout_seconds;
+use crate::review_lane::ReviewLane;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CodexOutput {
@@ -16,12 +17,18 @@ struct ReviewOutputPayload {
     overall_explanation: String,
     #[serde(default)]
     overall_correctness: Option<String>,
+    #[serde(default)]
+    overall_confidence_score: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReviewFindingPayload {
     title: String,
     body: String,
+    #[serde(default)]
+    confidence_score: Option<f32>,
+    #[serde(default)]
+    priority: Option<u8>,
     code_location: ReviewCodeLocationPayload,
 }
 
@@ -45,14 +52,45 @@ pub(crate) enum ReviewTargetRequest {
 
 const SINGLE_REVIEW_HEADER: &str = "Review comment:";
 const MULTI_REVIEW_HEADER: &str = "Full review comments:";
+const SECURITY_CONTEXT_PROMPT_VERSION: &str = "security-review-context-v1";
+const SECURITY_REVIEW_INSTRUCTIONS_TEMPLATE: &str =
+    include_str!("assets/security_review_instructions.md");
 
 impl DockerCodexRunner {
-    pub(crate) fn review_additional_developer_instructions(&self) -> Option<String> {
-        self.review_additional_developer_instructions
+    pub(crate) fn security_context_cache_repo_key<'a>(&self, ctx: &'a ReviewContext) -> &'a str {
+        ctx.repo.as_str()
+    }
+
+    pub(crate) fn prepare_review_gitlab_discovery_mcp(
+        &self,
+        ctx: &ReviewContext,
+    ) -> Option<PreparedGitLabDiscoveryMcp> {
+        if ctx.lane.is_security() {
+            return None;
+        }
+        self.prepare_gitlab_discovery_mcp(
+            &ctx.project_path,
+            &ctx.feature_flags,
+            &self.codex.mcp_server_overrides.review,
+        )
+    }
+
+    pub(crate) fn review_additional_developer_instructions(
+        &self,
+        ctx: &ReviewContext,
+    ) -> Option<String> {
+        ctx.additional_developer_instructions
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
+            .or_else(|| {
+                self.review_additional_developer_instructions
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
     }
 
     pub(crate) fn fallback_review_target_instructions(
@@ -120,7 +158,7 @@ impl DockerCodexRunner {
         container_id: &str,
         repo_path: &str,
     ) -> ReviewTargetRequest {
-        let additional_developer_instructions = self.review_additional_developer_instructions();
+        let additional_developer_instructions = self.review_additional_developer_instructions(ctx);
         let merge_base_sha = if let Some(branch) = ctx
             .mr
             .target_branch
@@ -142,6 +180,54 @@ impl DockerCodexRunner {
             merge_base_sha.as_deref(),
             additional_developer_instructions.as_deref(),
         )
+    }
+
+    fn security_review_instructions(
+        &self,
+        min_confidence_score: f32,
+        additional_developer_instructions: Option<&str>,
+    ) -> String {
+        let base = SECURITY_REVIEW_INSTRUCTIONS_TEMPLATE.replace(
+            "@@MIN_CONFIDENCE_SCORE@@",
+            &format!("{min_confidence_score:.2}"),
+        );
+        if let Some(extra) = additional_developer_instructions
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            format!("{base}\n\nSecurity review additions:\n{extra}")
+        } else {
+            base
+        }
+    }
+
+    fn security_context_output_schema() -> Value {
+        json!({
+            "type": "object",
+            "required": [
+                "components",
+                "entry_points",
+                "trust_boundaries",
+                "attacker_controlled_inputs",
+                "privileged_operations",
+                "sensitive_assets",
+                "security_critical_paths",
+                "runtime_notes",
+                "focus_paths"
+            ],
+            "properties": {
+                "components": { "type": "array", "items": { "type": "string" } },
+                "entry_points": { "type": "array", "items": { "type": "string" } },
+                "trust_boundaries": { "type": "array", "items": { "type": "string" } },
+                "attacker_controlled_inputs": { "type": "array", "items": { "type": "string" } },
+                "privileged_operations": { "type": "array", "items": { "type": "string" } },
+                "sensitive_assets": { "type": "array", "items": { "type": "string" } },
+                "security_critical_paths": { "type": "array", "items": { "type": "string" } },
+                "runtime_notes": { "type": "array", "items": { "type": "string" } },
+                "focus_paths": { "type": "array", "items": { "type": "string" } }
+            },
+            "additionalProperties": true
+        })
     }
 
     pub(crate) async fn try_resolve_review_merge_base(
@@ -188,6 +274,298 @@ impl DockerCodexRunner {
         }
     }
 
+    async fn try_resolve_base_branch_head_sha(
+        &self,
+        ctx: &ReviewContext,
+        container_id: &str,
+        repo_path: &str,
+        branch: &str,
+    ) -> Option<String> {
+        let remote_branch_ref = format!("refs/remotes/origin/{branch}");
+        let output = match self
+            .exec_container_git_command(
+                container_id,
+                &["rev-parse".to_string(), remote_branch_ref.clone()],
+                Some(repo_path),
+            )
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                warn!(
+                    repo = ctx.repo.as_str(),
+                    iid = ctx.mr.iid,
+                    branch,
+                    remote_branch_ref,
+                    error = %err,
+                    "failed to resolve target branch head SHA locally for security context"
+                );
+                return ctx
+                    .mr
+                    .diff_refs
+                    .as_ref()
+                    .and_then(|diff| diff.base_sha.clone())
+                    .filter(|value| !value.trim().is_empty());
+            }
+        };
+        let resolved = output.stdout.trim();
+        if resolved.is_empty() {
+            ctx.mr
+                .diff_refs
+                .as_ref()
+                .and_then(|diff| diff.base_sha.clone())
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            Some(resolved.to_string())
+        }
+    }
+
+    async fn create_security_context_worktree(
+        &self,
+        container_id: &str,
+        repo_path: &str,
+        base_head_sha: &str,
+    ) -> Result<String> {
+        let tmpdir = self
+            .exec_container_command(
+                container_id,
+                vec![
+                    "/bin/sh".to_string(),
+                    "-lc".to_string(),
+                    "mktemp -d /tmp/codex-security-context-XXXXXX".to_string(),
+                ],
+                Some(repo_path),
+            )
+            .await?
+            .stdout
+            .trim()
+            .to_string();
+        if tmpdir.is_empty() {
+            bail!("failed to allocate temporary worktree path for security context");
+        }
+        if let Err(err) = self
+            .exec_container_git_command(
+                container_id,
+                &[
+                    "worktree".to_string(),
+                    "add".to_string(),
+                    "--detach".to_string(),
+                    tmpdir.clone(),
+                    base_head_sha.to_string(),
+                ],
+                Some(repo_path),
+            )
+            .await
+        {
+            self.remove_security_context_tempdir(container_id, repo_path, &tmpdir)
+                .await;
+            return Err(err);
+        }
+        Ok(tmpdir)
+    }
+
+    async fn remove_security_context_tempdir(
+        &self,
+        container_id: &str,
+        repo_path: &str,
+        worktree_path: &str,
+    ) {
+        if let Err(err) = self
+            .exec_container_command(
+                container_id,
+                vec![
+                    "rm".to_string(),
+                    "-rf".to_string(),
+                    worktree_path.to_string(),
+                ],
+                Some(repo_path),
+            )
+            .await
+        {
+            warn!(
+                container_id,
+                worktree_path,
+                error = %err,
+                "failed to remove temporary security context directory"
+            );
+        }
+    }
+
+    async fn remove_security_context_worktree(
+        &self,
+        container_id: &str,
+        repo_path: &str,
+        worktree_path: &str,
+    ) {
+        if let Err(err) = self
+            .exec_container_git_command(
+                container_id,
+                &[
+                    "worktree".to_string(),
+                    "remove".to_string(),
+                    "--force".to_string(),
+                    worktree_path.to_string(),
+                ],
+                Some(repo_path),
+            )
+            .await
+        {
+            warn!(
+                container_id,
+                worktree_path,
+                error = %err,
+                "failed to remove security context worktree"
+            );
+        }
+    }
+
+    async fn build_security_context_payload(
+        &self,
+        ctx: &ReviewContext,
+        client: &mut AppServerClient,
+        gitlab_discovery_server_name: Option<&str>,
+        container_id: &str,
+        repo_path: &str,
+        base_branch: &str,
+        base_head_sha: &str,
+        extra_writable_roots: &[String],
+    ) -> Result<String> {
+        let worktree_path = self
+            .create_security_context_worktree(container_id, repo_path, base_head_sha)
+            .await?;
+        let result = async {
+            let thread_response = client
+                .request(
+                    "thread/start",
+                    self.thread_start_params(worktree_path.as_str(), None, extra_writable_roots),
+                )
+                .await?;
+            let thread_id = thread_response
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(|id| id.as_str())
+                .ok_or_else(|| anyhow!("thread/start missing thread id for security context"))?
+                .to_string();
+            let turn_response = client
+                .request(
+                    "turn/start",
+                    json!({
+                        "threadId": thread_id,
+                        "cwd": worktree_path.as_str(),
+                        "input": [
+                            {
+                                "type": "text",
+                                "text": format!(
+                                    "$security-threat-model Build a concise repository-grounded threat model for the base branch.\nReturn only JSON matching the provided output schema.\nFocus on runtime behavior on branch {} at commit {}.\nKeep the result compact and evidence-based.",
+                                    base_branch, base_head_sha
+                                ),
+                            },
+                            {
+                                "type": "skill",
+                                "name": "security-threat-model",
+                                "path": format!(
+                                    "{}/skills/security-threat-model/SKILL.md",
+                                    self.codex.auth_mount_path.trim_end_matches('/')
+                                ),
+                            }
+                        ],
+                        "outputSchema": Self::security_context_output_schema(),
+                    }),
+                )
+                .await?;
+            let turn_id = turn_response
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(|id| id.as_str())
+                .ok_or_else(|| anyhow!("turn/start missing turn id for security context"))?
+                .to_string();
+            let output = client
+                .stream_turn_message(
+                    &thread_id,
+                    &turn_id,
+                    gitlab_discovery_server_name,
+                    |events| async move {
+                        self.append_run_history_events(ctx.run_history_id, &events).await;
+                    },
+                    || async move {
+                        self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
+                            .await;
+                    },
+                )
+                .await?;
+            let payload: Value = serde_json::from_str(output.trim())
+                .context("parse security context JSON payload")?;
+            if !payload.is_object() {
+                bail!("security context output must be a JSON object");
+            }
+            serde_json::to_string(&payload).context("serialize security context cache payload")
+        }
+        .await;
+        self.remove_security_context_worktree(container_id, repo_path, &worktree_path)
+            .await;
+        result
+    }
+
+    async fn resolve_security_context_payload(
+        &self,
+        ctx: &ReviewContext,
+        client: &mut AppServerClient,
+        gitlab_discovery_server_name: Option<&str>,
+        container_id: &str,
+        repo_path: &str,
+        base_branch: &str,
+        extra_writable_roots: &[String],
+    ) -> Result<Option<String>> {
+        let Some(base_head_sha) = self
+            .try_resolve_base_branch_head_sha(ctx, container_id, repo_path, base_branch)
+            .await
+        else {
+            return Ok(None);
+        };
+        let cache_repo_key = self.security_context_cache_repo_key(ctx);
+        let now = Utc::now().timestamp();
+        if let Some(entry) = self
+            .state
+            .get_security_review_context_cache(
+                cache_repo_key,
+                base_branch,
+                base_head_sha.as_str(),
+                SECURITY_CONTEXT_PROMPT_VERSION,
+                now,
+            )
+            .await?
+        {
+            return Ok(Some(entry.payload_json));
+        }
+        let payload_json = self
+            .build_security_context_payload(
+                ctx,
+                client,
+                gitlab_discovery_server_name,
+                container_id,
+                repo_path,
+                base_branch,
+                base_head_sha.as_str(),
+                extra_writable_roots,
+            )
+            .await?;
+        let generated_at = Utc::now().timestamp();
+        let expires_at =
+            generated_at + ctx.security_context_ttl_seconds.unwrap_or(1_209_600) as i64;
+        self.state
+            .upsert_security_review_context_cache(&crate::state::SecurityReviewContextCacheEntry {
+                repo: cache_repo_key.to_string(),
+                base_branch: base_branch.to_string(),
+                base_head_sha,
+                prompt_version: SECURITY_CONTEXT_PROMPT_VERSION.to_string(),
+                payload_json: payload_json.clone(),
+                generated_at,
+                expires_at,
+            })
+            .await?;
+        Ok(Some(payload_json))
+    }
+
     pub(crate) fn review_target_value(review_target: ReviewTargetRequest) -> Value {
         match review_target {
             ReviewTargetRequest::NativeBaseBranch { branch } => {
@@ -199,17 +577,108 @@ impl DockerCodexRunner {
         }
     }
 
+    fn build_security_review_target_instructions(
+        &self,
+        base_prompt: &str,
+        security_context_payload_json: Option<&str>,
+        min_confidence_score: f32,
+        additional_developer_instructions: Option<&str>,
+    ) -> String {
+        let mut prompt = base_prompt.to_string();
+        if let Some(payload_json) = security_context_payload_json
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            prompt.push_str("\n\nCached repository security context (base branch):\n");
+            prompt.push_str(payload_json);
+        }
+        prompt.push_str("\n\n");
+        prompt.push_str(
+            self.security_review_instructions(
+                min_confidence_score,
+                additional_developer_instructions,
+            )
+            .trim(),
+        );
+        prompt
+    }
+
+    async fn resolve_security_review_target(
+        &self,
+        ctx: &ReviewContext,
+        client: &mut AppServerClient,
+        gitlab_discovery_server_name: Option<&str>,
+        container_id: &str,
+        repo_path: &str,
+        extra_writable_roots: &[String],
+    ) -> Result<Value> {
+        let min_confidence_score = validated_security_min_confidence_score(
+            ctx.min_confidence_score,
+            "security review min_confidence_score",
+        )?;
+        let base_branch = ctx
+            .mr
+            .target_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let merge_base_sha = if let Some(branch) = base_branch {
+            self.try_resolve_review_merge_base(container_id, repo_path, branch)
+                .await
+        } else {
+            None
+        };
+        let base_prompt = if let Some(branch) = base_branch {
+            build_base_branch_review_prompt(branch, merge_base_sha.as_deref())
+        } else {
+            Self::fallback_review_target_instructions(ctx, None)
+        };
+        let security_context_payload_json = if let Some(branch) = base_branch {
+            match self
+                .resolve_security_context_payload(
+                    ctx,
+                    client,
+                    gitlab_discovery_server_name,
+                    container_id,
+                    repo_path,
+                    branch,
+                    extra_writable_roots,
+                )
+                .await
+            {
+                Ok(payload) => payload,
+                Err(err) => {
+                    warn!(
+                        repo = ctx.repo.as_str(),
+                        iid = ctx.mr.iid,
+                        branch,
+                        error = %err,
+                        "failed to build cached security context; continuing without it"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(json!({
+            "type": "custom",
+            "instructions": self.build_security_review_target_instructions(
+                base_prompt.as_str(),
+                security_context_payload_json.as_deref(),
+                min_confidence_score,
+                ctx.additional_developer_instructions.as_deref(),
+            ),
+        }))
+    }
+
     pub(crate) async fn run_app_server_review_with_account(
         &self,
         ctx: &ReviewContext,
         account: &AuthAccount,
     ) -> Result<String> {
         let browser_mcp = self.effective_browser_mcp(&self.codex.mcp_server_overrides.review);
-        let gitlab_discovery_mcp = self.prepare_gitlab_discovery_mcp(
-            &ctx.project_path,
-            &ctx.feature_flags,
-            &self.codex.mcp_server_overrides.review,
-        );
+        let gitlab_discovery_mcp = self.prepare_review_gitlab_discovery_mcp(ctx);
         self.sync_effective_feature_flags(
             ctx.run_history_id,
             &ctx.feature_flags,
@@ -312,14 +781,28 @@ impl DockerCodexRunner {
                         ctx.run_history_id,
                     )
                     .await;
-                let review_target = Self::review_target_value(
-                    self.resolve_review_target_request(ctx, &container_id, repo_path.as_str())
-                        .await,
-                );
                 let extra_writable_roots = gitlab_discovery_mcp
                     .as_ref()
                     .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
                     .unwrap_or_default();
+                let review_target = if ctx.lane.is_security() {
+                    self.resolve_security_review_target(
+                        ctx,
+                        &mut client,
+                        gitlab_discovery_mcp
+                            .as_ref()
+                            .map(|prepared| prepared.runtime_config.server_name.as_str()),
+                        &container_id,
+                        repo_path.as_str(),
+                        &extra_writable_roots,
+                    )
+                    .await?
+                } else {
+                    Self::review_target_value(
+                        self.resolve_review_target_request(ctx, &container_id, repo_path.as_str())
+                            .await,
+                    )
+                };
                 let thread_response = client
                     .request(
                         "thread/start",
@@ -496,19 +979,40 @@ impl DockerCodexRunner {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_review_output(text: &str) -> Result<CodexResult> {
+    parse_review_output_for_lane(text, ReviewLane::General, None)
+}
+
+pub(crate) fn parse_review_output_for_lane(
+    text: &str,
+    lane: ReviewLane,
+    min_confidence_score: Option<f32>,
+) -> Result<CodexResult> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
+        if lane.is_security() {
+            bail!("security review output must be a structured JSON object");
+        }
         return Ok(CodexResult::Pass {
             summary: "no issues found".to_string(),
         });
+    }
+
+    if lane.is_security() {
+        let parsed = serde_json::from_str::<ReviewOutputPayload>(trimmed)
+            .map_err(|_| anyhow!("security review output must be a structured JSON object"))?;
+        if !review_output_payload_looks_structured(&parsed) {
+            bail!("security review output must be a structured JSON object");
+        }
+        return parse_structured_review_output(parsed, lane, min_confidence_score);
     }
 
     if let Some(json_text) = extract_json_block(trimmed)
         && let Ok(parsed) = serde_json::from_str::<ReviewOutputPayload>(&json_text)
         && review_output_payload_looks_structured(&parsed)
     {
-        return parse_structured_review_output(parsed);
+        return parse_structured_review_output(parsed, lane, min_confidence_score);
     }
 
     if let Some(json_text) = extract_json_block(trimmed)
@@ -521,6 +1025,7 @@ pub(crate) fn parse_review_output(text: &str) -> Result<CodexResult> {
             "comment" => Ok(CodexResult::Comment(ReviewComment {
                 summary: parsed.summary,
                 overall_explanation: None,
+                overall_confidence_score: None,
                 findings: Vec::new(),
                 body: parsed.comment_markdown,
             })),
@@ -540,13 +1045,39 @@ pub(crate) fn extract_json_block(text: &str) -> Option<String> {
     Some(text[start..=end].to_string())
 }
 
-fn parse_structured_review_output(parsed: ReviewOutputPayload) -> Result<CodexResult> {
+fn parse_structured_review_output(
+    parsed: ReviewOutputPayload,
+    lane: ReviewLane,
+    min_confidence_score: Option<f32>,
+) -> Result<CodexResult> {
+    let original_findings_count = parsed.findings.len();
+    if lane.is_security()
+        && parsed
+            .findings
+            .iter()
+            .any(|finding| finding.confidence_score.is_none())
+    {
+        bail!("security review findings must include confidence_score");
+    }
+    if lane.is_security()
+        && parsed.findings.iter().any(|finding| {
+            !matches!(
+                finding.confidence_score,
+                Some(score) if score.is_finite() && (0.0..=1.0).contains(&score)
+            )
+        })
+    {
+        bail!("security review findings must use confidence_score values between 0.0 and 1.0");
+    }
+
     let findings = parsed
         .findings
         .into_iter()
         .map(|finding| ReviewFinding {
             title: finding.title,
             body: finding.body,
+            confidence_score: finding.confidence_score,
+            priority: finding.priority,
             code_location: ReviewCodeLocation {
                 absolute_file_path: finding.code_location.absolute_file_path,
                 line_range: ReviewLineRange {
@@ -557,6 +1088,33 @@ fn parse_structured_review_output(parsed: ReviewOutputPayload) -> Result<CodexRe
         })
         .collect::<Vec<_>>();
     let overall_explanation = trim_to_option(parsed.overall_explanation);
+    let overall_confidence_score = parsed.overall_confidence_score;
+    let findings = if lane.is_security() {
+        let threshold = validated_security_min_confidence_score(
+            min_confidence_score,
+            "security review min_confidence_score",
+        )?;
+        findings
+            .into_iter()
+            .filter(|finding| finding.confidence_score.unwrap_or(0.0) >= threshold)
+            .collect::<Vec<_>>()
+    } else {
+        findings
+    };
+    if findings.is_empty() && lane.is_security() {
+        if parsed.overall_correctness.is_none() {
+            bail!("security review output must include overall_correctness");
+        }
+        if parsed.overall_correctness.as_deref() == Some("patch is incorrect")
+            && original_findings_count == 0
+        {
+            bail!("security review marked patch incorrect without confirmed findings");
+        }
+        return Ok(CodexResult::Pass {
+            summary: overall_explanation
+                .unwrap_or_else(|| "no confirmed security issues found".to_string()),
+        });
+    }
     if findings.is_empty()
         && parsed
             .overall_correctness
@@ -571,9 +1129,22 @@ fn parse_structured_review_output(parsed: ReviewOutputPayload) -> Result<CodexRe
     Ok(CodexResult::Comment(ReviewComment {
         summary: summary_from_text(body.as_str()),
         overall_explanation,
+        overall_confidence_score,
         findings,
         body,
     }))
+}
+
+fn validated_security_min_confidence_score(
+    min_confidence_score: Option<f32>,
+    field_name: &str,
+) -> Result<f32> {
+    let threshold = min_confidence_score.unwrap_or(0.85);
+    if threshold.is_finite() && (0.0..=1.0).contains(&threshold) {
+        Ok(threshold)
+    } else {
+        bail!("{field_name} must be a finite number between 0.0 and 1.0");
+    }
 }
 
 fn review_output_payload_looks_structured(payload: &ReviewOutputPayload) -> bool {
@@ -600,6 +1171,7 @@ fn parse_rendered_review_comment(text: &str) -> ReviewComment {
     ReviewComment {
         summary: summary_from_text(text),
         overall_explanation,
+        overall_confidence_score: None,
         findings,
         body: text.to_string(),
     }
@@ -642,6 +1214,8 @@ fn parse_rendered_review_findings(lines: &[&str]) -> Vec<ReviewFinding> {
         findings.push(ReviewFinding {
             title: title.trim().to_string(),
             body: body_lines.join("\n").trim().to_string(),
+            confidence_score: None,
+            priority: None,
             code_location,
         });
     }

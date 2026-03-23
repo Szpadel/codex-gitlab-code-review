@@ -100,11 +100,46 @@ async fn list_in_progress_reviews_returns_only_active_rows() -> Result<()> {
     assert_eq!(
         in_progress,
         vec![InProgressReview {
+            lane: crate::review_lane::ReviewLane::General,
             repo: "group/repo-a".to_string(),
             iid: 1,
             head_sha: "sha1".to_string(),
         }]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_review_context_cache_evicts_expired_rows_on_upsert() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    store
+        .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
+            repo: "group/repo".to_string(),
+            base_branch: "main".to_string(),
+            base_head_sha: "expired-sha".to_string(),
+            prompt_version: "v1".to_string(),
+            payload_json: "{}".to_string(),
+            generated_at: 100,
+            expires_at: 100,
+        })
+        .await?;
+
+    store
+        .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
+            repo: "group/repo".to_string(),
+            base_branch: "main".to_string(),
+            base_head_sha: "fresh-sha".to_string(),
+            prompt_version: "v1".to_string(),
+            payload_json: "{\"ok\":true}".to_string(),
+            generated_at: 200,
+            expires_at: 400,
+        })
+        .await?;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM security_review_context_cache")
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(count, 1);
     Ok(())
 }
 
@@ -739,6 +774,7 @@ async fn runtime_feature_flag_overrides_roundtrip() -> Result<()> {
     let overrides = RuntimeFeatureFlagOverrides {
         gitlab_discovery_mcp: Some(true),
         gitlab_inline_review_comments: Some(false),
+        security_review: Some(false),
         composer_install: Some(true),
         composer_auto_repositories: Some(true),
         composer_safe_install: Some(true),
@@ -769,6 +805,7 @@ async fn run_history_feature_flags_snapshot_roundtrip() -> Result<()> {
     let feature_flags = FeatureFlagSnapshot {
         gitlab_discovery_mcp: true,
         gitlab_inline_review_comments: true,
+        security_review: false,
         composer_install: true,
         composer_auto_repositories: true,
         composer_safe_install: true,
@@ -979,7 +1016,10 @@ async fn list_run_history_cursor_uses_id_as_tie_breaker() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    assert_eq!(first_page.runs.iter().map(|run| run.id).collect::<Vec<_>>(), vec![run_ids[2], run_ids[1]]);
+    assert_eq!(
+        first_page.runs.iter().map(|run| run.id).collect::<Vec<_>>(),
+        vec![run_ids[2], run_ids[1]]
+    );
 
     let second_page = store
         .list_run_history(&RunHistoryListQuery {
@@ -988,7 +1028,14 @@ async fn list_run_history_cursor_uses_id_as_tie_breaker() -> Result<()> {
             ..Default::default()
         })
         .await?;
-    assert_eq!(second_page.runs.iter().map(|run| run.id).collect::<Vec<_>>(), vec![run_ids[0]]);
+    assert_eq!(
+        second_page
+            .runs
+            .iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>(),
+        vec![run_ids[0]]
+    );
     Ok(())
 }
 

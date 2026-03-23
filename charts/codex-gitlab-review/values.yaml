@@ -44,6 +44,7 @@ config:
     # Only takes effect when composerInstall is enabled for a run.
     composerAutoRepositories: false
     composerSafeInstall: false
+    securityReview: false
   schedule:
     cron: "0 * * * * *"
     timezone: "UTC"
@@ -57,6 +58,12 @@ config:
     # Optional. Extra review instructions appended to a synced copy of Codex's
     # upstream review target prompt templates when set.
     additionalDeveloperInstructions: null
+    security:
+      contextTtlSeconds: 1209600
+      minConfidenceScore: 0.85
+      commentMarkerPrefix: "<!-- codex-security-review:sha="
+      findingMarkerPrefix: "<!-- codex-security-review-finding:sha="
+      additionalDeveloperInstructions: null
     mentionCommands:
       enabled: false
       botUsername: null

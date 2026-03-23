@@ -50,6 +50,7 @@ feature_flags:
   # This only has an effect when composer_install is also enabled.
   composer_auto_repositories: false
   composer_safe_install: false
+  security_review: false
 
 review:
   # Required. Max concurrent reviews.
@@ -67,6 +68,18 @@ review:
   # Optional. Extra review instructions appended to a synced copy of Codex's
   # upstream review target prompt templates when set.
   additional_developer_instructions: null
+  # Optional. Dedicated security review lane configuration.
+  security:
+    # Optional. TTL for cached base-branch security context entries in seconds.
+    context_ttl_seconds: 1209600
+    # Optional. Minimum confidence required before a security finding is emitted.
+    min_confidence_score: 0.85
+    # Required. Prefix used to mark security review comments to avoid duplicates.
+    comment_marker_prefix: "<!-- codex-security-review:sha="
+    # Required. Prefix used to mark individual security findings to avoid duplicates.
+    finding_marker_prefix: "<!-- codex-security-review-finding:sha="
+    # Optional. Extra security review instructions appended after the built-in rubric.
+    additional_developer_instructions: null
   # Optional. Mention-triggered thread commands configuration.
   mention_commands:
     # Optional. Enable mention-triggered command execution from MR discussions.

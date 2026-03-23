@@ -1,6 +1,7 @@
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
 use crate::gitlab::GitLabApi;
+use crate::review_lane::ReviewLane;
 use crate::state::ReviewStateStore;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ pub(crate) mod review_comments;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ActiveReviewKey {
+    pub(crate) lane: ReviewLane,
     pub(crate) repo: String,
     pub(crate) iid: u64,
     pub(crate) head_sha: String,

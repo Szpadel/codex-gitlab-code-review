@@ -4,6 +4,7 @@ use crate::gitlab::{
     DiffDiscussionPosition, GitLabApi, MergeRequest, MergeRequestDiff, MergeRequestDiffDiscussion,
     MergeRequestDiffVersion,
 };
+use crate::review_lane::ReviewLane;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
@@ -11,6 +12,13 @@ use url::Url;
 
 const REVIEW_FINDING_MARKER_PREFIX: &str = "<!-- codex-review-finding:sha=";
 const MAX_INLINE_FINDING_LINE_SPAN: usize = 500;
+
+#[derive(Clone, Copy)]
+struct ReviewCommentPostingOptions<'a> {
+    review_label: &'a str,
+    comment_marker_prefix: &'a str,
+    finding_marker_prefix: &'a str,
+}
 
 #[derive(Debug, Clone)]
 struct DiffAnchor {
@@ -27,6 +35,7 @@ struct DiffFileAnchors {
 
 pub(crate) async fn post_review_comment(
     inline_review_comments_enabled: bool,
+    lane: ReviewLane,
     config: &Config,
     gitlab: &dyn GitLabApi,
     bot_user_id: u64,
@@ -36,40 +45,48 @@ pub(crate) async fn post_review_comment(
     head_sha: &str,
     comment: &ReviewComment,
 ) -> Result<()> {
+    let options = posting_options(config, lane);
     let project_web_base = resolve_project_web_base(config, gitlab, repo, mr).await;
     let worktree_root = repo_checkout_root(project_path);
     if !inline_review_comments_enabled || comment.findings.is_empty() {
-        let full_body = legacy_note_body(config, head_sha, &comment.body);
+        let full_body = legacy_note_body(options, head_sha, &comment.body);
         gitlab.create_note(repo, mr.iid, &full_body).await?;
         return Ok(());
     }
 
-    let mut seen_finding_markers =
-        match load_existing_finding_markers(gitlab, repo, mr.iid, bot_user_id).await {
-            Ok(markers) => markers,
-            Err(err) => {
-                warn!(
-                    repo,
-                    iid = mr.iid,
-                    head_sha,
-                    error = %err,
-                    "failed to load existing inline review markers; falling back to regular MR note"
-                );
-                create_fallback_note(
-                    config,
-                    gitlab,
-                    repo,
-                    mr.iid,
-                    head_sha,
-                    comment,
-                    &comment.findings,
-                    project_web_base.as_str(),
-                    worktree_root.as_str(),
-                )
-                .await?;
-                return Ok(());
-            }
-        };
+    let mut seen_finding_markers = match load_existing_finding_markers(
+        gitlab,
+        repo,
+        mr.iid,
+        bot_user_id,
+        options.finding_marker_prefix,
+    )
+    .await
+    {
+        Ok(markers) => markers,
+        Err(err) => {
+            warn!(
+                repo,
+                iid = mr.iid,
+                head_sha,
+                error = %err,
+                "failed to load existing inline review markers; falling back to regular MR note"
+            );
+            create_fallback_note(
+                options,
+                gitlab,
+                repo,
+                mr.iid,
+                head_sha,
+                comment,
+                &comment.findings,
+                project_web_base.as_str(),
+                worktree_root.as_str(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let (latest_version, anchors_by_path) =
         match load_inline_review_context(gitlab, repo, mr.iid, head_sha).await {
             Ok(Some((latest_version, anchors_by_path))) => (Some(latest_version), anchors_by_path),
@@ -89,7 +106,7 @@ pub(crate) async fn post_review_comment(
     let mut fallback_findings = Vec::new();
     let mut findings = comment.findings.iter().peekable();
     while let Some(finding) = findings.next() {
-        let marker = finding_marker(head_sha, finding);
+        let marker = finding_marker(options.finding_marker_prefix, head_sha, finding);
         if !seen_finding_markers.insert(marker.clone()) {
             continue;
         }
@@ -98,6 +115,7 @@ pub(crate) async fn post_review_comment(
             finding,
             latest_version.as_ref(),
             &anchors_by_path,
+            options,
             head_sha,
             project_web_base.as_str(),
             worktree_root.as_str(),
@@ -115,7 +133,7 @@ pub(crate) async fn post_review_comment(
             );
             fallback_findings.push(finding.clone());
             for remaining in findings {
-                let marker = finding_marker(head_sha, remaining);
+                let marker = finding_marker(options.finding_marker_prefix, head_sha, remaining);
                 if seen_finding_markers.insert(marker) {
                     fallback_findings.push(remaining.clone());
                 }
@@ -126,7 +144,7 @@ pub(crate) async fn post_review_comment(
 
     if !fallback_findings.is_empty() || comment.overall_explanation.is_some() {
         create_fallback_note(
-            config,
+            options,
             gitlab,
             repo,
             mr.iid,
@@ -168,6 +186,7 @@ fn build_inline_discussion(
     finding: &ReviewFinding,
     latest_version: Option<&MergeRequestDiffVersion>,
     anchors_by_path: &HashMap<String, DiffFileAnchors>,
+    options: ReviewCommentPostingOptions<'_>,
     head_sha: &str,
     project_web_base: &str,
     worktree_root: &str,
@@ -182,7 +201,7 @@ fn build_inline_discussion(
 
     let body = format!(
         "{}\n\n{}\n\n{}",
-        finding.title,
+        inline_discussion_title(options, finding),
         rewrite_code_references(
             &finding.body,
             relative_path.as_str(),
@@ -190,7 +209,7 @@ fn build_inline_discussion(
             head_sha,
             worktree_root,
         ),
-        finding_marker(head_sha, finding)
+        finding_marker(options.finding_marker_prefix, head_sha, finding)
     );
 
     Some(MergeRequestDiffDiscussion {
@@ -308,7 +327,7 @@ fn select_anchor(anchors: &DiffFileAnchors, finding: &ReviewFinding) -> Option<D
 }
 
 fn build_fallback_note_body(
-    config: &Config,
+    options: ReviewCommentPostingOptions<'_>,
     head_sha: &str,
     comment: &ReviewComment,
     fallback_findings: &[ReviewFinding],
@@ -331,6 +350,7 @@ fn build_fallback_note_body(
     }
     if !fallback_findings.is_empty() {
         sections.push(render_fallback_findings(
+            options,
             head_sha,
             fallback_findings,
             project_web_base,
@@ -343,18 +363,22 @@ fn build_fallback_note_body(
         body.push_str("\n\n");
     }
     for finding in fallback_findings {
-        body.push_str(&finding_marker(head_sha, finding));
+        body.push_str(&finding_marker(
+            options.finding_marker_prefix,
+            head_sha,
+            finding,
+        ));
         body.push('\n');
     }
     body.push_str(&format!(
         "{}{} -->",
-        config.review.comment_marker_prefix, head_sha
+        options.comment_marker_prefix, head_sha
     ));
     Some(body)
 }
 
 async fn create_fallback_note(
-    config: &Config,
+    options: ReviewCommentPostingOptions<'_>,
     gitlab: &dyn GitLabApi,
     repo: &str,
     iid: u64,
@@ -365,34 +389,52 @@ async fn create_fallback_note(
     worktree_root: &str,
 ) -> Result<()> {
     let body = build_fallback_note_body(
-        config,
+        options,
         head_sha,
         comment,
         fallback_findings,
         project_web_base,
         worktree_root,
     )
-    .unwrap_or_else(|| legacy_note_body(config, head_sha, &comment.body));
+    .unwrap_or_else(|| legacy_note_body(options, head_sha, &comment.body));
     gitlab.create_note(repo, iid, &body).await
 }
 
-fn legacy_note_body(config: &Config, head_sha: &str, body: &str) -> String {
-    format!(
-        "{}\n\n{}{} -->",
-        body, config.review.comment_marker_prefix, head_sha
-    )
+fn legacy_note_body(
+    options: ReviewCommentPostingOptions<'_>,
+    head_sha: &str,
+    body: &str,
+) -> String {
+    if options.review_label == "Review" {
+        format!(
+            "{body}\n\n{}{} -->",
+            options.comment_marker_prefix, head_sha
+        )
+    } else {
+        format!(
+            "{}\n\n{}\n\n{}{} -->",
+            options.review_label, body, options.comment_marker_prefix, head_sha
+        )
+    }
 }
 
 fn render_fallback_findings(
+    options: ReviewCommentPostingOptions<'_>,
     head_sha: &str,
     findings: &[ReviewFinding],
     project_web_base: &str,
     worktree_root: &str,
 ) -> String {
-    let mut lines = vec![if findings.len() > 1 {
-        "Full review comments:".to_string()
+    let mut lines = vec![if options.review_label == "Review" {
+        if findings.len() > 1 {
+            "Full review comments:".to_string()
+        } else {
+            "Review comment:".to_string()
+        }
+    } else if findings.len() > 1 {
+        format!("Full {} comments:", options.review_label.to_lowercase())
     } else {
-        "Review comment:".to_string()
+        format!("{} comment:", options.review_label)
     }];
 
     for finding in findings {
@@ -448,10 +490,10 @@ fn format_location(finding: &ReviewFinding, worktree_root: &str) -> String {
     )
 }
 
-fn load_existing_finding_markers_from_text(text: &str) -> HashSet<String> {
+fn load_existing_finding_markers_from_text(text: &str, prefix: &str) -> HashSet<String> {
     let mut markers = HashSet::new();
     let mut remaining = text;
-    while let Some(start) = remaining.find(REVIEW_FINDING_MARKER_PREFIX) {
+    while let Some(start) = remaining.find(prefix) {
         let slice = &remaining[start..];
         let Some(end) = slice.find(" -->") else {
             break;
@@ -467,26 +509,60 @@ async fn load_existing_finding_markers(
     repo: &str,
     iid: u64,
     bot_user_id: u64,
+    finding_marker_prefix: &str,
 ) -> Result<HashSet<String>> {
     let mut markers = HashSet::new();
     for note in gitlab.list_notes(repo, iid).await? {
         if note.author.id == bot_user_id {
-            markers.extend(load_existing_finding_markers_from_text(&note.body));
+            markers.extend(load_existing_finding_markers_from_text(
+                &note.body,
+                finding_marker_prefix,
+            ));
         }
     }
     for discussion in gitlab.list_discussions(repo, iid).await? {
         for note in discussion.notes {
             if note.author.id == bot_user_id {
-                markers.extend(load_existing_finding_markers_from_text(&note.body));
+                markers.extend(load_existing_finding_markers_from_text(
+                    &note.body,
+                    finding_marker_prefix,
+                ));
             }
         }
     }
     Ok(markers)
 }
 
-fn finding_marker(head_sha: &str, finding: &ReviewFinding) -> String {
+fn finding_marker(finding_marker_prefix: &str, head_sha: &str, finding: &ReviewFinding) -> String {
     let fingerprint = finding_fingerprint(finding);
-    format!("{REVIEW_FINDING_MARKER_PREFIX}{head_sha} key={fingerprint} -->")
+    format!("{finding_marker_prefix}{head_sha} key={fingerprint} -->")
+}
+
+fn posting_options(config: &Config, lane: ReviewLane) -> ReviewCommentPostingOptions<'_> {
+    if lane.is_security() {
+        ReviewCommentPostingOptions {
+            review_label: lane.review_label(),
+            comment_marker_prefix: &config.review.security.comment_marker_prefix,
+            finding_marker_prefix: &config.review.security.finding_marker_prefix,
+        }
+    } else {
+        ReviewCommentPostingOptions {
+            review_label: lane.review_label(),
+            comment_marker_prefix: &config.review.comment_marker_prefix,
+            finding_marker_prefix: REVIEW_FINDING_MARKER_PREFIX,
+        }
+    }
+}
+
+fn inline_discussion_title(
+    options: ReviewCommentPostingOptions<'_>,
+    finding: &ReviewFinding,
+) -> String {
+    if options.review_label == "Review" {
+        finding.title.clone()
+    } else {
+        format!("Security finding: {}", finding.title)
+    }
 }
 
 fn finding_fingerprint(finding: &ReviewFinding) -> String {
@@ -722,13 +798,18 @@ mod tests {
         let finding = ReviewFinding {
             title: "Title".to_string(),
             body: "Body".to_string(),
+            confidence_score: None,
+            priority: None,
             code_location: crate::codex_runner::ReviewCodeLocation {
                 absolute_file_path: format!("{worktree_root}/src/lib.rs"),
                 line_range: crate::codex_runner::ReviewLineRange { start: 3, end: 4 },
             },
         };
-        let marker = finding_marker("sha1", &finding);
-        let markers = load_existing_finding_markers_from_text(&format!("note\n{marker}\nother"));
+        let marker = finding_marker(REVIEW_FINDING_MARKER_PREFIX, "sha1", &finding);
+        let markers = load_existing_finding_markers_from_text(
+            &format!("note\n{marker}\nother"),
+            REVIEW_FINDING_MARKER_PREFIX,
+        );
         assert!(markers.contains(&marker));
     }
 
@@ -809,6 +890,8 @@ mod tests {
         let finding = ReviewFinding {
             title: "Too wide".to_string(),
             body: "Body".to_string(),
+            confidence_score: None,
+            priority: None,
             code_location: crate::codex_runner::ReviewCodeLocation {
                 absolute_file_path: format!("{worktree_root}/src/lib.rs"),
                 line_range: crate::codex_runner::ReviewLineRange {

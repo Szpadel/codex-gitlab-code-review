@@ -5,6 +5,7 @@ use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
 use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome};
 use crate::flow::{ActiveTaskRegistry, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest};
+use crate::review_lane::ReviewLane;
 use crate::state::ReviewStateStore;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
@@ -40,10 +41,16 @@ enum RepoScanStatus {
 struct ScanCounters {
     total_mrs: usize,
     scheduled: usize,
+    security_scheduled: usize,
     mention_scheduled: usize,
     skipped_award: usize,
     skipped_marker: usize,
+    skipped_completed: usize,
     skipped_locked: usize,
+    security_skipped_marker: usize,
+    security_skipped_completed: usize,
+    security_skipped_locked: usize,
+    security_skipped_backoff: usize,
     mention_skipped_processed: usize,
     skipped_backoff: usize,
     missing_sha: usize,
@@ -57,7 +64,8 @@ pub struct ReviewService {
     state: Arc<ReviewStateStore>,
     codex: Arc<dyn CodexRunner>,
     created_after: DateTime<Utc>,
-    review_flow: ReviewFlow,
+    general_review_flow: ReviewFlow,
+    security_review_flow: ReviewFlow,
     mention_flow: MentionFlow,
     shutdown: Arc<AtomicBool>,
     active_tasks: Arc<ActiveTaskRegistry>,
@@ -88,14 +96,21 @@ impl ReviewService {
             Arc::clone(&active_tasks),
         );
         let mention_flow = MentionFlow::new(flow_shared.clone(), mention_branch_locks);
-        let review_flow = ReviewFlow::new(flow_shared, retry_backoff);
+        let general_review_flow = ReviewFlow::new(
+            flow_shared.clone(),
+            Arc::clone(&retry_backoff),
+            ReviewLane::General,
+        );
+        let security_review_flow =
+            ReviewFlow::new(flow_shared, retry_backoff, ReviewLane::Security);
         Self {
             config,
             gitlab,
             state,
             codex,
             created_after,
-            review_flow,
+            general_review_flow,
+            security_review_flow,
             mention_flow,
             shutdown,
             active_tasks,
@@ -127,7 +142,11 @@ impl ReviewService {
     }
 
     async fn recover_flows(&self) -> Result<()> {
-        let flows: [&dyn MergeRequestFlow; 2] = [&self.review_flow, &self.mention_flow];
+        let flows: [&dyn MergeRequestFlow; 3] = [
+            &self.general_review_flow,
+            &self.security_review_flow,
+            &self.mention_flow,
+        ];
         for flow in flows {
             debug!(flow = flow.flow_name(), "recover in-progress flow state");
             flow.recover_in_progress().await?;
@@ -137,7 +156,11 @@ impl ReviewService {
 
     async fn clear_stale_flow_state(&self) -> Result<()> {
         self.refresh_active_flow_state().await?;
-        let flows: [&dyn MergeRequestFlow; 2] = [&self.review_flow, &self.mention_flow];
+        let flows: [&dyn MergeRequestFlow; 3] = [
+            &self.general_review_flow,
+            &self.security_review_flow,
+            &self.mention_flow,
+        ];
         for flow in flows {
             flow.clear_stale_in_progress().await?;
         }
@@ -147,7 +170,12 @@ impl ReviewService {
     async fn refresh_active_flow_state(&self) -> Result<()> {
         for review in self.active_tasks.active_reviews() {
             self.state
-                .touch_in_progress_review(&review.repo, review.iid, &review.head_sha)
+                .touch_in_progress_review_for_lane(
+                    &review.repo,
+                    review.iid,
+                    &review.head_sha,
+                    review.lane,
+                )
                 .await?;
         }
         for mention in self.active_tasks.active_mentions() {
@@ -179,6 +207,104 @@ impl ReviewService {
         counters.mention_scheduled += outcome.scheduled;
         counters.mention_skipped_processed += outcome.skipped_processed;
         Ok(outcome)
+    }
+
+    fn apply_review_outcome(
+        &self,
+        lane: ReviewLane,
+        repo: &str,
+        iid: u64,
+        outcome: ReviewScheduleOutcome,
+        counters: &mut ScanCounters,
+        pending_same_mr_work: &mut bool,
+    ) -> Result<Option<RepoScanStatus>> {
+        match (lane, outcome) {
+            (_, ReviewScheduleOutcome::Scheduled) => {
+                if lane.is_security() {
+                    counters.security_scheduled += 1;
+                } else {
+                    counters.scheduled += 1;
+                }
+            }
+            (_, ReviewScheduleOutcome::Disabled) => {}
+            (ReviewLane::General, ReviewScheduleOutcome::SkippedBackoff) => {
+                counters.skipped_backoff += 1;
+                debug!(repo = repo, iid = iid, "skip: review backoff active");
+            }
+            (ReviewLane::Security, ReviewScheduleOutcome::SkippedBackoff) => {
+                counters.security_skipped_backoff += 1;
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: security review backoff active"
+                );
+            }
+            (ReviewLane::General, ReviewScheduleOutcome::SkippedAward) => {
+                counters.skipped_award += 1;
+                debug!(repo = repo, iid = iid, "skip: thumbs up already present");
+            }
+            (ReviewLane::General, ReviewScheduleOutcome::SkippedMarker) => {
+                counters.skipped_marker += 1;
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: review marker already present"
+                );
+            }
+            (ReviewLane::Security, ReviewScheduleOutcome::SkippedMarker) => {
+                counters.security_skipped_marker += 1;
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: security review marker already present"
+                );
+            }
+            (ReviewLane::General, ReviewScheduleOutcome::SkippedCompleted) => {
+                counters.skipped_completed += 1;
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: review already completed for this SHA"
+                );
+            }
+            (ReviewLane::Security, ReviewScheduleOutcome::SkippedCompleted) => {
+                counters.security_skipped_completed += 1;
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: security review already completed for this SHA"
+                );
+            }
+            (ReviewLane::General, ReviewScheduleOutcome::SkippedLocked) => {
+                counters.skipped_locked += 1;
+                *pending_same_mr_work = true;
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: same-MR work already in progress"
+                );
+            }
+            (ReviewLane::Security, ReviewScheduleOutcome::SkippedLocked) => {
+                counters.security_skipped_locked += 1;
+                *pending_same_mr_work = true;
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: same-MR work already in progress for security review"
+                );
+            }
+            (_, ReviewScheduleOutcome::Interrupted) => {
+                return Ok(Some(RepoScanStatus::Interrupted));
+            }
+            (ReviewLane::Security, ReviewScheduleOutcome::SkippedAward) => {
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: security review returned award outcome"
+                );
+            }
+        }
+        Ok(None)
     }
 
     async fn scan(&self, mode: ScanMode) -> Result<ScanRunStatus> {
@@ -263,10 +389,16 @@ impl ReviewService {
                 info!(
                     total_mrs = counters.total_mrs,
                     scheduled = counters.scheduled,
+                    security_scheduled = counters.security_scheduled,
                     mention_scheduled = counters.mention_scheduled,
                     skipped_award = counters.skipped_award,
                     skipped_marker = counters.skipped_marker,
+                    skipped_completed = counters.skipped_completed,
                     skipped_locked = counters.skipped_locked,
+                    security_skipped_marker = counters.security_skipped_marker,
+                    security_skipped_completed = counters.security_skipped_completed,
+                    security_skipped_locked = counters.security_skipped_locked,
+                    security_skipped_backoff = counters.security_skipped_backoff,
                     mention_skipped_processed = counters.mention_skipped_processed,
                     skipped_backoff = counters.skipped_backoff,
                     missing_sha = counters.missing_sha,
@@ -278,10 +410,16 @@ impl ReviewService {
                 info!(
                     total_mrs = counters.total_mrs,
                     scheduled = counters.scheduled,
+                    security_scheduled = counters.security_scheduled,
                     mention_scheduled = counters.mention_scheduled,
                     skipped_award = counters.skipped_award,
                     skipped_marker = counters.skipped_marker,
+                    skipped_completed = counters.skipped_completed,
                     skipped_locked = counters.skipped_locked,
+                    security_skipped_marker = counters.security_skipped_marker,
+                    security_skipped_completed = counters.security_skipped_completed,
+                    security_skipped_locked = counters.security_skipped_locked,
+                    security_skipped_backoff = counters.security_skipped_backoff,
                     mention_skipped_processed = counters.mention_skipped_processed,
                     skipped_backoff = counters.skipped_backoff,
                     missing_sha = counters.missing_sha,
@@ -526,41 +664,32 @@ impl ReviewService {
             }
             let mr_iid = mr.iid;
             let review_outcome = self
-                .review_flow
+                .general_review_flow
+                .schedule_for_scan(repo, mr.clone(), &head_sha, tasks)
+                .await?;
+            if let Some(status) = self.apply_review_outcome(
+                ReviewLane::General,
+                repo,
+                mr_iid,
+                review_outcome,
+                counters,
+                &mut pending_same_mr_work,
+            )? {
+                return Ok(status);
+            }
+            let security_review_outcome = self
+                .security_review_flow
                 .schedule_for_scan(repo, mr, &head_sha, tasks)
                 .await?;
-            match review_outcome {
-                ReviewScheduleOutcome::Scheduled => {
-                    counters.scheduled += 1;
-                }
-                ReviewScheduleOutcome::SkippedBackoff => {
-                    counters.skipped_backoff += 1;
-                    debug!(repo = repo, iid = mr_iid, "skip: review backoff active");
-                }
-                ReviewScheduleOutcome::SkippedAward => {
-                    counters.skipped_award += 1;
-                    debug!(repo = repo, iid = mr_iid, "skip: thumbs up already present");
-                }
-                ReviewScheduleOutcome::SkippedMarker => {
-                    counters.skipped_marker += 1;
-                    debug!(
-                        repo = repo,
-                        iid = mr_iid,
-                        "skip: review marker already present"
-                    );
-                }
-                ReviewScheduleOutcome::SkippedLocked => {
-                    counters.skipped_locked += 1;
-                    pending_same_mr_work = true;
-                    debug!(
-                        repo = repo,
-                        iid = mr_iid,
-                        "skip: same-MR work already in progress"
-                    );
-                }
-                ReviewScheduleOutcome::Interrupted => {
-                    return Ok(RepoScanStatus::Interrupted);
-                }
+            if let Some(status) = self.apply_review_outcome(
+                ReviewLane::Security,
+                repo,
+                mr_iid,
+                security_review_outcome,
+                counters,
+                &mut pending_same_mr_work,
+            )? {
+                return Ok(status);
             }
         }
         Ok(if pending_same_mr_work {
@@ -635,7 +764,14 @@ impl ReviewService {
             );
             return Ok(());
         }
-        let _ = self.review_flow.run_for_mr(repo, mr, &head_sha).await?;
+        let _ = self
+            .general_review_flow
+            .run_for_mr(repo, mr.clone(), &head_sha)
+            .await?;
+        let _ = self
+            .security_review_flow
+            .run_for_mr(repo, mr, &head_sha)
+            .await?;
         Ok(())
     }
 }

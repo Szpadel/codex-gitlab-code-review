@@ -1,13 +1,12 @@
 use crate::feature_flags::{FeatureFlagSnapshot, RuntimeFeatureFlagOverrides};
+use crate::review_lane::ReviewLane;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool,
-    sqlite::{
-        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-    },
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
@@ -211,9 +210,21 @@ pub struct RunHistoryEventRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InProgressReview {
+    pub lane: ReviewLane,
     pub repo: String,
     pub iid: u64,
     pub head_sha: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityReviewContextCacheEntry {
+    pub repo: String,
+    pub base_branch: String,
+    pub base_head_sha: String,
+    pub prompt_version: String,
+    pub payload_json: String,
+    pub generated_at: i64,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -334,18 +345,31 @@ impl ReviewStateStore {
     }
 
     pub async fn begin_review(&self, repo: &str, iid: u64, sha: &str) -> Result<bool> {
+        self.begin_review_for_lane(repo, iid, sha, ReviewLane::General)
+            .await
+    }
+
+    pub async fn begin_review_for_lane(
+        &self,
+        repo: &str,
+        iid: u64,
+        sha: &str,
+        lane: ReviewLane,
+    ) -> Result<bool> {
         let now = Utc::now().timestamp();
         let mut tx = self
             .pool
             .begin()
             .await
             .context("start sqlite transaction")?;
-        let row = sqlx::query("SELECT status FROM review_state WHERE repo = ? AND iid = ?")
-            .bind(repo)
-            .bind(iid as i64)
-            .fetch_optional(&mut *tx)
-            .await
-            .context("load existing review state")?;
+        let row =
+            sqlx::query("SELECT status FROM review_state WHERE repo = ? AND iid = ? AND lane = ?")
+                .bind(repo)
+                .bind(iid as i64)
+                .bind(lane.as_str())
+                .fetch_optional(&mut *tx)
+                .await
+                .context("load existing review state")?;
         if let Some(existing) = row {
             let status: String = existing.try_get("status").context("read review status")?;
             if status == "in_progress" {
@@ -355,9 +379,9 @@ impl ReviewStateStore {
         }
         sqlx::query(
             r#"
-            INSERT INTO review_state (repo, iid, head_sha, status, started_at, updated_at)
-            VALUES (?, ?, ?, 'in_progress', ?, ?)
-            ON CONFLICT(repo, iid) DO UPDATE SET
+            INSERT INTO review_state (repo, iid, lane, head_sha, status, started_at, updated_at)
+            VALUES (?, ?, ?, ?, 'in_progress', ?, ?)
+            ON CONFLICT(repo, iid, lane) DO UPDATE SET
                 head_sha = excluded.head_sha,
                 status = 'in_progress',
                 started_at = excluded.started_at,
@@ -367,6 +391,7 @@ impl ReviewStateStore {
         )
         .bind(repo)
         .bind(iid as i64)
+        .bind(lane.as_str())
         .bind(sha)
         .bind(now)
         .bind(now)
@@ -378,12 +403,24 @@ impl ReviewStateStore {
     }
 
     pub async fn finish_review(&self, repo: &str, iid: u64, sha: &str, result: &str) -> Result<()> {
+        self.finish_review_for_lane(repo, iid, sha, ReviewLane::General, result)
+            .await
+    }
+
+    pub async fn finish_review_for_lane(
+        &self,
+        repo: &str,
+        iid: u64,
+        sha: &str,
+        lane: ReviewLane,
+        result: &str,
+    ) -> Result<()> {
         let now = Utc::now().timestamp();
         sqlx::query(
             r#"
             UPDATE review_state
             SET status = 'done', head_sha = ?, result = ?, updated_at = ?
-            WHERE repo = ? AND iid = ? AND head_sha = ? AND status = 'in_progress'
+            WHERE repo = ? AND iid = ? AND lane = ? AND head_sha = ? AND status = 'in_progress'
             "#,
         )
         .bind(sha)
@@ -391,6 +428,7 @@ impl ReviewStateStore {
         .bind(now)
         .bind(repo)
         .bind(iid as i64)
+        .bind(lane.as_str())
         .bind(sha)
         .execute(&self.pool)
         .await
@@ -404,11 +442,23 @@ impl ReviewStateStore {
         iid: u64,
         sha: &str,
     ) -> Result<bool> {
+        self.has_completed_inline_review_for_lane(repo, iid, sha, ReviewLane::General)
+            .await
+    }
+
+    pub async fn has_completed_inline_review_for_lane(
+        &self,
+        repo: &str,
+        iid: u64,
+        sha: &str,
+        lane: ReviewLane,
+    ) -> Result<bool> {
         let row = sqlx::query(
             r#"
             SELECT 1
             FROM run_history
             WHERE kind = 'review'
+              AND review_lane = ?
               AND repo = ?
               AND iid = ?
               AND head_sha = ?
@@ -418,6 +468,7 @@ impl ReviewStateStore {
             LIMIT 1
             "#,
         )
+        .bind(lane.as_str())
         .bind(repo)
         .bind(iid as i64)
         .bind(sha)
@@ -432,12 +483,24 @@ impl ReviewStateStore {
     }
 
     pub async fn review_result(&self, repo: &str, iid: u64, sha: &str) -> Result<Option<String>> {
+        self.review_result_for_lane(repo, iid, sha, ReviewLane::General)
+            .await
+    }
+
+    pub async fn review_result_for_lane(
+        &self,
+        repo: &str,
+        iid: u64,
+        sha: &str,
+        lane: ReviewLane,
+    ) -> Result<Option<String>> {
         let row = sqlx::query(
             r#"
             SELECT result
             FROM review_state
             WHERE repo = ?
               AND iid = ?
+              AND lane = ?
               AND head_sha = ?
               AND status = 'done'
             LIMIT 1
@@ -445,6 +508,7 @@ impl ReviewStateStore {
         )
         .bind(repo)
         .bind(iid as i64)
+        .bind(lane.as_str())
         .bind(sha)
         .fetch_optional(&self.pool)
         .await
@@ -455,10 +519,10 @@ impl ReviewStateStore {
     pub async fn list_in_progress_reviews(&self) -> Result<Vec<InProgressReview>> {
         let rows = sqlx::query(
             r#"
-            SELECT repo, iid, head_sha
+            SELECT repo, iid, lane, head_sha
             FROM review_state
             WHERE status = 'in_progress'
-            ORDER BY repo, iid
+            ORDER BY repo, iid, lane
             "#,
         )
         .fetch_all(&self.pool)
@@ -470,8 +534,14 @@ impl ReviewStateStore {
                 let repo: String = row.try_get("repo").context("read review repo")?;
                 let iid_raw: i64 = row.try_get("iid").context("read review iid")?;
                 let iid = u64::try_from(iid_raw).context("convert review iid to u64")?;
+                let lane = parse_review_lane(
+                    row.try_get::<String, _>("lane")
+                        .context("read review lane")?
+                        .as_str(),
+                )?;
                 let head_sha: String = row.try_get("head_sha").context("read review head sha")?;
                 Ok(InProgressReview {
+                    lane,
                     repo,
                     iid,
                     head_sha,
@@ -517,21 +587,117 @@ impl ReviewStateStore {
     }
 
     pub async fn touch_in_progress_review(&self, repo: &str, iid: u64, sha: &str) -> Result<()> {
+        self.touch_in_progress_review_for_lane(repo, iid, sha, ReviewLane::General)
+            .await
+    }
+
+    pub async fn touch_in_progress_review_for_lane(
+        &self,
+        repo: &str,
+        iid: u64,
+        sha: &str,
+        lane: ReviewLane,
+    ) -> Result<()> {
         let now = Utc::now().timestamp();
         sqlx::query(
             r#"
             UPDATE review_state
             SET updated_at = ?
-            WHERE repo = ? AND iid = ? AND head_sha = ? AND status = 'in_progress'
+            WHERE repo = ? AND iid = ? AND lane = ? AND head_sha = ? AND status = 'in_progress'
             "#,
         )
         .bind(now)
         .bind(repo)
         .bind(iid as i64)
+        .bind(lane.as_str())
         .bind(sha)
         .execute(&self.pool)
         .await
         .context("touch in-progress review")?;
+        Ok(())
+    }
+
+    pub async fn get_security_review_context_cache(
+        &self,
+        repo: &str,
+        base_branch: &str,
+        base_head_sha: &str,
+        prompt_version: &str,
+        now: i64,
+    ) -> Result<Option<SecurityReviewContextCacheEntry>> {
+        self.delete_expired_security_review_context_cache(now)
+            .await?;
+        let row = sqlx::query(
+            r#"
+            SELECT repo, base_branch, base_head_sha, prompt_version, payload_json, generated_at, expires_at
+            FROM security_review_context_cache
+            WHERE repo = ?
+              AND base_branch = ?
+              AND base_head_sha = ?
+              AND prompt_version = ?
+              AND expires_at > ?
+            LIMIT 1
+            "#,
+        )
+        .bind(repo)
+        .bind(base_branch)
+        .bind(base_head_sha)
+        .bind(prompt_version)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load security review context cache")?;
+        row.map(map_security_review_context_cache_entry).transpose()
+    }
+
+    pub async fn upsert_security_review_context_cache(
+        &self,
+        entry: &SecurityReviewContextCacheEntry,
+    ) -> Result<()> {
+        self.delete_expired_security_review_context_cache(entry.generated_at)
+            .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO security_review_context_cache (
+                repo,
+                base_branch,
+                base_head_sha,
+                prompt_version,
+                payload_json,
+                generated_at,
+                expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(repo, base_branch, base_head_sha, prompt_version) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                generated_at = excluded.generated_at,
+                expires_at = excluded.expires_at
+            "#,
+        )
+        .bind(&entry.repo)
+        .bind(&entry.base_branch)
+        .bind(&entry.base_head_sha)
+        .bind(&entry.prompt_version)
+        .bind(&entry.payload_json)
+        .bind(entry.generated_at)
+        .bind(entry.expires_at)
+        .execute(&self.pool)
+        .await
+        .context("upsert security review context cache")?;
+        Ok(())
+    }
+
+    async fn delete_expired_security_review_context_cache(&self, now: i64) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM security_review_context_cache
+            WHERE expires_at <= ?
+            "#,
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("delete expired security review context cache")?;
         Ok(())
     }
 
@@ -803,11 +969,24 @@ impl ReviewStateStore {
     }
 
     pub async fn start_run_history(&self, new_run: NewRunHistory) -> Result<i64> {
+        let review_lane = match new_run.kind {
+            RunHistoryKind::Review => Some(ReviewLane::General),
+            RunHistoryKind::Mention => None,
+        };
+        self.start_run_history_for_lane(new_run, review_lane).await
+    }
+
+    pub async fn start_run_history_for_lane(
+        &self,
+        new_run: NewRunHistory,
+        review_lane: Option<ReviewLane>,
+    ) -> Result<i64> {
         let now = Utc::now().timestamp();
         let result = sqlx::query(
             r#"
             INSERT INTO run_history (
                 kind,
+                review_lane,
                 repo,
                 iid,
                 head_sha,
@@ -820,10 +999,11 @@ impl ReviewStateStore {
                 trigger_note_body,
                 command_repo
             )
-            VALUES (?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(run_history_kind_label(new_run.kind))
+        .bind(review_lane.map(ReviewLane::as_str))
         .bind(new_run.repo)
         .bind(new_run.iid as i64)
         .bind(new_run.head_sha)
@@ -1173,7 +1353,7 @@ impl ReviewStateStore {
     ) -> Result<Vec<RunHistoryRecord>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
+            SELECT id, kind, review_lane, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
                    command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
@@ -1194,7 +1374,7 @@ impl ReviewStateStore {
     pub async fn get_run_history(&self, run_id: i64) -> Result<Option<RunHistoryRecord>> {
         let row = sqlx::query(
             r#"
-            SELECT id, kind, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
+            SELECT id, kind, review_lane, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
                    command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
@@ -1220,7 +1400,7 @@ impl ReviewStateStore {
 
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
-            SELECT id, kind, repo, iid, status, result, started_at, preview, summary
+            SELECT id, kind, review_lane, repo, iid, status, result, started_at, preview, summary
             FROM run_history
             "#,
         );
@@ -1759,6 +1939,14 @@ fn parse_run_history_kind(value: &str) -> Result<RunHistoryKind> {
     }
 }
 
+fn parse_review_lane(value: &str) -> Result<ReviewLane> {
+    match value {
+        "general" => Ok(ReviewLane::General),
+        "security" => Ok(ReviewLane::Security),
+        other => bail!("unknown review lane: {other}"),
+    }
+}
+
 fn transcript_backfill_state_label(state: TranscriptBackfillState) -> &'static str {
     match state {
         TranscriptBackfillState::NotRequested => "not_requested",
@@ -1892,9 +2080,7 @@ fn map_run_history_list_item_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHist
                 .context("read run history list kind")?
                 .as_str(),
         )?,
-        repo: row
-            .try_get("repo")
-            .context("read run history list repo")?,
+        repo: row.try_get("repo").context("read run history list repo")?,
         iid: u64::try_from(iid_raw).context("convert run history list iid to u64")?,
         status: row
             .try_get("status")
@@ -1911,6 +2097,34 @@ fn map_run_history_list_item_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHist
         summary: row
             .try_get("summary")
             .context("read run history list summary")?,
+    })
+}
+
+fn map_security_review_context_cache_entry(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<SecurityReviewContextCacheEntry> {
+    Ok(SecurityReviewContextCacheEntry {
+        repo: row
+            .try_get("repo")
+            .context("read security review cache repo")?,
+        base_branch: row
+            .try_get("base_branch")
+            .context("read security review cache base_branch")?,
+        base_head_sha: row
+            .try_get("base_head_sha")
+            .context("read security review cache base_head_sha")?,
+        prompt_version: row
+            .try_get("prompt_version")
+            .context("read security review cache prompt_version")?,
+        payload_json: row
+            .try_get("payload_json")
+            .context("read security review cache payload_json")?,
+        generated_at: row
+            .try_get("generated_at")
+            .context("read security review cache generated_at")?,
+        expires_at: row
+            .try_get("expires_at")
+            .context("read security review cache expires_at")?,
     })
 }
 

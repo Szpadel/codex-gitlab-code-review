@@ -6,8 +6,8 @@ use crate::codex_runner::{
 };
 use crate::config::{
     CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
-    McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
-    ServerConfig, TargetSelector,
+    McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ReviewSecurityConfig,
+    ScheduleConfig, ServerConfig, TargetSelector,
 };
 use crate::flow::mention::{contains_mention, extract_parent_chain};
 use crate::flow::review::{RetryKey, ReviewRunContext};
@@ -996,6 +996,7 @@ fn test_config() -> Config {
             stale_in_progress_minutes: 60,
             dry_run: false,
             additional_developer_instructions: None,
+            security: ReviewSecurityConfig::default(),
             mention_commands: ReviewMentionCommandsConfig::default(),
         },
         codex: CodexConfig {
@@ -1233,11 +1234,14 @@ async fn inline_review_comments_post_inline_discussions_and_fallback_note() -> R
                     "Overall see /work/repo/group/repo/src/other.rs:8 for fallback context."
                         .to_string(),
                 ),
+                overall_confidence_score: None,
                 findings: vec![
                     crate::codex_runner::ReviewFinding {
                         title: "Inline finding".to_string(),
                         body: "Please fix /work/repo/group/repo/src/lib.rs:10 before merging."
                             .to_string(),
+                        confidence_score: None,
+                        priority: None,
                         code_location: crate::codex_runner::ReviewCodeLocation {
                             absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                             line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
@@ -1247,6 +1251,8 @@ async fn inline_review_comments_post_inline_discussions_and_fallback_note() -> R
                         title: "Fallback finding".to_string(),
                         body: "This remains unresolved near /work/repo/group/repo/src/other.rs:8."
                             .to_string(),
+                        confidence_score: None,
+                        priority: None,
                         code_location: crate::codex_runner::ReviewCodeLocation {
                             absolute_file_path: "/work/repo/group/repo/src/other.rs".to_string(),
                             line_range: crate::codex_runner::ReviewLineRange { start: 8, end: 8 },
@@ -1335,10 +1341,13 @@ async fn inline_review_comments_fallback_to_plain_note_when_no_diff_anchor_exist
             crate::codex_runner::ReviewComment {
                 summary: "needs changes".to_string(),
                 overall_explanation: None,
+                overall_confidence_score: None,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Fallback only".to_string(),
                     body: "See /work/repo/group/repo/src/lib.rs:30 for the broken call."
                         .to_string(),
+                    confidence_score: None,
+                    priority: None,
                     code_location: crate::codex_runner::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                         line_range: crate::codex_runner::ReviewLineRange { start: 30, end: 30 },
@@ -1683,9 +1692,12 @@ async fn inline_review_comments_fallback_when_head_sha_no_longer_matches_latest_
             crate::codex_runner::ReviewComment {
                 summary: "needs changes".to_string(),
                 overall_explanation: None,
+                overall_confidence_score: None,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Head moved".to_string(),
                     body: "See /work/repo/group/repo/src/lib.rs:10 before merging.".to_string(),
+                    confidence_score: None,
+                    priority: None,
                     code_location: crate::codex_runner::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                         line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
@@ -1759,9 +1771,12 @@ async fn inline_review_comments_use_matching_diff_version_even_when_not_first() 
             crate::codex_runner::ReviewComment {
                 summary: "needs changes".to_string(),
                 overall_explanation: None,
+                overall_confidence_score: None,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Inline finding".to_string(),
                     body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
+                    confidence_score: None,
+                    priority: None,
                     code_location: crate::codex_runner::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                         line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
@@ -1825,9 +1840,12 @@ async fn inline_review_comments_fallback_to_note_when_marker_prefetch_fails() ->
             crate::codex_runner::ReviewComment {
                 summary: "needs changes".to_string(),
                 overall_explanation: None,
+                overall_confidence_score: None,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Fallback finding".to_string(),
                     body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
+                    confidence_score: None,
+                    priority: None,
                     code_location: crate::codex_runner::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                         line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
@@ -1897,9 +1915,12 @@ async fn inline_review_comments_fallback_to_note_when_inline_post_fails() -> Res
             crate::codex_runner::ReviewComment {
                 summary: "needs changes".to_string(),
                 overall_explanation: Some("Overall context.".to_string()),
+                overall_confidence_score: None,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Fallback finding".to_string(),
                     body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
+                    confidence_score: None,
+                    priority: None,
                     code_location: crate::codex_runner::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
                         line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
@@ -1970,9 +1991,12 @@ async fn inline_review_comments_use_source_project_links_for_fork_mrs() -> Resul
             crate::codex_runner::ReviewComment {
                 summary: "needs changes".to_string(),
                 overall_explanation: Some("See /work/repo/fork/source/src/lib.rs:10.".to_string()),
+                overall_confidence_score: None,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Fork fallback".to_string(),
                     body: "Fix /work/repo/fork/source/src/lib.rs:10.".to_string(),
+                    confidence_score: None,
+                    priority: None,
                     code_location: crate::codex_runner::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/fork/source/src/lib.rs".to_string(),
                         line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
@@ -2292,6 +2316,8 @@ async fn inline_review_comments_dedupe_duplicate_findings_in_single_response() -
     let finding = crate::codex_runner::ReviewFinding {
         title: "Duplicate".to_string(),
         body: "See /work/repo/group/repo/src/lib.rs:10.".to_string(),
+        confidence_score: None,
+        priority: None,
         code_location: crate::codex_runner::ReviewCodeLocation {
             absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
             line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
@@ -2302,6 +2328,7 @@ async fn inline_review_comments_dedupe_duplicate_findings_in_single_response() -
             crate::codex_runner::ReviewComment {
                 summary: "needs changes".to_string(),
                 overall_explanation: None,
+                overall_confidence_score: None,
                 findings: vec![finding.clone(), finding],
                 body: "legacy body".to_string(),
             },
@@ -2483,10 +2510,84 @@ async fn fork_reviews_use_source_project_path_for_runner_context() -> Result<()>
     Ok(())
 }
 
+#[tokio::test]
+async fn security_reviews_use_canonical_project_path_for_runner_context() -> Result<()> {
+    let mut config = test_config();
+    config.gitlab.targets.repos = TargetSelector::List(vec!["target/repo".to_string()]);
+    config.feature_flags.security_review = true;
+    let bot_user = GitLabUser {
+        id: 1,
+        username: None,
+        name: None,
+    };
+    let mut fork_mr = mr(12, "sha1");
+    fork_mr.source_project_id = Some(42);
+    fork_mr.target_project_id = Some(7);
+    let gitlab = Arc::new(FakeGitLab {
+        bot_user,
+        mrs: Mutex::new(vec![fork_mr]),
+        awards: Mutex::new(HashMap::new()),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::new()),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::from([(
+            "42".to_string(),
+            "forks/source-repo".to_string(),
+        )])),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let runner = Arc::new(CapturingReviewRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        review_contexts: Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab,
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    let _ = service.scan_once().await?;
+
+    let contexts = runner.review_contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(
+        contexts
+            .iter()
+            .find(|ctx| ctx.lane == crate::review_lane::ReviewLane::General)
+            .map(|ctx| ctx.project_path.as_str()),
+        Some("forks/source-repo")
+    );
+    assert_eq!(
+        contexts
+            .iter()
+            .find(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
+            .map(|ctx| ctx.project_path.as_str()),
+        Some("target/repo")
+    );
+    Ok(())
+}
+
 #[test]
 fn retry_backoff_doubles_delay() {
     let backoff = RetryBackoff::new(Duration::hours(1));
-    let key = RetryKey::new("group/repo", 1, "sha1");
+    let key = RetryKey::new(
+        crate::review_lane::ReviewLane::General,
+        "group/repo",
+        1,
+        "sha1",
+    );
     let start = Utc
         .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
         .single()
@@ -3738,6 +3839,7 @@ async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes()
         calls: Mutex::new(0),
     });
     let review_context = ReviewRunContext {
+        lane: crate::review_lane::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
         codex: runner.clone(),
@@ -3837,6 +3939,7 @@ async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state.begin_review("group/repo", 23, "sha23").await?;
     let review_context = ReviewRunContext {
+        lane: crate::review_lane::ReviewLane::General,
         config,
         gitlab,
         codex: runner.clone(),
@@ -3936,6 +4039,7 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state.begin_review("group/repo", 24, "sha24").await?;
     let review_context = ReviewRunContext {
+        lane: crate::review_lane::ReviewLane::General,
         config,
         gitlab,
         codex: runner.clone(),
@@ -3991,6 +4095,70 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
 }
 
 #[tokio::test]
+async fn security_review_pass_stays_silent() -> Result<()> {
+    let config = test_config();
+    let gitlab = fake_gitlab(Vec::new());
+    let runner = Arc::new(FakeRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "no confirmed security issues found".to_string(),
+        })),
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    state
+        .begin_review_for_lane(
+            "group/repo",
+            25,
+            "sha25",
+            crate::review_lane::ReviewLane::Security,
+        )
+        .await?;
+    let review_context = ReviewRunContext {
+        lane: crate::review_lane::ReviewLane::Security,
+        config,
+        gitlab: gitlab.clone(),
+        codex: runner.clone(),
+        state: state.clone(),
+        retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
+        bot_user_id: 1,
+        shutdown: Arc::new(AtomicBool::new(false)),
+    };
+
+    review_context
+        .run(
+            "group/repo",
+            mr(25, "sha25"),
+            "sha25",
+            crate::feature_flags::FeatureFlagSnapshot {
+                security_review: true,
+                ..crate::feature_flags::FeatureFlagSnapshot::default()
+            },
+            0,
+        )
+        .await?;
+
+    assert_eq!(*runner.calls.lock().unwrap(), 1);
+    let calls = gitlab.calls.lock().unwrap().clone();
+    assert!(!calls.iter().any(|call| call.contains(":eyes")));
+    assert!(!calls.iter().any(|call| call.contains(":thumbsup")));
+    assert!(!calls.iter().any(|call| call.starts_with("create_note:")));
+
+    let row = sqlx::query(
+        "SELECT status, result FROM review_state WHERE repo = ? AND iid = ? AND lane = ?",
+    )
+    .bind("group/repo")
+    .bind(25i64)
+    .bind("security")
+    .fetch_one(state.pool())
+    .await?;
+    let status: String = row.try_get("status")?;
+    let result: Option<String> = row.try_get("result")?;
+    assert_eq!(status, "done");
+    assert_eq!(result, Some("pass".to_string()));
+    Ok(())
+}
+
+#[tokio::test]
 async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<()> {
     let mut config = test_config();
     config.review.max_concurrent = 1;
@@ -4037,6 +4205,7 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,
+            security_review: None,
         })
         .await?;
     let service = Arc::new(ReviewService::new(
@@ -4074,6 +4243,7 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,
+            security_review: None,
         })
         .await?;
 
@@ -4640,6 +4810,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,
+            security_review: None,
         })
         .await?;
     let service = Arc::new(ReviewService::new(
@@ -4677,6 +4848,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,
+            security_review: None,
         })
         .await?;
 

@@ -4,6 +4,7 @@ use crate::feature_flags::FeatureFlagSnapshot;
 use crate::flow::review_comments::post_review_comment;
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
+use crate::review_lane::ReviewLane;
 use crate::state::{NewRunHistory, ReviewStateStore, RunHistoryFinish, RunHistoryKind};
 use anyhow::{Error, Result};
 use async_trait::async_trait;
@@ -18,14 +19,16 @@ const INLINE_REVIEW_MARKER_PREFIX: &str = "<!-- codex-review-finding:sha=";
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct RetryKey {
+    lane: ReviewLane,
     repo: String,
     iid: u64,
     head_sha: String,
 }
 
 impl RetryKey {
-    pub(crate) fn new(repo: &str, iid: u64, head_sha: &str) -> Self {
+    pub(crate) fn new(lane: ReviewLane, repo: &str, iid: u64, head_sha: &str) -> Self {
         Self {
+            lane,
             repo: repo.to_string(),
             iid,
             head_sha: head_sha.to_string(),
@@ -96,9 +99,11 @@ impl RetryBackoff {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewScheduleOutcome {
     Scheduled,
+    Disabled,
     SkippedBackoff,
     SkippedAward,
     SkippedMarker,
+    SkippedCompleted,
     SkippedLocked,
     Interrupted,
 }
@@ -111,14 +116,44 @@ enum ReviewGateOutcome {
 pub(crate) struct ReviewFlow {
     shared: FlowShared,
     retry_backoff: Arc<RetryBackoff>,
+    lane: ReviewLane,
 }
 
 impl ReviewFlow {
-    pub(crate) fn new(shared: FlowShared, retry_backoff: Arc<RetryBackoff>) -> Self {
+    pub(crate) fn new(
+        shared: FlowShared,
+        retry_backoff: Arc<RetryBackoff>,
+        lane: ReviewLane,
+    ) -> Self {
         Self {
             shared,
             retry_backoff,
+            lane,
         }
+    }
+
+    fn review_marker_prefix(&self) -> &str {
+        if self.lane.is_security() {
+            &self.shared.config.review.security.comment_marker_prefix
+        } else {
+            &self.shared.config.review.comment_marker_prefix
+        }
+    }
+
+    fn finding_marker_prefix(&self) -> &str {
+        if self.lane.is_security() {
+            &self.shared.config.review.security.finding_marker_prefix
+        } else {
+            INLINE_REVIEW_MARKER_PREFIX
+        }
+    }
+
+    fn uses_awards(&self) -> bool {
+        !self.lane.is_security()
+    }
+
+    fn is_enabled(&self, feature_flags: &FeatureFlagSnapshot) -> bool {
+        !self.lane.is_security() || feature_flags.security_review
     }
 
     pub(crate) async fn clear_stale_in_progress(&self) -> Result<()> {
@@ -136,9 +171,16 @@ impl ReviewFlow {
                 "recovering interrupted in-progress reviews"
             );
             for review in in_progress {
-                let retry_key =
-                    RetryKey::new(review.repo.as_str(), review.iid, review.head_sha.as_str());
-                if self.shared.config.review.dry_run {
+                if review.lane != self.lane {
+                    continue;
+                }
+                let retry_key = RetryKey::new(
+                    review.lane,
+                    review.repo.as_str(),
+                    review.iid,
+                    review.head_sha.as_str(),
+                );
+                if self.shared.config.review.dry_run || !self.uses_awards() {
                     info!(
                         repo = review.repo.as_str(),
                         iid = review.iid,
@@ -164,10 +206,11 @@ impl ReviewFlow {
                 if let Err(err) = self
                     .shared
                     .state
-                    .finish_review(
+                    .finish_review_for_lane(
                         review.repo.as_str(),
                         review.iid,
                         review.head_sha.as_str(),
+                        review.lane,
                         "cancelled",
                     )
                     .await
@@ -190,54 +233,66 @@ impl ReviewFlow {
         mr: &MergeRequest,
         head_sha: &str,
     ) -> Result<ReviewGateOutcome> {
-        let retry_key = RetryKey::new(repo, mr.iid, head_sha);
+        let feature_flags = self.resolve_feature_flags().await?;
+        if !self.is_enabled(&feature_flags) {
+            return Ok(ReviewGateOutcome::Decision(ReviewScheduleOutcome::Disabled));
+        }
+        let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
         if !self.retry_backoff.should_retry(&retry_key, Utc::now()) {
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::SkippedBackoff,
             ));
         }
-        let awards = self.shared.gitlab.list_awards(repo, mr.iid).await?;
-        if has_bot_award(
-            &awards,
-            self.shared.bot_user_id,
-            &self.shared.config.review.thumbs_emoji,
-        ) {
-            return Ok(ReviewGateOutcome::Decision(
-                ReviewScheduleOutcome::SkippedAward,
-            ));
+        if self.uses_awards() {
+            let awards = self.shared.gitlab.list_awards(repo, mr.iid).await?;
+            if has_bot_award(
+                &awards,
+                self.shared.bot_user_id,
+                &self.shared.config.review.thumbs_emoji,
+            ) {
+                return Ok(ReviewGateOutcome::Decision(
+                    ReviewScheduleOutcome::SkippedAward,
+                ));
+            }
         }
         let notes = self.shared.gitlab.list_notes(repo, mr.iid).await?;
         if has_review_marker(
             &notes,
             self.shared.bot_user_id,
-            &self.shared.config.review.comment_marker_prefix,
+            self.review_marker_prefix(),
             head_sha,
         ) {
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::SkippedMarker,
             ));
         }
-        let inline_review_comments_enabled = self
-            .resolve_feature_flags()
-            .await?
-            .gitlab_inline_review_comments;
+        let inline_review_comments_enabled = feature_flags.gitlab_inline_review_comments;
         let completed_inline_review = self
             .shared
             .state
-            .has_completed_inline_review(repo, mr.iid, head_sha)
+            .has_completed_inline_review_for_lane(repo, mr.iid, head_sha, self.lane)
             .await?;
         let review_result = self
             .shared
             .state
-            .review_result(repo, mr.iid, head_sha)
+            .review_result_for_lane(repo, mr.iid, head_sha, self.lane)
             .await?;
+        if self.lane.is_security() && matches!(review_result.as_deref(), Some("pass" | "comment")) {
+            return Ok(ReviewGateOutcome::Decision(
+                ReviewScheduleOutcome::SkippedCompleted,
+            ));
+        }
         let should_check_inline_markers =
             inline_review_comments_enabled || completed_inline_review || review_result.is_some();
         if should_check_inline_markers {
             match self.shared.gitlab.list_discussions(repo, mr.iid).await {
                 Ok(discussions) => {
-                    if has_inline_review_marker(&discussions, self.shared.bot_user_id, head_sha)
-                        && review_result.as_deref() != Some("error")
+                    if has_inline_review_marker(
+                        &discussions,
+                        self.shared.bot_user_id,
+                        head_sha,
+                        self.finding_marker_prefix(),
+                    ) && review_result.as_deref() != Some("error")
                         && (completed_inline_review || review_result.as_deref() == Some("comment"))
                     {
                         return Ok(ReviewGateOutcome::Decision(
@@ -274,7 +329,7 @@ impl ReviewFlow {
         if !self
             .shared
             .state
-            .begin_review(repo, mr.iid, head_sha)
+            .begin_review_for_lane(repo, mr.iid, head_sha, self.lane)
             .await?
         {
             return Ok(ReviewGateOutcome::Decision(
@@ -284,7 +339,7 @@ impl ReviewFlow {
         if self.shared.shutdown_requested() {
             self.shared
                 .state
-                .finish_review(repo, mr.iid, head_sha, "cancelled")
+                .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, "cancelled")
                 .await?;
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::Interrupted,
@@ -307,17 +362,20 @@ impl ReviewFlow {
         let run_history_id = match self
             .shared
             .state
-            .start_run_history(NewRunHistory {
-                kind: RunHistoryKind::Review,
-                repo: repo.to_string(),
-                iid: mr.iid,
-                head_sha: head_sha.to_string(),
-                discussion_id: None,
-                trigger_note_id: None,
-                trigger_note_author_name: None,
-                trigger_note_body: None,
-                command_repo: None,
-            })
+            .start_run_history_for_lane(
+                NewRunHistory {
+                    kind: RunHistoryKind::Review,
+                    repo: repo.to_string(),
+                    iid: mr.iid,
+                    head_sha: head_sha.to_string(),
+                    discussion_id: None,
+                    trigger_note_id: None,
+                    trigger_note_author_name: None,
+                    trigger_note_body: None,
+                    command_repo: None,
+                },
+                Some(self.lane),
+            )
             .await
         {
             Ok(run_history_id) => run_history_id,
@@ -349,6 +407,7 @@ impl ReviewFlow {
         let semaphore = Arc::clone(&self.shared.semaphore);
         let active_tasks = Arc::clone(&self.shared.active_tasks);
         let review_context = ReviewRunContext {
+            lane: self.lane,
             config: self.shared.config.clone(),
             gitlab: Arc::clone(&self.shared.gitlab),
             codex: Arc::clone(&self.shared.codex),
@@ -360,6 +419,7 @@ impl ReviewFlow {
         let head_sha = head_sha.to_string();
         tasks.push(tokio::spawn(async move {
             let _active_review = active_tasks.track_review(ActiveReviewKey {
+                lane: review_context.lane,
                 repo: repo_name.clone(),
                 iid: mr.iid,
                 head_sha: head_sha.clone(),
@@ -394,17 +454,20 @@ impl ReviewFlow {
         let run_history_id = match self
             .shared
             .state
-            .start_run_history(NewRunHistory {
-                kind: RunHistoryKind::Review,
-                repo: repo.to_string(),
-                iid: mr.iid,
-                head_sha: head_sha.to_string(),
-                discussion_id: None,
-                trigger_note_id: None,
-                trigger_note_author_name: None,
-                trigger_note_body: None,
-                command_repo: None,
-            })
+            .start_run_history_for_lane(
+                NewRunHistory {
+                    kind: RunHistoryKind::Review,
+                    repo: repo.to_string(),
+                    iid: mr.iid,
+                    head_sha: head_sha.to_string(),
+                    discussion_id: None,
+                    trigger_note_id: None,
+                    trigger_note_author_name: None,
+                    trigger_note_body: None,
+                    command_repo: None,
+                },
+                Some(self.lane),
+            )
             .await
         {
             Ok(run_history_id) => run_history_id,
@@ -442,6 +505,7 @@ impl ReviewFlow {
             }
         };
         let review_context = ReviewRunContext {
+            lane: self.lane,
             config: self.shared.config.clone(),
             gitlab: Arc::clone(&self.shared.gitlab),
             codex: Arc::clone(&self.shared.codex),
@@ -450,6 +514,12 @@ impl ReviewFlow {
             bot_user_id: self.shared.bot_user_id,
             shutdown: Arc::clone(&self.shared.shutdown),
         };
+        let _active_review = self.shared.active_tasks.track_review(ActiveReviewKey {
+            lane: self.lane,
+            repo: repo.to_string(),
+            iid: mr.iid,
+            head_sha: head_sha.to_string(),
+        });
         review_context
             .run(repo, mr, head_sha, feature_flags, run_history_id)
             .await?;
@@ -474,7 +544,7 @@ impl ReviewFlow {
         if let Err(recovery_err) = self
             .shared
             .state
-            .finish_review(repo, iid, head_sha, "error")
+            .finish_review_for_lane(repo, iid, head_sha, self.lane, "error")
             .await
         {
             warn!(
@@ -504,7 +574,7 @@ impl ReviewFlow {
                 run_history_id,
                 RunHistoryFinish {
                     result: "error".to_string(),
-                    preview: Some(format!("Review {repo} !{iid}")),
+                    preview: Some(format!("{} {repo} !{iid}", self.lane.review_label())),
                     error: Some(format!("{err:#}")),
                     ..RunHistoryFinish::default()
                 },
@@ -525,7 +595,11 @@ impl ReviewFlow {
 #[async_trait]
 impl MergeRequestFlow for ReviewFlow {
     fn flow_name(&self) -> &'static str {
-        "review"
+        if self.lane.is_security() {
+            "security_review"
+        } else {
+            "review"
+        }
     }
 
     async fn clear_stale_in_progress(&self) -> Result<()> {
@@ -538,6 +612,7 @@ impl MergeRequestFlow for ReviewFlow {
 }
 
 pub(crate) struct ReviewRunContext {
+    pub(crate) lane: ReviewLane,
     pub(crate) config: Config,
     pub(crate) gitlab: Arc<dyn GitLabApi>,
     pub(crate) codex: Arc<dyn crate::codex_runner::CodexRunner>,
@@ -548,6 +623,14 @@ pub(crate) struct ReviewRunContext {
 }
 
 impl ReviewRunContext {
+    fn uses_awards(&self) -> bool {
+        !self.lane.is_security()
+    }
+
+    fn review_preview(&self, repo: &str, iid: u64) -> String {
+        format!("{} {repo} !{iid}", self.lane.review_label())
+    }
+
     fn shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
     }
@@ -596,7 +679,7 @@ impl ReviewRunContext {
     }
 
     async fn remove_eyes_best_effort(&self, repo: &str, iid: u64) {
-        if self.config.review.dry_run {
+        if self.config.review.dry_run || !self.uses_awards() {
             info!(repo = repo, iid = iid, "dry run: skipping eyes removal");
             return;
         }
@@ -629,14 +712,14 @@ impl ReviewRunContext {
         self.remove_eyes_best_effort(repo, iid).await;
         self.retry_backoff.clear(retry_key);
         self.state
-            .finish_review(repo, iid, head_sha, "cancelled")
+            .finish_review_for_lane(repo, iid, head_sha, self.lane, "cancelled")
             .await?;
         self.state
             .finish_run_history(
                 run_history_id,
                 RunHistoryFinish {
                     result: "cancelled".to_string(),
-                    preview: Some(format!("Review {repo} !{iid}")),
+                    preview: Some(self.review_preview(repo, iid)),
                     ..RunHistoryFinish::default()
                 },
             )
@@ -653,7 +736,11 @@ impl ReviewRunContext {
         run_history_id: i64,
         err: &anyhow::Error,
     ) {
-        if let Err(recovery_err) = self.state.finish_review(repo, iid, head_sha, "error").await {
+        if let Err(recovery_err) = self
+            .state
+            .finish_review_for_lane(repo, iid, head_sha, self.lane, "error")
+            .await
+        {
             warn!(
                 repo = repo,
                 iid = iid,
@@ -668,7 +755,7 @@ impl ReviewRunContext {
                 run_history_id,
                 RunHistoryFinish {
                     result: "error".to_string(),
-                    preview: Some(format!("Review {repo} !{iid}")),
+                    preview: Some(self.review_preview(repo, iid)),
                     error: Some(format!("{err:#}")),
                     ..RunHistoryFinish::default()
                 },
@@ -693,7 +780,7 @@ impl ReviewRunContext {
         feature_flags: FeatureFlagSnapshot,
         run_history_id: i64,
     ) -> Result<()> {
-        let retry_key = RetryKey::new(repo, mr.iid, head_sha);
+        let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
         let inline_review_comments_enabled = feature_flags.gitlab_inline_review_comments;
         if self.shutdown_requested() {
             self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
@@ -701,7 +788,7 @@ impl ReviewRunContext {
             return Ok(());
         }
 
-        if self.config.review.dry_run {
+        if self.config.review.dry_run || !self.uses_awards() {
             info!(repo = repo, iid = mr.iid, "dry run: skipping eyes award");
         } else {
             self.gitlab
@@ -710,13 +797,35 @@ impl ReviewRunContext {
                 .ok();
         }
 
-        let project_path = self.resolve_review_project_path(repo, &mr).await;
+        let project_path = if self.lane.is_security() {
+            repo.to_string()
+        } else {
+            self.resolve_review_project_path(repo, &mr).await
+        };
         let review_ctx = ReviewContext {
+            lane: self.lane,
             repo: repo.to_string(),
             project_path,
             mr: mr.clone(),
             head_sha: head_sha.to_string(),
             feature_flags,
+            additional_developer_instructions: if self.lane.is_security() {
+                self.config
+                    .review
+                    .security
+                    .additional_developer_instructions
+                    .clone()
+            } else {
+                None
+            },
+            min_confidence_score: self
+                .lane
+                .is_security()
+                .then_some(self.config.review.security.min_confidence_score),
+            security_context_ttl_seconds: self
+                .lane
+                .is_security()
+                .then_some(self.config.review.security.context_ttl_seconds),
             run_history_id: Some(run_history_id),
         };
         let review_project_path = review_ctx.project_path.clone();
@@ -747,7 +856,7 @@ impl ReviewRunContext {
                         .await?;
                     return Ok(());
                 }
-                if self.config.review.dry_run {
+                if self.config.review.dry_run || !self.uses_awards() {
                     info!(repo = repo, iid = mr.iid, "dry run: skipping thumbs up");
                 } else {
                     self.gitlab
@@ -761,14 +870,14 @@ impl ReviewRunContext {
                     "pass"
                 };
                 self.state
-                    .finish_review(repo, mr.iid, head_sha, review_result)
+                    .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, review_result)
                     .await?;
                 self.state
                     .finish_run_history(
                         run_history_id,
                         RunHistoryFinish {
                             result: review_result.to_string(),
-                            preview: Some(format!("Review {repo} !{}", mr.iid)),
+                            preview: Some(self.review_preview(repo, mr.iid)),
                             summary: Some(summary.clone()),
                             ..RunHistoryFinish::default()
                         },
@@ -792,6 +901,7 @@ impl ReviewRunContext {
                 } else {
                     post_review_comment(
                         inline_review_comments_enabled,
+                        self.lane,
                         &self.config,
                         self.gitlab.as_ref(),
                         self.bot_user_id,
@@ -810,14 +920,14 @@ impl ReviewRunContext {
                     "comment"
                 };
                 self.state
-                    .finish_review(repo, mr.iid, head_sha, review_result)
+                    .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, review_result)
                     .await?;
                 self.state
                     .finish_run_history(
                         run_history_id,
                         RunHistoryFinish {
                             result: review_result.to_string(),
-                            preview: Some(format!("Review {repo} !{}", mr.iid)),
+                            preview: Some(self.review_preview(repo, mr.iid)),
                             summary: Some(comment.summary.clone()),
                             error: Some(comment.body.clone()),
                             ..RunHistoryFinish::default()
@@ -848,14 +958,14 @@ impl ReviewRunContext {
                     return Ok(());
                 }
                 self.state
-                    .finish_review(repo, mr.iid, head_sha, "error")
+                    .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, "error")
                     .await?;
                 self.state
                     .finish_run_history(
                         run_history_id,
                         RunHistoryFinish {
                             result: "error".to_string(),
-                            preview: Some(format!("Review {repo} !{}", mr.iid)),
+                            preview: Some(self.review_preview(repo, mr.iid)),
                             error: Some(err.to_string()),
                             ..RunHistoryFinish::default()
                         },
@@ -891,11 +1001,12 @@ pub(crate) fn has_inline_review_marker(
     discussions: &[MergeRequestDiscussion],
     bot_user_id: u64,
     sha: &str,
+    prefix: &str,
 ) -> bool {
     if bot_user_id == 0 {
         return false;
     }
-    let marker_prefix = format!("{INLINE_REVIEW_MARKER_PREFIX}{sha} ");
+    let marker_prefix = format!("{prefix}{sha} ");
     discussions
         .iter()
         .flat_map(|discussion| &discussion.notes)

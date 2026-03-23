@@ -7,6 +7,8 @@ pub struct FeatureFlagSnapshot {
     #[serde(default)]
     pub gitlab_inline_review_comments: bool,
     #[serde(default)]
+    pub security_review: bool,
+    #[serde(default)]
     pub composer_install: bool,
     #[serde(default)]
     pub composer_auto_repositories: bool,
@@ -20,6 +22,8 @@ pub struct RuntimeFeatureFlagOverrides {
     pub gitlab_discovery_mcp: Option<bool>,
     #[serde(default)]
     pub gitlab_inline_review_comments: Option<bool>,
+    #[serde(default)]
+    pub security_review: Option<bool>,
     #[serde(default)]
     pub composer_install: Option<bool>,
     #[serde(default)]
@@ -35,6 +39,8 @@ pub struct FeatureFlagDefaults {
     #[serde(default)]
     pub gitlab_inline_review_comments: bool,
     #[serde(default)]
+    pub security_review: bool,
+    #[serde(default)]
     pub composer_install: bool,
     #[serde(default)]
     pub composer_auto_repositories: bool,
@@ -46,6 +52,7 @@ pub struct FeatureFlagDefaults {
 pub struct FeatureFlagAvailability {
     pub gitlab_discovery_mcp: bool,
     pub gitlab_inline_review_comments: bool,
+    pub security_review: bool,
     pub composer_install: bool,
     pub composer_auto_repositories: bool,
     pub composer_safe_install: bool,
@@ -67,6 +74,11 @@ impl FeatureFlagSnapshot {
                 defaults.gitlab_inline_review_comments,
                 availability.gitlab_inline_review_comments,
                 overrides.gitlab_inline_review_comments,
+            ),
+            security_review: resolve_flag(
+                defaults.security_review,
+                availability.security_review,
+                overrides.security_review,
             ),
             composer_install: resolve_flag(
                 defaults.composer_install,
@@ -105,6 +117,7 @@ mod tests {
             &FeatureFlagDefaults {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: false,
+                security_review: false,
                 composer_install: false,
                 composer_auto_repositories: false,
                 composer_safe_install: false,
@@ -112,6 +125,7 @@ mod tests {
             &FeatureFlagAvailability {
                 gitlab_discovery_mcp: true,
                 gitlab_inline_review_comments: true,
+                security_review: true,
                 composer_install: true,
                 composer_auto_repositories: true,
                 composer_safe_install: true,
@@ -119,6 +133,7 @@ mod tests {
             &RuntimeFeatureFlagOverrides {
                 gitlab_discovery_mcp: Some(true),
                 gitlab_inline_review_comments: None,
+                security_review: None,
                 composer_install: None,
                 composer_auto_repositories: None,
                 composer_safe_install: None,
@@ -134,6 +149,7 @@ mod tests {
             &FeatureFlagDefaults {
                 gitlab_discovery_mcp: true,
                 gitlab_inline_review_comments: true,
+                security_review: true,
                 composer_install: false,
                 composer_auto_repositories: false,
                 composer_safe_install: false,
@@ -141,6 +157,7 @@ mod tests {
             &FeatureFlagAvailability {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: false,
+                security_review: false,
                 composer_install: true,
                 composer_auto_repositories: true,
                 composer_safe_install: true,
@@ -148,6 +165,7 @@ mod tests {
             &RuntimeFeatureFlagOverrides {
                 gitlab_discovery_mcp: Some(true),
                 gitlab_inline_review_comments: Some(true),
+                security_review: Some(true),
                 composer_install: None,
                 composer_auto_repositories: None,
                 composer_safe_install: None,
@@ -156,6 +174,7 @@ mod tests {
 
         assert!(!snapshot.gitlab_discovery_mcp);
         assert!(!snapshot.gitlab_inline_review_comments);
+        assert!(!snapshot.security_review);
     }
 
     #[test]
@@ -164,6 +183,7 @@ mod tests {
             &FeatureFlagDefaults {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: false,
+                security_review: false,
                 composer_install: false,
                 composer_auto_repositories: false,
                 composer_safe_install: false,
@@ -171,6 +191,7 @@ mod tests {
             &FeatureFlagAvailability {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: true,
+                security_review: true,
                 composer_install: true,
                 composer_auto_repositories: true,
                 composer_safe_install: true,
@@ -178,6 +199,7 @@ mod tests {
             &RuntimeFeatureFlagOverrides {
                 gitlab_discovery_mcp: None,
                 gitlab_inline_review_comments: Some(true),
+                security_review: Some(true),
                 composer_install: Some(true),
                 composer_auto_repositories: Some(true),
                 composer_safe_install: Some(true),
@@ -185,6 +207,7 @@ mod tests {
         );
 
         assert!(snapshot.gitlab_inline_review_comments);
+        assert!(snapshot.security_review);
         assert!(snapshot.composer_install);
         assert!(snapshot.composer_auto_repositories);
         assert!(snapshot.composer_safe_install);

@@ -390,7 +390,7 @@ async fn status_snapshot_includes_feature_flag_state() -> anyhow::Result<()> {
 
     let snapshot = service.snapshot().await?;
 
-    assert_eq!(snapshot.config.feature_flags.len(), 5);
+    assert_eq!(snapshot.config.feature_flags.len(), 6);
     assert_eq!(
         snapshot
             .config
@@ -401,6 +401,7 @@ async fn status_snapshot_includes_feature_flag_state() -> anyhow::Result<()> {
         vec![
             "gitlab_discovery_mcp",
             "gitlab_inline_review_comments",
+            "security_review",
             "composer_install",
             "composer_auto_repositories",
             "composer_safe_install",
@@ -440,6 +441,27 @@ async fn update_runtime_feature_flag_persists_override() -> anyhow::Result<()> {
             .get_runtime_feature_flag_overrides()
             .await?
             .gitlab_discovery_mcp,
+        Some(true)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_runtime_feature_flag_persists_security_review_override() -> anyhow::Result<()> {
+    let store = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+
+    let updated = service
+        .update_runtime_feature_flag("security_review", Some(true))
+        .await?;
+
+    assert_eq!(updated.runtime_override, Some(true));
+    assert!(updated.effective_enabled);
+    assert_eq!(
+        store
+            .get_runtime_feature_flag_overrides()
+            .await?
+            .security_review,
         Some(true)
     );
     Ok(())
@@ -505,6 +527,7 @@ async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> a
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,
+            security_review: None,
         })
         .await?;
     let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
@@ -1356,6 +1379,7 @@ fn test_config() -> Config {
             stale_in_progress_minutes: 120,
             dry_run: true,
             additional_developer_instructions: None,
+            security: crate::config::ReviewSecurityConfig::default(),
             mention_commands: ReviewMentionCommandsConfig {
                 enabled: false,
                 bot_username: None,

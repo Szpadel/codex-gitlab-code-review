@@ -5,6 +5,7 @@ use crate::docker_utils::{connect_docker, ensure_image, normalize_image_referenc
 use crate::feature_flags::FeatureFlagSnapshot;
 use crate::gitlab::MergeRequest;
 use crate::gitlab_discovery_mcp::{GitLabDiscoveryMcpService, ResolvedGitLabDiscoveryAllowList};
+use crate::review_lane::ReviewLane;
 use crate::review_prompt_templates::{
     append_additional_review_instructions, build_base_branch_review_prompt,
     build_commit_review_prompt, upstream_review_prompt_source_commit,
@@ -59,11 +60,15 @@ use self::scripts::*;
 
 #[derive(Debug, Clone)]
 pub struct ReviewContext {
+    pub lane: ReviewLane,
     pub repo: String,
     pub project_path: String,
     pub mr: MergeRequest,
     pub head_sha: String,
     pub feature_flags: FeatureFlagSnapshot,
+    pub additional_developer_instructions: Option<String>,
+    pub min_confidence_score: Option<f32>,
+    pub security_context_ttl_seconds: Option<u64>,
     pub run_history_id: Option<i64>,
 }
 
@@ -95,17 +100,20 @@ pub struct ReviewCodeLocation {
     pub line_range: ReviewLineRange,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReviewFinding {
     pub title: String,
     pub body: String,
+    pub confidence_score: Option<f32>,
+    pub priority: Option<u8>,
     pub code_location: ReviewCodeLocation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReviewComment {
     pub summary: String,
     pub overall_explanation: Option<String>,
+    pub overall_confidence_score: Option<f32>,
     pub findings: Vec<ReviewFinding>,
     pub body: String,
 }
@@ -478,15 +486,18 @@ impl CodexRunner for DockerCodexRunner {
         info!(
             repo = ctx.repo.as_str(),
             iid = ctx.mr.iid,
+            lane = ctx.lane.as_str(),
             "starting codex review"
         );
         let output = self.run_app_server_review(&ctx).await?;
-        parse_review_output(&output).with_context(|| {
-            format!(
-                "parse codex review output for repo {} merge request {}",
-                ctx.repo, ctx.mr.iid
-            )
-        })
+        parse_review_output_for_lane(&output, ctx.lane, ctx.min_confidence_score).with_context(
+            || {
+                format!(
+                    "parse codex review output for repo {} merge request {}",
+                    ctx.repo, ctx.mr.iid
+                )
+            },
+        )
     }
 
     async fn run_mention_command(

@@ -468,6 +468,7 @@ mod tests {
                     composer_install: false,
                     composer_auto_repositories: false,
                     composer_safe_install: false,
+                    security_review: false,
                 },
                 allow: ResolvedGitLabDiscoveryAllowList::default(),
                 created_at: Utc::now(),

@@ -149,7 +149,35 @@ pub struct ReviewConfig {
     #[serde(default)]
     pub additional_developer_instructions: Option<String>,
     #[serde(default)]
+    pub security: ReviewSecurityConfig,
+    #[serde(default)]
     pub mention_commands: ReviewMentionCommandsConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct ReviewSecurityConfig {
+    #[serde(default = "default_security_review_context_ttl_seconds")]
+    pub context_ttl_seconds: u64,
+    #[serde(default = "default_security_review_min_confidence_score")]
+    pub min_confidence_score: f32,
+    #[serde(default = "default_security_review_comment_marker_prefix")]
+    pub comment_marker_prefix: String,
+    #[serde(default = "default_security_review_finding_marker_prefix")]
+    pub finding_marker_prefix: String,
+    #[serde(default)]
+    pub additional_developer_instructions: Option<String>,
+}
+
+impl Default for ReviewSecurityConfig {
+    fn default() -> Self {
+        Self {
+            context_ttl_seconds: default_security_review_context_ttl_seconds(),
+            min_confidence_score: default_security_review_min_confidence_score(),
+            comment_marker_prefix: default_security_review_comment_marker_prefix(),
+            finding_marker_prefix: default_security_review_finding_marker_prefix(),
+            additional_developer_instructions: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -316,6 +344,22 @@ fn default_gitlab_discovery_mcp_server_name() -> String {
     "gitlab-discovery".to_string()
 }
 
+fn default_security_review_context_ttl_seconds() -> u64 {
+    1_209_600
+}
+
+fn default_security_review_min_confidence_score() -> f32 {
+    0.85
+}
+
+fn default_security_review_comment_marker_prefix() -> String {
+    "<!-- codex-security-review:sha=".to_string()
+}
+
+fn default_security_review_finding_marker_prefix() -> String {
+    "<!-- codex-security-review-finding:sha=".to_string()
+}
+
 fn default_gitlab_discovery_mcp_bind_addr() -> String {
     "0.0.0.0:8091".to_string()
 }
@@ -425,6 +469,7 @@ impl Config {
             gitlab_discovery_mcp: self.codex.gitlab_discovery_mcp.enabled
                 && !self.codex.gitlab_discovery_mcp.allow.is_empty(),
             gitlab_inline_review_comments: true,
+            security_review: true,
             composer_install: true,
             composer_auto_repositories: true,
             composer_safe_install: true,

@@ -185,6 +185,174 @@ fn parse_review_output_upstream_rendered_review_text() -> Result<()> {
 }
 
 #[test]
+fn parse_security_review_output_filters_low_confidence_findings() -> Result<()> {
+    let text = r#"{
+      "findings": [
+        {
+          "title": "[P1] Reject missing auth check",
+          "body": "The endpoint can be reached without the intended guard.",
+          "confidence_score": 0.84,
+          "priority": 1,
+          "code_location": {
+            "absolute_file_path": "/work/repo/src/auth.rs",
+            "line_range": { "start": 14, "end": 16 }
+          }
+        }
+      ],
+      "overall_correctness": "patch is incorrect",
+      "overall_explanation": "No confirmed security issues after validation.",
+      "overall_confidence_score": 0.84
+    }"#;
+    let result =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))?;
+    match result {
+        CodexResult::Pass { summary } => {
+            assert_eq!(summary, "No confirmed security issues after validation.");
+            Ok(())
+        }
+        _ => bail!("expected pass"),
+    }
+}
+
+#[test]
+fn parse_security_review_output_rejects_unstructured_text() {
+    let err = parse_review_output_for_lane(
+        "This patch looks safe.",
+        crate::review_lane::ReviewLane::Security,
+        Some(0.85),
+    )
+    .expect_err("security review should reject prose output");
+    assert!(
+        err.to_string()
+            .contains("security review output must be a structured JSON object")
+    );
+}
+
+#[test]
+fn parse_security_review_output_rejects_wrapped_json() {
+    let text = r#"Security review result:
+{
+  "findings": [],
+  "overall_correctness": "patch is correct",
+  "overall_explanation": "No confirmed issues."
+}"#;
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("security review should reject prose-wrapped JSON output");
+    assert!(
+        err.to_string()
+            .contains("security review output must be a structured JSON object")
+    );
+}
+
+#[test]
+fn parse_security_review_output_rejects_empty_text() {
+    let err =
+        parse_review_output_for_lane("", crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("security review should reject empty output");
+    assert!(
+        err.to_string()
+            .contains("security review output must be a structured JSON object")
+    );
+}
+
+#[test]
+fn parse_security_review_output_rejects_findings_without_confidence() {
+    let text = r#"{
+      "findings": [
+        {
+          "title": "[P1] Missing auth guard",
+          "body": "An attacker can reach the endpoint without the intended check.",
+          "priority": 1,
+          "code_location": {
+            "absolute_file_path": "/work/repo/src/auth.rs",
+            "line_range": { "start": 14, "end": 16 }
+          }
+        }
+      ],
+      "overall_correctness": "patch is incorrect",
+      "overall_explanation": "A security issue was found."
+    }"#;
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("security review should reject findings without confidence");
+    assert!(
+        err.to_string()
+            .contains("security review findings must include confidence_score")
+    );
+}
+
+#[test]
+fn parse_security_review_output_rejects_invalid_confidence_threshold() {
+    let text = r#"{
+      "findings": [
+        {
+          "title": "[P1] Missing auth guard",
+          "body": "An attacker can reach the endpoint without the intended check.",
+          "confidence_score": 0.91,
+          "priority": 1,
+          "code_location": {
+            "absolute_file_path": "/work/repo/src/auth.rs",
+            "line_range": { "start": 14, "end": 16 }
+          }
+        }
+      ],
+      "overall_correctness": "patch is incorrect",
+      "overall_explanation": "A security issue was found."
+    }"#;
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(1.5))
+            .expect_err("security review should reject invalid thresholds");
+    assert!(err.to_string().contains(
+        "security review min_confidence_score must be a finite number between 0.0 and 1.0"
+    ));
+}
+
+#[test]
+fn parse_security_review_output_rejects_invalid_finding_confidence_scores() {
+    let text = r#"{
+      "findings": [
+        {
+          "title": "[P1] Missing auth guard",
+          "body": "An attacker can reach the endpoint without the intended check.",
+          "confidence_score": 7,
+          "priority": 1,
+          "code_location": {
+            "absolute_file_path": "/work/repo/src/auth.rs",
+            "line_range": { "start": 14, "end": 16 }
+          }
+        }
+      ],
+      "overall_correctness": "patch is incorrect",
+      "overall_explanation": "A security issue was found."
+    }"#;
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("security review should reject invalid finding confidence");
+    assert!(
+        err.to_string().contains(
+            "security review findings must use confidence_score values between 0.0 and 1.0"
+        )
+    );
+}
+
+#[test]
+fn parse_security_review_output_rejects_incorrect_verdict_without_confirmed_findings() {
+    let text = r#"{
+      "findings": [],
+      "overall_correctness": "patch is incorrect",
+      "overall_explanation": "The patch is unsafe."
+    }"#;
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("security review should reject incorrect verdict without findings");
+    assert!(
+        err.to_string()
+            .contains("security review marked patch incorrect without confirmed findings")
+    );
+}
+
+#[test]
 fn handle_turn_notification_enriches_agent_message_from_deltas() -> Result<()> {
     let mut client = empty_app_server_client();
     let mut capture = TurnHistoryCapture::default();
@@ -289,6 +457,7 @@ fn handle_turn_notification_enriches_command_output_from_deltas() -> Result<()> 
 
 fn review_context_with_target_branch(target_branch: Option<&str>) -> ReviewContext {
     ReviewContext {
+        lane: crate::review_lane::ReviewLane::General,
         repo: "group/repo".to_string(),
         project_path: "group/repo".to_string(),
         mr: MergeRequest {
@@ -307,8 +476,60 @@ fn review_context_with_target_branch(target_branch: Option<&str>) -> ReviewConte
         },
         head_sha: "abc123".to_string(),
         feature_flags: FeatureFlagSnapshot::default(),
+        additional_developer_instructions: None,
+        min_confidence_score: None,
+        security_context_ttl_seconds: None,
         run_history_id: None,
     }
+}
+
+#[test]
+fn security_context_cache_repo_key_uses_canonical_repo_identity() {
+    let runner = test_runner_with_codex(test_codex_config());
+    let mut ctx = review_context_with_target_branch(Some("main"));
+    ctx.project_path = "fork/source".to_string();
+    assert_eq!(runner.security_context_cache_repo_key(&ctx), "group/repo");
+}
+
+#[test]
+fn security_review_disables_gitlab_discovery_mcp() {
+    let mut codex = test_codex_config();
+    codex.gitlab_discovery_mcp = crate::config::GitLabDiscoveryMcpConfig {
+        enabled: true,
+        bind_addr: "127.0.0.1:8091".to_string(),
+        advertise_url: "http://mcp.internal:8091/mcp".to_string(),
+        allow: vec![crate::config::GitLabDiscoveryAllowRule {
+            source_repos: vec!["fork/source".to_string()],
+            source_group_prefixes: Vec::new(),
+            target_repos: vec!["group/shared".to_string()],
+            target_groups: Vec::new(),
+        }],
+        ..crate::config::GitLabDiscoveryMcpConfig::default()
+    };
+    let service = Arc::new(
+        crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService::new(
+            DockerConfig {
+                host: "tcp://127.0.0.1:2375".to_string(),
+            },
+            &crate::config::GitLabConfig {
+                base_url: "https://gitlab.example.com".to_string(),
+                token: "token".to_string(),
+                bot_user_id: Some(1),
+                created_after: None,
+                targets: GitLabTargets::default(),
+            },
+            codex.gitlab_discovery_mcp.clone(),
+        )
+        .expect("gitlab discovery service"),
+    );
+    let mut runner = test_runner_with_codex(codex);
+    runner.gitlab_discovery_mcp = Some(service as Arc<dyn GitLabDiscoveryHandle>);
+    let mut ctx = review_context_with_target_branch(Some("main"));
+    ctx.lane = crate::review_lane::ReviewLane::Security;
+    ctx.project_path = "fork/source".to_string();
+    ctx.feature_flags.gitlab_discovery_mcp = true;
+
+    assert!(runner.prepare_review_gitlab_discovery_mcp(&ctx).is_none());
 }
 
 #[test]
@@ -1636,6 +1857,7 @@ fn effective_feature_flags_require_injected_gitlab_discovery_mcp() {
         composer_install: false,
         composer_auto_repositories: false,
         composer_safe_install: false,
+        security_review: false,
     };
 
     assert!(DockerCodexRunner::effective_feature_flags(&requested, true).gitlab_discovery_mcp);
@@ -1708,6 +1930,7 @@ fn prepare_gitlab_discovery_mcp_rejects_empty_source_repo() {
             composer_install: false,
             composer_auto_repositories: false,
             composer_safe_install: false,
+            security_review: false,
         },
         &BTreeMap::new(),
     );
@@ -1772,8 +1995,7 @@ fn browser_wait_script_probes_endpoint_until_ready() -> Result<()> {
             }
         }
 
-        if request
-            == b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        if request == b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
         {
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
         }
@@ -3061,6 +3283,7 @@ async fn run_review_with_fake_runtime_persists_gitlab_discovery_startup_warning(
                 composer_install: false,
                 composer_auto_repositories: false,
                 composer_safe_install: false,
+                security_review: false,
             },
             ..review_context_with_target_branch(Some("main"))
         })
