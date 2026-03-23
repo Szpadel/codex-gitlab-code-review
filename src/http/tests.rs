@@ -676,6 +676,25 @@ fn history_query_accepts_all_kind_as_unfiltered() -> Result<()> {
 }
 
 #[test]
+fn history_query_accepts_security_kind() -> Result<()> {
+    let query = HistoryQueryParams {
+        repo: None,
+        iid: None,
+        kind: Some("security".to_string()),
+        result: None,
+        q: None,
+        limit: None,
+        page: None,
+        after: None,
+        before: None,
+    }
+    .into_query()?;
+
+    assert_eq!(query.kind, Some(RunHistoryKind::Security));
+    Ok(())
+}
+
+#[test]
 fn history_query_rejects_page_based_pagination() {
     let error = HistoryQueryParams {
         repo: None,

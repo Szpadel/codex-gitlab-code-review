@@ -2576,6 +2576,15 @@ async fn security_reviews_use_canonical_project_path_for_runner_context() -> Res
             .map(|ctx| ctx.project_path.as_str()),
         Some("target/repo")
     );
+    let run_kinds = service
+        .state
+        .list_run_history_for_mr("target/repo", 12)
+        .await?
+        .into_iter()
+        .map(|record| record.kind)
+        .collect::<Vec<_>>();
+    assert!(run_kinds.contains(&crate::state::RunHistoryKind::Review));
+    assert!(run_kinds.contains(&crate::state::RunHistoryKind::Security));
     Ok(())
 }
 

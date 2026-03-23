@@ -435,6 +435,7 @@ fn render_kind_options(selected: Option<RunHistoryKind>) -> String {
     let values = [
         (None, "all"),
         (Some(RunHistoryKind::Review), "review"),
+        (Some(RunHistoryKind::Security), "security"),
         (Some(RunHistoryKind::Mention), "mention"),
     ];
     values
@@ -1647,6 +1648,7 @@ fn bool_label(value: bool) -> &'static str {
 fn run_kind_label(kind: RunHistoryKind) -> &'static str {
     match kind {
         RunHistoryKind::Review => "review",
+        RunHistoryKind::Security => "security",
         RunHistoryKind::Mention => "mention",
     }
 }

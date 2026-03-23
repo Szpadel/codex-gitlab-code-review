@@ -50,6 +50,7 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
 .empty { margin: 0; color: var(--text-secondary); }
 .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 12px; line-height: 16px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; background: var(--surface-subtle); color: var(--text-secondary); border: 1px solid var(--divider); }
 .badge-review { background: #E7F6EC; color: var(--success); border-color: #CFE9D8; }
+.badge-security { background: #FEF3C7; color: var(--warning); border-color: #FCD34D; }
 .badge-mention { background: #EFF6FF; color: var(--info); border-color: #CFE1FD; }
 .badge-result { text-transform: none; letter-spacing: 0; }
 .filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }

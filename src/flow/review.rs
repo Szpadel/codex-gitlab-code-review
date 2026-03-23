@@ -364,7 +364,11 @@ impl ReviewFlow {
             .state
             .start_run_history_for_lane(
                 NewRunHistory {
-                    kind: RunHistoryKind::Review,
+                    kind: if self.lane.is_security() {
+                        RunHistoryKind::Security
+                    } else {
+                        RunHistoryKind::Review
+                    },
                     repo: repo.to_string(),
                     iid: mr.iid,
                     head_sha: head_sha.to_string(),
@@ -456,7 +460,11 @@ impl ReviewFlow {
             .state
             .start_run_history_for_lane(
                 NewRunHistory {
-                    kind: RunHistoryKind::Review,
+                    kind: if self.lane.is_security() {
+                        RunHistoryKind::Security
+                    } else {
+                        RunHistoryKind::Review
+                    },
                     repo: repo.to_string(),
                     iid: mr.iid,
                     head_sha: head_sha.to_string(),

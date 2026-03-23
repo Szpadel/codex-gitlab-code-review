@@ -823,6 +823,34 @@ async fn run_history_feature_flags_snapshot_roundtrip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn security_run_history_roundtrip_uses_security_kind() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let run_id = store
+        .start_run_history_for_lane(
+            NewRunHistory {
+                kind: RunHistoryKind::Security,
+                repo: "group/repo".to_string(),
+                iid: 13,
+                head_sha: "sha-security".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            Some(crate::review_lane::ReviewLane::Security),
+        )
+        .await?;
+
+    let record = store
+        .get_run_history(run_id)
+        .await?
+        .context("run history row should exist")?;
+    assert_eq!(record.kind, RunHistoryKind::Security);
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_history_filters_by_mr() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let first = store
@@ -872,6 +900,57 @@ async fn run_history_filters_by_mr() -> Result<()> {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].repo, "group/repo".to_string());
     assert_eq!(records[0].iid, 11);
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_inline_review_detection_respects_security_kind() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let run_id = store
+        .start_run_history_for_lane(
+            NewRunHistory {
+                kind: RunHistoryKind::Security,
+                repo: "group/repo".to_string(),
+                iid: 21,
+                head_sha: "sha-security-inline".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            },
+            Some(crate::review_lane::ReviewLane::Security),
+        )
+        .await?;
+    store
+        .set_run_history_feature_flags(
+            run_id,
+            &FeatureFlagSnapshot {
+                gitlab_inline_review_comments: true,
+                ..FeatureFlagSnapshot::default()
+            },
+        )
+        .await?;
+    store
+        .finish_run_history(
+            run_id,
+            RunHistoryFinish {
+                result: "comment".to_string(),
+                ..RunHistoryFinish::default()
+            },
+        )
+        .await?;
+
+    assert!(
+        store
+            .has_completed_inline_review_for_lane(
+                "group/repo",
+                21,
+                "sha-security-inline",
+                crate::review_lane::ReviewLane::Security,
+            )
+            .await?
+    );
     Ok(())
 }
 

@@ -32,6 +32,7 @@ pub struct ProjectCatalog {
 #[serde(rename_all = "snake_case")]
 pub enum RunHistoryKind {
     Review,
+    Security,
     Mention,
 }
 
@@ -453,11 +454,16 @@ impl ReviewStateStore {
         sha: &str,
         lane: ReviewLane,
     ) -> Result<bool> {
+        let kind = if lane.is_security() {
+            RunHistoryKind::Security
+        } else {
+            RunHistoryKind::Review
+        };
         let row = sqlx::query(
             r#"
             SELECT 1
             FROM run_history
-            WHERE kind = 'review'
+            WHERE kind = ?
               AND review_lane = ?
               AND repo = ?
               AND iid = ?
@@ -468,6 +474,7 @@ impl ReviewStateStore {
             LIMIT 1
             "#,
         )
+        .bind(run_history_kind_label(kind))
         .bind(lane.as_str())
         .bind(repo)
         .bind(iid as i64)
@@ -971,6 +978,7 @@ impl ReviewStateStore {
     pub async fn start_run_history(&self, new_run: NewRunHistory) -> Result<i64> {
         let review_lane = match new_run.kind {
             RunHistoryKind::Review => Some(ReviewLane::General),
+            RunHistoryKind::Security => Some(ReviewLane::Security),
             RunHistoryKind::Mention => None,
         };
         self.start_run_history_for_lane(new_run, review_lane).await
@@ -1833,6 +1841,7 @@ fn auth_limit_reset_key(account_name: &str) -> String {
 fn run_history_kind_label(kind: RunHistoryKind) -> &'static str {
     match kind {
         RunHistoryKind::Review => "review",
+        RunHistoryKind::Security => "security",
         RunHistoryKind::Mention => "mention",
     }
 }
@@ -1934,6 +1943,7 @@ fn append_run_history_cursor_clause<'args>(
 fn parse_run_history_kind(value: &str) -> Result<RunHistoryKind> {
     match value {
         "review" => Ok(RunHistoryKind::Review),
+        "security" => Ok(RunHistoryKind::Security),
         "mention" => Ok(RunHistoryKind::Mention),
         other => bail!("unknown run_history kind: {other}"),
     }
