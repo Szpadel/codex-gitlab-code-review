@@ -878,6 +878,67 @@ async fn security_run_history_roundtrip_uses_security_kind() -> Result<()> {
 }
 
 #[tokio::test]
+async fn run_history_session_roundtrips_security_context_metadata() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let run_id = store
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Security,
+            repo: "group/repo".to_string(),
+            iid: 13,
+            head_sha: "sha-security".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+
+    store
+        .update_run_history_session(
+            run_id,
+            RunHistorySessionUpdate {
+                security_context_source_run_id: Some(run_id),
+                security_context_base_branch: Some("main".to_string()),
+                security_context_base_head_sha: Some("base-sha".to_string()),
+                security_context_prompt_version: Some(
+                    "security-review-context-v1".to_string(),
+                ),
+                security_context_payload_json: Some("{\"components\":[\"api\"]}".to_string()),
+                security_context_generated_at: Some(100),
+                security_context_expires_at: Some(200),
+                ..RunHistorySessionUpdate::default()
+            },
+        )
+        .await?;
+
+    let record = store
+        .get_run_history(run_id)
+        .await?
+        .context("run history row should exist")?;
+    assert_eq!(record.security_context_source_run_id, Some(run_id));
+    assert_eq!(
+        record.security_context_base_branch.as_deref(),
+        Some("main")
+    );
+    assert_eq!(
+        record.security_context_base_head_sha.as_deref(),
+        Some("base-sha")
+    );
+    assert_eq!(
+        record.security_context_prompt_version.as_deref(),
+        Some("security-review-context-v1")
+    );
+    assert_eq!(
+        record.security_context_payload_json.as_deref(),
+        Some("{\"components\":[\"api\"]}")
+    );
+    assert_eq!(record.security_context_generated_at, Some(100));
+    assert_eq!(record.security_context_expires_at, Some(200));
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_history_filters_by_mr() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let first = store

@@ -18,8 +18,8 @@ use crate::config::{
 };
 use crate::feature_flags::{FeatureFlagDefaults, FeatureFlagSnapshot};
 use crate::state::{
-    ReviewStateStore, RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord,
-    TranscriptBackfillState,
+    NewRunHistory, ReviewStateStore, RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord,
+    RunHistorySessionUpdate, SecurityReviewContextCacheEntry, TranscriptBackfillState,
 };
 use crate::transcript_backfill::TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR;
 use serde_json::json;
@@ -545,6 +545,125 @@ async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> a
             .gitlab_discovery_mcp,
         None
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_detail_snapshot_includes_security_context_preview_for_legacy_cached_entry(
+) -> anyhow::Result<()> {
+    let store = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+    let run_id = store
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Security,
+            repo: "group/repo".to_string(),
+            iid: 1,
+            head_sha: "head-sha".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    store
+        .update_run_history_session(
+            run_id,
+            RunHistorySessionUpdate {
+                security_context_base_branch: Some("main".to_string()),
+                security_context_base_head_sha: Some("base-sha".to_string()),
+                security_context_prompt_version: Some("security-review-context-v1".to_string()),
+                ..RunHistorySessionUpdate::default()
+            },
+        )
+        .await?;
+    store
+        .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
+            repo: "group/repo".to_string(),
+            base_branch: "main".to_string(),
+            base_head_sha: "base-sha".to_string(),
+            prompt_version: "security-review-context-v1".to_string(),
+            payload_json: "{\"components\":[\"api\"]}".to_string(),
+            source_run_history_id: 0,
+            generated_at: 100,
+            expires_at: 200,
+        })
+        .await?;
+
+    let snapshot = service
+        .run_detail_snapshot(run_id)
+        .await?
+        .expect("run detail snapshot");
+
+    let preview = snapshot
+        .security_context_preview
+        .expect("security context preview");
+    assert_eq!(preview.base_branch, "main");
+    assert_eq!(preview.base_head_sha, "base-sha");
+    assert_eq!(preview.prompt_version, "security-review-context-v1");
+    assert_eq!(preview.payload_json, "{\"components\":[\"api\"]}");
+    assert_eq!(preview.source_run_history_id, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_detail_snapshot_prefers_immutable_run_payload_over_mutated_cache(
+) -> anyhow::Result<()> {
+    let store = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+    let run_id = store
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Security,
+            repo: "group/repo".to_string(),
+            iid: 2,
+            head_sha: "head-sha".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    store
+        .update_run_history_session(
+            run_id,
+            RunHistorySessionUpdate {
+                security_context_source_run_id: Some(run_id),
+                security_context_base_branch: Some("main".to_string()),
+                security_context_base_head_sha: Some("base-sha".to_string()),
+                security_context_prompt_version: Some("security-review-context-v1".to_string()),
+                security_context_payload_json: Some("{\"components\":[\"original\"]}".to_string()),
+                security_context_generated_at: Some(111),
+                security_context_expires_at: Some(222),
+                ..RunHistorySessionUpdate::default()
+            },
+        )
+        .await?;
+    store
+        .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
+            repo: "group/repo".to_string(),
+            base_branch: "main".to_string(),
+            base_head_sha: "base-sha".to_string(),
+            prompt_version: "security-review-context-v1".to_string(),
+            payload_json: "{\"components\":[\"mutated\"]}".to_string(),
+            source_run_history_id: run_id,
+            generated_at: 100,
+            expires_at: 200,
+        })
+        .await?;
+
+    let snapshot = service
+        .run_detail_snapshot(run_id)
+        .await?
+        .expect("run detail snapshot");
+
+    let preview = snapshot
+        .security_context_preview
+        .expect("security context preview");
+    assert_eq!(preview.payload_json, "{\"components\":[\"original\"]}");
+    assert_eq!(preview.source_run_history_id, Some(run_id));
+    assert_eq!(preview.generated_at, 111);
+    assert_eq!(preview.expires_at, 222);
     Ok(())
 }
 
@@ -1334,7 +1453,13 @@ fn sample_run_history_record(updated_at: i64) -> RunHistoryRecord {
         thread_id: Some("thread-1".to_string()),
         turn_id: Some("turn-1".to_string()),
         review_thread_id: None,
-            security_context_source_run_id: None,
+        security_context_source_run_id: None,
+        security_context_base_branch: None,
+        security_context_base_head_sha: None,
+        security_context_prompt_version: None,
+        security_context_payload_json: None,
+        security_context_generated_at: None,
+        security_context_expires_at: None,
         preview: Some("Preview".to_string()),
         summary: None,
         error: None,

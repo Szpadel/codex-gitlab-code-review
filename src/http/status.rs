@@ -479,6 +479,7 @@ impl StatusService {
             .state
             .list_run_history_for_mr(&run.repo, run.iid)
             .await?;
+        let security_context_preview = self.resolve_security_context_preview(&run).await?;
         let events = self.state.list_run_history_events(run.id).await?;
         let thread = thread_snapshot_from_events(&run, &events);
         let transcript_backfill = self
@@ -488,8 +489,55 @@ impl StatusService {
             generated_at: Utc::now().to_rfc3339(),
             run,
             related_runs,
+            security_context_preview,
             thread,
             transcript_backfill,
+        }))
+    }
+
+    async fn resolve_security_context_preview(
+        &self,
+        run: &RunHistoryRecord,
+    ) -> Result<Option<SecurityContextPreview>> {
+        if run.kind != RunHistoryKind::Security {
+            return Ok(None);
+        }
+        let (Some(base_branch), Some(base_head_sha), Some(prompt_version)) = (
+            run.security_context_base_branch.as_deref(),
+            run.security_context_base_head_sha.as_deref(),
+            run.security_context_prompt_version.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        if let Some(payload_json) = run.security_context_payload_json.as_ref() {
+            return Ok(Some(SecurityContextPreview {
+                base_branch: base_branch.to_string(),
+                base_head_sha: base_head_sha.to_string(),
+                prompt_version: prompt_version.to_string(),
+                payload_json: payload_json.clone(),
+                source_run_history_id: run.security_context_source_run_id,
+                generated_at: run.security_context_generated_at.unwrap_or(run.started_at),
+                expires_at: run
+                    .security_context_expires_at
+                    .unwrap_or(run.finished_at.unwrap_or(run.updated_at)),
+            }));
+        }
+        let cache_entry = self
+            .state
+            .find_security_review_context_cache(&run.repo, base_branch, base_head_sha, prompt_version)
+            .await?;
+        let Some(entry) = cache_entry else {
+            return Ok(None);
+        };
+        Ok(Some(SecurityContextPreview {
+            base_branch: entry.base_branch,
+            base_head_sha: entry.base_head_sha,
+            prompt_version: entry.prompt_version,
+            payload_json: entry.payload_json,
+            source_run_history_id: (entry.source_run_history_id > 0)
+                .then_some(entry.source_run_history_id),
+            generated_at: entry.generated_at,
+            expires_at: entry.expires_at,
         }))
     }
 
@@ -1544,8 +1592,20 @@ pub struct RunDetailSnapshot {
     pub generated_at: String,
     pub run: RunHistoryRecord,
     pub related_runs: Vec<RunHistoryRecord>,
+    pub security_context_preview: Option<SecurityContextPreview>,
     pub thread: Option<ThreadSnapshot>,
     pub transcript_backfill: Option<TranscriptBackfillSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SecurityContextPreview {
+    pub base_branch: String,
+    pub base_head_sha: String,
+    pub prompt_version: String,
+    pub payload_json: String,
+    pub source_run_history_id: Option<i64>,
+    pub generated_at: i64,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

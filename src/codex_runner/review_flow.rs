@@ -50,6 +50,8 @@ struct SecurityContextPayloadResolution {
     source_run_history_id: Option<i64>,
     base_head_sha: Option<String>,
     worktree_path: Option<String>,
+    generated_at: Option<i64>,
+    expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -582,6 +584,8 @@ impl DockerCodexRunner {
                     .then_some(entry.source_run_history_id),
                 base_head_sha: Some(base_head_sha),
                 worktree_path: None,
+                generated_at: Some(entry.generated_at),
+                expires_at: Some(entry.expires_at),
             });
         }
         let worktree_path = self
@@ -592,6 +596,8 @@ impl DockerCodexRunner {
             source_run_history_id: None,
             base_head_sha: Some(base_head_sha),
             worktree_path: Some(worktree_path),
+            generated_at: None,
+            expires_at: None,
         })
     }
 
@@ -630,6 +636,25 @@ impl DockerCodexRunner {
             .trim(),
         );
         prompt
+    }
+
+    fn security_context_session_update(
+        base_branch: Option<&str>,
+        resolution: &SecurityContextPayloadResolution,
+    ) -> RunHistorySessionUpdate {
+        if resolution.payload_json.is_none() {
+            return RunHistorySessionUpdate::default();
+        }
+        RunHistorySessionUpdate {
+            security_context_source_run_id: resolution.source_run_history_id,
+            security_context_base_branch: base_branch.map(ToOwned::to_owned),
+            security_context_base_head_sha: resolution.base_head_sha.clone(),
+            security_context_prompt_version: Some(SECURITY_CONTEXT_PROMPT_VERSION.to_string()),
+            security_context_payload_json: resolution.payload_json.clone(),
+            security_context_generated_at: resolution.generated_at,
+            security_context_expires_at: resolution.expires_at,
+            ..RunHistorySessionUpdate::default()
+        }
     }
 
     pub(crate) async fn run_app_server_review_with_account(
@@ -852,17 +877,14 @@ impl DockerCodexRunner {
                         bail!("thread/start missing thread id");
                     }
                 };
-                self.update_run_history_session(
-                    ctx.run_history_id,
-                    RunHistorySessionUpdate {
-                        thread_id: Some(thread_id.clone()),
-                        auth_account_name: Some(account.name.clone()),
-                        security_context_source_run_id: security_context_resolution
-                            .source_run_history_id,
-                        ..RunHistorySessionUpdate::default()
-                    },
-                )
-                .await;
+                let mut session_update = Self::security_context_session_update(
+                    security_context_base_branch.as_deref(),
+                    &security_context_resolution,
+                );
+                session_update.thread_id = Some(thread_id.clone());
+                session_update.auth_account_name = Some(account.name.clone());
+                self.update_run_history_session(ctx.run_history_id, session_update)
+                    .await;
                 if ctx.lane.is_security() {
                     if let (Some(worktree_path), Some(base_branch), Some(base_head_sha)) = (
                         security_context_resolution.worktree_path.as_deref(),
@@ -923,6 +945,18 @@ impl DockerCodexRunner {
                                 }
                                 security_context_resolution.payload_json =
                                     Some(payload_json.clone());
+                                security_context_resolution.source_run_history_id =
+                                    ctx.run_history_id;
+                                security_context_resolution.generated_at = Some(generated_at);
+                                security_context_resolution.expires_at = Some(expires_at);
+                                self.update_run_history_session(
+                                    ctx.run_history_id,
+                                    Self::security_context_session_update(
+                                        security_context_base_branch.as_deref(),
+                                        &security_context_resolution,
+                                    ),
+                                )
+                                .await;
                                 security_review_instructions = Some(
                                     self.build_security_review_instructions(
                                         security_base_prompt
@@ -971,18 +1005,15 @@ impl DockerCodexRunner {
                         .and_then(|id| id.as_str())
                         .ok_or_else(|| anyhow!("turn/start missing turn id for security review"))?
                         .to_string();
-                    self.update_run_history_session(
-                        ctx.run_history_id,
-                        RunHistorySessionUpdate {
-                            thread_id: Some(thread_id.clone()),
-                            turn_id: Some(turn_id.clone()),
-                            auth_account_name: Some(account.name.clone()),
-                            security_context_source_run_id: security_context_resolution
-                                .source_run_history_id,
-                            ..RunHistorySessionUpdate::default()
-                        },
-                    )
-                    .await;
+                    let mut session_update = Self::security_context_session_update(
+                        security_context_base_branch.as_deref(),
+                        &security_context_resolution,
+                    );
+                    session_update.thread_id = Some(thread_id.clone());
+                    session_update.turn_id = Some(turn_id.clone());
+                    session_update.auth_account_name = Some(account.name.clone());
+                    self.update_run_history_session(ctx.run_history_id, session_update)
+                        .await;
                     client
                         .stream_turn_message(
                             &thread_id,

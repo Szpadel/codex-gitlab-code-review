@@ -1,5 +1,6 @@
 use super::status::{
-    HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, StatusFeatureFlagSnapshot,
+    HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, SecurityContextPreview,
+    StatusFeatureFlagSnapshot,
     StatusSnapshot, ThreadItemSnapshot, ThreadSnapshot, TranscriptBackfillSnapshot,
 };
 use super::timestamp::{self, UiTimestamp};
@@ -152,7 +153,7 @@ pub(super) fn render_run_detail_page(
          <article class=\"card\"><h2>Run metadata</h2>{}</article>\
          <article class=\"card\"><h2>Related sessions</h2>{}</article>\
          </section>\
-         {}{}",
+         {}{}{}",
         run.id,
         escape_html(run_kind_label(run.kind)),
         escape_html(&run.repo),
@@ -160,6 +161,7 @@ pub(super) fn render_run_detail_page(
         render_run_metadata(run),
         render_related_runs(&snapshot.related_runs, run.id),
         render_trigger_card(run),
+        render_security_context_card(run, snapshot.security_context_preview.as_ref()),
         render_thread_card(
             run,
             snapshot.thread.as_ref(),
@@ -821,6 +823,38 @@ fn render_trigger_card(run: &RunHistoryRecord) -> String {
                 .as_deref()
                 .unwrap_or("(no trigger note body)")
         )
+    )
+}
+
+fn render_security_context_card(
+    run: &RunHistoryRecord,
+    preview: Option<&SecurityContextPreview>,
+) -> String {
+    let Some(preview) = preview else {
+        return String::new();
+    };
+    let source = match preview.source_run_history_id {
+        Some(source_run_id) if source_run_id > 0 && source_run_id != run.id => format!(
+            "<a href=\"/history/{source_run_id}\">run {source_run_id}</a>"
+        ),
+        Some(source_run_id) if source_run_id == run.id => "generated in this run".to_string(),
+        _ => "legacy cached context".to_string(),
+    };
+    let pretty_payload = pretty_print_json(preview.payload_json.as_str());
+    format!(
+        "<section class=\"card\"><h2>Security context</h2>\
+         <p class=\"muted\">Exact cached threat-model payload injected into the security review prompt.</p>\
+         <dl>{}</dl>\
+         <pre class=\"codeblock\">{}</pre></section>",
+        render_definition_list(&[
+            ("Base branch".to_string(), escape_html(&preview.base_branch)),
+            ("Base head".to_string(), format!("<code>{}</code>", escape_html(&preview.base_head_sha))),
+            ("Prompt version".to_string(), format!("<code>{}</code>", escape_html(&preview.prompt_version))),
+            ("Source".to_string(), source),
+            ("Generated".to_string(), render_unix_timestamp(preview.generated_at)),
+            ("Expires".to_string(), render_unix_timestamp(preview.expires_at)),
+        ]),
+        escape_html(&pretty_payload),
     )
 }
 
@@ -1578,6 +1612,13 @@ fn render_definition_list(items: &[(String, String)]) -> String {
         .join("")
 }
 
+fn pretty_print_json(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| raw.to_string())
+}
+
 fn render_shell(title: &str, active: NavItem, content: String, csrf_token: Option<&str>) -> String {
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -1720,7 +1761,7 @@ fn page_style() -> &'static str {
 mod tests {
     use super::*;
     use crate::feature_flags::FeatureFlagSnapshot;
-    use crate::http::status::RunDetailSnapshot;
+    use crate::http::status::{RunDetailSnapshot, SecurityContextPreview};
     use crate::state::{RunHistoryKind, RunHistoryRecord, TranscriptBackfillState};
 
     fn sample_run(kind: RunHistoryKind) -> RunHistoryRecord {
@@ -1739,6 +1780,12 @@ mod tests {
             turn_id: Some("turn-1".to_string()),
             review_thread_id: None,
             security_context_source_run_id: None,
+            security_context_base_branch: None,
+            security_context_base_head_sha: None,
+            security_context_prompt_version: None,
+            security_context_payload_json: None,
+            security_context_generated_at: None,
+            security_context_expires_at: None,
             preview: Some("Preview".to_string()),
             summary: Some("Summary".to_string()),
             error: None,
@@ -1764,6 +1811,7 @@ mod tests {
             generated_at: "2026-03-23T00:00:00Z".to_string(),
             run,
             related_runs: Vec::new(),
+            security_context_preview: None,
             thread: None,
             transcript_backfill: None,
         };
@@ -1771,6 +1819,36 @@ mod tests {
         let html = render_run_detail_page(&snapshot, None);
 
         assert!(html.contains("Reused cached security context from"));
+        assert!(html.contains("/history/42"));
+    }
+
+    #[test]
+    fn run_detail_page_renders_security_context_preview() {
+        let run = sample_run(RunHistoryKind::Security);
+        let snapshot = RunDetailSnapshot {
+            generated_at: "2026-03-23T00:00:00Z".to_string(),
+            run,
+            related_runs: Vec::new(),
+            security_context_preview: Some(SecurityContextPreview {
+                base_branch: "main".to_string(),
+                base_head_sha: "deadbeef".to_string(),
+                prompt_version: "security-review-context-v1".to_string(),
+                payload_json: "{\"components\":[\"api\"],\"focus_paths\":[\"src/auth.rs\"]}"
+                    .to_string(),
+                source_run_history_id: Some(42),
+                generated_at: 1_711_152_000,
+                expires_at: 1_712_361_600,
+            }),
+            thread: None,
+            transcript_backfill: None,
+        };
+
+        let html = render_run_detail_page(&snapshot, None);
+
+        assert!(html.contains("Security context"));
+        assert!(html.contains("main"));
+        assert!(html.contains("deadbeef"));
+        assert!(html.contains("&quot;components&quot;"));
         assert!(html.contains("/history/42"));
     }
 }

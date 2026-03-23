@@ -1002,6 +1002,7 @@ async fn run_detail_page_renders_trigger_note_and_thread_preview() -> Result<()>
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "committed".to_string(),
@@ -1259,6 +1260,7 @@ async fn run_detail_uses_review_thread_id_in_metadata_when_events_exist() -> Res
             review_thread_id: Some("thread-review".to_string()),
             auth_account_name: Some("primary".to_string()),
             security_context_source_run_id: None,
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -1341,6 +1343,7 @@ async fn run_detail_renders_dynamic_tool_results_and_failed_command_status() -> 
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -1436,6 +1439,7 @@ async fn run_detail_formats_numeric_millisecond_timestamps_as_utc() -> Result<()
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -1513,6 +1517,7 @@ async fn run_detail_page_falls_back_when_event_history_is_missing() -> Result<()
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "committed".to_string(),
@@ -1560,6 +1565,7 @@ async fn run_detail_renders_non_diff_file_change_payload_as_plain_body() -> Resu
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -1643,6 +1649,7 @@ async fn run_detail_renders_mixed_file_change_payloads_with_diff_sections() -> R
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -1750,6 +1757,7 @@ async fn run_detail_page_shows_unavailable_transcript_for_legacy_runs() -> Resul
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "committed".to_string(),
@@ -1814,6 +1822,7 @@ async fn run_detail_keeps_partial_persisted_history_without_thread_reader() -> R
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -1900,6 +1909,7 @@ async fn run_detail_prefers_complete_persisted_event_history() -> Result<()> {
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -1992,6 +2002,7 @@ async fn run_detail_skips_live_thread_when_complete_persisted_history_exists() -
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -2071,6 +2082,7 @@ async fn run_detail_keeps_incomplete_persisted_history_without_thread_reader() -
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -2155,6 +2167,7 @@ async fn run_detail_keeps_completed_turn_without_items_without_thread_reader() -
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "committed".to_string(),
@@ -2238,6 +2251,7 @@ async fn run_detail_keeps_command_without_body_without_thread_reader() -> Result
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -2471,6 +2485,7 @@ async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -2599,6 +2614,7 @@ async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread(
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "pass".to_string(),
@@ -2748,6 +2764,7 @@ async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Res
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -2882,6 +2899,7 @@ async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -3016,6 +3034,7 @@ async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewri
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -3177,6 +3196,7 @@ async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_c
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -3357,6 +3377,7 @@ async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing(
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -3588,6 +3609,7 @@ async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> R
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -3795,6 +3817,7 @@ async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_tu
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -3969,6 +3992,7 @@ async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -4103,6 +4127,7 @@ async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_mark
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -4237,6 +4262,7 @@ async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -4388,6 +4414,7 @@ async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_t
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -4552,6 +4579,7 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -4661,6 +4689,7 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -4787,6 +4816,7 @@ async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers(
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -4933,6 +4963,7 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -5191,6 +5222,7 @@ async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
                 review_thread_id: None,
             security_context_source_run_id: None,
                 auth_account_name: Some("primary".to_string()),
+                ..RunHistorySessionUpdate::default()
             },
         )
         .await?;
@@ -5258,6 +5290,7 @@ async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -5381,6 +5414,7 @@ async fn run_detail_retries_after_transient_missing_session_history() -> Result<
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -5549,6 +5583,7 @@ async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -5690,6 +5725,7 @@ async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -5840,6 +5876,7 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing()
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -6050,6 +6087,7 @@ async fn run_detail_full_thread_fallback_ignores_unrelated_pending_review_marker
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -6269,6 +6307,7 @@ async fn run_detail_uses_full_thread_fallback_when_turn_scoped_backfill_is_incom
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -6459,6 +6498,7 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missi
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -6636,6 +6676,7 @@ async fn run_detail_backfill_uses_base_thread_id_when_review_thread_differs() ->
             review_thread_id: Some("thread-review".to_string()),
             auth_account_name: Some("primary".to_string()),
             security_context_source_run_id: None,
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -6762,6 +6803,7 @@ async fn run_detail_retries_when_session_history_directory_appears_later() -> Re
             review_thread_id: None,
             security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
+            ..RunHistorySessionUpdate::default()
         },
         RunHistoryFinish {
             result: "commented".to_string(),

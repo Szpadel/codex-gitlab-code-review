@@ -78,6 +78,12 @@ pub struct RunHistorySessionUpdate {
     pub review_thread_id: Option<String>,
     pub auth_account_name: Option<String>,
     pub security_context_source_run_id: Option<i64>,
+    pub security_context_base_branch: Option<String>,
+    pub security_context_base_head_sha: Option<String>,
+    pub security_context_prompt_version: Option<String>,
+    pub security_context_payload_json: Option<String>,
+    pub security_context_generated_at: Option<i64>,
+    pub security_context_expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -96,6 +102,12 @@ pub struct RunHistoryRecord {
     pub turn_id: Option<String>,
     pub review_thread_id: Option<String>,
     pub security_context_source_run_id: Option<i64>,
+    pub security_context_base_branch: Option<String>,
+    pub security_context_base_head_sha: Option<String>,
+    pub security_context_prompt_version: Option<String>,
+    pub security_context_payload_json: Option<String>,
+    pub security_context_generated_at: Option<i64>,
+    pub security_context_expires_at: Option<i64>,
     pub preview: Option<String>,
     pub summary: Option<String>,
     pub error: Option<String>,
@@ -661,6 +673,35 @@ impl ReviewStateStore {
         row.map(map_security_review_context_cache_entry).transpose()
     }
 
+    pub async fn find_security_review_context_cache(
+        &self,
+        repo: &str,
+        base_branch: &str,
+        base_head_sha: &str,
+        prompt_version: &str,
+    ) -> Result<Option<SecurityReviewContextCacheEntry>> {
+        let row = sqlx::query(
+            r#"
+            SELECT repo, base_branch, base_head_sha, prompt_version, payload_json, source_run_history_id,
+                   generated_at, expires_at
+            FROM security_review_context_cache
+            WHERE repo = ?
+              AND base_branch = ?
+              AND base_head_sha = ?
+              AND prompt_version = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(repo)
+        .bind(base_branch)
+        .bind(base_head_sha)
+        .bind(prompt_version)
+        .fetch_optional(&self.pool)
+        .await
+        .context("find security review context cache")?;
+        row.map(map_security_review_context_cache_entry).transpose()
+    }
+
     pub async fn upsert_security_review_context_cache(
         &self,
         entry: &SecurityReviewContextCacheEntry,
@@ -1048,6 +1089,12 @@ impl ReviewStateStore {
                 review_thread_id = COALESCE(?, review_thread_id),
                 auth_account_name = COALESCE(?, auth_account_name),
                 security_context_source_run_id = COALESCE(?, security_context_source_run_id),
+                security_context_base_branch = COALESCE(?, security_context_base_branch),
+                security_context_base_head_sha = COALESCE(?, security_context_base_head_sha),
+                security_context_prompt_version = COALESCE(?, security_context_prompt_version),
+                security_context_payload_json = COALESCE(?, security_context_payload_json),
+                security_context_generated_at = COALESCE(?, security_context_generated_at),
+                security_context_expires_at = COALESCE(?, security_context_expires_at),
                 updated_at = ?
             WHERE id = ?
             "#,
@@ -1057,6 +1104,12 @@ impl ReviewStateStore {
         .bind(update.review_thread_id)
         .bind(update.auth_account_name)
         .bind(update.security_context_source_run_id)
+        .bind(update.security_context_base_branch)
+        .bind(update.security_context_base_head_sha)
+        .bind(update.security_context_prompt_version)
+        .bind(update.security_context_payload_json)
+        .bind(update.security_context_generated_at)
+        .bind(update.security_context_expires_at)
         .bind(Utc::now().timestamp())
         .bind(run_id)
         .execute(&self.pool)
@@ -1372,6 +1425,9 @@ impl ReviewStateStore {
             r#"
             SELECT id, kind, review_lane, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, security_context_source_run_id,
+                   security_context_base_branch, security_context_base_head_sha,
+                   security_context_prompt_version, security_context_payload_json,
+                   security_context_generated_at, security_context_expires_at,
                    preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
                    command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
@@ -1394,6 +1450,9 @@ impl ReviewStateStore {
             r#"
             SELECT id, kind, review_lane, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, security_context_source_run_id,
+                   security_context_base_branch, security_context_base_head_sha,
+                   security_context_prompt_version, security_context_payload_json,
+                   security_context_generated_at, security_context_expires_at,
                    preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
                    command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
@@ -2028,6 +2087,24 @@ fn map_run_history_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord>
         security_context_source_run_id: row
             .try_get("security_context_source_run_id")
             .context("read run history security_context_source_run_id")?,
+        security_context_base_branch: row
+            .try_get("security_context_base_branch")
+            .context("read run history security_context_base_branch")?,
+        security_context_base_head_sha: row
+            .try_get("security_context_base_head_sha")
+            .context("read run history security_context_base_head_sha")?,
+        security_context_prompt_version: row
+            .try_get("security_context_prompt_version")
+            .context("read run history security_context_prompt_version")?,
+        security_context_payload_json: row
+            .try_get("security_context_payload_json")
+            .context("read run history security_context_payload_json")?,
+        security_context_generated_at: row
+            .try_get("security_context_generated_at")
+            .context("read run history security_context_generated_at")?,
+        security_context_expires_at: row
+            .try_get("security_context_expires_at")
+            .context("read run history security_context_expires_at")?,
         preview: row.try_get("preview").context("read run history preview")?,
         summary: row.try_get("summary").context("read run history summary")?,
         error: row.try_get("error").context("read run history error")?,
