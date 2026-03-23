@@ -211,7 +211,7 @@ impl DockerCodexRunner {
         }
     }
 
-    fn security_context_output_schema() -> Value {
+    pub(crate) fn security_context_output_schema() -> Value {
         json!({
             "type": "object",
             "required": [
@@ -236,7 +236,7 @@ impl DockerCodexRunner {
                 "runtime_notes": { "type": "array", "items": { "type": "string" } },
                 "focus_paths": { "type": "array", "items": { "type": "string" } }
             },
-            "additionalProperties": true
+            "additionalProperties": false
         })
     }
 

@@ -80,6 +80,15 @@ fn parse_review_output_json_pass() -> Result<()> {
 }
 
 #[test]
+fn security_context_output_schema_is_strict_root_object() {
+    let schema = DockerCodexRunner::security_context_output_schema();
+    assert_eq!(
+        schema.get("additionalProperties"),
+        Some(&serde_json::Value::Bool(false))
+    );
+}
+
+#[test]
 fn parse_review_output_json_comment() -> Result<()> {
     let text = r#"{"verdict":"comment","summary":"needs changes","comment_markdown":"- fix"}"#;
     let result = parse_review_output(text)?;
