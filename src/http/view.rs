@@ -1,7 +1,7 @@
 use super::status::{
     HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, SecurityContextPreview,
-    StatusFeatureFlagSnapshot,
-    StatusSnapshot, ThreadItemSnapshot, ThreadSnapshot, TranscriptBackfillSnapshot,
+    StatusFeatureFlagSnapshot, StatusSnapshot, ThreadItemSnapshot, ThreadSnapshot,
+    TranscriptBackfillSnapshot,
 };
 use super::timestamp::{self, UiTimestamp};
 use crate::skills::{
@@ -834,9 +834,9 @@ fn render_security_context_card(
         return String::new();
     };
     let source = match preview.source_run_history_id {
-        Some(source_run_id) if source_run_id > 0 && source_run_id != run.id => format!(
-            "<a href=\"/history/{source_run_id}\">run {source_run_id}</a>"
-        ),
+        Some(source_run_id) if source_run_id > 0 && source_run_id != run.id => {
+            format!("<a href=\"/history/{source_run_id}\">run {source_run_id}</a>")
+        }
         Some(source_run_id) if source_run_id == run.id => "generated in this run".to_string(),
         _ => "legacy cached context".to_string(),
     };
@@ -848,11 +848,23 @@ fn render_security_context_card(
          <pre class=\"codeblock\">{}</pre></section>",
         render_definition_list(&[
             ("Base branch".to_string(), escape_html(&preview.base_branch)),
-            ("Base head".to_string(), format!("<code>{}</code>", escape_html(&preview.base_head_sha))),
-            ("Prompt version".to_string(), format!("<code>{}</code>", escape_html(&preview.prompt_version))),
+            (
+                "Base head".to_string(),
+                format!("<code>{}</code>", escape_html(&preview.base_head_sha))
+            ),
+            (
+                "Prompt version".to_string(),
+                format!("<code>{}</code>", escape_html(&preview.prompt_version))
+            ),
             ("Source".to_string(), source),
-            ("Generated".to_string(), render_unix_timestamp(preview.generated_at)),
-            ("Expires".to_string(), render_unix_timestamp(preview.expires_at)),
+            (
+                "Generated".to_string(),
+                render_unix_timestamp(preview.generated_at)
+            ),
+            (
+                "Expires".to_string(),
+                render_unix_timestamp(preview.expires_at)
+            ),
         ]),
         escape_html(&pretty_payload),
     )

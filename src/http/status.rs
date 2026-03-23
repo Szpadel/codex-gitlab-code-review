@@ -524,7 +524,12 @@ impl StatusService {
         }
         let cache_entry = self
             .state
-            .find_security_review_context_cache(&run.repo, base_branch, base_head_sha, prompt_version)
+            .find_security_review_context_cache(
+                &run.repo,
+                base_branch,
+                base_head_sha,
+                prompt_version,
+            )
             .await?;
         let Some(entry) = cache_entry else {
             return Ok(None);

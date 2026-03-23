@@ -9,6 +9,7 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
+use tokio::time::{Duration, sleep};
 use tokio_util::io::ReaderStream;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +58,7 @@ pub(crate) struct ManagedContainerSummary {
 pub(crate) enum ScriptedAppChunk {
     Json(Value),
     Line(String),
+    SleepMillis(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -569,6 +571,10 @@ async fn serve_scripted_app_server(
             let write_result = match chunk {
                 ScriptedAppChunk::Json(value) => write_json_line(&mut server_output, &value).await,
                 ScriptedAppChunk::Line(line) => write_text_line(&mut server_output, &line).await,
+                ScriptedAppChunk::SleepMillis(millis) => {
+                    sleep(Duration::from_millis(millis)).await;
+                    Ok(())
+                }
             };
             if write_result.is_err() {
                 return;

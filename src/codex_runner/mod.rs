@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Notify;
 use tokio::time::{Instant, sleep, timeout};
 use tracing::{debug, info, warn};
 use url::Url;
@@ -137,6 +138,103 @@ pub struct MentionCommandResult {
     pub reply_message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SecurityContextBuildKey {
+    pub(crate) repo: String,
+    pub(crate) base_branch: String,
+    pub(crate) base_head_sha: String,
+    pub(crate) prompt_version: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityContextBuildStatus {
+    Running,
+    Finished,
+}
+
+#[derive(Debug)]
+pub(crate) struct SecurityContextBuildSlot {
+    status: Mutex<SecurityContextBuildStatus>,
+    notify: Notify,
+}
+
+impl SecurityContextBuildSlot {
+    fn new_running() -> Self {
+        Self {
+            status: Mutex::new(SecurityContextBuildStatus::Running),
+            notify: Notify::new(),
+        }
+    }
+
+    fn finish(&self) {
+        let mut status = self
+            .status
+            .lock()
+            .expect("security context build slot lock poisoned");
+        *status = SecurityContextBuildStatus::Finished;
+        drop(status);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let status = self
+                    .status
+                    .lock()
+                    .expect("security context build slot lock poisoned");
+                if *status == SecurityContextBuildStatus::Finished {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+enum SecurityContextBuildRegistration {
+    Leader(SecurityContextBuildCompletionGuard),
+    Follower(Arc<SecurityContextBuildSlot>),
+}
+
+pub(crate) struct SecurityContextBuildCompletionGuard {
+    builds: Arc<Mutex<HashMap<SecurityContextBuildKey, Arc<SecurityContextBuildSlot>>>>,
+    key: SecurityContextBuildKey,
+    slot: Arc<SecurityContextBuildSlot>,
+    completed: bool,
+}
+
+impl SecurityContextBuildCompletionGuard {
+    fn finish_build(&self) {
+        self.slot.finish();
+        let mut builds = self
+            .builds
+            .lock()
+            .expect("security context build map lock poisoned");
+        if builds
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.slot))
+        {
+            builds.remove(&self.key);
+        }
+    }
+
+    fn complete(mut self) {
+        self.finish_build();
+        self.completed = true;
+    }
+}
+
+impl Drop for SecurityContextBuildCompletionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.finish_build();
+            self.completed = true;
+        }
+    }
+}
+
 const REVIEW_CONTAINER_NAME_PREFIX: &str = "codex-review-";
 const BROWSER_CONTAINER_NAME_PREFIX: &str = "codex-browser-";
 const REVIEW_OWNER_LABEL_KEY: &str = "codex.gitlab.review.owner";
@@ -199,6 +297,8 @@ pub trait CodexRunner: Send + Sync {
 
 pub struct DockerCodexRunner {
     runtime: RunnerRuntime,
+    security_context_builds:
+        Arc<Mutex<HashMap<SecurityContextBuildKey, Arc<SecurityContextBuildSlot>>>>,
     codex: CodexConfig,
     gitlab_discovery_mcp: Option<Arc<dyn GitLabDiscoveryHandle>>,
     mention_commands_active: bool,
@@ -221,6 +321,27 @@ pub struct RunnerRuntimeOptions {
 }
 
 impl DockerCodexRunner {
+    fn register_security_context_build(
+        &self,
+        key: SecurityContextBuildKey,
+    ) -> SecurityContextBuildRegistration {
+        let mut builds = self
+            .security_context_builds
+            .lock()
+            .expect("security context build map lock poisoned");
+        if let Some(slot) = builds.get(&key) {
+            return SecurityContextBuildRegistration::Follower(Arc::clone(slot));
+        }
+        let slot = Arc::new(SecurityContextBuildSlot::new_running());
+        builds.insert(key.clone(), Arc::clone(&slot));
+        SecurityContextBuildRegistration::Leader(SecurityContextBuildCompletionGuard {
+            builds: Arc::clone(&self.security_context_builds),
+            key,
+            slot,
+            completed: false,
+        })
+    }
+
     async fn update_run_history_session(
         &self,
         run_history_id: Option<i64>,
@@ -329,6 +450,7 @@ impl DockerCodexRunner {
                 image_pulls: Mutex::new(HashMap::new()),
                 next_image_pull_id: AtomicU64::new(1),
             },
+            security_context_builds: Arc::new(Mutex::new(HashMap::new())),
             codex,
             gitlab_discovery_mcp: gitlab_discovery_mcp.map(|service| {
                 let handle: Arc<dyn GitLabDiscoveryHandle> = service;
@@ -358,6 +480,7 @@ impl DockerCodexRunner {
         let auth_accounts = Self::build_auth_accounts(&codex);
         Self {
             runtime: RunnerRuntime::Fake(harness),
+            security_context_builds: Arc::new(Mutex::new(HashMap::new())),
             codex,
             gitlab_discovery_mcp,
             mention_commands_active: runtime.mention_commands_active,

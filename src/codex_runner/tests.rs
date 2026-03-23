@@ -511,6 +511,103 @@ fn review_context_with_target_branch(target_branch: Option<&str>) -> ReviewConte
     }
 }
 
+fn scripted_security_review_server(
+    thread_id: &str,
+    threat_turn_id: Option<&str>,
+    threat_output: Option<&str>,
+    threat_delay_ms: u64,
+    review_turn_id: &str,
+    review_output: &str,
+) -> ScriptedAppServer {
+    let mut requests = vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": thread_id } })),
+    ];
+    if let (Some(threat_turn_id), Some(threat_output)) = (threat_turn_id, threat_output) {
+        let mut after_response = vec![ScriptedAppChunk::Json(json!({
+            "method": "turn/started",
+            "params": { "threadId": thread_id, "turnId": threat_turn_id }
+        }))];
+        if threat_delay_ms > 0 {
+            after_response.push(ScriptedAppChunk::SleepMillis(threat_delay_ms));
+        }
+        after_response.extend([
+            ScriptedAppChunk::Json(json!({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": threat_turn_id,
+                    "itemId": "agent-threat",
+                    "delta": threat_output
+                }
+            })),
+            ScriptedAppChunk::Json(json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": threat_turn_id,
+                    "item": {
+                        "id": "agent-threat",
+                        "type": "AgentMessage",
+                        "phase": "final"
+                    }
+                }
+            })),
+            ScriptedAppChunk::Json(json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": threat_turn_id,
+                    "turn": { "status": "completed" }
+                }
+            })),
+        ]);
+        requests.push(
+            ScriptedAppRequest::result("turn/start", json!({ "turn": { "id": threat_turn_id } }))
+                .with_after_response(after_response),
+        );
+    }
+    requests.push(
+        ScriptedAppRequest::result("turn/start", json!({ "turn": { "id": review_turn_id } }))
+            .with_after_response(vec![
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/started",
+                    "params": { "threadId": thread_id, "turnId": review_turn_id }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": review_turn_id,
+                        "itemId": "agent-review",
+                        "delta": review_output
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": review_turn_id,
+                        "item": {
+                            "id": "agent-review",
+                            "type": "AgentMessage",
+                            "phase": "final"
+                        }
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": review_turn_id,
+                        "turn": { "status": "completed" }
+                    }
+                })),
+            ]),
+    );
+    ScriptedAppServer::from_requests(requests)
+}
+
 #[test]
 fn security_context_cache_repo_key_uses_canonical_repo_identity() {
     let runner = test_runner_with_codex(test_codex_config());
@@ -925,6 +1022,7 @@ fn runner_env_vars_do_not_include_proxy_settings() {
             image_pulls: Mutex::new(HashMap::new()),
             next_image_pull_id: AtomicU64::new(1),
         },
+        security_context_builds: Arc::new(Mutex::new(HashMap::new())),
         codex: CodexConfig {
             image: "ghcr.io/openai/codex-universal:latest".to_string(),
             timeout_seconds: 300,
@@ -2532,6 +2630,7 @@ fn test_runner_with_codex_and_mentions(
             image_pulls: Mutex::new(HashMap::new()),
             next_image_pull_id: AtomicU64::new(1),
         },
+        security_context_builds: Arc::new(Mutex::new(HashMap::new())),
         codex,
         gitlab_discovery_mcp: None,
         mention_commands_active,
@@ -3468,6 +3567,490 @@ async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_t
         .await?
         .expect("cache entry");
     assert_eq!(cache_entry.source_run_history_id, run_history_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Result<()> {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    let repo_dir = repo_checkout_root("group/repo");
+    let security_context_json = "{\"components\":[],\"entry_points\":[],\"trust_boundaries\":[],\"attacker_controlled_inputs\":[],\"privileged_operations\":[],\"sensitive_assets\":[],\"security_critical_paths\":[],\"runtime_notes\":[],\"focus_paths\":[]}";
+    let security_review_json = "{\"findings\":[],\"overall_correctness\":\"patch is correct\",\"overall_explanation\":\"No confirmed security issues.\",\"overall_confidence_score\":0.95}";
+
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "merge-base".to_string(),
+                "HEAD".to_string(),
+                "main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "merge-base-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "rev-parse".to_string(),
+                "refs/remotes/origin/main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "base-head-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: vec![
+                "mktemp".to_string(),
+                "-d".to_string(),
+                "/tmp/codex-security-context-XXXXXX".to_string(),
+            ],
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "/tmp/codex-security-context-123456\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "worktree".to_string(),
+                "add".to_string(),
+                "--detach".to_string(),
+                "/tmp/codex-security-context-123456".to_string(),
+                "base-head-sha".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "worktree".to_string(),
+                "remove".to_string(),
+                "--force".to_string(),
+                "/tmp/codex-security-context-123456".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-2".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "merge-base".to_string(),
+                "HEAD".to_string(),
+                "main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "merge-base-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-2".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "rev-parse".to_string(),
+                "refs/remotes/origin/main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "base-head-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+
+    harness.push_app_server(scripted_security_review_server(
+        "thread-1",
+        Some("turn-threat-1"),
+        Some(security_context_json),
+        200,
+        "turn-review-1",
+        security_review_json,
+    ));
+    harness.push_app_server(scripted_security_review_server(
+        "thread-2",
+        None,
+        None,
+        0,
+        "turn-review-2",
+        security_review_json,
+    ));
+
+    let runner = Arc::new(
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await,
+    );
+    let run_history_id_1 = runner
+        .state
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Security,
+            repo: "group/repo".to_string(),
+            iid: 11,
+            head_sha: "abc123".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    let run_history_id_2 = runner
+        .state
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Security,
+            repo: "group/repo".to_string(),
+            iid: 12,
+            head_sha: "def456".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+
+    let mut ctx1 = review_context_with_target_branch(Some("main"));
+    ctx1.lane = crate::review_lane::ReviewLane::Security;
+    ctx1.min_confidence_score = Some(0.85);
+    ctx1.run_history_id = Some(run_history_id_1);
+
+    let mut ctx2 = review_context_with_target_branch(Some("main"));
+    ctx2.lane = crate::review_lane::ReviewLane::Security;
+    ctx2.min_confidence_score = Some(0.85);
+    ctx2.run_history_id = Some(run_history_id_2);
+    ctx2.head_sha = "def456".to_string();
+    ctx2.mr.iid = 12;
+    ctx2.mr.sha = Some("def456".to_string());
+    ctx2.mr.web_url = Some("https://gitlab.example.com/group/repo/-/merge_requests/12".to_string());
+    ctx2.mr.source_branch = Some("feature-2".to_string());
+
+    let leader_runner = Arc::clone(&runner);
+    let leader = tokio::spawn(async move { leader_runner.run_review(ctx1).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let follower_runner = Arc::clone(&runner);
+    let follower = tokio::spawn(async move { follower_runner.run_review(ctx2).await });
+
+    let leader_result = leader.await??;
+    let follower_result = follower.await??;
+    assert!(matches!(leader_result, CodexResult::Pass { .. }));
+    assert!(matches!(follower_result, CodexResult::Pass { .. }));
+
+    let exec_requests = harness.exec_requests();
+    let mktemp_requests = exec_requests
+        .iter()
+        .filter(|request| {
+            request
+                .command
+                .first()
+                .is_some_and(|command| command == "mktemp")
+        })
+        .count();
+    assert_eq!(mktemp_requests, 1);
+
+    let cache_entry = runner
+        .state
+        .get_security_review_context_cache(
+            "group/repo",
+            "main",
+            "base-head-sha",
+            "security-review-context-v1",
+            1_000_000_000,
+        )
+        .await?
+        .expect("cache entry");
+    assert_eq!(cache_entry.source_run_history_id, run_history_id_1);
+
+    let follower_run = runner
+        .state
+        .get_run_history(run_history_id_2)
+        .await?
+        .expect("follower run history");
+    assert_eq!(follower_run.thread_id.as_deref(), Some("thread-2"));
+    let follower_events = runner
+        .state
+        .list_run_history_events(run_history_id_2)
+        .await?;
+    let follower_turn_ids = follower_events
+        .iter()
+        .filter_map(|event| event.turn_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(follower_turn_ids, BTreeSet::from(["turn-review-2"]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -> Result<()> {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    let repo_dir = repo_checkout_root("group/repo");
+    let security_review_json = "{\"findings\":[],\"overall_correctness\":\"patch is correct\",\"overall_explanation\":\"No confirmed security issues.\",\"overall_confidence_score\":0.95}";
+
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "merge-base".to_string(),
+                "HEAD".to_string(),
+                "main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "merge-base-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "rev-parse".to_string(),
+                "refs/remotes/origin/main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "base-head-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: vec![
+                "mktemp".to_string(),
+                "-d".to_string(),
+                "/tmp/codex-security-context-XXXXXX".to_string(),
+            ],
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "/tmp/codex-security-context-654321\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "worktree".to_string(),
+                "add".to_string(),
+                "--detach".to_string(),
+                "/tmp/codex-security-context-654321".to_string(),
+                "base-head-sha".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "worktree".to_string(),
+                "remove".to_string(),
+                "--force".to_string(),
+                "/tmp/codex-security-context-654321".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-2".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "merge-base".to_string(),
+                "HEAD".to_string(),
+                "main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "merge-base-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-2".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "rev-parse".to_string(),
+                "refs/remotes/origin/main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "base-head-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+
+    harness.push_app_server(scripted_security_review_server(
+        "thread-1",
+        Some("turn-threat-fail"),
+        Some("not-json"),
+        200,
+        "turn-review-1",
+        security_review_json,
+    ));
+    harness.push_app_server(scripted_security_review_server(
+        "thread-2",
+        None,
+        None,
+        0,
+        "turn-review-2",
+        security_review_json,
+    ));
+
+    let runner = Arc::new(
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await,
+    );
+    let run_history_id_1 = runner
+        .state
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Security,
+            repo: "group/repo".to_string(),
+            iid: 21,
+            head_sha: "abc123".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    let run_history_id_2 = runner
+        .state
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Security,
+            repo: "group/repo".to_string(),
+            iid: 22,
+            head_sha: "def456".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+
+    let mut ctx1 = review_context_with_target_branch(Some("main"));
+    ctx1.lane = crate::review_lane::ReviewLane::Security;
+    ctx1.min_confidence_score = Some(0.85);
+    ctx1.run_history_id = Some(run_history_id_1);
+    ctx1.mr.iid = 21;
+    ctx1.mr.web_url = Some("https://gitlab.example.com/group/repo/-/merge_requests/21".to_string());
+
+    let mut ctx2 = review_context_with_target_branch(Some("main"));
+    ctx2.lane = crate::review_lane::ReviewLane::Security;
+    ctx2.min_confidence_score = Some(0.85);
+    ctx2.run_history_id = Some(run_history_id_2);
+    ctx2.head_sha = "def456".to_string();
+    ctx2.mr.iid = 22;
+    ctx2.mr.sha = Some("def456".to_string());
+    ctx2.mr.web_url = Some("https://gitlab.example.com/group/repo/-/merge_requests/22".to_string());
+    ctx2.mr.source_branch = Some("feature-2".to_string());
+
+    let leader_runner = Arc::clone(&runner);
+    let leader = tokio::spawn(async move { leader_runner.run_review(ctx1).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let follower_runner = Arc::clone(&runner);
+    let follower = tokio::spawn(async move { follower_runner.run_review(ctx2).await });
+
+    let leader_result = leader.await??;
+    let follower_result = follower.await??;
+    assert!(matches!(leader_result, CodexResult::Pass { .. }));
+    assert!(matches!(follower_result, CodexResult::Pass { .. }));
+
+    let exec_requests = harness.exec_requests();
+    let mktemp_requests = exec_requests
+        .iter()
+        .filter(|request| {
+            request
+                .command
+                .first()
+                .is_some_and(|command| command == "mktemp")
+        })
+        .count();
+    assert_eq!(mktemp_requests, 1);
+
+    assert!(
+        runner
+            .state
+            .get_security_review_context_cache(
+                "group/repo",
+                "main",
+                "base-head-sha",
+                "security-review-context-v1",
+                1_000_000_000,
+            )
+            .await?
+            .is_none()
+    );
+    let follower_run = runner
+        .state
+        .get_run_history(run_history_id_2)
+        .await?
+        .expect("follower run history");
+    assert!(follower_run.security_context_payload_json.is_none());
     Ok(())
 }
 

@@ -5220,7 +5220,7 @@ async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
                 thread_id: Some("thread-active".to_string()),
                 turn_id: Some("turn-active".to_string()),
                 review_thread_id: None,
-            security_context_source_run_id: None,
+                security_context_source_run_id: None,
                 auth_account_name: Some("primary".to_string()),
                 ..RunHistorySessionUpdate::default()
             },

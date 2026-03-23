@@ -44,7 +44,7 @@ struct ReviewLineRangePayload {
     end: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Default)]
 struct SecurityContextPayloadResolution {
     payload_json: Option<String>,
     source_run_history_id: Option<i64>,
@@ -52,6 +52,7 @@ struct SecurityContextPayloadResolution {
     worktree_path: Option<String>,
     generated_at: Option<i64>,
     expires_at: Option<i64>,
+    build_guard: Option<SecurityContextBuildCompletionGuard>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -536,7 +537,8 @@ impl DockerCodexRunner {
                 &turn_id,
                 gitlab_discovery_server_name,
                 |events| async move {
-                    self.append_run_history_events(ctx.run_history_id, &events).await;
+                    self.append_run_history_events(ctx.run_history_id, &events)
+                        .await;
                 },
                 || async move {
                     self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
@@ -586,19 +588,108 @@ impl DockerCodexRunner {
                 worktree_path: None,
                 generated_at: Some(entry.generated_at),
                 expires_at: Some(entry.expires_at),
+                build_guard: None,
             });
         }
-        let worktree_path = self
-            .create_security_context_worktree(container_id, repo_path, base_head_sha.as_str())
-            .await?;
-        Ok(SecurityContextPayloadResolution {
-            payload_json: None,
-            source_run_history_id: None,
-            base_head_sha: Some(base_head_sha),
-            worktree_path: Some(worktree_path),
-            generated_at: None,
-            expires_at: None,
-        })
+        let build_key = SecurityContextBuildKey {
+            repo: cache_repo_key.to_string(),
+            base_branch: base_branch.to_string(),
+            base_head_sha: base_head_sha.clone(),
+            prompt_version: SECURITY_CONTEXT_PROMPT_VERSION.to_string(),
+        };
+        match self.register_security_context_build(build_key) {
+            SecurityContextBuildRegistration::Leader(build_guard) => {
+                let now = Utc::now().timestamp();
+                if let Some(entry) = self
+                    .state
+                    .get_security_review_context_cache(
+                        cache_repo_key,
+                        base_branch,
+                        base_head_sha.as_str(),
+                        SECURITY_CONTEXT_PROMPT_VERSION,
+                        now,
+                    )
+                    .await?
+                {
+                    build_guard.complete();
+                    return Ok(SecurityContextPayloadResolution {
+                        payload_json: Some(entry.payload_json),
+                        source_run_history_id: (entry.source_run_history_id > 0)
+                            .then_some(entry.source_run_history_id),
+                        base_head_sha: Some(base_head_sha),
+                        worktree_path: None,
+                        generated_at: Some(entry.generated_at),
+                        expires_at: Some(entry.expires_at),
+                        build_guard: None,
+                    });
+                }
+                let worktree_path = self
+                    .create_security_context_worktree(
+                        container_id,
+                        repo_path,
+                        base_head_sha.as_str(),
+                    )
+                    .await?;
+                Ok(SecurityContextPayloadResolution {
+                    payload_json: None,
+                    source_run_history_id: None,
+                    base_head_sha: Some(base_head_sha),
+                    worktree_path: Some(worktree_path),
+                    generated_at: None,
+                    expires_at: None,
+                    build_guard: Some(build_guard),
+                })
+            }
+            SecurityContextBuildRegistration::Follower(slot) => {
+                debug!(
+                    repo = ctx.repo.as_str(),
+                    iid = ctx.mr.iid,
+                    branch = base_branch,
+                    base_head_sha,
+                    "waiting for in-flight security context build"
+                );
+                slot.wait().await;
+                let now = Utc::now().timestamp();
+                if let Some(entry) = self
+                    .state
+                    .get_security_review_context_cache(
+                        cache_repo_key,
+                        base_branch,
+                        base_head_sha.as_str(),
+                        SECURITY_CONTEXT_PROMPT_VERSION,
+                        now,
+                    )
+                    .await?
+                {
+                    return Ok(SecurityContextPayloadResolution {
+                        payload_json: Some(entry.payload_json),
+                        source_run_history_id: (entry.source_run_history_id > 0)
+                            .then_some(entry.source_run_history_id),
+                        base_head_sha: Some(base_head_sha),
+                        worktree_path: None,
+                        generated_at: Some(entry.generated_at),
+                        expires_at: Some(entry.expires_at),
+                        build_guard: None,
+                    });
+                }
+                debug!(
+                    repo = ctx.repo.as_str(),
+                    iid = ctx.mr.iid,
+                    branch = base_branch,
+                    base_head_sha,
+                    "in-flight security context build finished without a cached result"
+                );
+                Ok(SecurityContextPayloadResolution {
+                    payload_json: None,
+                    source_run_history_id: None,
+                    base_head_sha: Some(base_head_sha),
+                    worktree_path: None,
+                    generated_at: None,
+                    expires_at: None,
+                    build_guard: None,
+                })
+            }
+        }
     }
 
     pub(crate) fn review_target_value(review_target: ReviewTargetRequest) -> Value {
@@ -642,7 +733,7 @@ impl DockerCodexRunner {
         base_branch: Option<&str>,
         resolution: &SecurityContextPayloadResolution,
     ) -> RunHistorySessionUpdate {
-        if resolution.payload_json.is_none() {
+        if resolution.base_head_sha.is_none() {
             return RunHistorySessionUpdate::default();
         }
         RunHistorySessionUpdate {
@@ -910,6 +1001,7 @@ impl DockerCodexRunner {
                             worktree_path,
                         )
                         .await;
+                        let mut build_guard = security_context_resolution.build_guard.take();
                         match build_result {
                             Ok(payload_json) => {
                                 let generated_at = Utc::now().timestamp();
@@ -969,8 +1061,14 @@ impl DockerCodexRunner {
                                         ctx.additional_developer_instructions.as_deref(),
                                     ),
                                 );
+                                if let Some(build_guard) = build_guard.take() {
+                                    build_guard.complete();
+                                }
                             }
                             Err(err) => {
+                                if let Some(build_guard) = build_guard.take() {
+                                    build_guard.complete();
+                                }
                                 warn!(
                                     repo = ctx.repo.as_str(),
                                     iid = ctx.mr.iid,

@@ -901,9 +901,7 @@ async fn run_history_session_roundtrips_security_context_metadata() -> Result<()
                 security_context_source_run_id: Some(run_id),
                 security_context_base_branch: Some("main".to_string()),
                 security_context_base_head_sha: Some("base-sha".to_string()),
-                security_context_prompt_version: Some(
-                    "security-review-context-v1".to_string(),
-                ),
+                security_context_prompt_version: Some("security-review-context-v1".to_string()),
                 security_context_payload_json: Some("{\"components\":[\"api\"]}".to_string()),
                 security_context_generated_at: Some(100),
                 security_context_expires_at: Some(200),
@@ -917,10 +915,7 @@ async fn run_history_session_roundtrips_security_context_metadata() -> Result<()
         .await?
         .context("run history row should exist")?;
     assert_eq!(record.security_context_source_run_id, Some(run_id));
-    assert_eq!(
-        record.security_context_base_branch.as_deref(),
-        Some("main")
-    );
+    assert_eq!(record.security_context_base_branch.as_deref(), Some("main"));
     assert_eq!(
         record.security_context_base_head_sha.as_deref(),
         Some("base-sha")

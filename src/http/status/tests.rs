@@ -549,8 +549,8 @@ async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> a
 }
 
 #[tokio::test]
-async fn run_detail_snapshot_includes_security_context_preview_for_legacy_cached_entry(
-) -> anyhow::Result<()> {
+async fn run_detail_snapshot_includes_security_context_preview_for_legacy_cached_entry()
+-> anyhow::Result<()> {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
     let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
     let run_id = store
@@ -607,8 +607,8 @@ async fn run_detail_snapshot_includes_security_context_preview_for_legacy_cached
 }
 
 #[tokio::test]
-async fn run_detail_snapshot_prefers_immutable_run_payload_over_mutated_cache(
-) -> anyhow::Result<()> {
+async fn run_detail_snapshot_prefers_immutable_run_payload_over_mutated_cache() -> anyhow::Result<()>
+{
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
     let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
     let run_id = store
