@@ -337,6 +337,25 @@ fn parse_security_review_output_rejects_invalid_finding_confidence_scores() {
 }
 
 #[test]
+fn parse_security_review_output_accepts_nullable_optional_fields() -> Result<()> {
+    let text = r#"{
+      "findings": [],
+      "overall_correctness": "patch is correct",
+      "overall_explanation": null,
+      "overall_confidence_score": null
+    }"#;
+    let result =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))?;
+    match result {
+        CodexResult::Pass { summary } => {
+            assert_eq!(summary, "no confirmed security issues found");
+            Ok(())
+        }
+        _ => bail!("expected pass"),
+    }
+}
+
+#[test]
 fn parse_security_review_output_rejects_incorrect_verdict_without_confirmed_findings() {
     let text = r#"{
       "findings": [],

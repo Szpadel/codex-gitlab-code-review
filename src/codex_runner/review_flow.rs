@@ -14,7 +14,7 @@ struct ReviewOutputPayload {
     #[serde(default)]
     findings: Vec<ReviewFindingPayload>,
     #[serde(default)]
-    overall_explanation: String,
+    overall_explanation: Option<String>,
     #[serde(default)]
     overall_correctness: Option<String>,
     #[serde(default)]
@@ -241,18 +241,29 @@ impl DockerCodexRunner {
     fn security_review_output_schema() -> Value {
         json!({
             "type": "object",
-            "required": ["findings", "overall_correctness"],
+            "required": [
+                "findings",
+                "overall_explanation",
+                "overall_correctness",
+                "overall_confidence_score"
+            ],
             "properties": {
                 "findings": {
                     "type": "array",
                     "items": {
                         "type": "object",
-                        "required": ["title", "body", "confidence_score", "code_location"],
+                        "required": [
+                            "title",
+                            "body",
+                            "confidence_score",
+                            "priority",
+                            "code_location"
+                        ],
                         "properties": {
                             "title": { "type": "string" },
                             "body": { "type": "string" },
                             "confidence_score": { "type": "number" },
-                            "priority": { "type": "integer" },
+                            "priority": { "type": ["integer", "null"] },
                             "code_location": {
                                 "type": "object",
                                 "required": ["absolute_file_path", "line_range"],
@@ -274,12 +285,12 @@ impl DockerCodexRunner {
                         "additionalProperties": false
                     }
                 },
-                "overall_explanation": { "type": "string" },
+                "overall_explanation": { "type": ["string", "null"] },
                 "overall_correctness": {
                     "type": "string",
                     "enum": ["patch is correct", "patch is incorrect"]
                 },
-                "overall_confidence_score": { "type": "number" }
+                "overall_confidence_score": { "type": ["number", "null"] }
             },
             "additionalProperties": false
         })
@@ -1259,7 +1270,7 @@ fn parse_structured_review_output(
             },
         })
         .collect::<Vec<_>>();
-    let overall_explanation = trim_to_option(parsed.overall_explanation);
+    let overall_explanation = parsed.overall_explanation.and_then(trim_to_option);
     let overall_confidence_score = parsed.overall_confidence_score;
     let findings = if lane.is_security() {
         let threshold = validated_security_min_confidence_score(
@@ -1321,7 +1332,10 @@ fn validated_security_min_confidence_score(
 
 fn review_output_payload_looks_structured(payload: &ReviewOutputPayload) -> bool {
     !payload.findings.is_empty()
-        || !payload.overall_explanation.trim().is_empty()
+        || payload
+            .overall_explanation
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
         || payload.overall_correctness.is_some()
 }
 
