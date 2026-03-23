@@ -260,7 +260,7 @@ impl DockerCodexRunner {
         {
             warn!(
                 run_history_id,
-                error = %err,
+                error = %format!("{err:#}"),
                 "failed to append run history events"
             );
             // Sticky on purpose: a failed batch means this run's persisted transcript may have
@@ -272,7 +272,7 @@ impl DockerCodexRunner {
             {
                 warn!(
                     run_history_id,
-                    error = %mark_err,
+                    error = %format!("{mark_err:#}"),
                     "failed to mark run history events incomplete"
                 );
             }
@@ -296,7 +296,7 @@ impl DockerCodexRunner {
             warn!(
                 run_history_id,
                 turn_id,
-                error = %err,
+                error = %format!("{err:#}"),
                 "failed to rewrite run history events for turn"
             );
             if let Err(mark_err) = self
@@ -306,7 +306,7 @@ impl DockerCodexRunner {
             {
                 warn!(
                     run_history_id,
-                    error = %mark_err,
+                    error = %format!("{mark_err:#}"),
                     "failed to mark run history events incomplete after turn rewrite error"
                 );
             }
