@@ -398,9 +398,9 @@ impl DockerCodexRunner {
             .exec_container_command(
                 container_id,
                 vec![
-                    "/bin/sh".to_string(),
-                    "-lc".to_string(),
-                    "mktemp -d /tmp/codex-security-context-XXXXXX".to_string(),
+                    "mktemp".to_string(),
+                    "-d".to_string(),
+                    "/tmp/codex-security-context-XXXXXX".to_string(),
                 ],
                 Some(repo_path),
             )

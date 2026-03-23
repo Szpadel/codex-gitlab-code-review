@@ -3241,9 +3241,9 @@ async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_t
         ExecContainerCommandRequest {
             container_id: "app-1".to_string(),
             command: vec![
-                "/bin/sh".to_string(),
-                "-lc".to_string(),
-                "mktemp -d /tmp/codex-security-context-XXXXXX".to_string(),
+                "mktemp".to_string(),
+                "-d".to_string(),
+                "/tmp/codex-security-context-XXXXXX".to_string(),
             ],
             cwd: Some(repo_dir.clone()),
             env: None,
@@ -3426,7 +3426,19 @@ async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_t
     assert_eq!(run.thread_id.as_deref(), Some("thread-1"));
     assert_eq!(run.turn_id.as_deref(), Some("turn-review"));
     assert_eq!(run.review_thread_id, None);
-    assert_eq!(run.security_context_source_run_id, None);
+    assert_eq!(run.security_context_source_run_id, Some(run_history_id));
+    assert_eq!(run.security_context_base_branch.as_deref(), Some("main"));
+    assert_eq!(
+        run.security_context_base_head_sha.as_deref(),
+        Some("base-head-sha")
+    );
+    assert_eq!(
+        run.security_context_prompt_version.as_deref(),
+        Some("security-review-context-v1")
+    );
+    assert!(run.security_context_payload_json.is_some());
+    assert!(run.security_context_generated_at.is_some());
+    assert!(run.security_context_expires_at.is_some());
 
     let events = runner.state.list_run_history_events(run_history_id).await?;
     let turn_ids = events
