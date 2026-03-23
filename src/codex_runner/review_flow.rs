@@ -44,6 +44,14 @@ struct ReviewLineRangePayload {
     end: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SecurityContextPayloadResolution {
+    payload_json: Option<String>,
+    source_run_history_id: Option<i64>,
+    base_head_sha: Option<String>,
+    worktree_path: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewTargetRequest {
     NativeBaseBranch { branch: String },
@@ -227,6 +235,53 @@ impl DockerCodexRunner {
                 "focus_paths": { "type": "array", "items": { "type": "string" } }
             },
             "additionalProperties": true
+        })
+    }
+
+    fn security_review_output_schema() -> Value {
+        json!({
+            "type": "object",
+            "required": ["findings", "overall_correctness"],
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["title", "body", "confidence_score", "code_location"],
+                        "properties": {
+                            "title": { "type": "string" },
+                            "body": { "type": "string" },
+                            "confidence_score": { "type": "number" },
+                            "priority": { "type": "integer" },
+                            "code_location": {
+                                "type": "object",
+                                "required": ["absolute_file_path", "line_range"],
+                                "properties": {
+                                    "absolute_file_path": { "type": "string" },
+                                    "line_range": {
+                                        "type": "object",
+                                        "required": ["start", "end"],
+                                        "properties": {
+                                            "start": { "type": "integer" },
+                                            "end": { "type": "integer" }
+                                        },
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                "overall_explanation": { "type": "string" },
+                "overall_correctness": {
+                    "type": "string",
+                    "enum": ["patch is correct", "patch is incorrect"]
+                },
+                "overall_confidence_score": { "type": "number" }
+            },
+            "additionalProperties": false
         })
     }
 
@@ -424,103 +479,78 @@ impl DockerCodexRunner {
         ctx: &ReviewContext,
         client: &mut AppServerClient,
         gitlab_discovery_server_name: Option<&str>,
-        container_id: &str,
-        repo_path: &str,
+        thread_id: &str,
+        turn_cwd: &str,
         base_branch: &str,
         base_head_sha: &str,
-        extra_writable_roots: &[String],
     ) -> Result<String> {
-        let worktree_path = self
-            .create_security_context_worktree(container_id, repo_path, base_head_sha)
+        let turn_response = client
+            .request(
+                "turn/start",
+                json!({
+                    "threadId": thread_id,
+                    "cwd": turn_cwd,
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": format!(
+                                "$security-threat-model Build a concise repository-grounded threat model for the base branch.\nReturn only JSON matching the provided output schema.\nFocus on runtime behavior on branch {} at commit {}.\nKeep the result compact and evidence-based.",
+                                base_branch, base_head_sha
+                            ),
+                        },
+                        {
+                            "type": "skill",
+                            "name": "security-threat-model",
+                            "path": format!(
+                                "{}/skills/security-threat-model/SKILL.md",
+                                self.codex.auth_mount_path.trim_end_matches('/')
+                            ),
+                        }
+                    ],
+                    "outputSchema": Self::security_context_output_schema(),
+                }),
+            )
             .await?;
-        let result = async {
-            let thread_response = client
-                .request(
-                    "thread/start",
-                    self.thread_start_params(worktree_path.as_str(), None, extra_writable_roots),
-                )
-                .await?;
-            let thread_id = thread_response
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(|id| id.as_str())
-                .ok_or_else(|| anyhow!("thread/start missing thread id for security context"))?
-                .to_string();
-            let turn_response = client
-                .request(
-                    "turn/start",
-                    json!({
-                        "threadId": thread_id,
-                        "cwd": worktree_path.as_str(),
-                        "input": [
-                            {
-                                "type": "text",
-                                "text": format!(
-                                    "$security-threat-model Build a concise repository-grounded threat model for the base branch.\nReturn only JSON matching the provided output schema.\nFocus on runtime behavior on branch {} at commit {}.\nKeep the result compact and evidence-based.",
-                                    base_branch, base_head_sha
-                                ),
-                            },
-                            {
-                                "type": "skill",
-                                "name": "security-threat-model",
-                                "path": format!(
-                                    "{}/skills/security-threat-model/SKILL.md",
-                                    self.codex.auth_mount_path.trim_end_matches('/')
-                                ),
-                            }
-                        ],
-                        "outputSchema": Self::security_context_output_schema(),
-                    }),
-                )
-                .await?;
-            let turn_id = turn_response
-                .get("turn")
-                .and_then(|turn| turn.get("id"))
-                .and_then(|id| id.as_str())
-                .ok_or_else(|| anyhow!("turn/start missing turn id for security context"))?
-                .to_string();
-            let output = client
-                .stream_turn_message(
-                    &thread_id,
-                    &turn_id,
-                    gitlab_discovery_server_name,
-                    |events| async move {
-                        self.append_run_history_events(ctx.run_history_id, &events).await;
-                    },
-                    || async move {
-                        self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
-                            .await;
-                    },
-                )
-                .await?;
-            let payload: Value = serde_json::from_str(output.trim())
-                .context("parse security context JSON payload")?;
-            if !payload.is_object() {
-                bail!("security context output must be a JSON object");
-            }
-            serde_json::to_string(&payload).context("serialize security context cache payload")
+        let turn_id = turn_response
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| anyhow!("turn/start missing turn id for security context"))?
+            .to_string();
+        let output = client
+            .stream_turn_message(
+                thread_id,
+                &turn_id,
+                gitlab_discovery_server_name,
+                |events| async move {
+                    self.append_run_history_events(ctx.run_history_id, &events).await;
+                },
+                || async move {
+                    self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
+                        .await;
+                },
+            )
+            .await?;
+        let payload: Value =
+            serde_json::from_str(output.trim()).context("parse security context JSON payload")?;
+        if !payload.is_object() {
+            bail!("security context output must be a JSON object");
         }
-        .await;
-        self.remove_security_context_worktree(container_id, repo_path, &worktree_path)
-            .await;
-        result
+        serde_json::to_string(&payload).context("serialize security context cache payload")
     }
 
     async fn resolve_security_context_payload(
         &self,
         ctx: &ReviewContext,
-        client: &mut AppServerClient,
-        gitlab_discovery_server_name: Option<&str>,
         container_id: &str,
         repo_path: &str,
         base_branch: &str,
-        extra_writable_roots: &[String],
-    ) -> Result<Option<String>> {
+    ) -> Result<SecurityContextPayloadResolution> {
         let Some(base_head_sha) = self
             .try_resolve_base_branch_head_sha(ctx, container_id, repo_path, base_branch)
             .await
         else {
-            return Ok(None);
+            return Ok(SecurityContextPayloadResolution::default());
         };
         let cache_repo_key = self.security_context_cache_repo_key(ctx);
         let now = Utc::now().timestamp();
@@ -535,35 +565,23 @@ impl DockerCodexRunner {
             )
             .await?
         {
-            return Ok(Some(entry.payload_json));
+            return Ok(SecurityContextPayloadResolution {
+                payload_json: Some(entry.payload_json),
+                source_run_history_id: (entry.source_run_history_id > 0)
+                    .then_some(entry.source_run_history_id),
+                base_head_sha: Some(base_head_sha),
+                worktree_path: None,
+            });
         }
-        let payload_json = self
-            .build_security_context_payload(
-                ctx,
-                client,
-                gitlab_discovery_server_name,
-                container_id,
-                repo_path,
-                base_branch,
-                base_head_sha.as_str(),
-                extra_writable_roots,
-            )
+        let worktree_path = self
+            .create_security_context_worktree(container_id, repo_path, base_head_sha.as_str())
             .await?;
-        let generated_at = Utc::now().timestamp();
-        let expires_at =
-            generated_at + ctx.security_context_ttl_seconds.unwrap_or(1_209_600) as i64;
-        self.state
-            .upsert_security_review_context_cache(&crate::state::SecurityReviewContextCacheEntry {
-                repo: cache_repo_key.to_string(),
-                base_branch: base_branch.to_string(),
-                base_head_sha,
-                prompt_version: SECURITY_CONTEXT_PROMPT_VERSION.to_string(),
-                payload_json: payload_json.clone(),
-                generated_at,
-                expires_at,
-            })
-            .await?;
-        Ok(Some(payload_json))
+        Ok(SecurityContextPayloadResolution {
+            payload_json: None,
+            source_run_history_id: None,
+            base_head_sha: Some(base_head_sha),
+            worktree_path: Some(worktree_path),
+        })
     }
 
     pub(crate) fn review_target_value(review_target: ReviewTargetRequest) -> Value {
@@ -577,7 +595,7 @@ impl DockerCodexRunner {
         }
     }
 
-    fn build_security_review_target_instructions(
+    fn build_security_review_instructions(
         &self,
         base_prompt: &str,
         security_context_payload_json: Option<&str>,
@@ -601,75 +619,6 @@ impl DockerCodexRunner {
             .trim(),
         );
         prompt
-    }
-
-    async fn resolve_security_review_target(
-        &self,
-        ctx: &ReviewContext,
-        client: &mut AppServerClient,
-        gitlab_discovery_server_name: Option<&str>,
-        container_id: &str,
-        repo_path: &str,
-        extra_writable_roots: &[String],
-    ) -> Result<Value> {
-        let min_confidence_score = validated_security_min_confidence_score(
-            ctx.min_confidence_score,
-            "security review min_confidence_score",
-        )?;
-        let base_branch = ctx
-            .mr
-            .target_branch
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let merge_base_sha = if let Some(branch) = base_branch {
-            self.try_resolve_review_merge_base(container_id, repo_path, branch)
-                .await
-        } else {
-            None
-        };
-        let base_prompt = if let Some(branch) = base_branch {
-            build_base_branch_review_prompt(branch, merge_base_sha.as_deref())
-        } else {
-            Self::fallback_review_target_instructions(ctx, None)
-        };
-        let security_context_payload_json = if let Some(branch) = base_branch {
-            match self
-                .resolve_security_context_payload(
-                    ctx,
-                    client,
-                    gitlab_discovery_server_name,
-                    container_id,
-                    repo_path,
-                    branch,
-                    extra_writable_roots,
-                )
-                .await
-            {
-                Ok(payload) => payload,
-                Err(err) => {
-                    warn!(
-                        repo = ctx.repo.as_str(),
-                        iid = ctx.mr.iid,
-                        branch,
-                        error = %err,
-                        "failed to build cached security context; continuing without it"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        Ok(json!({
-            "type": "custom",
-            "instructions": self.build_security_review_target_instructions(
-                base_prompt.as_str(),
-                security_context_payload_json.as_deref(),
-                min_confidence_score,
-                ctx.additional_developer_instructions.as_deref(),
-            ),
-        }))
     }
 
     pub(crate) async fn run_app_server_review_with_account(
@@ -781,97 +730,320 @@ impl DockerCodexRunner {
                         ctx.run_history_id,
                     )
                     .await;
-                let extra_writable_roots = gitlab_discovery_mcp
+                let mut extra_writable_roots = gitlab_discovery_mcp
                     .as_ref()
                     .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
                     .unwrap_or_default();
-                let review_target = if ctx.lane.is_security() {
-                    self.resolve_security_review_target(
-                        ctx,
-                        &mut client,
-                        gitlab_discovery_mcp
-                            .as_ref()
-                            .map(|prepared| prepared.runtime_config.server_name.as_str()),
-                        &container_id,
-                        repo_path.as_str(),
-                        &extra_writable_roots,
-                    )
-                    .await?
-                } else {
-                    Self::review_target_value(
-                        self.resolve_review_target_request(ctx, &container_id, repo_path.as_str())
-                            .await,
-                    )
-                };
+                let mut security_base_prompt = None;
+                let mut security_min_confidence_score = None;
+                let mut security_review_instructions = None;
+                let mut security_context_resolution = SecurityContextPayloadResolution::default();
+                let mut security_context_base_branch = None;
+                if ctx.lane.is_security() {
+                    let min_confidence_score = validated_security_min_confidence_score(
+                        ctx.min_confidence_score,
+                        "security review min_confidence_score",
+                    )?;
+                    let base_branch = ctx
+                        .mr
+                        .target_branch
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned);
+                    let merge_base_sha = if let Some(branch) = base_branch.as_deref() {
+                        self.try_resolve_review_merge_base(&container_id, repo_path.as_str(), branch)
+                            .await
+                    } else {
+                        None
+                    };
+                    let base_prompt = if let Some(branch) = base_branch.as_deref() {
+                        build_base_branch_review_prompt(branch, merge_base_sha.as_deref())
+                    } else {
+                        Self::fallback_review_target_instructions(ctx, None)
+                    };
+                    security_base_prompt = Some(base_prompt.clone());
+                    if let Some(branch) = base_branch.as_deref() {
+                        match self
+                            .resolve_security_context_payload(
+                                ctx,
+                                &container_id,
+                                repo_path.as_str(),
+                                branch,
+                            )
+                            .await
+                        {
+                            Ok(resolution) => {
+                                if let Some(worktree_path) = resolution.worktree_path.as_ref() {
+                                    extra_writable_roots.push(worktree_path.clone());
+                                }
+                                security_context_resolution = resolution;
+                                security_context_base_branch = Some(branch.to_string());
+                            }
+                            Err(err) => {
+                                warn!(
+                                    repo = ctx.repo.as_str(),
+                                    iid = ctx.mr.iid,
+                                    branch,
+                                    error = %err,
+                                    "failed to build cached security context; continuing without it"
+                                );
+                            }
+                        }
+                    }
+                    security_min_confidence_score = Some(min_confidence_score);
+                    security_review_instructions = Some(self.build_security_review_instructions(
+                        base_prompt.as_str(),
+                        security_context_resolution.payload_json.as_deref(),
+                        min_confidence_score,
+                        ctx.additional_developer_instructions.as_deref(),
+                    ));
+                }
                 let thread_response = client
                     .request(
                         "thread/start",
                         self.thread_start_params(repo_path.as_str(), None, &extra_writable_roots),
                     )
-                    .await?;
-                let thread_id = thread_response
+                    .await;
+                let thread_response = match thread_response {
+                    Ok(response) => response,
+                    Err(err) => {
+                        if let Some(worktree_path) =
+                            security_context_resolution.worktree_path.as_deref()
+                        {
+                            self.remove_security_context_worktree(
+                                &container_id,
+                                repo_path.as_str(),
+                                worktree_path,
+                            )
+                            .await;
+                        }
+                        return Err(err);
+                    }
+                };
+                let thread_id = match thread_response
                     .get("thread")
                     .and_then(|thread| thread.get("id"))
                     .and_then(|id| id.as_str())
-                    .ok_or_else(|| anyhow!("thread/start missing thread id"))?
-                    .to_string();
+                {
+                    Some(thread_id) => thread_id.to_string(),
+                    None => {
+                        if let Some(worktree_path) =
+                            security_context_resolution.worktree_path.as_deref()
+                        {
+                            self.remove_security_context_worktree(
+                                &container_id,
+                                repo_path.as_str(),
+                                worktree_path,
+                            )
+                            .await;
+                        }
+                        bail!("thread/start missing thread id");
+                    }
+                };
                 self.update_run_history_session(
                     ctx.run_history_id,
                     RunHistorySessionUpdate {
                         thread_id: Some(thread_id.clone()),
                         auth_account_name: Some(account.name.clone()),
+                        security_context_source_run_id: security_context_resolution
+                            .source_run_history_id,
                         ..RunHistorySessionUpdate::default()
                     },
                 )
                 .await;
-                let review_response = client
-                    .request(
-                        "review/start",
-                        json!({
-                            "threadId": thread_id,
-                            "delivery": "inline",
-                            "target": review_target,
-                        }),
-                    )
-                    .await?;
-                let turn_id = review_response
-                    .get("turn")
-                    .and_then(|turn| turn.get("id"))
-                    .and_then(|id| id.as_str())
-                    .ok_or_else(|| anyhow!("review/start missing turn id"))?
-                    .to_string();
-                let review_thread_id = review_response
-                    .get("reviewThreadId")
-                    .and_then(|id| id.as_str())
-                    .unwrap_or(thread_id.as_str())
-                    .to_string();
-                self.update_run_history_session(
-                    ctx.run_history_id,
-                    RunHistorySessionUpdate {
-                        thread_id: Some(thread_id.clone()),
-                        turn_id: Some(turn_id.clone()),
-                        review_thread_id: Some(review_thread_id.clone()),
-                        auth_account_name: Some(account.name.clone()),
-                    },
-                )
-                .await;
-                client
-                    .stream_review(
-                        &review_thread_id,
-                        &turn_id,
-                        gitlab_discovery_mcp
-                            .as_ref()
-                            .map(|prepared| prepared.runtime_config.server_name.as_str()),
-                        |events| async move {
-                            self.append_run_history_events(ctx.run_history_id, &events)
-                                .await;
+                if ctx.lane.is_security() {
+                    if let (Some(worktree_path), Some(base_branch), Some(base_head_sha)) = (
+                        security_context_resolution.worktree_path.as_deref(),
+                        security_context_base_branch.as_deref(),
+                        security_context_resolution.base_head_sha.as_deref(),
+                    ) {
+                        let build_result = self
+                            .build_security_context_payload(
+                                ctx,
+                                &mut client,
+                                gitlab_discovery_mcp
+                                    .as_ref()
+                                    .map(|prepared| prepared.runtime_config.server_name.as_str()),
+                                &thread_id,
+                                worktree_path,
+                                base_branch,
+                                base_head_sha,
+                            )
+                            .await;
+                        self.remove_security_context_worktree(
+                            &container_id,
+                            repo_path.as_str(),
+                            worktree_path,
+                        )
+                        .await;
+                        match build_result {
+                            Ok(payload_json) => {
+                                let generated_at = Utc::now().timestamp();
+                                let expires_at = generated_at
+                                    + ctx.security_context_ttl_seconds.unwrap_or(1_209_600) as i64;
+                                if let Err(err) = self
+                                    .state
+                                    .upsert_security_review_context_cache(
+                                        &crate::state::SecurityReviewContextCacheEntry {
+                                            repo: self.security_context_cache_repo_key(ctx)
+                                                .to_string(),
+                                            base_branch: base_branch.to_string(),
+                                            base_head_sha: base_head_sha.to_string(),
+                                            prompt_version:
+                                                SECURITY_CONTEXT_PROMPT_VERSION.to_string(),
+                                            payload_json: payload_json.clone(),
+                                            source_run_history_id: ctx
+                                                .run_history_id
+                                                .unwrap_or_default(),
+                                            generated_at,
+                                            expires_at,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        repo = ctx.repo.as_str(),
+                                        iid = ctx.mr.iid,
+                                        branch = base_branch,
+                                        error = %err,
+                                        "failed to persist cached security context; continuing without cache reuse"
+                                    );
+                                }
+                                security_context_resolution.payload_json =
+                                    Some(payload_json.clone());
+                                security_review_instructions = Some(
+                                    self.build_security_review_instructions(
+                                        security_base_prompt
+                                            .as_deref()
+                                            .expect("security base prompt set for security lane"),
+                                        Some(payload_json.as_str()),
+                                        security_min_confidence_score.expect(
+                                            "security min confidence score set for security lane",
+                                        ),
+                                        ctx.additional_developer_instructions.as_deref(),
+                                    ),
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    repo = ctx.repo.as_str(),
+                                    iid = ctx.mr.iid,
+                                    branch = base_branch,
+                                    error = %err,
+                                    "failed to build cached security context; continuing without it"
+                                );
+                            }
+                        }
+                    }
+                    let turn_response = client
+                        .request(
+                            "turn/start",
+                            json!({
+                                "threadId": thread_id,
+                                "cwd": repo_path.as_str(),
+                                "input": [
+                                    {
+                                        "type": "text",
+                                        "text": security_review_instructions
+                                            .as_deref()
+                                            .expect("security review instructions built"),
+                                    }
+                                ],
+                                "outputSchema": Self::security_review_output_schema(),
+                            }),
+                        )
+                        .await?;
+                    let turn_id = turn_response
+                        .get("turn")
+                        .and_then(|turn| turn.get("id"))
+                        .and_then(|id| id.as_str())
+                        .ok_or_else(|| anyhow!("turn/start missing turn id for security review"))?
+                        .to_string();
+                    self.update_run_history_session(
+                        ctx.run_history_id,
+                        RunHistorySessionUpdate {
+                            thread_id: Some(thread_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            auth_account_name: Some(account.name.clone()),
+                            security_context_source_run_id: security_context_resolution
+                                .source_run_history_id,
+                            ..RunHistorySessionUpdate::default()
                         },
-                        || async move {
-                            self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
-                                .await;
+                    )
+                    .await;
+                    client
+                        .stream_turn_message(
+                            &thread_id,
+                            &turn_id,
+                            gitlab_discovery_mcp
+                                .as_ref()
+                                .map(|prepared| prepared.runtime_config.server_name.as_str()),
+                            |events| async move {
+                                self.append_run_history_events(ctx.run_history_id, &events)
+                                    .await;
+                            },
+                            || async move {
+                                self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
+                                    .await;
+                            },
+                        )
+                        .await
+                } else {
+                    let review_target = Self::review_target_value(
+                        self.resolve_review_target_request(ctx, &container_id, repo_path.as_str())
+                            .await,
+                    );
+                    let review_response = client
+                        .request(
+                            "review/start",
+                            json!({
+                                "threadId": thread_id,
+                                "delivery": "inline",
+                                "target": review_target,
+                            }),
+                        )
+                        .await?;
+                    let turn_id = review_response
+                        .get("turn")
+                        .and_then(|turn| turn.get("id"))
+                        .and_then(|id| id.as_str())
+                        .ok_or_else(|| anyhow!("review/start missing turn id"))?
+                        .to_string();
+                    let review_thread_id = review_response
+                        .get("reviewThreadId")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or(thread_id.as_str())
+                        .to_string();
+                    self.update_run_history_session(
+                        ctx.run_history_id,
+                        RunHistorySessionUpdate {
+                            thread_id: Some(thread_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            review_thread_id: Some(review_thread_id.clone()),
+                            auth_account_name: Some(account.name.clone()),
+                            ..RunHistorySessionUpdate::default()
                         },
                     )
-                    .await
+                    .await;
+                    client
+                        .stream_review(
+                            &review_thread_id,
+                            &turn_id,
+                            gitlab_discovery_mcp
+                                .as_ref()
+                                .map(|prepared| prepared.runtime_config.server_name.as_str()),
+                            |events| async move {
+                                self.append_run_history_events(ctx.run_history_id, &events)
+                                    .await;
+                            },
+                            || async move {
+                                self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
+                                    .await;
+                            },
+                        )
+                        .await
+                }
             },
         )
         .await;

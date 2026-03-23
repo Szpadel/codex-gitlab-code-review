@@ -3,8 +3,8 @@ use chrono::{Duration, Utc};
 use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
 use codex_gitlab_code_review::config::{
     CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
-    McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
-    ServerConfig, TargetSelector,
+    McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ReviewSecurityConfig,
+    ScheduleConfig, ServerConfig, TargetSelector,
 };
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::review::ReviewService;
@@ -56,6 +56,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             stale_in_progress_minutes: 60,
             dry_run: true,
             additional_developer_instructions: None,
+            security: ReviewSecurityConfig::default(),
             mention_commands: ReviewMentionCommandsConfig::default(),
         },
         codex: CodexConfig {

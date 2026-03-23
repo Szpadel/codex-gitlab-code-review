@@ -107,6 +107,7 @@ async fn seed_example_history_with_store(
                             .use_review_thread_id
                             .then(|| transcript.thread_id.clone()),
                         auth_account_name: Some(PRIMARY_ACCOUNT_NAME.to_string()),
+                        ..RunHistorySessionUpdate::default()
                     },
                 )
                 .await

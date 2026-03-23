@@ -3181,6 +3181,257 @@ async fn run_review_with_fake_runtime_surfaces_closed_stdout_with_recent_runner_
 }
 
 #[tokio::test]
+async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_thread() -> Result<()>
+{
+    let harness = Arc::new(FakeRunnerHarness::default());
+    let repo_dir = repo_checkout_root("group/repo");
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "merge-base".to_string(),
+                "HEAD".to_string(),
+                "main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "merge-base-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "rev-parse".to_string(),
+                "refs/remotes/origin/main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "base-head-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                "mktemp -d /tmp/codex-security-context-XXXXXX".to_string(),
+            ],
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "/tmp/codex-security-context-123456\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "worktree".to_string(),
+                "add".to_string(),
+                "--detach".to_string(),
+                "/tmp/codex-security-context-123456".to_string(),
+                "base-head-sha".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "worktree".to_string(),
+                "remove".to_string(),
+                "--force".to_string(),
+                "/tmp/codex-security-context-123456".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "thread-1" } })),
+        ScriptedAppRequest::result("turn/start", json!({ "turn": { "id": "turn-threat" } }))
+            .with_after_response(vec![
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/started",
+                    "params": { "threadId": "thread-1", "turnId": "turn-threat" }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-threat",
+                        "itemId": "agent-threat",
+                        "delta": "{\"components\":[],\"entry_points\":[],\"trust_boundaries\":[],\"attacker_controlled_inputs\":[],\"privileged_operations\":[],\"sensitive_assets\":[],\"security_critical_paths\":[],\"runtime_notes\":[],\"focus_paths\":[]}"
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-threat",
+                        "item": {
+                            "id": "agent-threat",
+                            "type": "AgentMessage",
+                            "phase": "final"
+                        }
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-threat",
+                        "turn": { "status": "completed" }
+                    }
+                })),
+            ]),
+        ScriptedAppRequest::result("turn/start", json!({ "turn": { "id": "turn-review" } }))
+            .with_after_response(vec![
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/started",
+                    "params": { "threadId": "thread-1", "turnId": "turn-review" }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-review",
+                        "itemId": "agent-review",
+                        "delta": "{\"findings\":[],\"overall_correctness\":\"patch is correct\",\"overall_explanation\":\"No confirmed security issues.\",\"overall_confidence_score\":0.95}"
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-review",
+                        "item": {
+                            "id": "agent-review",
+                            "type": "AgentMessage",
+                            "phase": "final"
+                        }
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-review",
+                        "turn": { "status": "completed" }
+                    }
+                })),
+            ]),
+    ]));
+
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
+    let run_history_id = runner
+        .state
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Security,
+            repo: "group/repo".to_string(),
+            iid: 11,
+            head_sha: "abc123".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    let mut ctx = review_context_with_target_branch(Some("main"));
+    ctx.lane = crate::review_lane::ReviewLane::Security;
+    ctx.min_confidence_score = Some(0.85);
+    ctx.run_history_id = Some(run_history_id);
+
+    let result = runner.run_review(ctx).await?;
+    match result {
+        CodexResult::Pass { summary } => {
+            assert_eq!(summary, "No confirmed security issues.");
+        }
+        other => bail!("expected pass result, got {other:?}"),
+    }
+
+    let request_methods = harness
+        .app_protocol_requests()
+        .into_iter()
+        .filter_map(|message| {
+            message
+                .get("method")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        request_methods,
+        vec![
+            "initialize".to_string(),
+            "initialized".to_string(),
+            "thread/start".to_string(),
+            "turn/start".to_string(),
+            "turn/start".to_string(),
+        ]
+    );
+
+    let run = runner
+        .state
+        .get_run_history(run_history_id)
+        .await?
+        .expect("run history");
+    assert_eq!(run.thread_id.as_deref(), Some("thread-1"));
+    assert_eq!(run.turn_id.as_deref(), Some("turn-review"));
+    assert_eq!(run.review_thread_id, None);
+    assert_eq!(run.security_context_source_run_id, None);
+
+    let events = runner.state.list_run_history_events(run_history_id).await?;
+    let turn_ids = events
+        .iter()
+        .filter_map(|event| event.turn_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(turn_ids, BTreeSet::from(["turn-review", "turn-threat"]));
+
+    let cache_entry = runner
+        .state
+        .get_security_review_context_cache(
+            "group/repo",
+            "main",
+            "base-head-sha",
+            "security-review-context-v1",
+            1_000_000_000,
+        )
+        .await?
+        .expect("cache entry");
+    assert_eq!(cache_entry.source_run_history_id, run_history_id);
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_review_with_fake_runtime_persists_gitlab_discovery_startup_warning() -> Result<()> {
     let harness = Arc::new(FakeRunnerHarness::default());
     harness.set_peer_ips("app-1", BTreeSet::from(["10.42.0.15".to_string()]));

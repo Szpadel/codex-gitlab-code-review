@@ -119,6 +119,7 @@ async fn security_review_context_cache_evicts_expired_rows_on_upsert() -> Result
             base_head_sha: "expired-sha".to_string(),
             prompt_version: "v1".to_string(),
             payload_json: "{}".to_string(),
+            source_run_history_id: 0,
             generated_at: 100,
             expires_at: 100,
         })
@@ -131,6 +132,7 @@ async fn security_review_context_cache_evicts_expired_rows_on_upsert() -> Result
             base_head_sha: "fresh-sha".to_string(),
             prompt_version: "v1".to_string(),
             payload_json: "{\"ok\":true}".to_string(),
+            source_run_history_id: 0,
             generated_at: 200,
             expires_at: 400,
         })
@@ -140,6 +142,31 @@ async fn security_review_context_cache_evicts_expired_rows_on_upsert() -> Result
         .fetch_one(store.pool())
         .await?;
     assert_eq!(count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_review_context_cache_roundtrips_source_run_history_id() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    store
+        .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
+            repo: "group/repo".to_string(),
+            base_branch: "main".to_string(),
+            base_head_sha: "sha-1".to_string(),
+            prompt_version: "v1".to_string(),
+            payload_json: "{\"focus_paths\":[]}".to_string(),
+            source_run_history_id: 42,
+            generated_at: 100,
+            expires_at: 200,
+        })
+        .await?;
+
+    let entry = store
+        .get_security_review_context_cache("group/repo", "main", "sha-1", "v1", 150)
+        .await?
+        .expect("cache entry");
+
+    assert_eq!(entry.source_run_history_id, 42);
     Ok(())
 }
 

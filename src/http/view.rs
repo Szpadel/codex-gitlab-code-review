@@ -161,6 +161,7 @@ pub(super) fn render_run_detail_page(
         render_related_runs(&snapshot.related_runs, run.id),
         render_trigger_card(run),
         render_thread_card(
+            run,
             snapshot.thread.as_ref(),
             snapshot.transcript_backfill.as_ref(),
         ),
@@ -824,13 +825,15 @@ fn render_trigger_card(run: &RunHistoryRecord) -> String {
 }
 
 fn render_thread_card(
+    run: &RunHistoryRecord,
     thread: Option<&ThreadSnapshot>,
     transcript_backfill: Option<&TranscriptBackfillSnapshot>,
 ) -> String {
     let backfill_notice = render_transcript_backfill_notice(transcript_backfill);
+    let security_context_banner = render_security_context_banner(run);
     let Some(thread) = thread else {
         return format!(
-            "<section class=\"card transcript-panel\"><div class=\"transcript-header\"><div><h2>Session transcript</h2><p class=\"muted\">Persisted session detail is not available for this run.</p></div></div>{backfill_notice}<div class=\"thread-empty\"><p class=\"empty\">Codex thread detail is unavailable for this run.</p></div></section>"
+            "<section class=\"card transcript-panel\"><div class=\"transcript-header\"><div><h2>Session transcript</h2><p class=\"muted\">Persisted session detail is not available for this run.</p></div></div>{security_context_banner}{backfill_notice}<div class=\"thread-empty\"><p class=\"empty\">Codex thread detail is unavailable for this run.</p></div></section>"
         );
     };
     let multiple_turns = thread.turns.len() > 1;
@@ -856,12 +859,13 @@ fn render_thread_card(
          <span class=\"meta-chip\"><span class=\"meta-chip-label\">Thread</span><code>{}</code></span>\
          <span class=\"status-pill status-{}\">{}</span>\
          {}\
-         </div></div>{}\
+         </div></div>{}{}\
          <div class=\"transcript-stream\">{}</div></section>",
         escape_html(&thread.id),
         status_class(&thread.status),
         escape_html(&thread.status),
         render_optional_preview_chip(&thread.preview),
+        security_context_banner,
         backfill_notice,
         if items.is_empty() {
             "<div class=\"thread-empty\"><p class=\"empty\">No persisted items.</p></div>"
@@ -869,6 +873,19 @@ fn render_thread_card(
         } else {
             items
         }
+    )
+}
+
+fn render_security_context_banner(run: &RunHistoryRecord) -> String {
+    let Some(source_run_id) = run.security_context_source_run_id else {
+        return String::new();
+    };
+    if run.kind != RunHistoryKind::Security || source_run_id <= 0 || source_run_id == run.id {
+        return String::new();
+    }
+    format!(
+        "<div class=\"thread-empty\"><p class=\"empty\">Reused cached security context from <a href=\"/history/{}\">run {}</a>.</p></div>",
+        source_run_id, source_run_id
     )
 }
 
@@ -1697,4 +1714,63 @@ enum NavItem {
 
 fn page_style() -> &'static str {
     PAGE_STYLE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feature_flags::FeatureFlagSnapshot;
+    use crate::http::status::RunDetailSnapshot;
+    use crate::state::{RunHistoryKind, RunHistoryRecord, TranscriptBackfillState};
+
+    fn sample_run(kind: RunHistoryKind) -> RunHistoryRecord {
+        RunHistoryRecord {
+            id: 7,
+            kind,
+            repo: "group/repo".to_string(),
+            iid: 11,
+            head_sha: "abc123".to_string(),
+            status: "done".to_string(),
+            result: Some("pass".to_string()),
+            started_at: 0,
+            finished_at: Some(0),
+            updated_at: 0,
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            review_thread_id: None,
+            security_context_source_run_id: None,
+            preview: Some("Preview".to_string()),
+            summary: Some("Summary".to_string()),
+            error: None,
+            auth_account_name: Some("primary".to_string()),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+            commit_sha: None,
+            feature_flags: FeatureFlagSnapshot::default(),
+            events_persisted_cleanly: true,
+            transcript_backfill_state: TranscriptBackfillState::Complete,
+            transcript_backfill_error: None,
+        }
+    }
+
+    #[test]
+    fn run_detail_page_renders_security_context_source_banner_for_security_runs() {
+        let mut run = sample_run(RunHistoryKind::Security);
+        run.security_context_source_run_id = Some(42);
+        let snapshot = RunDetailSnapshot {
+            generated_at: "2026-03-23T00:00:00Z".to_string(),
+            run,
+            related_runs: Vec::new(),
+            thread: None,
+            transcript_backfill: None,
+        };
+
+        let html = render_run_detail_page(&snapshot, None);
+
+        assert!(html.contains("Reused cached security context from"));
+        assert!(html.contains("/history/42"));
+    }
 }

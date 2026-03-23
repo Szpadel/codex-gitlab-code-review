@@ -654,12 +654,14 @@ impl StatusService {
     }
 }
 
-async fn run_transcript_backfill(
+pub(super) async fn run_transcript_backfill(
     state: &ReviewStateStore,
     source: &dyn TranscriptBackfillSource,
     run: &RunHistoryRecord,
     retry_window_open_at_attempt_start: bool,
 ) -> Result<()> {
+    let preserve_all_thread_turns =
+        run.kind == RunHistoryKind::Security && run.review_thread_id.is_none();
     let Some(thread_id) = run.thread_id.as_deref().or(run.review_thread_id.as_deref()) else {
         state
             .update_run_history_transcript_backfill(
@@ -724,14 +726,15 @@ async fn run_transcript_backfill(
             .as_ref()
             .is_some_and(|thread| thread_snapshot_only_target_turn_is_incomplete(thread, turn_id))
     });
-    let needs_full_thread_rebuild = run.turn_id.as_deref().is_some()
-        && (candidate_events.is_empty()
-            || target_turn_missing_in_persisted
-            || needs_review_wrapper_missing_target_recovery
-            || (!rebuilt_thread
-                .as_ref()
-                .is_some_and(thread_snapshot_is_complete)
-                && !only_target_turn_is_incomplete));
+    let needs_full_thread_rebuild = preserve_all_thread_turns
+        || (run.turn_id.as_deref().is_some()
+            && (candidate_events.is_empty()
+                || target_turn_missing_in_persisted
+                || needs_review_wrapper_missing_target_recovery
+                || (!rebuilt_thread
+                    .as_ref()
+                    .is_some_and(thread_snapshot_is_complete)
+                    && !only_target_turn_is_incomplete)));
     if needs_full_thread_rebuild
         && let Some(full_thread_events) = source.load_events(thread_id, None).await?
     {
@@ -742,7 +745,9 @@ async fn run_transcript_backfill(
         );
         let persisted_turn_ids_in_full_thread =
             persisted_turn_ids(&persisted_events_for_full_thread);
-        let filtered_turn_ids = if persisted_turn_ids_in_full_thread.is_empty() {
+        let filtered_turn_ids = if preserve_all_thread_turns {
+            turn_ids_from_new_events(&full_thread_events)
+        } else if persisted_turn_ids_in_full_thread.is_empty() {
             run.turn_id
                 .as_deref()
                 .map(|turn_id| HashSet::from([turn_id.to_string()]))

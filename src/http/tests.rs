@@ -1000,6 +1000,7 @@ async fn run_detail_page_renders_trigger_note_and_thread_preview() -> Result<()>
             thread_id: Some("thread-1".to_string()),
             turn_id: Some("turn-1".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -1257,6 +1258,7 @@ async fn run_detail_uses_review_thread_id_in_metadata_when_events_exist() -> Res
             turn_id: Some("turn-1".to_string()),
             review_thread_id: Some("thread-review".to_string()),
             auth_account_name: Some("primary".to_string()),
+            security_context_source_run_id: None,
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -1337,6 +1339,7 @@ async fn run_detail_renders_dynamic_tool_results_and_failed_command_status() -> 
             thread_id: Some("thread-21".to_string()),
             turn_id: Some("turn-21".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -1431,6 +1434,7 @@ async fn run_detail_formats_numeric_millisecond_timestamps_as_utc() -> Result<()
             thread_id: Some("thread-24".to_string()),
             turn_id: Some("turn-24".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -1507,6 +1511,7 @@ async fn run_detail_page_falls_back_when_event_history_is_missing() -> Result<()
             thread_id: Some("thread-1".to_string()),
             turn_id: Some("turn-1".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -1553,6 +1558,7 @@ async fn run_detail_renders_non_diff_file_change_payload_as_plain_body() -> Resu
             thread_id: Some("thread-22".to_string()),
             turn_id: Some("turn-22".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -1635,6 +1641,7 @@ async fn run_detail_renders_mixed_file_change_payloads_with_diff_sections() -> R
             thread_id: Some("thread-23".to_string()),
             turn_id: Some("turn-23".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -1741,6 +1748,7 @@ async fn run_detail_page_shows_unavailable_transcript_for_legacy_runs() -> Resul
             thread_id: Some("thread-legacy".to_string()),
             turn_id: Some("turn-legacy".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -1804,6 +1812,7 @@ async fn run_detail_keeps_partial_persisted_history_without_thread_reader() -> R
             thread_id: Some("thread-live".to_string()),
             turn_id: Some("turn-live".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -1889,6 +1898,7 @@ async fn run_detail_prefers_complete_persisted_event_history() -> Result<()> {
             thread_id: Some("thread-persisted".to_string()),
             turn_id: Some("turn-persisted".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -1980,6 +1990,7 @@ async fn run_detail_skips_live_thread_when_complete_persisted_history_exists() -
             thread_id: Some("thread-richer".to_string()),
             turn_id: Some("turn-richer".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -2058,6 +2069,7 @@ async fn run_detail_keeps_incomplete_persisted_history_without_thread_reader() -
             thread_id: Some("thread-incomplete".to_string()),
             turn_id: Some("turn-incomplete".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -2141,6 +2153,7 @@ async fn run_detail_keeps_completed_turn_without_items_without_thread_reader() -
             thread_id: Some("thread-delta-only".to_string()),
             turn_id: Some("turn-delta-only".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -2223,6 +2236,7 @@ async fn run_detail_keeps_command_without_body_without_thread_reader() -> Result
             thread_id: Some("thread-command-body".to_string()),
             turn_id: Some("turn-command-body".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -2455,6 +2469,7 @@ async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history
             thread_id: Some("thread-backfill".to_string()),
             turn_id: Some("turn-backfill".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -2563,6 +2578,155 @@ async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history
 }
 
 #[tokio::test]
+async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let run_id = insert_run_history(
+        &state,
+        NewRunHistory {
+            kind: RunHistoryKind::Security,
+            repo: "group/repo".to_string(),
+            iid: 19,
+            head_sha: "feed333".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        },
+        RunHistorySessionUpdate {
+            thread_id: Some("thread-security".to_string()),
+            turn_id: Some("turn-review".to_string()),
+            review_thread_id: None,
+            security_context_source_run_id: None,
+            auth_account_name: Some("primary".to_string()),
+        },
+        RunHistoryFinish {
+            result: "pass".to_string(),
+            preview: Some("Security review group/repo !19".to_string()),
+            summary: Some("Rebuild shared-thread security transcript".to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    insert_run_history_events(
+        &state,
+        run_id,
+        vec![
+            NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("turn-review".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            NewRunHistoryEvent {
+                sequence: 2,
+                turn_id: Some("turn-review".to_string()),
+                event_type: "item_completed".to_string(),
+                payload: json!({
+                    "type": "agentMessage",
+                    "content": [{"type": "text", "text": "{\"findings\":[],\"overall_correctness\":\"patch is correct\"}"}]
+                }),
+            },
+            NewRunHistoryEvent {
+                sequence: 3,
+                turn_id: Some("turn-review".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+            },
+        ],
+    )
+    .await?;
+    state.mark_run_history_events_incomplete(run_id).await?;
+    let run = state
+        .get_run_history(run_id)
+        .await?
+        .expect("run history should exist");
+    let source = TurnScopedFallbackTranscriptBackfillSource {
+        turn_events: Some(vec![
+            NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("turn-review".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            NewRunHistoryEvent {
+                sequence: 2,
+                turn_id: Some("turn-review".to_string()),
+                event_type: "item_completed".to_string(),
+                payload: json!({
+                    "type": "agentMessage",
+                    "content": [{"type": "text", "text": "{\"findings\":[],\"overall_correctness\":\"patch is correct\"}"}]
+                }),
+            },
+            NewRunHistoryEvent {
+                sequence: 3,
+                turn_id: Some("turn-review".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+            },
+        ]),
+        full_thread_events: vec![
+            NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("turn-threat".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            NewRunHistoryEvent {
+                sequence: 2,
+                turn_id: Some("turn-threat".to_string()),
+                event_type: "item_completed".to_string(),
+                payload: json!({
+                    "type": "agentMessage",
+                    "content": [{"type": "text", "text": "{\"focus_paths\":[]}"}]
+                }),
+            },
+            NewRunHistoryEvent {
+                sequence: 3,
+                turn_id: Some("turn-threat".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+            },
+            NewRunHistoryEvent {
+                sequence: 4,
+                turn_id: Some("turn-review".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            NewRunHistoryEvent {
+                sequence: 5,
+                turn_id: Some("turn-review".to_string()),
+                event_type: "item_completed".to_string(),
+                payload: json!({
+                    "type": "agentMessage",
+                    "content": [{"type": "text", "text": "{\"findings\":[],\"overall_correctness\":\"patch is correct\"}"}]
+                }),
+            },
+            NewRunHistoryEvent {
+                sequence: 6,
+                turn_id: Some("turn-review".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({"status": "completed"}),
+            },
+        ],
+        seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    crate::http::status::run_transcript_backfill(&state, &source, &run, false).await?;
+
+    let persisted_events = state.list_run_history_events(run_id).await?;
+    let persisted_turn_ids = persisted_events
+        .iter()
+        .filter_map(|event| event.turn_id.as_deref())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        persisted_turn_ids,
+        std::collections::HashSet::from(["turn-threat", "turn-review"])
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let run_id = insert_run_history(
@@ -2582,6 +2746,7 @@ async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Res
             thread_id: Some("thread-review-wrapper".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -2715,6 +2880,7 @@ async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after
             thread_id: Some("thread-review-missing-parent-only-child".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -2848,6 +3014,7 @@ async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewri
             thread_id: Some("thread-review-duplicate".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -3008,6 +3175,7 @@ async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_c
             thread_id: Some("thread-review-later".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -3187,6 +3355,7 @@ async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing(
             thread_id: Some("thread-review-missing-parent".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -3417,6 +3586,7 @@ async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> R
             thread_id: Some("thread-review-target-only".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -3623,6 +3793,7 @@ async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_tu
             thread_id: Some("thread-review-plain-missing".to_string()),
             turn_id: Some("turn-target".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -3796,6 +3967,7 @@ async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<
             thread_id: Some("thread-review-empty".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -3929,6 +4101,7 @@ async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_mark
             thread_id: Some("thread-review-empty-other".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -4062,6 +4235,7 @@ async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history
             thread_id: Some("thread-review-target-other-missing".to_string()),
             turn_id: Some("turn-target".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -4212,6 +4386,7 @@ async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_t
             thread_id: Some("thread-review-stale-older-target-missing".to_string()),
             turn_id: Some("turn-target".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -4375,6 +4550,7 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
             thread_id: Some("thread-review-empty-target".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -4483,6 +4659,7 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
             thread_id: Some("thread-review-stale-missing-sibling".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -4608,6 +4785,7 @@ async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers(
             thread_id: Some("thread-review-stale-wrapper-fallback".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -4753,6 +4931,7 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
             thread_id: Some("thread-review-multi-child-missing-parent".to_string()),
             turn_id: Some("turn-parent".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -5010,6 +5189,7 @@ async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
                 thread_id: Some("thread-active".to_string()),
                 turn_id: Some("turn-active".to_string()),
                 review_thread_id: None,
+            security_context_source_run_id: None,
                 auth_account_name: Some("primary".to_string()),
             },
         )
@@ -5076,6 +5256,7 @@ async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result
             thread_id: Some("thread-stale-backfill".to_string()),
             turn_id: Some("turn-stale-backfill".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -5198,6 +5379,7 @@ async fn run_detail_retries_after_transient_missing_session_history() -> Result<
             thread_id: Some("thread-transient".to_string()),
             turn_id: Some("turn-transient".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -5365,6 +5547,7 @@ async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
             thread_id: Some("thread-partial-file".to_string()),
             turn_id: Some("turn-partial-file".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -5505,6 +5688,7 @@ async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -
             thread_id: Some("thread-partial".to_string()),
             turn_id: Some("turn-new".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -5654,6 +5838,7 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing()
             thread_id: Some("thread-full-fallback".to_string()),
             turn_id: Some("turn-new".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -5863,6 +6048,7 @@ async fn run_detail_full_thread_fallback_ignores_unrelated_pending_review_marker
             thread_id: Some("thread-ignore-unrelated-pending".to_string()),
             turn_id: Some("turn-new".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -6081,6 +6267,7 @@ async fn run_detail_uses_full_thread_fallback_when_turn_scoped_backfill_is_incom
             thread_id: Some("thread-turn-incomplete-full-ready".to_string()),
             turn_id: Some("turn-new".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -6270,6 +6457,7 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missi
             thread_id: Some("thread-missing-turn".to_string()),
             turn_id: Some("turn-new".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {
@@ -6447,6 +6635,7 @@ async fn run_detail_backfill_uses_base_thread_id_when_review_thread_differs() ->
             turn_id: Some("turn-review".to_string()),
             review_thread_id: Some("thread-review".to_string()),
             auth_account_name: Some("primary".to_string()),
+            security_context_source_run_id: None,
         },
         RunHistoryFinish {
             result: "commented".to_string(),
@@ -6571,6 +6760,7 @@ async fn run_detail_retries_when_session_history_directory_appears_later() -> Re
             thread_id: Some("thread-unavailable".to_string()),
             turn_id: Some("turn-unavailable".to_string()),
             review_thread_id: None,
+            security_context_source_run_id: None,
             auth_account_name: Some("primary".to_string()),
         },
         RunHistoryFinish {

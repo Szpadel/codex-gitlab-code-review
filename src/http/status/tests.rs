@@ -1334,6 +1334,7 @@ fn sample_run_history_record(updated_at: i64) -> RunHistoryRecord {
         thread_id: Some("thread-1".to_string()),
         turn_id: Some("turn-1".to_string()),
         review_thread_id: None,
+            security_context_source_run_id: None,
         preview: Some("Preview".to_string()),
         summary: None,
         error: None,

@@ -77,6 +77,7 @@ pub struct RunHistorySessionUpdate {
     pub turn_id: Option<String>,
     pub review_thread_id: Option<String>,
     pub auth_account_name: Option<String>,
+    pub security_context_source_run_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -94,6 +95,7 @@ pub struct RunHistoryRecord {
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub review_thread_id: Option<String>,
+    pub security_context_source_run_id: Option<i64>,
     pub preview: Option<String>,
     pub summary: Option<String>,
     pub error: Option<String>,
@@ -224,6 +226,7 @@ pub struct SecurityReviewContextCacheEntry {
     pub base_head_sha: String,
     pub prompt_version: String,
     pub payload_json: String,
+    pub source_run_history_id: i64,
     pub generated_at: i64,
     pub expires_at: i64,
 }
@@ -636,7 +639,8 @@ impl ReviewStateStore {
             .await?;
         let row = sqlx::query(
             r#"
-            SELECT repo, base_branch, base_head_sha, prompt_version, payload_json, generated_at, expires_at
+            SELECT repo, base_branch, base_head_sha, prompt_version, payload_json, source_run_history_id,
+                   generated_at, expires_at
             FROM security_review_context_cache
             WHERE repo = ?
               AND base_branch = ?
@@ -671,12 +675,14 @@ impl ReviewStateStore {
                 base_head_sha,
                 prompt_version,
                 payload_json,
+                source_run_history_id,
                 generated_at,
                 expires_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(repo, base_branch, base_head_sha, prompt_version) DO UPDATE SET
                 payload_json = excluded.payload_json,
+                source_run_history_id = excluded.source_run_history_id,
                 generated_at = excluded.generated_at,
                 expires_at = excluded.expires_at
             "#,
@@ -686,6 +692,7 @@ impl ReviewStateStore {
         .bind(&entry.base_head_sha)
         .bind(&entry.prompt_version)
         .bind(&entry.payload_json)
+        .bind(entry.source_run_history_id)
         .bind(entry.generated_at)
         .bind(entry.expires_at)
         .execute(&self.pool)
@@ -1040,6 +1047,7 @@ impl ReviewStateStore {
                 turn_id = COALESCE(?, turn_id),
                 review_thread_id = COALESCE(?, review_thread_id),
                 auth_account_name = COALESCE(?, auth_account_name),
+                security_context_source_run_id = COALESCE(?, security_context_source_run_id),
                 updated_at = ?
             WHERE id = ?
             "#,
@@ -1048,6 +1056,7 @@ impl ReviewStateStore {
         .bind(update.turn_id)
         .bind(update.review_thread_id)
         .bind(update.auth_account_name)
+        .bind(update.security_context_source_run_id)
         .bind(Utc::now().timestamp())
         .bind(run_id)
         .execute(&self.pool)
@@ -1362,7 +1371,8 @@ impl ReviewStateStore {
         let rows = sqlx::query(
             r#"
             SELECT id, kind, review_lane, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
-                   thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
+                   thread_id, turn_id, review_thread_id, security_context_source_run_id,
+                   preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
                    command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
                    transcript_backfill_state, transcript_backfill_error
@@ -1383,7 +1393,8 @@ impl ReviewStateStore {
         let row = sqlx::query(
             r#"
             SELECT id, kind, review_lane, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
-                   thread_id, turn_id, review_thread_id, preview, summary, error, auth_account_name,
+                   thread_id, turn_id, review_thread_id, security_context_source_run_id,
+                   preview, summary, error, auth_account_name,
                    discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
                    command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
                    transcript_backfill_state, transcript_backfill_error
@@ -2014,6 +2025,9 @@ fn map_run_history_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord>
         review_thread_id: row
             .try_get("review_thread_id")
             .context("read run history review_thread_id")?,
+        security_context_source_run_id: row
+            .try_get("security_context_source_run_id")
+            .context("read run history security_context_source_run_id")?,
         preview: row.try_get("preview").context("read run history preview")?,
         summary: row.try_get("summary").context("read run history summary")?,
         error: row.try_get("error").context("read run history error")?,
@@ -2129,6 +2143,9 @@ fn map_security_review_context_cache_entry(
         payload_json: row
             .try_get("payload_json")
             .context("read security review cache payload_json")?,
+        source_run_history_id: row
+            .try_get("source_run_history_id")
+            .context("read security review cache source_run_history_id")?,
         generated_at: row
             .try_get("generated_at")
             .context("read security review cache generated_at")?,
