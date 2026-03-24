@@ -255,6 +255,7 @@ impl StatusService {
             }
             "gitlab_inline_review_comments" => {}
             "security_review" => {}
+            "security_context_ignore_base_head" => {}
             "composer_install" => {}
             "composer_auto_repositories" => {}
             "composer_safe_install" => {}
@@ -266,6 +267,9 @@ impl StatusService {
             "gitlab_discovery_mcp" => overrides.gitlab_discovery_mcp = enabled,
             "gitlab_inline_review_comments" => overrides.gitlab_inline_review_comments = enabled,
             "security_review" => overrides.security_review = enabled,
+            "security_context_ignore_base_head" => {
+                overrides.security_context_ignore_base_head = enabled
+            }
             "composer_install" => overrides.composer_install = enabled,
             "composer_auto_repositories" => overrides.composer_auto_repositories = enabled,
             "composer_safe_install" => overrides.composer_safe_install = enabled,
@@ -338,6 +342,16 @@ impl StatusService {
                 default_enabled: self.config.feature_flag_defaults.security_review,
                 runtime_override: overrides.security_review,
                 effective_enabled: effective.security_review,
+            },
+            StatusFeatureFlagSnapshot {
+                name: "security_context_ignore_base_head".to_string(),
+                available: self.config.feature_flag_availability.security_context_ignore_base_head,
+                default_enabled: self
+                    .config
+                    .feature_flag_defaults
+                    .security_context_ignore_base_head,
+                runtime_override: overrides.security_context_ignore_base_head,
+                effective_enabled: effective.security_context_ignore_base_head,
             },
             StatusFeatureFlagSnapshot {
                 name: "composer_install".to_string(),

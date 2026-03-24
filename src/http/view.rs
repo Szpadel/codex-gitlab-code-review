@@ -611,6 +611,10 @@ fn render_run_feature_flags(run: &RunHistoryRecord) -> String {
             bool_label(run.feature_flags.composer_install)
         ),
         format!(
+            "security_context_ignore_base_head={}",
+            bool_label(run.feature_flags.security_context_ignore_base_head)
+        ),
+        format!(
             "composer_auto_repositories={}",
             bool_label(run.feature_flags.composer_auto_repositories)
         ),

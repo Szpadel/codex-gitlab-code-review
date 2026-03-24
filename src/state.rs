@@ -702,6 +702,38 @@ impl ReviewStateStore {
         row.map(map_security_review_context_cache_entry).transpose()
     }
 
+    pub async fn get_latest_security_review_context_cache_for_branch(
+        &self,
+        repo: &str,
+        base_branch: &str,
+        prompt_version: &str,
+        now: i64,
+    ) -> Result<Option<SecurityReviewContextCacheEntry>> {
+        self.delete_expired_security_review_context_cache(now)
+            .await?;
+        let row = sqlx::query(
+            r#"
+            SELECT repo, base_branch, base_head_sha, prompt_version, payload_json, source_run_history_id,
+                   generated_at, expires_at
+            FROM security_review_context_cache
+            WHERE repo = ?
+              AND base_branch = ?
+              AND prompt_version = ?
+              AND expires_at > ?
+            ORDER BY generated_at DESC, expires_at DESC, base_head_sha DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(repo)
+        .bind(base_branch)
+        .bind(prompt_version)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load latest security review context cache for branch")?;
+        row.map(map_security_review_context_cache_entry).transpose()
+    }
+
     pub async fn upsert_security_review_context_cache(
         &self,
         entry: &SecurityReviewContextCacheEntry,

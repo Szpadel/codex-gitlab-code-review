@@ -390,7 +390,7 @@ async fn status_snapshot_includes_feature_flag_state() -> anyhow::Result<()> {
 
     let snapshot = service.snapshot().await?;
 
-    assert_eq!(snapshot.config.feature_flags.len(), 6);
+    assert_eq!(snapshot.config.feature_flags.len(), 7);
     assert_eq!(
         snapshot
             .config
@@ -402,6 +402,7 @@ async fn status_snapshot_includes_feature_flag_state() -> anyhow::Result<()> {
             "gitlab_discovery_mcp",
             "gitlab_inline_review_comments",
             "security_review",
+            "security_context_ignore_base_head",
             "composer_install",
             "composer_auto_repositories",
             "composer_safe_install",
@@ -468,6 +469,28 @@ async fn update_runtime_feature_flag_persists_security_review_override() -> anyh
 }
 
 #[tokio::test]
+async fn update_runtime_feature_flag_persists_security_context_ignore_base_head_override(
+) -> anyhow::Result<()> {
+    let store = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+
+    let updated = service
+        .update_runtime_feature_flag("security_context_ignore_base_head", Some(true))
+        .await?;
+
+    assert_eq!(updated.runtime_override, Some(true));
+    assert!(updated.effective_enabled);
+    assert_eq!(
+        store
+            .get_runtime_feature_flag_overrides()
+            .await?
+            .security_context_ignore_base_head,
+        Some(true)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn update_runtime_feature_flag_rejects_unavailable_flags() -> anyhow::Result<()> {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
     let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
@@ -524,6 +547,7 @@ async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> a
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
+            security_context_ignore_base_head: None,
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,

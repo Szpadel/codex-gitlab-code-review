@@ -49,6 +49,7 @@ struct SecurityContextPayloadResolution {
     payload_json: Option<String>,
     source_run_history_id: Option<i64>,
     base_head_sha: Option<String>,
+    build_base_head_sha: Option<String>,
     generated_at: Option<i64>,
     expires_at: Option<i64>,
     build_guard: Option<SecurityContextBuildCompletionGuard>,
@@ -583,11 +584,35 @@ impl DockerCodexRunner {
                 payload_json: Some(entry.payload_json),
                 source_run_history_id: (entry.source_run_history_id > 0)
                     .then_some(entry.source_run_history_id),
-                base_head_sha: Some(base_head_sha),
+                base_head_sha: Some(base_head_sha.clone()),
+                build_base_head_sha: Some(base_head_sha.clone()),
                 generated_at: Some(entry.generated_at),
                 expires_at: Some(entry.expires_at),
                 build_guard: None,
             });
+        }
+        if ctx.feature_flags.security_context_ignore_base_head {
+            if let Some(entry) = self
+                .state
+                .get_latest_security_review_context_cache_for_branch(
+                    cache_repo_key,
+                    base_branch,
+                    SECURITY_CONTEXT_PROMPT_VERSION,
+                    now,
+                )
+                .await?
+            {
+                return Ok(SecurityContextPayloadResolution {
+                    payload_json: Some(entry.payload_json),
+                    source_run_history_id: (entry.source_run_history_id > 0)
+                        .then_some(entry.source_run_history_id),
+                    base_head_sha: Some(entry.base_head_sha),
+                    build_base_head_sha: Some(base_head_sha),
+                    generated_at: Some(entry.generated_at),
+                    expires_at: Some(entry.expires_at),
+                    build_guard: None,
+                });
+            }
         }
         let build_key = SecurityContextBuildKey {
             repo: cache_repo_key.to_string(),
@@ -610,20 +635,46 @@ impl DockerCodexRunner {
                     .await?
                 {
                     build_guard.complete();
-                    return Ok(SecurityContextPayloadResolution {
-                        payload_json: Some(entry.payload_json),
-                        source_run_history_id: (entry.source_run_history_id > 0)
-                            .then_some(entry.source_run_history_id),
-                        base_head_sha: Some(base_head_sha),
-                        generated_at: Some(entry.generated_at),
-                        expires_at: Some(entry.expires_at),
-                        build_guard: None,
-                    });
+                        return Ok(SecurityContextPayloadResolution {
+                            payload_json: Some(entry.payload_json),
+                            source_run_history_id: (entry.source_run_history_id > 0)
+                                .then_some(entry.source_run_history_id),
+                            base_head_sha: Some(base_head_sha.clone()),
+                            build_base_head_sha: Some(base_head_sha.clone()),
+                            generated_at: Some(entry.generated_at),
+                            expires_at: Some(entry.expires_at),
+                            build_guard: None,
+                        });
+                }
+                if ctx.feature_flags.security_context_ignore_base_head {
+                    if let Some(entry) = self
+                        .state
+                        .get_latest_security_review_context_cache_for_branch(
+                            cache_repo_key,
+                            base_branch,
+                            SECURITY_CONTEXT_PROMPT_VERSION,
+                            now,
+                        )
+                        .await?
+                    {
+                        build_guard.complete();
+                        return Ok(SecurityContextPayloadResolution {
+                            payload_json: Some(entry.payload_json),
+                            source_run_history_id: (entry.source_run_history_id > 0)
+                                .then_some(entry.source_run_history_id),
+                            base_head_sha: Some(entry.base_head_sha),
+                            build_base_head_sha: Some(base_head_sha.clone()),
+                            generated_at: Some(entry.generated_at),
+                            expires_at: Some(entry.expires_at),
+                            build_guard: None,
+                        });
+                    }
                 }
                 Ok(SecurityContextPayloadResolution {
                     payload_json: None,
                     source_run_history_id: None,
-                    base_head_sha: Some(base_head_sha),
+                    base_head_sha: Some(base_head_sha.clone()),
+                    build_base_head_sha: Some(base_head_sha.clone()),
                     generated_at: None,
                     expires_at: None,
                     build_guard: Some(build_guard),
@@ -650,15 +701,39 @@ impl DockerCodexRunner {
                     )
                     .await?
                 {
-                    return Ok(SecurityContextPayloadResolution {
-                        payload_json: Some(entry.payload_json),
-                        source_run_history_id: (entry.source_run_history_id > 0)
-                            .then_some(entry.source_run_history_id),
-                        base_head_sha: Some(base_head_sha),
-                        generated_at: Some(entry.generated_at),
-                        expires_at: Some(entry.expires_at),
-                        build_guard: None,
-                    });
+                        return Ok(SecurityContextPayloadResolution {
+                            payload_json: Some(entry.payload_json),
+                            source_run_history_id: (entry.source_run_history_id > 0)
+                                .then_some(entry.source_run_history_id),
+                            base_head_sha: Some(base_head_sha.clone()),
+                            build_base_head_sha: Some(base_head_sha.clone()),
+                            generated_at: Some(entry.generated_at),
+                            expires_at: Some(entry.expires_at),
+                            build_guard: None,
+                        });
+                }
+                if ctx.feature_flags.security_context_ignore_base_head {
+                    if let Some(entry) = self
+                        .state
+                        .get_latest_security_review_context_cache_for_branch(
+                            cache_repo_key,
+                            base_branch,
+                            SECURITY_CONTEXT_PROMPT_VERSION,
+                            now,
+                        )
+                        .await?
+                    {
+                        return Ok(SecurityContextPayloadResolution {
+                            payload_json: Some(entry.payload_json),
+                            source_run_history_id: (entry.source_run_history_id > 0)
+                                .then_some(entry.source_run_history_id),
+                            base_head_sha: Some(entry.base_head_sha),
+                            build_base_head_sha: Some(base_head_sha.clone()),
+                            generated_at: Some(entry.generated_at),
+                            expires_at: Some(entry.expires_at),
+                            build_guard: None,
+                        });
+                    }
                 }
                 debug!(
                     repo = ctx.repo.as_str(),
@@ -670,7 +745,8 @@ impl DockerCodexRunner {
                 Ok(SecurityContextPayloadResolution {
                     payload_json: None,
                     source_run_history_id: None,
-                    base_head_sha: Some(base_head_sha),
+                    base_head_sha: Some(base_head_sha.clone()),
+                    build_base_head_sha: Some(base_head_sha.clone()),
                     generated_at: None,
                     expires_at: None,
                     build_guard: None,
@@ -1033,7 +1109,7 @@ impl DockerCodexRunner {
                             .as_deref()
                             .expect("security context base branch set when build is pending");
                         let base_head_sha = security_context_resolution
-                            .base_head_sha
+                            .build_base_head_sha
                             .as_deref()
                             .expect("security context base head SHA set when build is pending");
                         let build_result = self

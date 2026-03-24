@@ -171,6 +171,57 @@ async fn security_review_context_cache_roundtrips_source_run_history_id() -> Res
 }
 
 #[tokio::test]
+async fn security_review_context_cache_fallback_returns_newest_live_branch_entry() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    store
+        .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
+            repo: "group/repo".to_string(),
+            base_branch: "main".to_string(),
+            base_head_sha: "stale-sha".to_string(),
+            prompt_version: "v1".to_string(),
+            payload_json: "{\"version\":1}".to_string(),
+            source_run_history_id: 1,
+            generated_at: 100,
+            expires_at: 100,
+        })
+        .await?;
+    store
+        .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
+            repo: "group/repo".to_string(),
+            base_branch: "main".to_string(),
+            base_head_sha: "older-live-sha".to_string(),
+            prompt_version: "v1".to_string(),
+            payload_json: "{\"version\":2}".to_string(),
+            source_run_history_id: 2,
+            generated_at: 200,
+            expires_at: 500,
+        })
+        .await?;
+    store
+        .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
+            repo: "group/repo".to_string(),
+            base_branch: "main".to_string(),
+            base_head_sha: "newest-live-sha".to_string(),
+            prompt_version: "v1".to_string(),
+            payload_json: "{\"version\":3}".to_string(),
+            source_run_history_id: 3,
+            generated_at: 300,
+            expires_at: 600,
+        })
+        .await?;
+
+    let entry = store
+        .get_latest_security_review_context_cache_for_branch("group/repo", "main", "v1", 400)
+        .await?
+        .expect("branch cache entry");
+
+    assert_eq!(entry.base_head_sha, "newest-live-sha");
+    assert_eq!(entry.payload_json, "{\"version\":3}");
+    assert_eq!(entry.source_run_history_id, 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn finish_review_is_noop_once_row_is_not_in_progress() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store.begin_review("group/repo", 3, "sha1").await?;
@@ -802,6 +853,7 @@ async fn runtime_feature_flag_overrides_roundtrip() -> Result<()> {
         gitlab_discovery_mcp: Some(true),
         gitlab_inline_review_comments: Some(false),
         security_review: Some(false),
+        security_context_ignore_base_head: Some(true),
         composer_install: Some(true),
         composer_auto_repositories: Some(true),
         composer_safe_install: Some(true),
@@ -833,6 +885,7 @@ async fn run_history_feature_flags_snapshot_roundtrip() -> Result<()> {
         gitlab_discovery_mcp: true,
         gitlab_inline_review_comments: true,
         security_review: false,
+        security_context_ignore_base_head: true,
         composer_install: true,
         composer_auto_repositories: true,
         composer_safe_install: true,

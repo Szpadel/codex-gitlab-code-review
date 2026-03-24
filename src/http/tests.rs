@@ -213,6 +213,7 @@ async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
+            security_context_ignore_base_head: None,
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,

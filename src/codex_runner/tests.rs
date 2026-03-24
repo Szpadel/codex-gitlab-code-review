@@ -2079,6 +2079,7 @@ fn effective_feature_flags_require_injected_gitlab_discovery_mcp() {
         composer_auto_repositories: false,
         composer_safe_install: false,
         security_review: false,
+        security_context_ignore_base_head: false,
     };
 
     assert!(DockerCodexRunner::effective_feature_flags(&requested, true).gitlab_discovery_mcp);
@@ -2153,6 +2154,7 @@ fn prepare_gitlab_discovery_mcp_rejects_empty_source_repo() {
             composer_auto_repositories: false,
             composer_safe_install: false,
             security_review: false,
+            security_context_ignore_base_head: false,
         },
         &BTreeMap::new(),
     );
@@ -4259,6 +4261,145 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
 }
 
 #[tokio::test]
+async fn security_review_reuses_branch_cached_context_when_ignore_base_head_enabled() -> Result<()> {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    let repo_dir = repo_checkout_root("group/repo");
+    let cached_payload =
+        "{\"components\":[\"api\"],\"entry_points\":[],\"trust_boundaries\":[],\"attacker_controlled_inputs\":[],\"privileged_operations\":[],\"sensitive_assets\":[],\"security_critical_paths\":[],\"runtime_notes\":[],\"focus_paths\":[]}";
+
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "merge-base".to_string(),
+                "HEAD".to_string(),
+                "main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "merge-base-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: auxiliary_git_exec_command(&[
+                "rev-parse".to_string(),
+                "refs/remotes/origin/main".to_string(),
+            ]),
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "current-base-head-sha\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_app_server(scripted_security_review_server(
+        "thread-review",
+        None,
+        None,
+        0,
+        "turn-review",
+        "{\"findings\":[],\"overall_correctness\":\"patch is correct\",\"overall_explanation\":\"No confirmed security issues.\",\"overall_confidence_score\":0.95}",
+    ));
+
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
+    runner
+        .state
+        .upsert_security_review_context_cache(&crate::state::SecurityReviewContextCacheEntry {
+            repo: "group/repo".to_string(),
+            base_branch: "main".to_string(),
+            base_head_sha: "cached-base-head-sha".to_string(),
+            prompt_version: "security-review-context-v1".to_string(),
+            payload_json: cached_payload.to_string(),
+            source_run_history_id: 777,
+            generated_at: 100,
+            expires_at: 4_000_000_000,
+        })
+        .await?;
+
+    let run_history_id = runner
+        .state
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Security,
+            repo: "group/repo".to_string(),
+            iid: 31,
+            head_sha: "abc123".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+
+    let mut ctx = review_context_with_target_branch(Some("main"));
+    ctx.lane = crate::review_lane::ReviewLane::Security;
+    ctx.feature_flags = FeatureFlagSnapshot {
+        security_context_ignore_base_head: true,
+        ..FeatureFlagSnapshot::default()
+    };
+    ctx.min_confidence_score = Some(0.85);
+    ctx.run_history_id = Some(run_history_id);
+    ctx.mr.iid = 31;
+    ctx.mr.web_url = Some("https://gitlab.example.com/group/repo/-/merge_requests/31".to_string());
+
+    let result = runner.run_review(ctx).await?;
+    assert!(matches!(result, CodexResult::Pass { .. }));
+
+    let mktemp_requests = harness
+        .exec_requests()
+        .iter()
+        .filter(|request| {
+            request
+                .command
+                .first()
+                .is_some_and(|command| command == "mktemp")
+        })
+        .count();
+    assert_eq!(mktemp_requests, 0);
+
+    let app_server_starts = harness.app_server_starts();
+    assert_eq!(app_server_starts.len(), 1);
+
+    let turn_start = harness
+        .app_protocol_requests()
+        .into_iter()
+        .find(|message| message.get("method").and_then(|value| value.as_str()) == Some("turn/start"))
+        .expect("turn/start request");
+    let prompt_text = turn_start["params"]["input"][0]["text"]
+        .as_str()
+        .expect("security review prompt text");
+    assert!(prompt_text.contains("Cached repository security context (base branch):"));
+    assert!(prompt_text.contains(cached_payload));
+
+    let run = runner
+        .state
+        .get_run_history(run_history_id)
+        .await?
+        .expect("run history");
+    assert_eq!(run.thread_id.as_deref(), Some("thread-review"));
+    assert_eq!(run.turn_id.as_deref(), Some("turn-review"));
+    assert_eq!(run.security_context_source_run_id, Some(777));
+    assert_eq!(run.security_context_base_branch.as_deref(), Some("main"));
+    assert_eq!(
+        run.security_context_base_head_sha.as_deref(),
+        Some("cached-base-head-sha")
+    );
+    assert_eq!(run.security_context_payload_json.as_deref(), Some(cached_payload));
+    assert_eq!(run.security_context_generated_at, Some(100));
+    assert_eq!(run.security_context_expires_at, Some(4_000_000_000));
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_review_with_fake_runtime_persists_gitlab_discovery_startup_warning() -> Result<()> {
     let harness = Arc::new(FakeRunnerHarness::default());
     harness.set_peer_ips("app-1", BTreeSet::from(["10.42.0.15".to_string()]));
@@ -4362,6 +4503,7 @@ async fn run_review_with_fake_runtime_persists_gitlab_discovery_startup_warning(
                 composer_auto_repositories: false,
                 composer_safe_install: false,
                 security_review: false,
+                security_context_ignore_base_head: false,
             },
             ..review_context_with_target_branch(Some("main"))
         })

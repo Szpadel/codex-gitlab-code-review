@@ -9,6 +9,8 @@ pub struct FeatureFlagSnapshot {
     #[serde(default)]
     pub security_review: bool,
     #[serde(default)]
+    pub security_context_ignore_base_head: bool,
+    #[serde(default)]
     pub composer_install: bool,
     #[serde(default)]
     pub composer_auto_repositories: bool,
@@ -24,6 +26,8 @@ pub struct RuntimeFeatureFlagOverrides {
     pub gitlab_inline_review_comments: Option<bool>,
     #[serde(default)]
     pub security_review: Option<bool>,
+    #[serde(default)]
+    pub security_context_ignore_base_head: Option<bool>,
     #[serde(default)]
     pub composer_install: Option<bool>,
     #[serde(default)]
@@ -41,6 +45,8 @@ pub struct FeatureFlagDefaults {
     #[serde(default)]
     pub security_review: bool,
     #[serde(default)]
+    pub security_context_ignore_base_head: bool,
+    #[serde(default)]
     pub composer_install: bool,
     #[serde(default)]
     pub composer_auto_repositories: bool,
@@ -53,6 +59,7 @@ pub struct FeatureFlagAvailability {
     pub gitlab_discovery_mcp: bool,
     pub gitlab_inline_review_comments: bool,
     pub security_review: bool,
+    pub security_context_ignore_base_head: bool,
     pub composer_install: bool,
     pub composer_auto_repositories: bool,
     pub composer_safe_install: bool,
@@ -79,6 +86,11 @@ impl FeatureFlagSnapshot {
                 defaults.security_review,
                 availability.security_review,
                 overrides.security_review,
+            ),
+            security_context_ignore_base_head: resolve_flag(
+                defaults.security_context_ignore_base_head,
+                availability.security_context_ignore_base_head,
+                overrides.security_context_ignore_base_head,
             ),
             composer_install: resolve_flag(
                 defaults.composer_install,
@@ -118,6 +130,7 @@ mod tests {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: false,
                 security_review: false,
+                security_context_ignore_base_head: false,
                 composer_install: false,
                 composer_auto_repositories: false,
                 composer_safe_install: false,
@@ -126,6 +139,7 @@ mod tests {
                 gitlab_discovery_mcp: true,
                 gitlab_inline_review_comments: true,
                 security_review: true,
+                security_context_ignore_base_head: true,
                 composer_install: true,
                 composer_auto_repositories: true,
                 composer_safe_install: true,
@@ -134,6 +148,7 @@ mod tests {
                 gitlab_discovery_mcp: Some(true),
                 gitlab_inline_review_comments: None,
                 security_review: None,
+                security_context_ignore_base_head: None,
                 composer_install: None,
                 composer_auto_repositories: None,
                 composer_safe_install: None,
@@ -150,6 +165,7 @@ mod tests {
                 gitlab_discovery_mcp: true,
                 gitlab_inline_review_comments: true,
                 security_review: true,
+                security_context_ignore_base_head: true,
                 composer_install: false,
                 composer_auto_repositories: false,
                 composer_safe_install: false,
@@ -158,6 +174,7 @@ mod tests {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: false,
                 security_review: false,
+                security_context_ignore_base_head: false,
                 composer_install: true,
                 composer_auto_repositories: true,
                 composer_safe_install: true,
@@ -166,6 +183,7 @@ mod tests {
                 gitlab_discovery_mcp: Some(true),
                 gitlab_inline_review_comments: Some(true),
                 security_review: Some(true),
+                security_context_ignore_base_head: Some(true),
                 composer_install: None,
                 composer_auto_repositories: None,
                 composer_safe_install: None,
@@ -175,6 +193,7 @@ mod tests {
         assert!(!snapshot.gitlab_discovery_mcp);
         assert!(!snapshot.gitlab_inline_review_comments);
         assert!(!snapshot.security_review);
+        assert!(!snapshot.security_context_ignore_base_head);
     }
 
     #[test]
@@ -184,6 +203,7 @@ mod tests {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: false,
                 security_review: false,
+                security_context_ignore_base_head: false,
                 composer_install: false,
                 composer_auto_repositories: false,
                 composer_safe_install: false,
@@ -192,6 +212,7 @@ mod tests {
                 gitlab_discovery_mcp: false,
                 gitlab_inline_review_comments: true,
                 security_review: true,
+                security_context_ignore_base_head: true,
                 composer_install: true,
                 composer_auto_repositories: true,
                 composer_safe_install: true,
@@ -200,6 +221,7 @@ mod tests {
                 gitlab_discovery_mcp: None,
                 gitlab_inline_review_comments: Some(true),
                 security_review: Some(true),
+                security_context_ignore_base_head: Some(true),
                 composer_install: Some(true),
                 composer_auto_repositories: Some(true),
                 composer_safe_install: Some(true),
@@ -208,6 +230,7 @@ mod tests {
 
         assert!(snapshot.gitlab_inline_review_comments);
         assert!(snapshot.security_review);
+        assert!(snapshot.security_context_ignore_base_head);
         assert!(snapshot.composer_install);
         assert!(snapshot.composer_auto_repositories);
         assert!(snapshot.composer_safe_install);

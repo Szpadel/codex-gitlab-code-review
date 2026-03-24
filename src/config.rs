@@ -493,6 +493,7 @@ impl Config {
                 && !self.codex.gitlab_discovery_mcp.allow.is_empty(),
             gitlab_inline_review_comments: true,
             security_review: true,
+            security_context_ignore_base_head: true,
             composer_install: true,
             composer_auto_repositories: true,
             composer_safe_install: true,

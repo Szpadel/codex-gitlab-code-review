@@ -39,6 +39,7 @@ config:
     # but agent access stays off until this flag is enabled at runtime.
     gitlabDiscoveryMcp: false
     gitlabInlineReviewComments: false
+    securityContextIgnoreBaseHead: false
     composerInstall: false
     # Derive temporary Composer repository entries from COMPOSER_AUTH HTTP auth hosts.
     # Only takes effect when composerInstall is enabled for a run.

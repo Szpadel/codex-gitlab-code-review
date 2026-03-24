@@ -44,6 +44,9 @@ feature_flags:
   # live from the status UI/API; changes apply only to newly started runs.
   gitlab_discovery_mcp: false
   gitlab_inline_review_comments: false
+  # Optional. When true, security reviews may reuse the newest cached base-branch
+  # security context even if the current base head SHA changed.
+  security_context_ignore_base_head: false
   composer_install: false
   # Optional. When true, composer install derives temporary global repositories
   # from host-keyed HTTP auth entries in the GitLab COMPOSER_AUTH variable.

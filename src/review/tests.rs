@@ -4393,6 +4393,7 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
+            security_context_ignore_base_head: None,
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,
@@ -4431,6 +4432,7 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(false),
             gitlab_inline_review_comments: None,
+            security_context_ignore_base_head: None,
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,
@@ -4998,6 +5000,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
+            security_context_ignore_base_head: None,
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,
@@ -5036,6 +5039,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(false),
             gitlab_inline_review_comments: None,
+            security_context_ignore_base_head: None,
             composer_install: None,
             composer_auto_repositories: None,
             composer_safe_install: None,
