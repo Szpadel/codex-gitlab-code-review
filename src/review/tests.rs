@@ -4107,7 +4107,49 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
 async fn security_inline_review_comments_link_sectioned_references() -> Result<()> {
     let mut config = test_config();
     config.feature_flags.gitlab_inline_review_comments = true;
-    let finding_body = "Summary:\nUntrusted callers can reach /work/repo/group/repo/src/auth.rs:10.\n\nSeverity:\nP1 because /work/repo/group/repo/src/auth.rs:10 removes the only authorization gate.\n\nReproduction:\nReplay the existing request flow and hit /work/repo/group/repo/src/auth.rs:10.\n\nEvidence:\n/work/repo/group/repo/src/auth.rs:10 returns before the guard and /work/repo/group/repo/src/http.rs:22 still executes the privileged handler.\n\nAttack-path analysis:\nAn attacker-controlled request crosses the HTTP boundary, bypasses the role check, and reaches the privileged sink.\n\nLikelihood:\nHigh because the endpoint is externally reachable.\n\nImpact:\nCross-tenant data exposure.\n\nAssumptions:\nThe route is reachable to ordinary API clients.\n\nBlindspots:\nDid not validate proxy-specific auth at /work/repo/group/repo/src/http.rs:22.";
+    let render_sectioned_body = |sections: &[(&str, String)]| -> String {
+        sections
+            .iter()
+            .map(|(label, body)| format!("{label}:\n{body}"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let auth_ref = "`/work/repo/group/repo/src/auth.rs:10`";
+    let http_ref = "`/work/repo/group/repo/src/http.rs:22`";
+    let finding_body = render_sectioned_body(&[
+        ("Summary", format!("Untrusted callers can reach {auth_ref}.")),
+        (
+            "Severity",
+            format!("P1 because {auth_ref} removes the only authorization gate."),
+        ),
+        (
+            "Reproduction",
+            format!("Replay the existing request flow and hit {auth_ref}."),
+        ),
+        (
+            "Evidence",
+            format!(
+                "{auth_ref} returns before the guard and {http_ref} still executes the privileged handler."
+            ),
+        ),
+        (
+            "Attack-path analysis",
+            "An attacker-controlled request crosses the HTTP boundary, bypasses the role check, and reaches the privileged sink.".to_string(),
+        ),
+        (
+            "Likelihood",
+            "High because the endpoint is externally reachable.".to_string(),
+        ),
+        ("Impact", "Cross-tenant data exposure.".to_string()),
+        (
+            "Assumptions",
+            "The route is reachable to ordinary API clients.".to_string(),
+        ),
+        (
+            "Blindspots",
+            format!("Did not validate proxy-specific auth at {http_ref}."),
+        ),
+    ]);
 
     let mut merge_request = mr(25, "sha25");
     merge_request.web_url =
@@ -4140,7 +4182,7 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
                 overall_confidence_score: Some(0.93),
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "[P1] Missing auth guard".to_string(),
-                    body: finding_body.to_string(),
+                    body: finding_body,
                     confidence_score: Some(0.93),
                     priority: Some(1),
                     code_location: crate::codex_runner::ReviewCodeLocation {
@@ -4193,10 +4235,50 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
         .body
         .rsplit_once("\n\n<!-- ")
         .expect("inline finding marker");
-    assert_eq!(
-        rendered_body,
-        "Security finding: [P1] Missing auth guard\n\nSummary:\nUntrusted callers can reach [src/auth.rs:10](https://gitlab.example.com/group/repo/-/blob/sha25/src/auth.rs#L10).\n\nSeverity:\nP1 because [src/auth.rs:10](https://gitlab.example.com/group/repo/-/blob/sha25/src/auth.rs#L10) removes the only authorization gate.\n\nReproduction:\nReplay the existing request flow and hit [src/auth.rs:10](https://gitlab.example.com/group/repo/-/blob/sha25/src/auth.rs#L10).\n\nEvidence:\n[src/auth.rs:10](https://gitlab.example.com/group/repo/-/blob/sha25/src/auth.rs#L10) returns before the guard and [src/http.rs:22](https://gitlab.example.com/group/repo/-/blob/sha25/src/http.rs#L22) still executes the privileged handler.\n\nAttack-path analysis:\nAn attacker-controlled request crosses the HTTP boundary, bypasses the role check, and reaches the privileged sink.\n\nLikelihood:\nHigh because the endpoint is externally reachable.\n\nImpact:\nCross-tenant data exposure.\n\nAssumptions:\nThe route is reachable to ordinary API clients.\n\nBlindspots:\nDid not validate proxy-specific auth at [src/http.rs:22](https://gitlab.example.com/group/repo/-/blob/sha25/src/http.rs#L22)."
+    let auth_link =
+        "[`src/auth.rs:10`](https://gitlab.example.com/group/repo/-/blob/sha25/src/auth.rs#L10)";
+    let http_link =
+        "[`src/http.rs:22`](https://gitlab.example.com/group/repo/-/blob/sha25/src/http.rs#L22)";
+    let expected_rendered_body = format!(
+        "Security finding: [P1] Missing auth guard\n\n{}",
+        render_sectioned_body(&[
+            ("Summary", format!("Untrusted callers can reach {auth_link}.")),
+            (
+                "Severity",
+                format!("P1 because {auth_link} removes the only authorization gate."),
+            ),
+            (
+                "Reproduction",
+                format!("Replay the existing request flow and hit {auth_link}."),
+            ),
+            (
+                "Evidence",
+                format!(
+                    "{auth_link} returns before the guard and {http_link} still executes the privileged handler."
+                ),
+            ),
+            (
+                "Attack-path analysis",
+                "An attacker-controlled request crosses the HTTP boundary, bypasses the role check, and reaches the privileged sink.".to_string(),
+            ),
+            (
+                "Likelihood",
+                "High because the endpoint is externally reachable.".to_string(),
+            ),
+            ("Impact", "Cross-tenant data exposure.".to_string()),
+            (
+                "Assumptions",
+                "The route is reachable to ordinary API clients.".to_string(),
+            ),
+            (
+                "Blindspots",
+                format!("Did not validate proxy-specific auth at {http_link}."),
+            ),
+        ])
     );
+    assert_eq!(rendered_body, expected_rendered_body);
+    assert!(!rendered_body.contains(auth_ref));
+    assert!(!rendered_body.contains(http_ref));
     assert!(marker_suffix.starts_with("codex-security-review-finding:sha=sha25 key="));
     assert!(marker_suffix.ends_with(" -->"));
     assert!(gitlab.created_note_bodies().is_empty());

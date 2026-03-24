@@ -638,8 +638,12 @@ fn rewrite_reference_token(
     worktree_root: &str,
 ) -> String {
     let (trimmed, suffix) = trim_token_suffix(token);
-    let Some((relative_path, start_line, end_line)) =
+    let Some((relative_path, start_line, end_line, code_label)) =
         parse_reference_token(trimmed, default_relative_path, worktree_root)
+            .map(|(relative_path, start_line, end_line)| {
+                (relative_path, start_line, end_line, false)
+            })
+            .or_else(|| parse_backticked_repo_reference_token(trimmed, worktree_root))
     else {
         return token.to_string();
     };
@@ -647,6 +651,11 @@ fn rewrite_reference_token(
         format!("{relative_path}:{start_line}")
     } else {
         format!("{relative_path}:{start_line}-{end_line}")
+    };
+    let label = if code_label {
+        format!("`{label}`")
+    } else {
+        label
     };
     format!(
         "[{label}]({}){suffix}",
@@ -677,6 +686,17 @@ fn parse_reference_token(
         .map(|(start, end)| Some((start, end)))
         .unwrap_or_else(|| Some((line_range, line_range)))?;
     Some((relative_path, start.parse().ok()?, end.parse().ok()?))
+}
+
+fn parse_backticked_repo_reference_token(
+    token: &str,
+    worktree_root: &str,
+) -> Option<(String, usize, usize, bool)> {
+    let inner = token.strip_prefix('`')?.strip_suffix('`')?;
+    let (path, _) = inner.rsplit_once(':')?;
+    normalize_repo_path(path, worktree_root)?;
+    parse_reference_token(inner, "", worktree_root)
+        .map(|(relative_path, start_line, end_line)| (relative_path, start_line, end_line, true))
 }
 
 fn trim_token_suffix(token: &str) -> (&str, &str) {
@@ -863,6 +883,34 @@ mod tests {
         );
         assert!(rewritten.contains("\n\n- [src/lib.rs:10]"));
         assert!(rewritten.ends_with("\n- keep"));
+    }
+
+    #[test]
+    fn rewrite_code_references_links_backticked_nested_project_prefix() {
+        let worktree_root = repo_checkout_root("group/repo");
+        let rewritten = rewrite_code_references(
+            format!("Paragraph one.\n\n- `{worktree_root}/src/lib.rs:10-12`\n- keep").as_str(),
+            "",
+            "https://gitlab.example.com/group/repo",
+            "sha1",
+            worktree_root.as_str(),
+        );
+        assert!(rewritten.contains("\n\n- [`src/lib.rs:10-12`]"));
+        assert!(rewritten.ends_with("\n- keep"));
+    }
+
+    #[test]
+    fn rewrite_code_references_keeps_non_reference_backticks_plain() {
+        let worktree_root = repo_checkout_root("group/repo");
+        let text = "Leave `RFC:2119` and `step:3` unchanged.";
+        let rewritten = rewrite_code_references(
+            text,
+            "",
+            "https://gitlab.example.com/group/repo",
+            "sha1",
+            worktree_root.as_str(),
+        );
+        assert_eq!(rewritten, text);
     }
 
     #[test]

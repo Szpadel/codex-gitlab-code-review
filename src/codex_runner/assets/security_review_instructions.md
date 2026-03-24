@@ -69,11 +69,12 @@ Validation rules:
   - `**Blindspots**`
 - Put each label on its own line, then the section content on the following line(s).
 - Fill every section. If a section has no extra detail, say `None.` rather than omitting it.
-- `Severity:` must include the severity level and why it fits.
-- `Reproduction:` must give the fastest realistic developer repro path.
-- `Evidence:` must cite the exact proof from the repo, runtime behavior, or validation artifact.
-- `Attack-path analysis:` must explain the attacker-controlled input, boundary crossing, failed guard, and sink.
+- The `**Severity**` section must include the severity level and why it fits.
+- The `**Reproduction**` section must give the fastest realistic developer repro path.
+- The `**Evidence**` section must cite the exact proof from the repo, runtime behavior, or validation artifact.
+- The `**Attack-path analysis**` section must explain the attacker-controlled input, boundary crossing, failed guard, and sink.
 - When citing repository locations in the narrative sections, use checked-out file references like `/work/repo/<project-path>/src/auth.rs:42` or `/work/repo/<project-path>/src/auth.rs:42-47`.
+- Do not wrap repository-location references in backticks or code fences.
 - Be especially careful about representation and transformation bugs:
   validate-before-decode, auth checks on one representation but sink uses another, policy checks before state changes, and mismatches between validation and interpretation.
 

@@ -1702,34 +1702,43 @@ mod tests {
         let section_heading_idx = lines
             .iter()
             .position(|line| {
-                *line == "- Each finding body must use these exact sections, in this exact order:"
+                *line
+                    == "- Each finding body must use these exact Markdown section labels, in this exact order:"
             })
             .expect("section heading marker");
+        let required_section_labels = lines[(section_heading_idx + 1)..]
+            .iter()
+            .copied()
+            .take_while(|line| line.starts_with("  - "))
+            .collect::<Vec<_>>();
         assert_eq!(
-            &lines[section_heading_idx..=section_heading_idx + 10],
+            required_section_labels,
             [
-                "- Each finding body must use these exact sections, in this exact order:",
-                "  - `Summary:`",
-                "  - `Severity:`",
-                "  - `Reproduction:`",
-                "  - `Evidence:`",
-                "  - `Attack-path analysis:`",
-                "  - `Likelihood:`",
-                "  - `Impact:`",
-                "  - `Assumptions:`",
-                "  - `Blindspots:`",
-                "- Fill every section. If a section has no extra detail, say `None.` rather than omitting it.",
+                "  - `**Summary**`",
+                "  - `**Severity**`",
+                "  - `**Reproduction**`",
+                "  - `**Evidence**`",
+                "  - `**Attack-path analysis**`",
+                "  - `**Likelihood**`",
+                "  - `**Impact**`",
+                "  - `**Assumptions**`",
+                "  - `**Blindspots**`",
             ]
         );
-        assert_eq!(
-            &lines[section_heading_idx + 11..=section_heading_idx + 15],
-            [
-                "- `Severity:` must include the severity level and why it fits.",
-                "- `Reproduction:` must give the fastest realistic developer repro path.",
-                "- `Evidence:` must cite the exact proof from the repo, runtime behavior, or validation artifact.",
-                "- `Attack-path analysis:` must explain the attacker-controlled input, boundary crossing, failed guard, and sink.",
-                "- When citing repository locations in the narrative sections, use checked-out file references like `/work/repo/<project-path>/src/auth.rs:42` or `/work/repo/<project-path>/src/auth.rs:42-47`.",
-            ]
-        );
+        for required_rule in [
+            "- Put each label on its own line, then the section content on the following line(s).",
+            "- Fill every section. If a section has no extra detail, say `None.` rather than omitting it.",
+            "- The `**Severity**` section must include the severity level and why it fits.",
+            "- The `**Reproduction**` section must give the fastest realistic developer repro path.",
+            "- The `**Evidence**` section must cite the exact proof from the repo, runtime behavior, or validation artifact.",
+            "- The `**Attack-path analysis**` section must explain the attacker-controlled input, boundary crossing, failed guard, and sink.",
+            "- When citing repository locations in the narrative sections, use checked-out file references like `/work/repo/<project-path>/src/auth.rs:42` or `/work/repo/<project-path>/src/auth.rs:42-47`.",
+            "- Do not wrap repository-location references in backticks or code fences.",
+        ] {
+            assert!(
+                validation_rules.contains(required_rule),
+                "missing validation rule: {required_rule}"
+            );
+        }
     }
 }
