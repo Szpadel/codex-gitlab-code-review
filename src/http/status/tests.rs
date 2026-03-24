@@ -469,8 +469,8 @@ async fn update_runtime_feature_flag_persists_security_review_override() -> anyh
 }
 
 #[tokio::test]
-async fn update_runtime_feature_flag_persists_security_context_ignore_base_head_override(
-) -> anyhow::Result<()> {
+async fn update_runtime_feature_flag_persists_security_context_ignore_base_head_override()
+-> anyhow::Result<()> {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
     let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
 

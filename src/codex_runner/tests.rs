@@ -4261,11 +4261,11 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
 }
 
 #[tokio::test]
-async fn security_review_reuses_branch_cached_context_when_ignore_base_head_enabled() -> Result<()> {
+async fn security_review_reuses_branch_cached_context_when_ignore_base_head_enabled() -> Result<()>
+{
     let harness = Arc::new(FakeRunnerHarness::default());
     let repo_dir = repo_checkout_root("group/repo");
-    let cached_payload =
-        "{\"components\":[\"api\"],\"entry_points\":[],\"trust_boundaries\":[],\"attacker_controlled_inputs\":[],\"privileged_operations\":[],\"sensitive_assets\":[],\"security_critical_paths\":[],\"runtime_notes\":[],\"focus_paths\":[]}";
+    let cached_payload = "{\"components\":[\"api\"],\"entry_points\":[],\"trust_boundaries\":[],\"attacker_controlled_inputs\":[],\"privileged_operations\":[],\"sensitive_assets\":[],\"security_critical_paths\":[],\"runtime_notes\":[],\"focus_paths\":[]}";
 
     harness.push_exec_output(
         ExecContainerCommandRequest {
@@ -4372,7 +4372,9 @@ async fn security_review_reuses_branch_cached_context_when_ignore_base_head_enab
     let turn_start = harness
         .app_protocol_requests()
         .into_iter()
-        .find(|message| message.get("method").and_then(|value| value.as_str()) == Some("turn/start"))
+        .find(|message| {
+            message.get("method").and_then(|value| value.as_str()) == Some("turn/start")
+        })
         .expect("turn/start request");
     let prompt_text = turn_start["params"]["input"][0]["text"]
         .as_str()
@@ -4393,7 +4395,10 @@ async fn security_review_reuses_branch_cached_context_when_ignore_base_head_enab
         run.security_context_base_head_sha.as_deref(),
         Some("cached-base-head-sha")
     );
-    assert_eq!(run.security_context_payload_json.as_deref(), Some(cached_payload));
+    assert_eq!(
+        run.security_context_payload_json.as_deref(),
+        Some(cached_payload)
+    );
     assert_eq!(run.security_context_generated_at, Some(100));
     assert_eq!(run.security_context_expires_at, Some(4_000_000_000));
     Ok(())

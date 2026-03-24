@@ -101,6 +101,7 @@ pub(crate) enum ReviewScheduleOutcome {
     Scheduled,
     Disabled,
     SkippedBackoff,
+    SkippedDebounce,
     SkippedAward,
     SkippedMarker,
     SkippedCompleted,
@@ -237,12 +238,40 @@ impl ReviewFlow {
         if !self.is_enabled(&feature_flags) {
             return Ok(ReviewGateOutcome::Decision(ReviewScheduleOutcome::Disabled));
         }
+        let now = Utc::now().timestamp();
         let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
         if !self.retry_backoff.should_retry(&retry_key, Utc::now()) {
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::SkippedBackoff,
             ));
         }
+        let due_security_rerun = if self.lane.is_security() {
+            match self.shared.config.review.security.debounce {
+                Some(_) => {
+                    // Security debounce is MR-wide, not SHA-specific: any update inside the
+                    // window waits until the timer expires, and only then is the next run eligible.
+                    match self
+                        .shared
+                        .state
+                        .get_security_review_debounce(repo, mr.iid)
+                        .await?
+                    {
+                        Some(state) => {
+                            if now < state.next_eligible_at {
+                                return Ok(ReviewGateOutcome::Decision(
+                                    ReviewScheduleOutcome::SkippedDebounce,
+                                ));
+                            }
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
         if self.uses_awards() {
             let awards = self.shared.gitlab.list_awards(repo, mr.iid).await?;
             if has_bot_award(
@@ -261,7 +290,8 @@ impl ReviewFlow {
             self.shared.bot_user_id,
             self.review_marker_prefix(),
             head_sha,
-        ) {
+        ) && !due_security_rerun
+        {
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::SkippedMarker,
             ));
@@ -277,7 +307,10 @@ impl ReviewFlow {
             .state
             .review_result_for_lane(repo, mr.iid, head_sha, self.lane)
             .await?;
-        if self.lane.is_security() && matches!(review_result.as_deref(), Some("pass" | "comment")) {
+        if self.lane.is_security()
+            && !due_security_rerun
+            && matches!(review_result.as_deref(), Some("pass" | "comment"))
+        {
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::SkippedCompleted,
             ));
@@ -292,7 +325,8 @@ impl ReviewFlow {
                         self.shared.bot_user_id,
                         head_sha,
                         self.finding_marker_prefix(),
-                    ) && review_result.as_deref() != Some("error")
+                    ) && !due_security_rerun
+                        && review_result.as_deref() != Some("error")
                         && (completed_inline_review || review_result.as_deref() == Some("comment"))
                     {
                         return Ok(ReviewGateOutcome::Decision(
@@ -643,6 +677,23 @@ impl ReviewRunContext {
         self.shutdown.load(Ordering::SeqCst)
     }
 
+    async fn arm_security_review_debounce(&self, repo: &str, iid: u64) -> Result<()> {
+        let Some(debounce_seconds) = self.config.review.security.debounce else {
+            return Ok(());
+        };
+        if !self.lane.is_security() {
+            return Ok(());
+        }
+        // The approved contract arms debounce on every started security run, including failures,
+        // so repeated MR updates do not trigger another run until the window expires.
+        let started_at = Utc::now().timestamp();
+        let next_eligible_at =
+            started_at.saturating_add(i64::try_from(debounce_seconds).ok().unwrap_or(i64::MAX));
+        self.state
+            .upsert_security_review_debounce(repo, iid, started_at, next_eligible_at)
+            .await
+    }
+
     async fn resolve_review_project_path(&self, repo: &str, mr: &MergeRequest) -> String {
         let Some(source_project_id) = mr.source_project_id else {
             return repo.to_string();
@@ -795,6 +846,7 @@ impl ReviewRunContext {
                 .await?;
             return Ok(());
         }
+        self.arm_security_review_debounce(repo, mr.iid).await?;
 
         if self.config.review.dry_run || !self.uses_awards() {
             info!(repo = repo, iid = mr.iid, "dry run: skipping eyes award");

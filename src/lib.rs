@@ -4,6 +4,7 @@ pub mod composer_install;
 pub mod config;
 pub mod demo_history;
 pub mod docker_utils;
+mod duration;
 pub mod feature_flags;
 pub mod flow;
 mod generated_review_prompt_templates;

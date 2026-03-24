@@ -156,6 +156,81 @@ fn defaults_mention_commands_when_missing() {
 }
 
 #[test]
+fn parses_security_debounce_duration_string() {
+    let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+  security:
+    debounce: "1h 30m"
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+    let config = load_from_yaml(yaml);
+    assert_eq!(config.review.security.debounce, Some(5_400));
+}
+
+#[test]
+fn rejects_invalid_security_debounce_duration_string() {
+    let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+  security:
+    debounce: "90"
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+    let err = try_load_from_yaml(yaml).expect_err("invalid debounce should fail");
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("review.security.debounce must be a positive duration string"));
+}
+
+#[test]
 fn ignores_legacy_proxy_block() {
     let yaml = base_config_yaml(
         r#"

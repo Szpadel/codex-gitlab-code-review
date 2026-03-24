@@ -4350,6 +4350,293 @@ async fn security_review_pass_stays_silent() -> Result<()> {
 }
 
 #[tokio::test]
+async fn security_flow_skips_same_sha_until_debounce_expires() -> Result<()> {
+    let mut config = test_config();
+    config.feature_flags.security_review = true;
+    config.review.security.debounce = Some(3_600);
+    let gitlab = fake_gitlab(vec![mr(26, "sha26")]);
+    let runner = Arc::new(CapturingReviewRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        review_contexts: Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab,
+        state.clone(),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    let first = service
+        .security_review_flow
+        .run_for_mr("group/repo", mr(26, "sha26"), "sha26")
+        .await?;
+    let second = service
+        .security_review_flow
+        .run_for_mr("group/repo", mr(26, "sha26"), "sha26")
+        .await?;
+
+    assert_eq!(first, crate::flow::review::ReviewScheduleOutcome::Scheduled);
+    assert_eq!(
+        second,
+        crate::flow::review::ReviewScheduleOutcome::SkippedDebounce
+    );
+    assert_eq!(
+        runner
+            .review_contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_flow_ignores_existing_marker_after_debounce_expires() -> Result<()> {
+    let mut config = test_config();
+    config.feature_flags.security_review = true;
+    config.review.security.debounce = Some(3_600);
+    let gitlab = fake_gitlab(vec![mr(27, "sha27")]);
+    let runner = Arc::new(CapturingReviewRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        review_contexts: Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state.clone(),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    let first = service
+        .security_review_flow
+        .run_for_mr("group/repo", mr(27, "sha27"), "sha27")
+        .await?;
+    assert_eq!(first, crate::flow::review::ReviewScheduleOutcome::Scheduled);
+
+    state
+        .upsert_security_review_debounce("group/repo", 27, 0, 0)
+        .await?;
+    gitlab.notes.lock().unwrap().insert(
+        ("group/repo".to_string(), 27),
+        vec![Note {
+            id: 1,
+            body: "Security review\n\n<!-- codex-security-review:sha=sha27 -->".to_string(),
+            author: GitLabUser {
+                id: 1,
+                username: Some("bot".to_string()),
+                name: Some("Bot".to_string()),
+            },
+        }],
+    );
+
+    let second = service
+        .security_review_flow
+        .run_for_mr("group/repo", mr(27, "sha27"), "sha27")
+        .await?;
+    assert_eq!(
+        second,
+        crate::flow::review::ReviewScheduleOutcome::Scheduled
+    );
+    assert_eq!(
+        runner
+            .review_contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn security_flow_skips_new_sha_until_debounce_expires() -> Result<()> {
+    let mut config = test_config();
+    config.feature_flags.security_review = true;
+    config.review.security.debounce = Some(3_600);
+    let gitlab = fake_gitlab(vec![mr(271, "sha271-new")]);
+    let runner = Arc::new(CapturingReviewRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        review_contexts: Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab,
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    let first = service
+        .security_review_flow
+        .run_for_mr("group/repo", mr(271, "sha271-old"), "sha271-old")
+        .await?;
+    let second = service
+        .security_review_flow
+        .run_for_mr("group/repo", mr(271, "sha271-new"), "sha271-new")
+        .await?;
+
+    assert_eq!(first, crate::flow::review::ReviewScheduleOutcome::Scheduled);
+    assert_eq!(
+        second,
+        crate::flow::review::ReviewScheduleOutcome::SkippedDebounce
+    );
+    assert_eq!(
+        runner
+            .review_contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_security_run_arms_debounce_state() -> Result<()> {
+    let mut config = test_config();
+    config.feature_flags.security_review = true;
+    config.review.security.debounce = Some(3_600);
+    let gitlab = fake_gitlab(Vec::new());
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    state
+        .begin_review_for_lane(
+            "group/repo",
+            272,
+            "sha272",
+            crate::review_lane::ReviewLane::Security,
+        )
+        .await?;
+    let review_context = ReviewRunContext {
+        lane: crate::review_lane::ReviewLane::Security,
+        config,
+        gitlab,
+        codex: Arc::new(FailingRunner {
+            calls: Mutex::new(0),
+        }),
+        state: state.clone(),
+        retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
+        bot_user_id: 1,
+        shutdown: Arc::new(AtomicBool::new(false)),
+    };
+
+    review_context
+        .run(
+            "group/repo",
+            mr(272, "sha272"),
+            "sha272",
+            crate::feature_flags::FeatureFlagSnapshot {
+                security_review: true,
+                ..crate::feature_flags::FeatureFlagSnapshot::default()
+            },
+            0,
+        )
+        .await?;
+
+    let debounce = state
+        .get_security_review_debounce("group/repo", 272)
+        .await?
+        .expect("debounce state");
+    assert!(debounce.next_eligible_at > debounce.last_started_at);
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_scans_unchanged_repo_when_security_debounce_is_due() -> Result<()> {
+    let mut config = test_config();
+    config.feature_flags.security_review = true;
+    config.review.security.debounce = Some(3_600);
+    let gitlab = fake_gitlab(vec![mr(28, "sha28")]);
+    let runner = Arc::new(CapturingReviewRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        review_contexts: Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state.clone(),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once().await?;
+    let list_open_calls_before = *gitlab.list_open_calls.lock().unwrap();
+    state
+        .upsert_security_review_debounce("group/repo", 28, 0, 0)
+        .await?;
+    gitlab.awards.lock().unwrap().insert(
+        ("group/repo".to_string(), 28),
+        vec![AwardEmoji {
+            id: 1,
+            name: "thumbsup".to_string(),
+            user: GitLabUser {
+                id: 1,
+                username: Some("bot".to_string()),
+                name: Some("Bot".to_string()),
+            },
+        }],
+    );
+
+    service.scan_once_incremental().await?;
+
+    assert!(*gitlab.list_open_calls.lock().unwrap() > list_open_calls_before);
+    for _ in 0..50 {
+        if runner
+            .review_contexts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
+            .count()
+            == 2
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let review_contexts = runner.review_contexts.lock().unwrap();
+    assert_eq!(
+        review_contexts
+            .iter()
+            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::General)
+            .count(),
+        1
+    );
+    assert_eq!(
+        review_contexts
+            .iter()
+            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<()> {
     let mut config = test_config();
     config.review.max_concurrent = 1;

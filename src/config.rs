@@ -1,3 +1,4 @@
+use crate::duration::parse_duration_seconds_strict;
 use crate::feature_flags::{
     FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
 };
@@ -156,6 +157,8 @@ pub struct ReviewConfig {
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ReviewSecurityConfig {
+    #[serde(default, deserialize_with = "optional_duration_string_as_seconds")]
+    pub debounce: Option<u64>,
     #[serde(default = "default_security_review_context_ttl_seconds")]
     pub context_ttl_seconds: u64,
     #[serde(default = "default_security_review_min_confidence_score")]
@@ -171,6 +174,7 @@ pub struct ReviewSecurityConfig {
 impl Default for ReviewSecurityConfig {
     fn default() -> Self {
         Self {
+            debounce: None,
             context_ttl_seconds: default_security_review_context_ttl_seconds(),
             min_confidence_score: default_security_review_min_confidence_score(),
             comment_marker_prefix: default_security_review_comment_marker_prefix(),
@@ -589,6 +593,28 @@ where
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }))
+}
+
+fn optional_duration_string_as_seconds<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    let Some(value) = value.map(|raw| raw.trim().to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let seconds = parse_duration_seconds_strict(&value)
+        .and_then(|seconds| u64::try_from(seconds).ok())
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| {
+            de::Error::custom(
+                "review.security.debounce must be a positive duration string such as '30m' or '1h 30m'",
+            )
+        })?;
+    Ok(Some(seconds))
 }
 
 fn legacy_proxy_config_present(cfg: &config::Config) -> bool {

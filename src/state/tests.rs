@@ -222,6 +222,66 @@ async fn security_review_context_cache_fallback_returns_newest_live_branch_entry
 }
 
 #[tokio::test]
+async fn security_review_debounce_state_roundtrips_and_marks_repo_due() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    store
+        .upsert_security_review_debounce("group/repo", 7, 100, 3_700)
+        .await?;
+
+    let row = store
+        .get_security_review_debounce("group/repo", 7)
+        .await?
+        .expect("debounce state");
+    assert_eq!(row.last_started_at, 100);
+    assert_eq!(row.next_eligible_at, 3_700);
+    assert!(
+        !store
+            .repo_has_due_security_review_debounce("group/repo", 3_699)
+            .await?
+    );
+    assert!(
+        store
+            .repo_has_due_security_review_debounce("group/repo", 3_700)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_security_review_debounce_state_prunes_closed_merge_requests() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    store
+        .upsert_security_review_debounce("group/repo", 7, 100, 200)
+        .await?;
+    store
+        .upsert_security_review_debounce("group/repo", 8, 100, 150)
+        .await?;
+
+    store
+        .sync_security_review_debounce_rows("group/repo", &[8])
+        .await?;
+
+    assert!(
+        store
+            .get_security_review_debounce("group/repo", 7)
+            .await?
+            .is_none()
+    );
+    assert!(
+        store
+            .get_security_review_debounce("group/repo", 8)
+            .await?
+            .is_some()
+    );
+    assert!(
+        store
+            .repo_has_due_security_review_debounce("group/repo", 150)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn finish_review_is_noop_once_row_is_not_in_progress() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store.begin_review("group/repo", 3, "sha1").await?;

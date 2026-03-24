@@ -1,5 +1,6 @@
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
+use crate::feature_flags::FeatureFlagSnapshot;
 use crate::flow::FlowShared;
 use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
 use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome};
@@ -51,6 +52,7 @@ struct ScanCounters {
     security_skipped_completed: usize,
     security_skipped_locked: usize,
     security_skipped_backoff: usize,
+    security_skipped_debounce: usize,
     mention_skipped_processed: usize,
     skipped_backoff: usize,
     missing_sha: usize,
@@ -239,6 +241,14 @@ impl ReviewService {
                     "skip: security review backoff active"
                 );
             }
+            (ReviewLane::Security, ReviewScheduleOutcome::SkippedDebounce) => {
+                counters.security_skipped_debounce += 1;
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: security review debounce active"
+                );
+            }
             (ReviewLane::General, ReviewScheduleOutcome::SkippedAward) => {
                 counters.skipped_award += 1;
                 debug!(repo = repo, iid = iid, "skip: thumbs up already present");
@@ -296,6 +306,13 @@ impl ReviewService {
             (_, ReviewScheduleOutcome::Interrupted) => {
                 return Ok(Some(RepoScanStatus::Interrupted));
             }
+            (ReviewLane::General, ReviewScheduleOutcome::SkippedDebounce) => {
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: general review returned debounce outcome unexpectedly"
+                );
+            }
             (ReviewLane::Security, ReviewScheduleOutcome::SkippedAward) => {
                 debug!(
                     repo = repo,
@@ -305,6 +322,11 @@ impl ReviewService {
             }
         }
         Ok(None)
+    }
+
+    async fn resolve_feature_flags(&self) -> Result<FeatureFlagSnapshot> {
+        let overrides = self.state.get_runtime_feature_flag_overrides().await?;
+        Ok(self.config.resolve_feature_flags(&overrides))
     }
 
     async fn scan(&self, mode: ScanMode) -> Result<ScanRunStatus> {
@@ -322,6 +344,9 @@ impl ReviewService {
             info!("no gitlab repositories configured");
             return Ok(ScanRunStatus::Completed);
         }
+        let feature_flags = self.resolve_feature_flags().await?;
+        let security_debounce_enabled =
+            feature_flags.security_review && self.config.review.security.debounce.is_some();
         let mut tasks = Vec::new();
         let mut counters = ScanCounters::default();
         let mut interrupted = false;
@@ -336,6 +361,13 @@ impl ReviewService {
                 && let Some(marker) = activity_marker.as_ref()
             {
                 let previous = self.state.get_project_last_mr_activity(repo).await?;
+                let debounce_due = if security_debounce_enabled {
+                    self.state
+                        .repo_has_due_security_review_debounce(repo, Utc::now().timestamp())
+                        .await?
+                } else {
+                    false
+                };
                 if marker.as_str() == NO_OPEN_MRS_MARKER {
                     if previous.as_ref() != Some(marker) {
                         self.state
@@ -348,6 +380,7 @@ impl ReviewService {
                 }
                 if let Some(previous) = previous
                     && previous == *marker
+                    && !debounce_due
                 {
                     counters.skipped_inactive += 1;
                     debug!(repo = repo.as_str(), "skip: latest MR activity unchanged");
@@ -356,7 +389,13 @@ impl ReviewService {
             }
             let mrs = self.gitlab.list_open_mrs(repo).await?;
             match self
-                .scan_repo_mrs(repo, mrs, &mut counters, &mut tasks)
+                .scan_repo_mrs(
+                    repo,
+                    mrs,
+                    security_debounce_enabled,
+                    &mut counters,
+                    &mut tasks,
+                )
                 .await?
             {
                 RepoScanStatus::Complete => {
@@ -399,6 +438,7 @@ impl ReviewService {
                     security_skipped_completed = counters.security_skipped_completed,
                     security_skipped_locked = counters.security_skipped_locked,
                     security_skipped_backoff = counters.security_skipped_backoff,
+                    security_skipped_debounce = counters.security_skipped_debounce,
                     mention_skipped_processed = counters.mention_skipped_processed,
                     skipped_backoff = counters.skipped_backoff,
                     missing_sha = counters.missing_sha,
@@ -420,6 +460,7 @@ impl ReviewService {
                     security_skipped_completed = counters.security_skipped_completed,
                     security_skipped_locked = counters.security_skipped_locked,
                     security_skipped_backoff = counters.security_skipped_backoff,
+                    security_skipped_debounce = counters.security_skipped_debounce,
                     mention_skipped_processed = counters.mention_skipped_processed,
                     skipped_backoff = counters.skipped_backoff,
                     missing_sha = counters.missing_sha,
@@ -606,12 +647,19 @@ impl ReviewService {
         &self,
         repo: &str,
         mrs: Vec<MergeRequest>,
+        security_debounce_enabled: bool,
         counters: &mut ScanCounters,
         tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<RepoScanStatus> {
         let mut pending_same_mr_work = false;
         counters.total_mrs += mrs.len();
         info!(repo = repo, count = mrs.len(), "loaded open MRs");
+        if security_debounce_enabled {
+            let open_iids = mrs.iter().map(|mr| mr.iid).collect::<Vec<_>>();
+            self.state
+                .sync_security_review_debounce_rows(repo, &open_iids)
+                .await?;
+        }
         for mr in mrs {
             if self.shutdown_requested() {
                 info!(repo = repo, "stopping MR scheduling: shutdown requested");

@@ -345,7 +345,10 @@ impl StatusService {
             },
             StatusFeatureFlagSnapshot {
                 name: "security_context_ignore_base_head".to_string(),
-                available: self.config.feature_flag_availability.security_context_ignore_base_head,
+                available: self
+                    .config
+                    .feature_flag_availability
+                    .security_context_ignore_base_head,
                 default_enabled: self
                     .config
                     .feature_flag_defaults

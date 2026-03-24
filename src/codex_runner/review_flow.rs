@@ -635,16 +635,16 @@ impl DockerCodexRunner {
                     .await?
                 {
                     build_guard.complete();
-                        return Ok(SecurityContextPayloadResolution {
-                            payload_json: Some(entry.payload_json),
-                            source_run_history_id: (entry.source_run_history_id > 0)
-                                .then_some(entry.source_run_history_id),
-                            base_head_sha: Some(base_head_sha.clone()),
-                            build_base_head_sha: Some(base_head_sha.clone()),
-                            generated_at: Some(entry.generated_at),
-                            expires_at: Some(entry.expires_at),
-                            build_guard: None,
-                        });
+                    return Ok(SecurityContextPayloadResolution {
+                        payload_json: Some(entry.payload_json),
+                        source_run_history_id: (entry.source_run_history_id > 0)
+                            .then_some(entry.source_run_history_id),
+                        base_head_sha: Some(base_head_sha.clone()),
+                        build_base_head_sha: Some(base_head_sha.clone()),
+                        generated_at: Some(entry.generated_at),
+                        expires_at: Some(entry.expires_at),
+                        build_guard: None,
+                    });
                 }
                 if ctx.feature_flags.security_context_ignore_base_head {
                     if let Some(entry) = self
@@ -701,16 +701,16 @@ impl DockerCodexRunner {
                     )
                     .await?
                 {
-                        return Ok(SecurityContextPayloadResolution {
-                            payload_json: Some(entry.payload_json),
-                            source_run_history_id: (entry.source_run_history_id > 0)
-                                .then_some(entry.source_run_history_id),
-                            base_head_sha: Some(base_head_sha.clone()),
-                            build_base_head_sha: Some(base_head_sha.clone()),
-                            generated_at: Some(entry.generated_at),
-                            expires_at: Some(entry.expires_at),
-                            build_guard: None,
-                        });
+                    return Ok(SecurityContextPayloadResolution {
+                        payload_json: Some(entry.payload_json),
+                        source_run_history_id: (entry.source_run_history_id > 0)
+                            .then_some(entry.source_run_history_id),
+                        base_head_sha: Some(base_head_sha.clone()),
+                        build_base_head_sha: Some(base_head_sha.clone()),
+                        generated_at: Some(entry.generated_at),
+                        expires_at: Some(entry.expires_at),
+                        build_guard: None,
+                    });
                 }
                 if ctx.feature_flags.security_context_ignore_base_head {
                     if let Some(entry) = self

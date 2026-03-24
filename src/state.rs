@@ -243,6 +243,14 @@ pub struct SecurityReviewContextCacheEntry {
     pub expires_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityReviewDebounceEntry {
+    pub repo: String,
+    pub iid: u64,
+    pub last_started_at: i64,
+    pub next_eligible_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MentionCommandStateKey {
     pub repo: String,
@@ -636,6 +644,112 @@ impl ReviewStateStore {
         .execute(&self.pool)
         .await
         .context("touch in-progress review")?;
+        Ok(())
+    }
+
+    pub async fn upsert_security_review_debounce(
+        &self,
+        repo: &str,
+        iid: u64,
+        last_started_at: i64,
+        next_eligible_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO security_review_debounce_state (repo, iid, last_started_at, next_eligible_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(repo, iid) DO UPDATE SET
+                last_started_at = excluded.last_started_at,
+                next_eligible_at = excluded.next_eligible_at
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(last_started_at)
+        .bind(next_eligible_at)
+        .execute(&self.pool)
+        .await
+        .context("upsert security review debounce state")?;
+        Ok(())
+    }
+
+    pub async fn get_security_review_debounce(
+        &self,
+        repo: &str,
+        iid: u64,
+    ) -> Result<Option<SecurityReviewDebounceEntry>> {
+        let row = sqlx::query(
+            r#"
+            SELECT repo, iid, last_started_at, next_eligible_at
+            FROM security_review_debounce_state
+            WHERE repo = ? AND iid = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(repo)
+        .bind(iid as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .context("load security review debounce state")?;
+        row.map(map_security_review_debounce_entry).transpose()
+    }
+
+    pub async fn repo_has_due_security_review_debounce(
+        &self,
+        repo: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM security_review_debounce_state debounce
+                LEFT JOIN review_state review
+                  ON review.repo = debounce.repo
+                 AND review.iid = debounce.iid
+                 AND review.lane = 'security'
+                WHERE debounce.repo = ?
+                  AND debounce.next_eligible_at <= ?
+                  AND COALESCE(review.status, 'done') != 'in_progress'
+            )
+            "#,
+        )
+        .bind(repo)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .context("check due security review debounce state")?;
+        Ok(exists != 0)
+    }
+
+    pub async fn sync_security_review_debounce_rows(
+        &self,
+        repo: &str,
+        open_iids: &[u64],
+    ) -> Result<()> {
+        if open_iids.is_empty() {
+            sqlx::query("DELETE FROM security_review_debounce_state WHERE repo = ?")
+                .bind(repo)
+                .execute(&self.pool)
+                .await
+                .context("clear security review debounce state for closed repo")?;
+            return Ok(());
+        }
+
+        let mut builder =
+            QueryBuilder::<Sqlite>::new("DELETE FROM security_review_debounce_state WHERE repo = ");
+        builder.push_bind(repo);
+        builder.push(" AND iid NOT IN (");
+        let mut separated = builder.separated(", ");
+        for iid in open_iids {
+            separated.push_bind(*iid as i64);
+        }
+        separated.push_unseparated(")");
+        builder
+            .build()
+            .execute(&self.pool)
+            .await
+            .context("prune closed merge requests from security review debounce state")?;
         Ok(())
     }
 
@@ -2261,6 +2375,27 @@ fn map_security_review_context_cache_entry(
         expires_at: row
             .try_get("expires_at")
             .context("read security review cache expires_at")?,
+    })
+}
+
+fn map_security_review_debounce_entry(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<SecurityReviewDebounceEntry> {
+    Ok(SecurityReviewDebounceEntry {
+        repo: row
+            .try_get("repo")
+            .context("read security review debounce repo")?,
+        iid: u64::try_from(
+            row.try_get::<i64, _>("iid")
+                .context("read security review debounce iid")?,
+        )
+        .context("convert security review debounce iid to u64")?,
+        last_started_at: row
+            .try_get("last_started_at")
+            .context("read security review debounce last_started_at")?,
+        next_eligible_at: row
+            .try_get("next_eligible_at")
+            .context("read security review debounce next_eligible_at")?,
     })
 }
 
