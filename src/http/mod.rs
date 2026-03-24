@@ -1,3 +1,4 @@
+mod markdown;
 mod status;
 mod timestamp;
 mod transcript;
@@ -149,6 +150,7 @@ async fn run_detail_page(
     };
     Ok(Html(render_run_detail_page(
         &snapshot,
+        status_service.gitlab_base_url(),
         Some(status_service.feature_flag_csrf_token()),
     )))
 }

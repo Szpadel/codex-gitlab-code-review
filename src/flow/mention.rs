@@ -1,7 +1,9 @@
 use crate::codex_runner::{MentionCommandContext, MentionCommandResult, MentionCommandStatus};
 use crate::feature_flags::FeatureFlagSnapshot;
+use crate::flow::mention_assets::collect_note_image_uploads;
 use crate::flow::{ActiveMentionKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{DiscussionNote, GitLabApi, GitLabUser, MergeRequest, MergeRequestDiscussion};
+use crate::gitlab_links::{extract_root_relative_markdown_urls, gitlab_web_base};
 use crate::state::{MentionCommandScanState, NewRunHistory, RunHistoryFinish, RunHistoryKind};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -299,6 +301,7 @@ impl MentionFlow {
         mr: &MergeRequest,
         head_sha: &str,
         trigger: &MentionTrigger,
+        gitlab_base_url: &str,
     ) -> String {
         let title = mr
             .title
@@ -315,6 +318,7 @@ impl MentionFlow {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("(unknown)");
+        let gitlab_web_base = gitlab_web_base(gitlab_base_url);
         let chain = trigger
             .parent_chain
             .iter()
@@ -325,7 +329,21 @@ impl MentionFlow {
                     .as_deref()
                     .or(note.author.name.as_deref())
                     .unwrap_or("unknown");
-                format!("note:{} author:{}\n{}", note.id, author, note.body)
+                let mut entry = format!("note:{} author:{}\n{}", note.id, author, note.body);
+                let asset_urls = extract_root_relative_markdown_urls(
+                    note.body.as_str(),
+                    gitlab_web_base.as_str(),
+                );
+                if !asset_urls.is_empty() {
+                    entry.push_str("\n\nResolved asset URLs:\n");
+                    for url in asset_urls {
+                        entry.push_str("- ");
+                        entry.push_str(url.as_str());
+                        entry.push('\n');
+                    }
+                    entry = entry.trim_end().to_string();
+                }
+                entry
             })
             .collect::<Vec<_>>()
             .join("\n\n---\n\n");
@@ -419,6 +437,7 @@ impl MentionFlow {
             .mention_commands
             .additional_developer_instructions
             .clone();
+        let gitlab_base_url = gitlab_web_base(&self.shared.config.gitlab.base_url);
         for trigger in triggers {
             if self.shared.shutdown_requested() {
                 break;
@@ -560,6 +579,7 @@ impl MentionFlow {
             let eyes_emoji = mention_eyes_emoji.clone();
             let bot_user_id = self.shared.bot_user_id;
             let additional_developer_instructions = additional_developer_instructions.clone();
+            let gitlab_base_url = gitlab_base_url.clone();
             let requester = self
                 .resolve_requester_identity(&trigger.trigger_note.author)
                 .await;
@@ -648,7 +668,10 @@ impl MentionFlow {
                     &effective_mr,
                     &effective_head_sha,
                     &trigger,
+                    &gitlab_base_url,
                 );
+                let image_uploads =
+                    collect_note_image_uploads(&trigger.parent_chain, &gitlab_base_url);
                 if let Err(err) = add_eyes_to_discussion_note(
                     gitlab.as_ref(),
                     &repo_name,
@@ -675,6 +698,7 @@ impl MentionFlow {
                 let command_context = MentionCommandContext {
                     repo: command_repo_name.clone(),
                     project_path: command_repo_name.clone(),
+                    discussion_project_path: repo_name.clone(),
                     mr: effective_mr,
                     head_sha: effective_head_sha.clone(),
                     discussion_id: discussion_id.clone(),
@@ -683,6 +707,7 @@ impl MentionFlow {
                     requester_email: requester.email.clone(),
                     additional_developer_instructions,
                     prompt,
+                    image_uploads,
                     feature_flags,
                     run_history_id: Some(run_history_id),
                 };
@@ -1167,4 +1192,85 @@ pub(crate) async fn remove_eyes_from_discussion_note(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gitlab::DiffRefs;
+
+    #[test]
+    fn build_mention_prompt_absolutizes_gitlab_upload_image_urls() {
+        let trigger = MentionTrigger {
+            discussion_id: "discussion-1".to_string(),
+            trigger_note: DiscussionNote {
+                id: 2,
+                body: "@botuser please inspect this".to_string(),
+                author: GitLabUser {
+                    id: 5,
+                    username: Some("alice".to_string()),
+                    name: Some("Alice".to_string()),
+                },
+                system: false,
+                in_reply_to_id: Some(1),
+                created_at: None,
+            },
+            parent_chain: vec![
+                DiscussionNote {
+                    id: 1,
+                    body: "![shot](/uploads/hash/screenshot.png)".to_string(),
+                    author: GitLabUser {
+                        id: 4,
+                        username: Some("bob".to_string()),
+                        name: Some("Bob".to_string()),
+                    },
+                    system: false,
+                    in_reply_to_id: None,
+                    created_at: None,
+                },
+                DiscussionNote {
+                    id: 2,
+                    body: "@botuser please inspect this".to_string(),
+                    author: GitLabUser {
+                        id: 5,
+                        username: Some("alice".to_string()),
+                        name: Some("Alice".to_string()),
+                    },
+                    system: false,
+                    in_reply_to_id: Some(1),
+                    created_at: None,
+                },
+            ],
+        };
+        let mr = MergeRequest {
+            iid: 7,
+            title: Some("Demo".to_string()),
+            web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/7".to_string()),
+            created_at: None,
+            updated_at: None,
+            sha: Some("deadbeef".to_string()),
+            source_branch: Some("feature".to_string()),
+            target_branch: Some("main".to_string()),
+            author: None,
+            source_project_id: None,
+            target_project_id: None,
+            diff_refs: Some(DiffRefs {
+                base_sha: Some("base".to_string()),
+                head_sha: Some("deadbeef".to_string()),
+                start_sha: Some("start".to_string()),
+            }),
+        };
+
+        let prompt = MentionFlow::build_mention_prompt(
+            "group/repo",
+            &mr,
+            "deadbeef",
+            &trigger,
+            "https://gitlab.example.com/api/v4",
+        );
+
+        assert!(prompt.contains("![shot](/uploads/hash/screenshot.png)"));
+        assert!(prompt.contains("Resolved asset URLs:"));
+        assert!(prompt.contains("https://gitlab.example.com/uploads/hash/screenshot.png"));
+    }
 }

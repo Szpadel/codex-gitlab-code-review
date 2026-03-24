@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Semaphore;
 
 pub(crate) mod mention;
+pub(crate) mod mention_assets;
 pub(crate) mod review;
 pub(crate) mod review_comments;
 

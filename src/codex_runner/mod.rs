@@ -5,6 +5,7 @@ use crate::docker_utils::{connect_docker, ensure_image, normalize_image_referenc
 use crate::feature_flags::FeatureFlagSnapshot;
 use crate::gitlab::MergeRequest;
 use crate::gitlab_discovery_mcp::{GitLabDiscoveryMcpService, ResolvedGitLabDiscoveryAllowList};
+use crate::gitlab_links::GitLabMarkdownImageUpload;
 use crate::review_lane::ReviewLane;
 use crate::review_prompt_templates::{
     append_additional_review_instructions, build_base_branch_review_prompt,
@@ -47,6 +48,7 @@ mod composer;
 mod container;
 mod gitlab_discovery;
 mod mention_flow;
+mod mention_inputs;
 mod review_flow;
 mod scripts;
 #[cfg(test)]
@@ -77,6 +79,7 @@ pub struct ReviewContext {
 pub struct MentionCommandContext {
     pub repo: String,
     pub project_path: String,
+    pub(crate) discussion_project_path: String,
     pub mr: MergeRequest,
     pub head_sha: String,
     pub discussion_id: String,
@@ -85,6 +88,7 @@ pub struct MentionCommandContext {
     pub requester_email: String,
     pub additional_developer_instructions: Option<String>,
     pub prompt: String,
+    pub(crate) image_uploads: Vec<GitLabMarkdownImageUpload>,
     pub feature_flags: FeatureFlagSnapshot,
     pub run_history_id: Option<i64>,
 }

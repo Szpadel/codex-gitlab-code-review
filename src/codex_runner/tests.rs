@@ -2246,6 +2246,7 @@ fn mention_command_script_clones_repo_and_starts_app_server() {
     let ctx = MentionCommandContext {
         repo: "group/repo".to_string(),
         project_path: "group/repo".to_string(),
+        discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
             title: Some("Title".to_string()),
@@ -2267,6 +2268,7 @@ fn mention_command_script_clones_repo_and_starts_app_server() {
         requester_email: "alice@example.com".to_string(),
         additional_developer_instructions: None,
         prompt: "Do the change".to_string(),
+        image_uploads: Vec::new(),
         feature_flags: FeatureFlagSnapshot::default(),
         run_history_id: None,
     };
@@ -2306,6 +2308,7 @@ fn mention_command_script_includes_mcp_server_overrides() {
     let ctx = MentionCommandContext {
         repo: "group/repo".to_string(),
         project_path: "group/repo".to_string(),
+        discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
             title: Some("Title".to_string()),
@@ -2327,6 +2330,7 @@ fn mention_command_script_includes_mcp_server_overrides() {
         requester_email: "alice@example.com".to_string(),
         additional_developer_instructions: None,
         prompt: "Do the change".to_string(),
+        image_uploads: Vec::new(),
         feature_flags: FeatureFlagSnapshot::default(),
         run_history_id: None,
     };
@@ -2352,6 +2356,7 @@ fn mention_command_script_includes_reasoning_effort_override() {
     let ctx = MentionCommandContext {
         repo: "group/repo".to_string(),
         project_path: "group/repo".to_string(),
+        discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
             title: Some("Title".to_string()),
@@ -2373,6 +2378,7 @@ fn mention_command_script_includes_reasoning_effort_override() {
         requester_email: "alice@example.com".to_string(),
         additional_developer_instructions: None,
         prompt: "Do the change".to_string(),
+        image_uploads: Vec::new(),
         feature_flags: FeatureFlagSnapshot::default(),
         run_history_id: None,
     };
@@ -2397,6 +2403,7 @@ fn mention_command_script_includes_reasoning_summary_override() {
     let ctx = MentionCommandContext {
         repo: "group/repo".to_string(),
         project_path: "group/repo".to_string(),
+        discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
             title: Some("Title".to_string()),
@@ -2418,6 +2425,7 @@ fn mention_command_script_includes_reasoning_summary_override() {
         requester_email: "alice@example.com".to_string(),
         additional_developer_instructions: None,
         prompt: "Do the change".to_string(),
+        image_uploads: Vec::new(),
         feature_flags: FeatureFlagSnapshot::default(),
         run_history_id: None,
     };
@@ -2442,6 +2450,7 @@ fn mention_developer_instructions_require_commit_and_sha_reporting() {
     let ctx = MentionCommandContext {
         repo: "group/repo".to_string(),
         project_path: "group/repo".to_string(),
+        discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
             title: Some("Title".to_string()),
@@ -2463,6 +2472,7 @@ fn mention_developer_instructions_require_commit_and_sha_reporting() {
         requester_email: "alice@example.com".to_string(),
         additional_developer_instructions: None,
         prompt: "Do the change".to_string(),
+        image_uploads: Vec::new(),
         feature_flags: FeatureFlagSnapshot::default(),
         run_history_id: None,
     };
@@ -2480,6 +2490,7 @@ fn mention_developer_instructions_include_additional_section_when_configured() {
     let ctx = MentionCommandContext {
         repo: "group/repo".to_string(),
         project_path: "group/repo".to_string(),
+        discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
             title: Some("Title".to_string()),
@@ -2503,6 +2514,7 @@ fn mention_developer_instructions_include_additional_section_when_configured() {
             "  Prefer minimal diffs and include tests.  ".to_string(),
         ),
         prompt: "Do the change".to_string(),
+        image_uploads: Vec::new(),
         feature_flags: FeatureFlagSnapshot::default(),
         run_history_id: None,
     };
@@ -3175,6 +3187,7 @@ async fn run_mention_command_with_fake_runtime_executes_git_helpers_and_returns_
         .run_mention_command(MentionCommandContext {
             repo: "group/repo".to_string(),
             project_path: "group/repo".to_string(),
+            discussion_project_path: "group/repo".to_string(),
             mr: MergeRequest {
                 iid: 11,
                 title: Some("Title".to_string()),
@@ -3196,6 +3209,7 @@ async fn run_mention_command_with_fake_runtime_executes_git_helpers_and_returns_
             requester_email: "requester@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Please fix it".to_string(),
+            image_uploads: Vec::new(),
             feature_flags: FeatureFlagSnapshot::default(),
             run_history_id: None,
         })
@@ -3216,6 +3230,103 @@ async fn run_mention_command_with_fake_runtime_executes_git_helpers_and_returns_
         ])
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn prepare_mention_inputs_downloads_images_inside_container() {
+    let repo_dir = repo_checkout_root("group/repo");
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: vec![
+                "mktemp".to_string(),
+                "-d".to_string(),
+                "/tmp/codex-mention-images-XXXXXX".to_string(),
+            ],
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "/tmp/codex-mention-images-123456\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: super::mention_inputs::mention_image_download_exec_command(
+                "/tmp/codex-mention-images-123456/01-screenshot.png",
+                "https://gitlab.example.com/api/v4/projects/group%2Frepo/uploads/hash/screenshot.png",
+            ),
+            cwd: Some(repo_dir.clone()),
+            env: Some(vec!["GITLAB_TOKEN=token".to_string()]),
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    );
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), true, Arc::clone(&harness), None).await;
+
+    let prepared = runner
+        .prepare_mention_inputs(
+            "app-1",
+            repo_dir.as_str(),
+            &MentionCommandContext {
+                repo: "group/repo".to_string(),
+                project_path: "group/repo".to_string(),
+                discussion_project_path: "group/repo".to_string(),
+                mr: MergeRequest {
+                    iid: 11,
+                    title: Some("Title".to_string()),
+                    web_url: None,
+                    created_at: None,
+                    updated_at: None,
+                    sha: Some("before-sha".to_string()),
+                    source_branch: Some("feature".to_string()),
+                    target_branch: Some("main".to_string()),
+                    author: None,
+                    source_project_id: Some(1),
+                    target_project_id: Some(1),
+                    diff_refs: None,
+                },
+                head_sha: "before-sha".to_string(),
+                discussion_id: "discussion-1".to_string(),
+                trigger_note_id: 77,
+                requester_name: "Requester".to_string(),
+                requester_email: "requester@example.com".to_string(),
+                additional_developer_instructions: None,
+                prompt: "Please fix it".to_string(),
+                image_uploads: vec![crate::gitlab_links::GitLabMarkdownImageUpload {
+                    markdown_path: "/uploads/hash/screenshot.png".to_string(),
+                    absolute_url: "https://gitlab.example.com/uploads/hash/screenshot.png"
+                        .to_string(),
+                    secret: "hash".to_string(),
+                    filename: "screenshot.png".to_string(),
+                }],
+                feature_flags: FeatureFlagSnapshot::default(),
+                run_history_id: None,
+            },
+        )
+        .await;
+
+    assert_eq!(
+        prepared.turn_input,
+        vec![
+            json!({
+                "type": "text",
+                "text": "Please fix it",
+            }),
+            json!({
+                "type": "localImage",
+                "path": "/tmp/codex-mention-images-123456/01-screenshot.png",
+            }),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -3259,6 +3370,7 @@ async fn run_mention_command_with_fake_runtime_initializes_before_composer_insta
         .run_mention_command(MentionCommandContext {
             repo: "group/repo".to_string(),
             project_path: "group/repo".to_string(),
+            discussion_project_path: "group/repo".to_string(),
             mr: MergeRequest {
                 iid: 11,
                 title: Some("Title".to_string()),
@@ -3280,6 +3392,7 @@ async fn run_mention_command_with_fake_runtime_initializes_before_composer_insta
             requester_email: "requester@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Please fix it".to_string(),
+            image_uploads: Vec::new(),
             feature_flags: FeatureFlagSnapshot {
                 composer_install: true,
                 ..FeatureFlagSnapshot::default()
@@ -3336,6 +3449,7 @@ async fn run_mention_command_with_fake_runtime_surfaces_exec_failures() {
         .run_mention_command(MentionCommandContext {
             repo: "group/repo".to_string(),
             project_path: "group/repo".to_string(),
+            discussion_project_path: "group/repo".to_string(),
             mr: MergeRequest {
                 iid: 11,
                 title: Some("Title".to_string()),
@@ -3357,6 +3471,7 @@ async fn run_mention_command_with_fake_runtime_surfaces_exec_failures() {
             requester_email: "requester@example.com".to_string(),
             additional_developer_instructions: None,
             prompt: "Please fix it".to_string(),
+            image_uploads: Vec::new(),
             feature_flags: FeatureFlagSnapshot::default(),
             run_history_id: None,
         })

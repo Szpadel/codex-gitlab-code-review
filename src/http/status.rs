@@ -127,6 +127,10 @@ struct StatusConfig {
 }
 
 impl StatusService {
+    pub fn gitlab_base_url(&self) -> &str {
+        &self.config.gitlab_base_url
+    }
+
     pub fn new(
         config: Config,
         state: Arc<ReviewStateStore>,

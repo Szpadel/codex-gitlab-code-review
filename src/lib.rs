@@ -9,6 +9,7 @@ pub mod flow;
 mod generated_review_prompt_templates;
 pub mod gitlab;
 pub mod gitlab_discovery_mcp;
+mod gitlab_links;
 pub mod http;
 pub mod review;
 pub mod review_lane;

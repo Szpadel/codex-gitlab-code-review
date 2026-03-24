@@ -191,6 +191,9 @@ impl DockerCodexRunner {
                         .as_ref()
                         .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
                         .unwrap_or_default();
+                    let prepared_inputs = self
+                        .prepare_mention_inputs(&container_id, repo_dir.as_str(), ctx)
+                        .await;
                     let thread_response = client
                         .request(
                             "thread/start",
@@ -266,7 +269,7 @@ impl DockerCodexRunner {
                             json!({
                                 "threadId": thread_id.as_str(),
                                 "cwd": repo_dir.as_str(),
-                                "input": [{ "type": "text", "text": ctx.prompt.as_str() }],
+                                "input": prepared_inputs.turn_input,
                             }),
                         )
                         .await?;

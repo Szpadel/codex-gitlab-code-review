@@ -113,7 +113,18 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
 .message-entry { padding: 16px; }
 .message-entry-user { background: var(--surface-subtle); }
 .message-entry-agent { border-left: 3px solid var(--accent-soft); padding-left: 13px; }
-.message-body { color: var(--text-primary); white-space: pre-wrap; word-break: break-word; }
+.message-body { color: var(--text-primary); }
+.trigger-note-body { margin-top: 12px; }
+.markdown-body { color: var(--text-primary); word-break: break-word; overflow-wrap: anywhere; }
+.markdown-body > :first-child { margin-top: 0; }
+.markdown-body > :last-child { margin-bottom: 0; }
+.markdown-body p, .markdown-body ul, .markdown-body ol, .markdown-body pre, .markdown-body blockquote { margin: 0 0 12px; }
+.markdown-body ul, .markdown-body ol { padding-left: 20px; }
+.markdown-body code { padding: 1px 4px; border-radius: 4px; background: rgba(15, 23, 42, 0.06); font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12px; }
+.markdown-body pre { padding: 12px; border: 1px solid var(--divider); border-radius: 8px; background: var(--surface-subtle); overflow-x: auto; }
+.markdown-body pre code { padding: 0; background: transparent; }
+.markdown-body a { color: var(--accent); }
+.markdown-body img { display: block; max-width: 100%; height: auto; margin: 12px 0; border: 1px solid var(--divider); border-radius: 8px; background: var(--surface-subtle); }
 .reasoning-entry { background: var(--reasoning-bg); border-color: var(--reasoning-border); }
 .reasoning-entry > .entry-summary::before { color: var(--reasoning-text); }
 .reasoning-summary-text { font-size: 14px; line-height: 20px; font-weight: 600; color: var(--reasoning-text); }
@@ -150,6 +161,7 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
 .diff-line-hunk { background: #EFF6FF; color: #1D4ED8; }
 .diff-line-meta { background: #F8FAFC; color: var(--text-tertiary); }
 .activity-body { margin: 10px 16px 0; padding: 12px; background: var(--surface-subtle); border: 1px solid var(--divider); border-radius: 8px; white-space: pre-wrap; word-break: break-word; overflow-x: auto; font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12px; line-height: 18px; color: var(--text-secondary); }
+.review-markdown-body { font-family: inherit; font-size: 14px; line-height: 20px; color: var(--text-primary); overflow: visible; white-space: normal; }
 @media (max-width: 960px) {
   .layout { grid-template-columns: 1fr; }
   .sidebar { position: static; height: auto; }

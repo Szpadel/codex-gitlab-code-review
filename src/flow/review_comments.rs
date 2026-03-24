@@ -4,11 +4,11 @@ use crate::gitlab::{
     DiffDiscussionPosition, GitLabApi, MergeRequest, MergeRequestDiff, MergeRequestDiffDiscussion,
     MergeRequestDiffVersion,
 };
+use crate::gitlab_links::gitlab_web_base;
 use crate::review_lane::ReviewLane;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
-use url::Url;
 
 const REVIEW_FINDING_MARKER_PREFIX: &str = "<!-- codex-review-finding:sha=";
 const MAX_INLINE_FINDING_LINE_SPAN: usize = 500;
@@ -743,22 +743,6 @@ fn project_web_base(config: &Config, repo: &str, mr: &MergeRequest) -> String {
     format!("{}/{}", gitlab_web_base(&config.gitlab.base_url), repo)
 }
 
-fn gitlab_web_base(base_url: &str) -> String {
-    match Url::parse(base_url) {
-        Ok(mut url) => {
-            let path = url.path().trim_end_matches('/').to_string();
-            let stripped = path.strip_suffix("/api/v4").unwrap_or(&path);
-            url.set_path(stripped);
-            url.to_string().trim_end_matches('/').to_string()
-        }
-        Err(_) => base_url
-            .trim_end_matches('/')
-            .strip_suffix("/api/v4")
-            .unwrap_or(base_url.trim_end_matches('/'))
-            .to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,6 +895,22 @@ mod tests {
             worktree_root.as_str(),
         );
         assert_eq!(rewritten, text);
+    }
+
+    #[test]
+    fn legacy_note_body_preserves_markdown_images() {
+        let body = legacy_note_body(
+            ReviewCommentPostingOptions {
+                review_label: "Review",
+                comment_marker_prefix: "<!-- codex-review:sha=",
+                finding_marker_prefix: REVIEW_FINDING_MARKER_PREFIX,
+            },
+            "sha1",
+            "![shot](/uploads/hash/screenshot.png)",
+        );
+
+        assert!(body.contains("![shot](/uploads/hash/screenshot.png)"));
+        assert!(body.contains("<!-- codex-review:sha=sha1 -->"));
     }
 
     #[test]

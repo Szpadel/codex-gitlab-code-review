@@ -1,3 +1,4 @@
+use super::markdown::render_safe_markdown;
 use super::status::{
     HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, SecurityContextPreview,
     StatusFeatureFlagSnapshot, StatusSnapshot, ThreadItemSnapshot, ThreadSnapshot,
@@ -144,6 +145,7 @@ pub(super) fn render_mr_history_page(
 
 pub(super) fn render_run_detail_page(
     snapshot: &RunDetailSnapshot,
+    gitlab_base_url: &str,
     csrf_token: Option<&str>,
 ) -> String {
     let run = &snapshot.run;
@@ -160,12 +162,13 @@ pub(super) fn render_run_detail_page(
         run.iid,
         render_run_metadata(run),
         render_related_runs(&snapshot.related_runs, run.id),
-        render_trigger_card(run),
+        render_trigger_card(run, gitlab_base_url),
         render_security_context_card(run, snapshot.security_context_preview.as_ref()),
         render_thread_card(
             run,
             snapshot.thread.as_ref(),
             snapshot.transcript_backfill.as_ref(),
+            gitlab_base_url,
         ),
     );
     render_shell("Run Detail", NavItem::History, body, csrf_token)
@@ -792,14 +795,14 @@ fn render_related_runs(runs: &[RunHistoryRecord], current_id: i64) -> String {
     }
 }
 
-fn render_trigger_card(run: &RunHistoryRecord) -> String {
+fn render_trigger_card(run: &RunHistoryRecord, gitlab_base_url: &str) -> String {
     if run.kind != RunHistoryKind::Mention {
         return String::new();
     }
     format!(
         "<section class=\"card\"><h2>Trigger note</h2>\
          <dl>{}</dl>\
-         <pre class=\"codeblock\">{}</pre></section>",
+         {}</section>",
         render_definition_list(&[
             (
                 "Discussion".to_string(),
@@ -818,10 +821,12 @@ fn render_trigger_card(run: &RunHistoryRecord) -> String {
                 escape_html(run.trigger_note_author_name.as_deref().unwrap_or("-")),
             ),
         ]),
-        escape_html(
+        render_markdown_block(
             run.trigger_note_body
                 .as_deref()
-                .unwrap_or("(no trigger note body)")
+                .unwrap_or("(no trigger note body)"),
+            "trigger-note-body",
+            gitlab_base_url,
         )
     )
 }
@@ -874,6 +879,7 @@ fn render_thread_card(
     run: &RunHistoryRecord,
     thread: Option<&ThreadSnapshot>,
     transcript_backfill: Option<&TranscriptBackfillSnapshot>,
+    gitlab_base_url: &str,
 ) -> String {
     let backfill_notice = render_transcript_backfill_notice(transcript_backfill);
     let security_context_banner = render_security_context_banner(run);
@@ -892,7 +898,11 @@ fn render_thread_card(
             if multiple_turns {
                 rendered.push(render_turn_divider(&turn.id, &turn.status, index == 0));
             }
-            rendered.extend(turn.items.iter().map(render_thread_item));
+            rendered.extend(
+                turn.items
+                    .iter()
+                    .map(|item| render_thread_item(item, gitlab_base_url)),
+            );
             rendered
         })
         .collect::<Vec<_>>()
@@ -959,17 +969,19 @@ fn render_transcript_backfill_notice(
     }
 }
 
-fn render_thread_item(item: &ThreadItemSnapshot) -> String {
+fn render_thread_item(item: &ThreadItemSnapshot, gitlab_base_url: &str) -> String {
     match item.item_type.as_str() {
-        "userMessage" => render_message_entry("User", "user", item),
-        "agentMessage" | "AgentMessage" => render_message_entry("Agent", "agent", item),
+        "userMessage" => render_message_entry("User", "user", item, gitlab_base_url),
+        "agentMessage" | "AgentMessage" => {
+            render_message_entry("Agent", "agent", item, gitlab_base_url)
+        }
         "reasoning" => render_reasoning_entry(item),
         "commandExecution" => render_terminal_entry(item),
         "mcpToolCall" => render_mcp_entry(item),
         "dynamicToolCall" => render_dynamic_tool_entry(item),
         "fileChange" => render_file_change_entry(item),
         "webSearch" => render_web_search_entry(item),
-        _ => render_activity_entry(item),
+        _ => render_activity_entry(item, gitlab_base_url),
     }
 }
 
@@ -983,7 +995,12 @@ fn render_turn_divider(turn_id: &str, status: &str, is_first: bool) -> String {
     )
 }
 
-fn render_message_entry(role: &str, role_class: &str, item: &ThreadItemSnapshot) -> String {
+fn render_message_entry(
+    role: &str,
+    role_class: &str,
+    item: &ThreadItemSnapshot,
+    gitlab_base_url: &str,
+) -> String {
     format!(
         "<article class=\"transcript-entry message-entry message-entry-{}\">\
          <header class=\"message-header\">\
@@ -994,7 +1011,11 @@ fn render_message_entry(role: &str, role_class: &str, item: &ThreadItemSnapshot)
         escape_html(role),
         render_meta_pills(&item.meta),
         render_entry_timestamp(item),
-        render_text_block(item.body.as_deref(), "message-body")
+        render_markdown_block(
+            item.body.as_deref().unwrap_or(""),
+            "message-body",
+            gitlab_base_url
+        )
     )
 }
 
@@ -1212,7 +1233,7 @@ fn render_file_change_entry(item: &ThreadItemSnapshot) -> String {
     )
 }
 
-fn render_activity_entry(item: &ThreadItemSnapshot) -> String {
+fn render_activity_entry(item: &ThreadItemSnapshot, gitlab_base_url: &str) -> String {
     render_static_entry(
         &format!(
             "activity-entry activity-entry-{}",
@@ -1233,12 +1254,22 @@ fn render_activity_entry(item: &ThreadItemSnapshot) -> String {
         format!(
             "{}{}",
             render_optional_preview_text(item.preview.as_deref()),
-            item.body
-                .as_deref()
-                .map(|body| format!("<pre class=\"activity-body\">{}</pre>", escape_html(body)))
-                .unwrap_or_default()
+            render_activity_body(item, gitlab_base_url)
         ),
     )
+}
+
+fn render_activity_body(item: &ThreadItemSnapshot, gitlab_base_url: &str) -> String {
+    let Some(body) = item.body.as_deref() else {
+        return String::new();
+    };
+    if matches!(
+        item.item_type.as_str(),
+        "enteredReviewMode" | "exitedReviewMode"
+    ) {
+        return render_markdown_block(body, "activity-body review-markdown-body", gitlab_base_url);
+    }
+    format!("<pre class=\"activity-body\">{}</pre>", escape_html(body))
 }
 
 fn render_static_entry(
@@ -1331,9 +1362,15 @@ fn render_entry_meta(item: &ThreadItemSnapshot, meta: &[(String, String)]) -> St
     )
 }
 
-fn render_text_block(body: Option<&str>, class_name: &str) -> String {
-    body.map(|body| format!("<div class=\"{}\">{}</div>", class_name, escape_html(body)))
-        .unwrap_or_default()
+fn render_markdown_block(body: &str, class_name: &str, gitlab_base_url: &str) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<div class=\"{} markdown-body\">{}</div>",
+        class_name,
+        render_safe_markdown(body, gitlab_base_url)
+    )
 }
 
 fn render_tool_preview_box(preview: &str) -> String {
@@ -1828,7 +1865,7 @@ mod tests {
             transcript_backfill: None,
         };
 
-        let html = render_run_detail_page(&snapshot, None);
+        let html = render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None);
 
         assert!(html.contains("Reused cached security context from"));
         assert!(html.contains("/history/42"));
@@ -1855,12 +1892,35 @@ mod tests {
             transcript_backfill: None,
         };
 
-        let html = render_run_detail_page(&snapshot, None);
+        let html = render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None);
 
         assert!(html.contains("Security context"));
         assert!(html.contains("main"));
         assert!(html.contains("deadbeef"));
         assert!(html.contains("&quot;components&quot;"));
         assert!(html.contains("/history/42"));
+    }
+
+    #[test]
+    fn run_detail_page_renders_trigger_note_markdown_images() {
+        let mut run = sample_run(RunHistoryKind::Mention);
+        run.discussion_id = Some("discussion-1".to_string());
+        run.trigger_note_id = Some(77);
+        run.trigger_note_author_name = Some("Alice".to_string());
+        run.trigger_note_body = Some("![shot](/uploads/hash/screenshot.png)".to_string());
+        let snapshot = RunDetailSnapshot {
+            generated_at: "2026-03-23T00:00:00Z".to_string(),
+            run,
+            related_runs: Vec::new(),
+            security_context_preview: None,
+            thread: None,
+            transcript_backfill: None,
+        };
+
+        let html = render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None);
+
+        assert!(html.contains("trigger-note-body"));
+        assert!(html.contains("<img"));
+        assert!(html.contains("https://gitlab.example.com/uploads/hash/screenshot.png"));
     }
 }

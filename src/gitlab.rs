@@ -343,6 +343,16 @@ pub trait GitLabApi: Send + Sync {
             "get_user not implemented for this gitlab client (user_id={user_id})"
         ))
     }
+    async fn download_project_upload(
+        &self,
+        _project: &str,
+        _secret: &str,
+        _filename: &str,
+    ) -> Result<Vec<u8>> {
+        Err(anyhow!(
+            "download_project_upload not implemented for this gitlab client"
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -935,6 +945,27 @@ impl GitLabApi for GitLabClient {
         let url = format!("{}/users/{}", self.api_base, user_id);
         self.get_json(&url).await
     }
+
+    async fn download_project_upload(
+        &self,
+        project: &str,
+        secret: &str,
+        filename: &str,
+    ) -> Result<Vec<u8>> {
+        let url = format!(
+            "{}/uploads/{}/{}",
+            self.project_path(project),
+            urlencoding::encode(secret),
+            urlencoding::encode(filename)
+        );
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("gitlab GET {}", url))?;
+        ensure_success_bytes(response, "GET", &url).await
+    }
 }
 
 const GITLAB_ERROR_BODY_LIMIT: usize = 512;
@@ -967,6 +998,21 @@ async fn ensure_success_empty(response: Response, method: &str, url: &str) -> Re
         )));
     }
     Ok(())
+}
+
+async fn ensure_success_bytes(response: Response, method: &str, url: &str) -> Result<Vec<u8>> {
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow!(format_gitlab_http_error(
+            method, url, status, &text
+        )));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("gitlab {method} {url} response bytes"))?;
+    Ok(bytes.to_vec())
 }
 
 fn format_gitlab_http_error(
@@ -1279,6 +1325,60 @@ mod tests {
         assert!(message.contains("/projects/group%2Frepo/merge_requests/7/notes"));
         assert!(message.contains("status=403 Forbidden"));
         assert!(message.contains(r#"body={"message":"forbidden"}"#));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_project_upload_fetches_bytes_from_gitlab() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/uploads/hash/screenshot%20final.png",
+            ))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(b"png-bytes".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        assert_eq!(
+            client
+                .download_project_upload("group/repo", "hash", "screenshot final.png")
+                .await?,
+            b"png-bytes".to_vec()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_project_upload_error_is_self_contained() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/uploads/hash/missing.png",
+            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"message":"404 Upload Not Found"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let err = client
+            .download_project_upload("group/repo", "hash", "missing.png")
+            .await
+            .expect_err("request should fail");
+        let message = err.to_string();
+        assert!(message.contains("gitlab GET"));
+        assert!(message.contains("/projects/group%2Frepo/uploads/hash/missing.png"));
+        assert!(message.contains("status=404 Not Found"));
+        assert!(message.contains(r#"body={"message":"404 Upload Not Found"}"#));
         Ok(())
     }
 
