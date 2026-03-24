@@ -57,16 +57,17 @@ Validation rules:
 - You may run builds, tests, local servers, curl requests, package managers, and temporary PoCs.
 - You may create temporary files outside tracked repo content, but do not modify tracked files as part of review.
 - Keep `code_location` as small as possible and overlapping the diff.
-- Each finding body must use these exact sections, in this exact order:
-  - `Summary:`
-  - `Severity:`
-  - `Reproduction:`
-  - `Evidence:`
-  - `Attack-path analysis:`
-  - `Likelihood:`
-  - `Impact:`
-  - `Assumptions:`
-  - `Blindspots:`
+- Each finding body must use these exact Markdown section labels, in this exact order:
+  - `**Summary**`
+  - `**Severity**`
+  - `**Reproduction**`
+  - `**Evidence**`
+  - `**Attack-path analysis**`
+  - `**Likelihood**`
+  - `**Impact**`
+  - `**Assumptions**`
+  - `**Blindspots**`
+- Put each label on its own line, then the section content on the following line(s).
 - Fill every section. If a section has no extra detail, say `None.` rather than omitting it.
 - `Severity:` must include the severity level and why it fits.
 - `Reproduction:` must give the fastest realistic developer repro path.
