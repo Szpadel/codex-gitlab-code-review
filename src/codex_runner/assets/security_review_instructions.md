@@ -57,8 +57,22 @@ Validation rules:
 - You may run builds, tests, local servers, curl requests, package managers, and temporary PoCs.
 - You may create temporary files outside tracked repo content, but do not modify tracked files as part of review.
 - Keep `code_location` as small as possible and overlapping the diff.
-- The finding body must explain, in one paragraph:
-  trigger conditions, why the control/check fails, validation method, and impact.
+- Each finding body must use these exact sections, in this exact order:
+  - `Summary:`
+  - `Severity:`
+  - `Reproduction:`
+  - `Evidence:`
+  - `Attack-path analysis:`
+  - `Likelihood:`
+  - `Impact:`
+  - `Assumptions:`
+  - `Blindspots:`
+- Fill every section. If a section has no extra detail, say `None.` rather than omitting it.
+- `Severity:` must include the severity level and why it fits.
+- `Reproduction:` must give the fastest realistic developer repro path.
+- `Evidence:` must cite the exact proof from the repo, runtime behavior, or validation artifact.
+- `Attack-path analysis:` must explain the attacker-controlled input, boundary crossing, failed guard, and sink.
+- When citing repository locations in the narrative sections, use checked-out file references like `/work/repo/<project-path>/src/auth.rs:42` or `/work/repo/<project-path>/src/auth.rs:42-47`.
 - Be especially careful about representation and transformation bugs:
   validate-before-decode, auth checks on one representation but sink uses another, policy checks before state changes, and mismatches between validation and interpretation.
 

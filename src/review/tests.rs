@@ -4104,6 +4104,106 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
 }
 
 #[tokio::test]
+async fn security_inline_review_comments_link_sectioned_references() -> Result<()> {
+    let mut config = test_config();
+    config.feature_flags.gitlab_inline_review_comments = true;
+    let finding_body = "Summary:\nUntrusted callers can reach /work/repo/group/repo/src/auth.rs:10.\n\nSeverity:\nP1 because /work/repo/group/repo/src/auth.rs:10 removes the only authorization gate.\n\nReproduction:\nReplay the existing request flow and hit /work/repo/group/repo/src/auth.rs:10.\n\nEvidence:\n/work/repo/group/repo/src/auth.rs:10 returns before the guard and /work/repo/group/repo/src/http.rs:22 still executes the privileged handler.\n\nAttack-path analysis:\nAn attacker-controlled request crosses the HTTP boundary, bypasses the role check, and reaches the privileged sink.\n\nLikelihood:\nHigh because the endpoint is externally reachable.\n\nImpact:\nCross-tenant data exposure.\n\nAssumptions:\nThe route is reachable to ordinary API clients.\n\nBlindspots:\nDid not validate proxy-specific auth at /work/repo/group/repo/src/http.rs:22.";
+
+    let mut merge_request = mr(25, "sha25");
+    merge_request.web_url =
+        Some("https://gitlab.example.com/group/repo/-/merge_requests/25".to_string());
+    let inner = fake_gitlab(vec![merge_request.clone()]);
+    let gitlab = Arc::new(InlineReviewGitLab::new(
+        Arc::clone(&inner),
+        vec![MergeRequestDiffVersion {
+            id: 1,
+            head_commit_sha: "sha25".to_string(),
+            base_commit_sha: "base25".to_string(),
+            start_commit_sha: "start25".to_string(),
+        }],
+        vec![MergeRequestDiff {
+            old_path: "src/auth.rs".to_string(),
+            new_path: "src/auth.rs".to_string(),
+            diff: "@@ -10,1 +10,1 @@\n-old\n+new\n".to_string(),
+            new_file: false,
+            deleted_file: false,
+            renamed_file: false,
+            collapsed: false,
+            too_large: false,
+        }],
+    ));
+    let runner = Arc::new(FakeRunner {
+        result: Mutex::new(Some(CodexResult::Comment(
+            crate::codex_runner::ReviewComment {
+                summary: "confirmed auth bypass".to_string(),
+                overall_explanation: None,
+                overall_confidence_score: Some(0.93),
+                findings: vec![crate::codex_runner::ReviewFinding {
+                    title: "[P1] Missing auth guard".to_string(),
+                    body: finding_body.to_string(),
+                    confidence_score: Some(0.93),
+                    priority: Some(1),
+                    code_location: crate::codex_runner::ReviewCodeLocation {
+                        absolute_file_path: "/work/repo/group/repo/src/auth.rs".to_string(),
+                        line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
+                    },
+                }],
+                body: "legacy body".to_string(),
+            },
+        ))),
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    state
+        .begin_review_for_lane(
+            "group/repo",
+            25,
+            "sha25",
+            crate::review_lane::ReviewLane::Security,
+        )
+        .await?;
+    let review_context = ReviewRunContext {
+        lane: crate::review_lane::ReviewLane::Security,
+        config,
+        gitlab: gitlab.clone(),
+        codex: runner.clone(),
+        state: state.clone(),
+        retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
+        bot_user_id: 1,
+        shutdown: Arc::new(AtomicBool::new(false)),
+    };
+
+    review_context
+        .run(
+            "group/repo",
+            merge_request,
+            "sha25",
+            crate::feature_flags::FeatureFlagSnapshot {
+                gitlab_inline_review_comments: true,
+                security_review: true,
+                ..crate::feature_flags::FeatureFlagSnapshot::default()
+            },
+            0,
+        )
+        .await?;
+
+    let inline_discussions = gitlab.created_diff_discussions();
+    assert_eq!(inline_discussions.len(), 1);
+    let (rendered_body, marker_suffix) = inline_discussions[0]
+        .body
+        .rsplit_once("\n\n<!-- ")
+        .expect("inline finding marker");
+    assert_eq!(
+        rendered_body,
+        "Security finding: [P1] Missing auth guard\n\nSummary:\nUntrusted callers can reach [src/auth.rs:10](https://gitlab.example.com/group/repo/-/blob/sha25/src/auth.rs#L10).\n\nSeverity:\nP1 because [src/auth.rs:10](https://gitlab.example.com/group/repo/-/blob/sha25/src/auth.rs#L10) removes the only authorization gate.\n\nReproduction:\nReplay the existing request flow and hit [src/auth.rs:10](https://gitlab.example.com/group/repo/-/blob/sha25/src/auth.rs#L10).\n\nEvidence:\n[src/auth.rs:10](https://gitlab.example.com/group/repo/-/blob/sha25/src/auth.rs#L10) returns before the guard and [src/http.rs:22](https://gitlab.example.com/group/repo/-/blob/sha25/src/http.rs#L22) still executes the privileged handler.\n\nAttack-path analysis:\nAn attacker-controlled request crosses the HTTP boundary, bypasses the role check, and reaches the privileged sink.\n\nLikelihood:\nHigh because the endpoint is externally reachable.\n\nImpact:\nCross-tenant data exposure.\n\nAssumptions:\nThe route is reachable to ordinary API clients.\n\nBlindspots:\nDid not validate proxy-specific auth at [src/http.rs:22](https://gitlab.example.com/group/repo/-/blob/sha25/src/http.rs#L22)."
+    );
+    assert!(marker_suffix.starts_with("codex-security-review-finding:sha=sha25 key="));
+    assert!(marker_suffix.ends_with(" -->"));
+    assert!(gitlab.created_note_bodies().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn security_review_pass_stays_silent() -> Result<()> {
     let config = test_config();
     let gitlab = fake_gitlab(Vec::new());

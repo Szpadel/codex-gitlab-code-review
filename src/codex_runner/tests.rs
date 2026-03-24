@@ -365,6 +365,49 @@ fn parse_security_review_output_accepts_nullable_optional_fields() -> Result<()>
 }
 
 #[test]
+fn parse_security_review_output_preserves_sectioned_body() -> Result<()> {
+    let finding_body = "Summary:\nUntrusted callers can reach src/auth.rs:14.\n\nSeverity:\nP1 because the missing guard exposes tenant data.\n\nReproduction:\nSend the authenticated request sequence described near src/http.rs:22.\n\nEvidence:\nsrc/auth.rs:14 skips the role check and src/http.rs:22 still reaches the handler.\n\nAttack-path analysis:\nAn attacker-controlled request crosses the HTTP boundary, bypasses the auth check, and reaches the privileged handler.\n\nLikelihood:\nHigh because the endpoint is externally reachable.\n\nImpact:\nCross-tenant data exposure.\n\nAssumptions:\nThe route remains available to normal API clients.\n\nBlindspots:\nDid not validate WAF-specific mitigations.";
+    let text = json!({
+        "findings": [
+            {
+                "title": "[P1] Missing auth guard",
+                "body": finding_body,
+                "confidence_score": 0.91,
+                "priority": 1,
+                "code_location": {
+                    "absolute_file_path": "/work/repo/src/auth.rs",
+                    "line_range": { "start": 14, "end": 16 }
+                }
+            }
+        ],
+        "overall_correctness": "patch is incorrect",
+        "overall_explanation": "The patch introduces a confirmed auth bypass.",
+        "overall_confidence_score": 0.91
+    })
+    .to_string();
+    let result =
+        parse_review_output_for_lane(&text, crate::review_lane::ReviewLane::Security, Some(0.85))?;
+
+    match result {
+        CodexResult::Comment(comment) => {
+            assert_eq!(
+                comment.overall_explanation.as_deref(),
+                Some("The patch introduces a confirmed auth bypass.")
+            );
+            assert_eq!(comment.findings.len(), 1);
+            assert_eq!(comment.findings[0].body, finding_body);
+            let expected_body = format!(
+                "The patch introduces a confirmed auth bypass.\n\nReview comment:\n\n- [P1] Missing auth guard — /work/repo/src/auth.rs:14-16\n  {}",
+                finding_body.replace('\n', "\n  ")
+            );
+            assert_eq!(comment.body, expected_body);
+            Ok(())
+        }
+        _ => bail!("expected comment"),
+    }
+}
+
+#[test]
 fn parse_security_review_output_rejects_incorrect_verdict_without_confirmed_findings() {
     let text = r#"{
       "findings": [],

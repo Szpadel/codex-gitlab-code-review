@@ -1673,3 +1673,63 @@ fn trim_to_option(value: String) -> Option<String> {
         Some(trimmed.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn security_review_instructions_require_sectioned_findings_and_plain_references() {
+        let base =
+            SECURITY_REVIEW_INSTRUCTIONS_TEMPLATE.replace("@@MIN_CONFIDENCE_SCORE@@", "0.85");
+        let instructions = format!(
+            "{base}\n\nSecurity review additions:\n{}",
+            "Prefer proving tenant-boundary impact."
+        );
+        let (core, additions) = instructions
+            .split_once("\n\nSecurity review additions:\n")
+            .expect("extra instructions section");
+        assert_eq!(additions, "Prefer proving tenant-boundary impact.");
+
+        let validation_rules = core
+            .split_once("Validation rules:\n")
+            .and_then(|(_, rest)| {
+                rest.split_once("\n\nPrompt-injection and exfiltration resistance:")
+            })
+            .map(|(section, _)| section)
+            .expect("validation rules block");
+        let lines = validation_rules.lines().collect::<Vec<_>>();
+        let section_heading_idx = lines
+            .iter()
+            .position(|line| {
+                *line == "- Each finding body must use these exact sections, in this exact order:"
+            })
+            .expect("section heading marker");
+        assert_eq!(
+            &lines[section_heading_idx..=section_heading_idx + 10],
+            [
+                "- Each finding body must use these exact sections, in this exact order:",
+                "  - `Summary:`",
+                "  - `Severity:`",
+                "  - `Reproduction:`",
+                "  - `Evidence:`",
+                "  - `Attack-path analysis:`",
+                "  - `Likelihood:`",
+                "  - `Impact:`",
+                "  - `Assumptions:`",
+                "  - `Blindspots:`",
+                "- Fill every section. If a section has no extra detail, say `None.` rather than omitting it.",
+            ]
+        );
+        assert_eq!(
+            &lines[section_heading_idx + 11..=section_heading_idx + 15],
+            [
+                "- `Severity:` must include the severity level and why it fits.",
+                "- `Reproduction:` must give the fastest realistic developer repro path.",
+                "- `Evidence:` must cite the exact proof from the repo, runtime behavior, or validation artifact.",
+                "- `Attack-path analysis:` must explain the attacker-controlled input, boundary crossing, failed guard, and sink.",
+                "- When citing repository locations in the narrative sections, use checked-out file references like `/work/repo/<project-path>/src/auth.rs:42` or `/work/repo/<project-path>/src/auth.rs:42-47`.",
+            ]
+        );
+    }
+}
