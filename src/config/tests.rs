@@ -137,6 +137,14 @@ fn defaults_mention_commands_when_missing() {
     assert_eq!(config.codex.reasoning_effort.review, None);
     assert_eq!(config.codex.reasoning_effort.mention, None);
     assert_eq!(
+        config.codex.reasoning_effort.security_context.as_deref(),
+        Some("xhigh")
+    );
+    assert_eq!(
+        config.codex.reasoning_effort.security_review.as_deref(),
+        Some("high")
+    );
+    assert_eq!(
         config.codex.reasoning_summary.review.as_deref(),
         Some("detailed")
     );
@@ -327,6 +335,8 @@ codex:
   reasoning_effort:
     review: "high"
     mention: "low"
+    security_context: "medium"
+    security_review: "xhigh"
 database:
   path: "/tmp/state.sqlite"
 server:
@@ -341,6 +351,53 @@ server:
         config.codex.reasoning_effort.mention.as_deref(),
         Some("low")
     );
+    assert_eq!(
+        config.codex.reasoning_effort.security_context.as_deref(),
+        Some("medium")
+    );
+    assert_eq!(
+        config.codex.reasoning_effort.security_review.as_deref(),
+        Some("xhigh")
+    );
+}
+
+#[test]
+fn explicit_null_security_reasoning_effort_overrides_disable_defaults() {
+    let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  reasoning_effort:
+    security_context: null
+    security_review: null
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+    let config = load_from_yaml(yaml);
+    assert_eq!(config.codex.reasoning_effort.security_context, None);
+    assert_eq!(config.codex.reasoning_effort.security_review, None);
 }
 
 #[test]

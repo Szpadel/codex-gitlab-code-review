@@ -96,12 +96,9 @@ impl DockerCodexRunner {
         &self,
         ctx: &ReviewContext,
         app_server: AppServerCommandOptions<'_>,
+        reasoning_effort: Option<&str>,
     ) -> Result<String> {
         let clone_url = self.clone_url(&ctx.repo)?;
-        let reasoning_summary =
-            configured_reasoning_summary(self.codex.reasoning_summary.review.as_deref());
-        let reasoning_effort =
-            configured_reasoning_effort(self.codex.reasoning_effort.review.as_deref());
         let mcp_server_overrides = self.effective_mcp_server_overrides_for_run(
             app_server.mcp_server_overrides,
             app_server.gitlab_discovery_mcp.is_some(),
@@ -125,10 +122,28 @@ impl DockerCodexRunner {
                 browser_mcp: app_server.browser_mcp,
                 gitlab_discovery_mcp: app_server.gitlab_discovery_mcp,
                 mcp_server_overrides: &mcp_server_overrides,
-                reasoning_summary: reasoning_summary.or(app_server.reasoning_summary),
+                reasoning_summary: self
+                    .review_reasoning_summary()
+                    .or(app_server.reasoning_summary),
                 reasoning_effort: reasoning_effort.or(app_server.reasoning_effort),
             },
         ))
+    }
+
+    pub(crate) fn review_reasoning_summary(&self) -> Option<&str> {
+        configured_reasoning_summary(self.codex.reasoning_summary.review.as_deref())
+    }
+
+    pub(crate) fn review_reasoning_effort(&self) -> Option<&str> {
+        configured_reasoning_effort(self.codex.reasoning_effort.review.as_deref())
+    }
+
+    pub(crate) fn security_context_reasoning_effort(&self) -> Option<&str> {
+        configured_reasoning_effort(self.codex.reasoning_effort.security_context.as_deref())
+    }
+
+    pub(crate) fn security_review_reasoning_effort(&self) -> Option<&str> {
+        configured_reasoning_effort(self.codex.reasoning_effort.security_review.as_deref())
     }
 
     pub(crate) fn browser_mcp(&self) -> Option<&BrowserMcpConfig> {

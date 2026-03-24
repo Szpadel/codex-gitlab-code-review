@@ -608,6 +608,58 @@ fn scripted_security_review_server(
     ScriptedAppServer::from_requests(requests)
 }
 
+fn scripted_security_context_server(
+    thread_id: &str,
+    threat_turn_id: &str,
+    threat_output: &str,
+    threat_delay_ms: u64,
+) -> ScriptedAppServer {
+    let mut after_response = vec![ScriptedAppChunk::Json(json!({
+        "method": "turn/started",
+        "params": { "threadId": thread_id, "turnId": threat_turn_id }
+    }))];
+    if threat_delay_ms > 0 {
+        after_response.push(ScriptedAppChunk::SleepMillis(threat_delay_ms));
+    }
+    after_response.extend([
+        ScriptedAppChunk::Json(json!({
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": thread_id,
+                "turnId": threat_turn_id,
+                "itemId": "agent-threat",
+                "delta": threat_output
+            }
+        })),
+        ScriptedAppChunk::Json(json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": thread_id,
+                "turnId": threat_turn_id,
+                "item": {
+                    "id": "agent-threat",
+                    "type": "AgentMessage",
+                    "phase": "final"
+                }
+            }
+        })),
+        ScriptedAppChunk::Json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": thread_id,
+                "turnId": threat_turn_id,
+                "turn": { "status": "completed" }
+            }
+        })),
+    ]);
+    ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": thread_id } })),
+        ScriptedAppRequest::result("turn/start", json!({ "turn": { "id": threat_turn_id } }))
+            .with_after_response(after_response),
+    ])
+}
+
 #[test]
 fn security_context_cache_repo_key_uses_canonical_repo_identity() {
     let runner = test_runner_with_codex(test_codex_config());
@@ -2008,6 +2060,7 @@ fn command_skips_static_gitlab_discovery_enable_override_without_injection() {
                 reasoning_summary: None,
                 reasoning_effort: None,
             },
+            runner.review_reasoning_effort(),
         )
         .expect("command script");
 
@@ -3308,7 +3361,7 @@ async fn run_review_with_fake_runtime_surfaces_closed_stdout_with_recent_runner_
 }
 
 #[tokio::test]
-async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_thread() -> Result<()>
+async fn run_review_with_fake_runtime_security_lane_uses_split_sessions_on_cache_miss() -> Result<()>
 {
     let harness = Arc::new(FakeRunnerHarness::default());
     let repo_dir = repo_checkout_root("group/repo");
@@ -3347,7 +3400,7 @@ async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_t
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-1".to_string(),
+            container_id: "app-2".to_string(),
             command: vec![
                 "mktemp".to_string(),
                 "-d".to_string(),
@@ -3364,7 +3417,7 @@ async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_t
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-1".to_string(),
+            container_id: "app-2".to_string(),
             command: auxiliary_git_exec_command(&[
                 "worktree".to_string(),
                 "add".to_string(),
@@ -3383,7 +3436,7 @@ async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_t
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-1".to_string(),
+            container_id: "app-2".to_string(),
             command: auxiliary_git_exec_command(&[
                 "worktree".to_string(),
                 "remove".to_string(),
@@ -3399,82 +3452,20 @@ async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_t
             stderr: String::new(),
         },
     );
-    harness.push_app_server(ScriptedAppServer::from_requests(vec![
-        ScriptedAppRequest::result("initialize", json!({})),
-        ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "thread-1" } })),
-        ScriptedAppRequest::result("turn/start", json!({ "turn": { "id": "turn-threat" } }))
-            .with_after_response(vec![
-                ScriptedAppChunk::Json(json!({
-                    "method": "turn/started",
-                    "params": { "threadId": "thread-1", "turnId": "turn-threat" }
-                })),
-                ScriptedAppChunk::Json(json!({
-                    "method": "item/agentMessage/delta",
-                    "params": {
-                        "threadId": "thread-1",
-                        "turnId": "turn-threat",
-                        "itemId": "agent-threat",
-                        "delta": "{\"components\":[],\"entry_points\":[],\"trust_boundaries\":[],\"attacker_controlled_inputs\":[],\"privileged_operations\":[],\"sensitive_assets\":[],\"security_critical_paths\":[],\"runtime_notes\":[],\"focus_paths\":[]}"
-                    }
-                })),
-                ScriptedAppChunk::Json(json!({
-                    "method": "item/completed",
-                    "params": {
-                        "threadId": "thread-1",
-                        "turnId": "turn-threat",
-                        "item": {
-                            "id": "agent-threat",
-                            "type": "AgentMessage",
-                            "phase": "final"
-                        }
-                    }
-                })),
-                ScriptedAppChunk::Json(json!({
-                    "method": "turn/completed",
-                    "params": {
-                        "threadId": "thread-1",
-                        "turnId": "turn-threat",
-                        "turn": { "status": "completed" }
-                    }
-                })),
-            ]),
-        ScriptedAppRequest::result("turn/start", json!({ "turn": { "id": "turn-review" } }))
-            .with_after_response(vec![
-                ScriptedAppChunk::Json(json!({
-                    "method": "turn/started",
-                    "params": { "threadId": "thread-1", "turnId": "turn-review" }
-                })),
-                ScriptedAppChunk::Json(json!({
-                    "method": "item/agentMessage/delta",
-                    "params": {
-                        "threadId": "thread-1",
-                        "turnId": "turn-review",
-                        "itemId": "agent-review",
-                        "delta": "{\"findings\":[],\"overall_correctness\":\"patch is correct\",\"overall_explanation\":\"No confirmed security issues.\",\"overall_confidence_score\":0.95}"
-                    }
-                })),
-                ScriptedAppChunk::Json(json!({
-                    "method": "item/completed",
-                    "params": {
-                        "threadId": "thread-1",
-                        "turnId": "turn-review",
-                        "item": {
-                            "id": "agent-review",
-                            "type": "AgentMessage",
-                            "phase": "final"
-                        }
-                    }
-                })),
-                ScriptedAppChunk::Json(json!({
-                    "method": "turn/completed",
-                    "params": {
-                        "threadId": "thread-1",
-                        "turnId": "turn-review",
-                        "turn": { "status": "completed" }
-                    }
-                })),
-            ]),
-    ]));
+    harness.push_app_server(scripted_security_review_server(
+        "thread-review",
+        None,
+        None,
+        0,
+        "turn-review",
+        "{\"findings\":[],\"overall_correctness\":\"patch is correct\",\"overall_explanation\":\"No confirmed security issues.\",\"overall_confidence_score\":0.95}",
+    ));
+    harness.push_app_server(scripted_security_context_server(
+        "thread-context",
+        "turn-threat",
+        "{\"components\":[],\"entry_points\":[],\"trust_boundaries\":[],\"attacker_controlled_inputs\":[],\"privileged_operations\":[],\"sensitive_assets\":[],\"security_critical_paths\":[],\"runtime_notes\":[],\"focus_paths\":[]}",
+        0,
+    ));
 
     let runner =
         test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
@@ -3521,9 +3512,28 @@ async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_t
             "initialize".to_string(),
             "initialized".to_string(),
             "thread/start".to_string(),
+            "initialize".to_string(),
+            "initialized".to_string(),
+            "thread/start".to_string(),
             "turn/start".to_string(),
             "turn/start".to_string(),
         ]
+    );
+    let app_server_starts = harness.app_server_starts();
+    assert_eq!(app_server_starts.len(), 2);
+    assert!(
+        app_server_starts[0]
+            .request
+            .cmd
+            .iter()
+            .any(|part| part.contains("model_reasoning_effort=\"high\""))
+    );
+    assert!(
+        app_server_starts[1]
+            .request
+            .cmd
+            .iter()
+            .any(|part| part.contains("model_reasoning_effort=\"xhigh\""))
     );
 
     let run = runner
@@ -3531,7 +3541,7 @@ async fn run_review_with_fake_runtime_security_lane_uses_turn_start_and_shared_t
         .get_run_history(run_history_id)
         .await?
         .expect("run history");
-    assert_eq!(run.thread_id.as_deref(), Some("thread-1"));
+    assert_eq!(run.thread_id.as_deref(), Some("thread-review"));
     assert_eq!(run.turn_id.as_deref(), Some("turn-review"));
     assert_eq!(run.review_thread_id, None);
     assert_eq!(run.security_context_source_run_id, Some(run_history_id));
@@ -3612,7 +3622,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-1".to_string(),
+            container_id: "app-2".to_string(),
             command: vec![
                 "mktemp".to_string(),
                 "-d".to_string(),
@@ -3629,7 +3639,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-1".to_string(),
+            container_id: "app-2".to_string(),
             command: auxiliary_git_exec_command(&[
                 "worktree".to_string(),
                 "add".to_string(),
@@ -3648,7 +3658,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-1".to_string(),
+            container_id: "app-2".to_string(),
             command: auxiliary_git_exec_command(&[
                 "worktree".to_string(),
                 "remove".to_string(),
@@ -3666,7 +3676,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-2".to_string(),
+            container_id: "app-3".to_string(),
             command: auxiliary_git_exec_command(&[
                 "merge-base".to_string(),
                 "HEAD".to_string(),
@@ -3683,7 +3693,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-2".to_string(),
+            container_id: "app-3".to_string(),
             command: auxiliary_git_exec_command(&[
                 "rev-parse".to_string(),
                 "refs/remotes/origin/main".to_string(),
@@ -3699,15 +3709,21 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
     );
 
     harness.push_app_server(scripted_security_review_server(
-        "thread-1",
-        Some("turn-threat-1"),
-        Some(security_context_json),
-        200,
+        "thread-review-1",
+        None,
+        None,
+        0,
         "turn-review-1",
         security_review_json,
     ));
+    harness.push_app_server(scripted_security_context_server(
+        "thread-context-1",
+        "turn-threat-1",
+        security_context_json,
+        200,
+    ));
     harness.push_app_server(scripted_security_review_server(
-        "thread-2",
+        "thread-review-2",
         None,
         None,
         0,
@@ -3803,7 +3819,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
         .get_run_history(run_history_id_2)
         .await?
         .expect("follower run history");
-    assert_eq!(follower_run.thread_id.as_deref(), Some("thread-2"));
+    assert_eq!(follower_run.thread_id.as_deref(), Some("thread-review-2"));
     let follower_events = runner
         .state
         .list_run_history_events(run_history_id_2)
@@ -3813,6 +3829,29 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
         .filter_map(|event| event.turn_id.as_deref())
         .collect::<BTreeSet<_>>();
     assert_eq!(follower_turn_ids, BTreeSet::from(["turn-review-2"]));
+    let app_server_starts = harness.app_server_starts();
+    assert_eq!(app_server_starts.len(), 3);
+    assert!(
+        app_server_starts[0]
+            .request
+            .cmd
+            .iter()
+            .any(|part| part.contains("model_reasoning_effort=\"high\""))
+    );
+    assert!(
+        app_server_starts[1]
+            .request
+            .cmd
+            .iter()
+            .any(|part| part.contains("model_reasoning_effort=\"xhigh\""))
+    );
+    assert!(
+        app_server_starts[2]
+            .request
+            .cmd
+            .iter()
+            .any(|part| part.contains("model_reasoning_effort=\"high\""))
+    );
     Ok(())
 }
 
@@ -3857,7 +3896,7 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-1".to_string(),
+            container_id: "app-2".to_string(),
             command: vec![
                 "mktemp".to_string(),
                 "-d".to_string(),
@@ -3874,7 +3913,7 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-1".to_string(),
+            container_id: "app-2".to_string(),
             command: auxiliary_git_exec_command(&[
                 "worktree".to_string(),
                 "add".to_string(),
@@ -3893,7 +3932,7 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-1".to_string(),
+            container_id: "app-2".to_string(),
             command: auxiliary_git_exec_command(&[
                 "worktree".to_string(),
                 "remove".to_string(),
@@ -3911,7 +3950,7 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-2".to_string(),
+            container_id: "app-3".to_string(),
             command: auxiliary_git_exec_command(&[
                 "merge-base".to_string(),
                 "HEAD".to_string(),
@@ -3928,7 +3967,7 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
     );
     harness.push_exec_output(
         ExecContainerCommandRequest {
-            container_id: "app-2".to_string(),
+            container_id: "app-3".to_string(),
             command: auxiliary_git_exec_command(&[
                 "rev-parse".to_string(),
                 "refs/remotes/origin/main".to_string(),
@@ -3944,15 +3983,21 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
     );
 
     harness.push_app_server(scripted_security_review_server(
-        "thread-1",
-        Some("turn-threat-fail"),
-        Some("not-json"),
-        200,
+        "thread-review-1",
+        None,
+        None,
+        0,
         "turn-review-1",
         security_review_json,
     ));
+    harness.push_app_server(scripted_security_context_server(
+        "thread-context-1",
+        "turn-threat-fail",
+        "not-json",
+        200,
+    ));
     harness.push_app_server(scripted_security_review_server(
-        "thread-2",
+        "thread-review-2",
         None,
         None,
         0,
@@ -4051,6 +4096,7 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
         .await?
         .expect("follower run history");
     assert!(follower_run.security_context_payload_json.is_none());
+    assert_eq!(follower_run.thread_id.as_deref(), Some("thread-review-2"));
     Ok(())
 }
 

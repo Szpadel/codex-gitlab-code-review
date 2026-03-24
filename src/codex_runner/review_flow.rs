@@ -49,7 +49,6 @@ struct SecurityContextPayloadResolution {
     payload_json: Option<String>,
     source_run_history_id: Option<i64>,
     base_head_sha: Option<String>,
-    worktree_path: Option<String>,
     generated_at: Option<i64>,
     expires_at: Option<i64>,
     build_guard: Option<SecurityContextBuildCompletionGuard>,
@@ -585,7 +584,6 @@ impl DockerCodexRunner {
                 source_run_history_id: (entry.source_run_history_id > 0)
                     .then_some(entry.source_run_history_id),
                 base_head_sha: Some(base_head_sha),
-                worktree_path: None,
                 generated_at: Some(entry.generated_at),
                 expires_at: Some(entry.expires_at),
                 build_guard: None,
@@ -617,24 +615,15 @@ impl DockerCodexRunner {
                         source_run_history_id: (entry.source_run_history_id > 0)
                             .then_some(entry.source_run_history_id),
                         base_head_sha: Some(base_head_sha),
-                        worktree_path: None,
                         generated_at: Some(entry.generated_at),
                         expires_at: Some(entry.expires_at),
                         build_guard: None,
                     });
                 }
-                let worktree_path = self
-                    .create_security_context_worktree(
-                        container_id,
-                        repo_path,
-                        base_head_sha.as_str(),
-                    )
-                    .await?;
                 Ok(SecurityContextPayloadResolution {
                     payload_json: None,
                     source_run_history_id: None,
                     base_head_sha: Some(base_head_sha),
-                    worktree_path: Some(worktree_path),
                     generated_at: None,
                     expires_at: None,
                     build_guard: Some(build_guard),
@@ -666,7 +655,6 @@ impl DockerCodexRunner {
                         source_run_history_id: (entry.source_run_history_id > 0)
                             .then_some(entry.source_run_history_id),
                         base_head_sha: Some(base_head_sha),
-                        worktree_path: None,
                         generated_at: Some(entry.generated_at),
                         expires_at: Some(entry.expires_at),
                         build_guard: None,
@@ -683,7 +671,6 @@ impl DockerCodexRunner {
                     payload_json: None,
                     source_run_history_id: None,
                     base_head_sha: Some(base_head_sha),
-                    worktree_path: None,
                     generated_at: None,
                     expires_at: None,
                     build_guard: None,
@@ -748,6 +735,95 @@ impl DockerCodexRunner {
         }
     }
 
+    async fn build_security_context_with_separate_session(
+        &self,
+        ctx: &ReviewContext,
+        account: &AuthAccount,
+        browser_mcp: Option<&BrowserMcpConfig>,
+        repo_path: &str,
+        base_branch: &str,
+        base_head_sha: &str,
+        extra_session_container: Arc<Mutex<Option<(String, Option<String>)>>>,
+    ) -> Result<String> {
+        let script = self.command(
+            ctx,
+            AppServerCommandOptions {
+                browser_mcp,
+                gitlab_discovery_mcp: None,
+                mcp_server_overrides: &self.codex.mcp_server_overrides.review,
+                reasoning_summary: None,
+                reasoning_effort: None,
+            },
+            self.security_context_reasoning_effort(),
+        )?;
+        let StartedAppServer {
+            container_id,
+            browser_container_id,
+            mut client,
+        } = self
+            .start_app_server_container(
+                script,
+                &account.auth_host_path,
+                Vec::new(),
+                Vec::new(),
+                browser_mcp,
+                Vec::new(),
+            )
+            .await?;
+        {
+            let mut slot = extra_session_container
+                .lock()
+                .expect("security context extra session lock poisoned");
+            *slot = Some((container_id.clone(), browser_container_id.clone()));
+        }
+
+        let build_result = async {
+            client.initialize().await?;
+            client.initialized().await?;
+            let worktree_path = self
+                .create_security_context_worktree(&container_id, repo_path, base_head_sha)
+                .await?;
+            let thread_response = client
+                .request(
+                    "thread/start",
+                    self.thread_start_params(repo_path, None, &[worktree_path.to_string()]),
+                )
+                .await?;
+            let thread_id = thread_response
+                .get("thread")
+                .and_then(|thread| thread.get("id"))
+                .and_then(|id| id.as_str())
+                .ok_or_else(|| anyhow!("thread/start missing thread id for security context"))?
+                .to_string();
+            let build_result = self
+                .build_security_context_payload(
+                    ctx,
+                    &mut client,
+                    None,
+                    &thread_id,
+                    &worktree_path,
+                    base_branch,
+                    base_head_sha,
+                )
+                .await;
+            self.remove_security_context_worktree(&container_id, repo_path, &worktree_path)
+                .await;
+            build_result
+        }
+        .await;
+
+        self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
+            .await;
+        {
+            let mut slot = extra_session_container
+                .lock()
+                .expect("security context extra session lock poisoned");
+            *slot = None;
+        }
+
+        build_result
+    }
+
     pub(crate) async fn run_app_server_review_with_account(
         &self,
         ctx: &ReviewContext,
@@ -771,6 +847,11 @@ impl DockerCodexRunner {
                 mcp_server_overrides: &self.codex.mcp_server_overrides.review,
                 reasoning_summary: None,
                 reasoning_effort: None,
+            },
+            if ctx.lane.is_security() {
+                self.security_review_reasoning_effort()
+            } else {
+                self.review_reasoning_effort()
             },
         )?;
         let gitlab_discovery_extra_hosts = gitlab_discovery_mcp
@@ -837,6 +918,7 @@ impl DockerCodexRunner {
         .await;
         let run_timeout = Duration::from_secs(self.codex.timeout_seconds);
         let run_started_at = Instant::now();
+        let extra_security_context_session = Arc::new(Mutex::new(None::<(String, Option<String>)>));
         let review_result = timeout(
             run_timeout.saturating_sub(run_started_at.elapsed()),
             async {
@@ -857,7 +939,7 @@ impl DockerCodexRunner {
                         ctx.run_history_id,
                     )
                     .await;
-                let mut extra_writable_roots = gitlab_discovery_mcp
+                let extra_writable_roots = gitlab_discovery_mcp
                     .as_ref()
                     .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
                     .unwrap_or_default();
@@ -901,9 +983,6 @@ impl DockerCodexRunner {
                             .await
                         {
                             Ok(resolution) => {
-                                if let Some(worktree_path) = resolution.worktree_path.as_ref() {
-                                    extra_writable_roots.push(worktree_path.clone());
-                                }
                                 security_context_resolution = resolution;
                                 security_context_base_branch = Some(branch.to_string());
                             }
@@ -931,42 +1010,14 @@ impl DockerCodexRunner {
                         "thread/start",
                         self.thread_start_params(repo_path.as_str(), None, &extra_writable_roots),
                     )
-                    .await;
-                let thread_response = match thread_response {
-                    Ok(response) => response,
-                    Err(err) => {
-                        if let Some(worktree_path) =
-                            security_context_resolution.worktree_path.as_deref()
-                        {
-                            self.remove_security_context_worktree(
-                                &container_id,
-                                repo_path.as_str(),
-                                worktree_path,
-                            )
-                            .await;
-                        }
-                        return Err(err);
-                    }
-                };
+                    .await?;
                 let thread_id = match thread_response
                     .get("thread")
                     .and_then(|thread| thread.get("id"))
                     .and_then(|id| id.as_str())
                 {
                     Some(thread_id) => thread_id.to_string(),
-                    None => {
-                        if let Some(worktree_path) =
-                            security_context_resolution.worktree_path.as_deref()
-                        {
-                            self.remove_security_context_worktree(
-                                &container_id,
-                                repo_path.as_str(),
-                                worktree_path,
-                            )
-                            .await;
-                        }
-                        bail!("thread/start missing thread id");
-                    }
+                    None => bail!("thread/start missing thread id"),
                 };
                 let mut session_update = Self::security_context_session_update(
                     security_context_base_branch.as_deref(),
@@ -977,30 +1028,25 @@ impl DockerCodexRunner {
                 self.update_run_history_session(ctx.run_history_id, session_update)
                     .await;
                 if ctx.lane.is_security() {
-                    if let (Some(worktree_path), Some(base_branch), Some(base_head_sha)) = (
-                        security_context_resolution.worktree_path.as_deref(),
-                        security_context_base_branch.as_deref(),
-                        security_context_resolution.base_head_sha.as_deref(),
-                    ) {
+                    if security_context_resolution.build_guard.is_some() {
+                        let base_branch = security_context_base_branch
+                            .as_deref()
+                            .expect("security context base branch set when build is pending");
+                        let base_head_sha = security_context_resolution
+                            .base_head_sha
+                            .as_deref()
+                            .expect("security context base head SHA set when build is pending");
                         let build_result = self
-                            .build_security_context_payload(
+                            .build_security_context_with_separate_session(
                                 ctx,
-                                &mut client,
-                                gitlab_discovery_mcp
-                                    .as_ref()
-                                    .map(|prepared| prepared.runtime_config.server_name.as_str()),
-                                &thread_id,
-                                worktree_path,
+                                account,
+                                browser_mcp,
+                                repo_path.as_str(),
                                 base_branch,
                                 base_head_sha,
+                                Arc::clone(&extra_security_context_session),
                             )
                             .await;
-                        self.remove_security_context_worktree(
-                            &container_id,
-                            repo_path.as_str(),
-                            worktree_path,
-                        )
-                        .await;
                         let mut build_guard = security_context_resolution.build_guard.take();
                         match build_result {
                             Ok(payload_json) => {
@@ -1205,6 +1251,22 @@ impl DockerCodexRunner {
                 )
                 .await),
         };
+
+        let extra_security_context_session = {
+            let mut slot = extra_security_context_session
+                .lock()
+                .expect("security context extra session lock poisoned");
+            slot.take()
+        };
+        if let Some((extra_container_id, extra_browser_container_id)) =
+            extra_security_context_session
+        {
+            self.cleanup_app_server_containers(
+                &extra_container_id,
+                extra_browser_container_id.as_deref(),
+            )
+            .await;
+        }
 
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
             .await;

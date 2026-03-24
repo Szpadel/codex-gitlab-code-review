@@ -212,6 +212,16 @@ data:
 {{- else }}
         mention: null
 {{- end }}
+{{- if .Values.config.codex.reasoningEffort.securityContext }}
+        security_context: {{ .Values.config.codex.reasoningEffort.securityContext | quote }}
+{{- else }}
+        security_context: null
+{{- end }}
+{{- if .Values.config.codex.reasoningEffort.securityReview }}
+        security_review: {{ .Values.config.codex.reasoningEffort.securityReview | quote }}
+{{- else }}
+        security_review: null
+{{- end }}
       reasoning_summary:
 {{- if .Values.config.codex.reasoningSummary.review }}
         review: {{ .Values.config.codex.reasoningSummary.review | quote }}

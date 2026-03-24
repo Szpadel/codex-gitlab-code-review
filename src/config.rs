@@ -276,12 +276,27 @@ pub struct McpServerOverridesConfig {
     pub mention: BTreeMap<String, bool>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ReasoningEffortOverridesConfig {
     #[serde(default)]
     pub review: Option<String>,
     #[serde(default)]
     pub mention: Option<String>,
+    #[serde(default = "default_security_context_reasoning_effort_override")]
+    pub security_context: Option<String>,
+    #[serde(default = "default_security_review_reasoning_effort_override")]
+    pub security_review: Option<String>,
+}
+
+impl Default for ReasoningEffortOverridesConfig {
+    fn default() -> Self {
+        Self {
+            review: None,
+            mention: None,
+            security_context: default_security_context_reasoning_effort_override(),
+            security_review: default_security_review_reasoning_effort_override(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -338,6 +353,14 @@ fn default_browser_mcp_args() -> Vec<String> {
 
 fn default_reasoning_summary_override() -> Option<String> {
     Some("detailed".to_string())
+}
+
+fn default_security_context_reasoning_effort_override() -> Option<String> {
+    Some("xhigh".to_string())
+}
+
+fn default_security_review_reasoning_effort_override() -> Option<String> {
+    Some("high".to_string())
 }
 
 fn default_gitlab_discovery_mcp_server_name() -> String {
@@ -824,6 +847,14 @@ fn validate_reasoning_effort_overrides(codex: &CodexConfig) -> Result<()> {
     for (field, value) in [
         ("review", codex.reasoning_effort.review.as_deref()),
         ("mention", codex.reasoning_effort.mention.as_deref()),
+        (
+            "security_context",
+            codex.reasoning_effort.security_context.as_deref(),
+        ),
+        (
+            "security_review",
+            codex.reasoning_effort.security_review.as_deref(),
+        ),
     ] {
         let Some(value) = value else {
             continue;

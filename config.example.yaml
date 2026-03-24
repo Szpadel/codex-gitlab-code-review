@@ -192,6 +192,8 @@ codex:
   reasoning_effort:
     review: "high"
     mention: "low"
+    security_context: "xhigh"
+    security_review: "high"
   # Optional. Per-mode reasoning summary overrides for Codex app-server sessions.
   # Defaults restore readable reasoning summaries even if upstream model defaults change.
   # Supported values: none, auto, detailed.
