@@ -60,7 +60,6 @@ config:
     # upstream review target prompt templates when set.
     additionalDeveloperInstructions: null
     security:
-      debounce: null
       contextTtlSeconds: 1209600
       minConfidenceScore: 0.85
       commentMarkerPrefix: "<!-- codex-security-review:sha="

@@ -84,11 +84,6 @@ data:
       additional_developer_instructions: null
 {{- end }}
       security:
-{{- if .Values.config.review.security.debounce }}
-        debounce: {{ .Values.config.review.security.debounce | quote }}
-{{- else }}
-        debounce: null
-{{- end }}
         context_ttl_seconds: {{ .Values.config.review.security.contextTtlSeconds }}
         min_confidence_score: {{ .Values.config.review.security.minConfidenceScore }}
         comment_marker_prefix: {{ .Values.config.review.security.commentMarkerPrefix | quote }}

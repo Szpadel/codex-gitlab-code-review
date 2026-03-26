@@ -5,7 +5,10 @@ use crate::flow::review_comments::post_review_comment;
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
 use crate::review_lane::ReviewLane;
-use crate::state::{NewRunHistory, ReviewStateStore, RunHistoryFinish, RunHistoryKind};
+use crate::state::{
+    NewRunHistory, ReviewRateLimitAcquireOutcome, ReviewStateStore, RunHistoryFinish,
+    RunHistoryKind,
+};
 use anyhow::{Error, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -101,7 +104,7 @@ pub(crate) enum ReviewScheduleOutcome {
     Scheduled,
     Disabled,
     SkippedBackoff,
-    SkippedDebounce,
+    SkippedRateLimit,
     SkippedAward,
     SkippedMarker,
     SkippedCompleted,
@@ -110,8 +113,12 @@ pub(crate) enum ReviewScheduleOutcome {
 }
 
 enum ReviewGateOutcome {
-    Ready,
+    Ready(ReviewGateReady),
     Decision(ReviewScheduleOutcome),
+}
+
+struct ReviewGateReady {
+    acquired_rule_ids: Vec<String>,
 }
 
 pub(crate) struct ReviewFlow {
@@ -245,33 +252,6 @@ impl ReviewFlow {
                 ReviewScheduleOutcome::SkippedBackoff,
             ));
         }
-        let due_security_rerun = if self.lane.is_security() {
-            match self.shared.config.review.security.debounce {
-                Some(_) => {
-                    // Security debounce is MR-wide, not SHA-specific: any update inside the
-                    // window waits until the timer expires, and only then is the next run eligible.
-                    match self
-                        .shared
-                        .state
-                        .get_security_review_debounce(repo, mr.iid)
-                        .await?
-                    {
-                        Some(state) => {
-                            if now < state.next_eligible_at {
-                                return Ok(ReviewGateOutcome::Decision(
-                                    ReviewScheduleOutcome::SkippedDebounce,
-                                ));
-                            }
-                            true
-                        }
-                        None => false,
-                    }
-                }
-                None => false,
-            }
-        } else {
-            false
-        };
         if self.uses_awards() {
             let awards = self.shared.gitlab.list_awards(repo, mr.iid).await?;
             if has_bot_award(
@@ -290,8 +270,7 @@ impl ReviewFlow {
             self.shared.bot_user_id,
             self.review_marker_prefix(),
             head_sha,
-        ) && !due_security_rerun
-        {
+        ) {
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::SkippedMarker,
             ));
@@ -307,10 +286,7 @@ impl ReviewFlow {
             .state
             .review_result_for_lane(repo, mr.iid, head_sha, self.lane)
             .await?;
-        if self.lane.is_security()
-            && !due_security_rerun
-            && matches!(review_result.as_deref(), Some("pass" | "comment"))
-        {
+        if self.lane.is_security() && matches!(review_result.as_deref(), Some("pass" | "comment")) {
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::SkippedCompleted,
             ));
@@ -325,8 +301,7 @@ impl ReviewFlow {
                         self.shared.bot_user_id,
                         head_sha,
                         self.finding_marker_prefix(),
-                    ) && !due_security_rerun
-                        && review_result.as_deref() != Some("error")
+                    ) && review_result.as_deref() != Some("error")
                         && (completed_inline_review || review_result.as_deref() == Some("comment"))
                     {
                         return Ok(ReviewGateOutcome::Decision(
@@ -370,16 +345,78 @@ impl ReviewFlow {
                 ReviewScheduleOutcome::SkippedLocked,
             ));
         }
+        let acquired_rule_ids = match self
+            .shared
+            .state
+            .try_consume_review_rate_limits(self.lane, repo, mr.iid, now)
+            .await
+        {
+            Err(err) => {
+                self.release_review_lock_after_gate_failure(repo, mr.iid, head_sha, &err)
+                    .await;
+                return Err(err);
+            }
+            Ok(ReviewRateLimitAcquireOutcome::Unmatched) => Vec::new(),
+            Ok(ReviewRateLimitAcquireOutcome::Acquired { rule_ids }) => rule_ids,
+            Ok(ReviewRateLimitAcquireOutcome::Blocked { next_retry_at }) => {
+                self.shared
+                    .state
+                    .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, "cancelled")
+                    .await?;
+                self.shared
+                    .state
+                    .upsert_review_rate_limit_pending(
+                        self.lane,
+                        repo,
+                        mr.iid,
+                        head_sha,
+                        now,
+                        next_retry_at,
+                    )
+                    .await?;
+                return Ok(ReviewGateOutcome::Decision(
+                    ReviewScheduleOutcome::SkippedRateLimit,
+                ));
+            }
+        };
         if self.shared.shutdown_requested() {
-            self.shared
+            let refund_err = if acquired_rule_ids.is_empty() {
+                None
+            } else {
+                self.shared
+                    .state
+                    .refund_review_rate_limit_rules(&acquired_rule_ids, now)
+                    .await
+                    .err()
+            };
+            if let Err(lock_err) = self
+                .shared
                 .state
                 .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, "cancelled")
-                .await?;
+                .await
+            {
+                if let Some(refund_err) = refund_err {
+                    warn!(
+                        repo = repo,
+                        iid = mr.iid,
+                        head_sha = head_sha,
+                        lane = self.lane.as_str(),
+                        error = %refund_err,
+                        "failed to refund rate limit rules while shutting down review gate"
+                    );
+                }
+                return Err(lock_err);
+            }
+            if let Some(refund_err) = refund_err {
+                return Err(refund_err);
+            }
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::Interrupted,
             ));
         }
-        Ok(ReviewGateOutcome::Ready)
+        Ok(ReviewGateOutcome::Ready(ReviewGateReady {
+            acquired_rule_ids,
+        }))
     }
 
     pub(crate) async fn schedule_for_scan(
@@ -389,10 +426,10 @@ impl ReviewFlow {
         head_sha: &str,
         tasks: &mut Vec<JoinHandle<()>>,
     ) -> Result<ReviewScheduleOutcome> {
-        match self.evaluate_review_gate(repo, &mr, head_sha).await? {
+        let acquired_rule_ids = match self.evaluate_review_gate(repo, &mr, head_sha).await? {
             ReviewGateOutcome::Decision(decision) => return Ok(decision),
-            ReviewGateOutcome::Ready => {}
-        }
+            ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
+        };
         let run_history_id = match self
             .shared
             .state
@@ -418,16 +455,28 @@ impl ReviewFlow {
         {
             Ok(run_history_id) => run_history_id,
             Err(err) => {
-                self.release_review_lock_after_history_failure(repo, mr.iid, head_sha)
-                    .await;
+                self.release_review_lock_after_history_failure(
+                    repo,
+                    mr.iid,
+                    head_sha,
+                    &acquired_rule_ids,
+                )
+                .await;
                 return Err(err);
             }
         };
         let feature_flags = match self.resolve_feature_flags().await {
             Ok(feature_flags) => feature_flags,
             Err(err) => {
-                self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
-                    .await;
+                self.abort_review_after_setup_failure(
+                    repo,
+                    mr.iid,
+                    head_sha,
+                    run_history_id,
+                    &acquired_rule_ids,
+                    &err,
+                )
+                .await;
                 return Err(err);
             }
         };
@@ -437,8 +486,30 @@ impl ReviewFlow {
             .set_run_history_feature_flags(run_history_id, &feature_flags)
             .await
         {
-            self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
-                .await;
+            self.abort_review_after_setup_failure(
+                repo,
+                mr.iid,
+                head_sha,
+                run_history_id,
+                &acquired_rule_ids,
+                &err,
+            )
+            .await;
+            return Err(err);
+        }
+        if let Err(err) = self
+            .clear_review_rate_limit_pending_if_needed(repo, mr.iid, &acquired_rule_ids)
+            .await
+        {
+            self.abort_review_after_setup_failure(
+                repo,
+                mr.iid,
+                head_sha,
+                run_history_id,
+                &acquired_rule_ids,
+                &err,
+            )
+            .await;
             return Err(err);
         }
         let repo_name = repo.to_string();
@@ -453,6 +524,7 @@ impl ReviewFlow {
             retry_backoff: Arc::clone(&self.retry_backoff),
             bot_user_id: self.shared.bot_user_id,
             shutdown: Arc::clone(&self.shared.shutdown),
+            acquired_rate_limit_rule_ids: acquired_rule_ids.clone(),
         };
         let head_sha = head_sha.to_string();
         tasks.push(tokio::spawn(async move {
@@ -485,10 +557,10 @@ impl ReviewFlow {
         mr: MergeRequest,
         head_sha: &str,
     ) -> Result<ReviewScheduleOutcome> {
-        match self.evaluate_review_gate(repo, &mr, head_sha).await? {
+        let acquired_rule_ids = match self.evaluate_review_gate(repo, &mr, head_sha).await? {
             ReviewGateOutcome::Decision(decision) => return Ok(decision),
-            ReviewGateOutcome::Ready => {}
-        }
+            ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
+        };
         let run_history_id = match self
             .shared
             .state
@@ -514,16 +586,28 @@ impl ReviewFlow {
         {
             Ok(run_history_id) => run_history_id,
             Err(err) => {
-                self.release_review_lock_after_history_failure(repo, mr.iid, head_sha)
-                    .await;
+                self.release_review_lock_after_history_failure(
+                    repo,
+                    mr.iid,
+                    head_sha,
+                    &acquired_rule_ids,
+                )
+                .await;
                 return Err(err);
             }
         };
         let feature_flags = match self.resolve_feature_flags().await {
             Ok(feature_flags) => feature_flags,
             Err(err) => {
-                self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
-                    .await;
+                self.abort_review_after_setup_failure(
+                    repo,
+                    mr.iid,
+                    head_sha,
+                    run_history_id,
+                    &acquired_rule_ids,
+                    &err,
+                )
+                .await;
                 return Err(err);
             }
         };
@@ -533,19 +617,48 @@ impl ReviewFlow {
             .set_run_history_feature_flags(run_history_id, &feature_flags)
             .await
         {
-            self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
-                .await;
+            self.abort_review_after_setup_failure(
+                repo,
+                mr.iid,
+                head_sha,
+                run_history_id,
+                &acquired_rule_ids,
+                &err,
+            )
+            .await;
             return Err(err);
         }
         let _permit = match self.shared.semaphore.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(err) => {
                 let err = Error::from(err);
-                self.abort_review_after_setup_failure(repo, mr.iid, head_sha, run_history_id, &err)
-                    .await;
+                self.abort_review_after_setup_failure(
+                    repo,
+                    mr.iid,
+                    head_sha,
+                    run_history_id,
+                    &acquired_rule_ids,
+                    &err,
+                )
+                .await;
                 return Err(err);
             }
         };
+        if let Err(err) = self
+            .clear_review_rate_limit_pending_if_needed(repo, mr.iid, &acquired_rule_ids)
+            .await
+        {
+            self.abort_review_after_setup_failure(
+                repo,
+                mr.iid,
+                head_sha,
+                run_history_id,
+                &acquired_rule_ids,
+                &err,
+            )
+            .await;
+            return Err(err);
+        }
         let review_context = ReviewRunContext {
             lane: self.lane,
             config: self.shared.config.clone(),
@@ -555,6 +668,7 @@ impl ReviewFlow {
             retry_backoff: Arc::clone(&self.retry_backoff),
             bot_user_id: self.shared.bot_user_id,
             shutdown: Arc::clone(&self.shared.shutdown),
+            acquired_rate_limit_rule_ids: acquired_rule_ids.clone(),
         };
         let _active_review = self.shared.active_tasks.track_review(ActiveReviewKey {
             lane: self.lane,
@@ -577,12 +691,68 @@ impl ReviewFlow {
         Ok(self.shared.config.resolve_feature_flags(&overrides))
     }
 
+    async fn clear_review_rate_limit_pending_if_needed(
+        &self,
+        repo: &str,
+        iid: u64,
+        acquired_rule_ids: &[String],
+    ) -> Result<()> {
+        if acquired_rule_ids.is_empty() {
+            return Ok(());
+        }
+        self.shared
+            .state
+            .clear_review_rate_limit_pending(self.lane, repo, iid)
+            .await
+    }
+
+    async fn release_review_lock_after_gate_failure(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        err: &anyhow::Error,
+    ) {
+        if let Err(recovery_err) = self
+            .shared
+            .state
+            .finish_review_for_lane(repo, iid, head_sha, self.lane, "error")
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                head_sha = head_sha,
+                lane = self.lane.as_str(),
+                error = %recovery_err,
+                cause = %err,
+                "failed to release review lock after review gate error"
+            );
+        }
+    }
+
     async fn release_review_lock_after_history_failure(
         &self,
         repo: &str,
         iid: u64,
         head_sha: &str,
+        acquired_rule_ids: &[String],
     ) {
+        if !acquired_rule_ids.is_empty()
+            && let Err(recovery_err) = self
+                .shared
+                .state
+                .refund_review_rate_limit_rules(acquired_rule_ids, Utc::now().timestamp())
+                .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                head_sha = head_sha,
+                error = %recovery_err,
+                "failed to refund rate limit rules after run history creation error"
+            );
+        }
         if let Err(recovery_err) = self
             .shared
             .state
@@ -605,9 +775,10 @@ impl ReviewFlow {
         iid: u64,
         head_sha: &str,
         run_history_id: i64,
+        acquired_rule_ids: &[String],
         err: &anyhow::Error,
     ) {
-        self.release_review_lock_after_history_failure(repo, iid, head_sha)
+        self.release_review_lock_after_history_failure(repo, iid, head_sha, acquired_rule_ids)
             .await;
         if let Err(recovery_err) = self
             .shared
@@ -662,6 +833,7 @@ pub(crate) struct ReviewRunContext {
     pub(crate) retry_backoff: Arc<RetryBackoff>,
     pub(crate) bot_user_id: u64,
     pub(crate) shutdown: Arc<AtomicBool>,
+    pub(crate) acquired_rate_limit_rule_ids: Vec<String>,
 }
 
 impl ReviewRunContext {
@@ -675,23 +847,6 @@ impl ReviewRunContext {
 
     fn shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
-    }
-
-    async fn arm_security_review_debounce(&self, repo: &str, iid: u64) -> Result<()> {
-        let Some(debounce_seconds) = self.config.review.security.debounce else {
-            return Ok(());
-        };
-        if !self.lane.is_security() {
-            return Ok(());
-        }
-        // The approved contract arms debounce on every started security run, including failures,
-        // so repeated MR updates do not trigger another run until the window expires.
-        let started_at = Utc::now().timestamp();
-        let next_eligible_at =
-            started_at.saturating_add(i64::try_from(debounce_seconds).ok().unwrap_or(i64::MAX));
-        self.state
-            .upsert_security_review_debounce(repo, iid, started_at, next_eligible_at)
-            .await
     }
 
     async fn resolve_review_project_path(&self, repo: &str, mr: &MergeRequest) -> String {
@@ -769,6 +924,14 @@ impl ReviewRunContext {
         run_history_id: i64,
     ) -> Result<()> {
         self.remove_eyes_best_effort(repo, iid).await;
+        if !self.acquired_rate_limit_rule_ids.is_empty() {
+            self.state
+                .refund_review_rate_limit_rules(
+                    &self.acquired_rate_limit_rule_ids,
+                    Utc::now().timestamp(),
+                )
+                .await?;
+        }
         self.retry_backoff.clear(retry_key);
         self.state
             .finish_review_for_lane(repo, iid, head_sha, self.lane, "cancelled")
@@ -795,6 +958,23 @@ impl ReviewRunContext {
         run_history_id: i64,
         err: &anyhow::Error,
     ) {
+        if !self.acquired_rate_limit_rule_ids.is_empty()
+            && let Err(recovery_err) = self
+                .state
+                .refund_review_rate_limit_rules(
+                    &self.acquired_rate_limit_rule_ids,
+                    Utc::now().timestamp(),
+                )
+                .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                head_sha = head_sha,
+                error = %recovery_err,
+                "failed to refund rate limit rules after queued review setup error"
+            );
+        }
         if let Err(recovery_err) = self
             .state
             .finish_review_for_lane(repo, iid, head_sha, self.lane, "error")
@@ -846,7 +1026,6 @@ impl ReviewRunContext {
                 .await?;
             return Ok(());
         }
-        self.arm_security_review_debounce(repo, mr.iid).await?;
 
         if self.config.review.dry_run || !self.uses_awards() {
             info!(repo = repo, iid = mr.iid, "dry run: skipping eyes award");

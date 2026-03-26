@@ -98,26 +98,6 @@ pub(crate) fn seconds_from_numeric_value(value: f64, unit_seconds: i64) -> i64 {
     }
 }
 
-pub(crate) fn parse_duration_seconds_strict(text: &str) -> Option<i64> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let total = parse_duration_seconds_from_text(trimmed)?;
-    let normalized = trimmed
-        .split_whitespace()
-        .filter(|token| !matches!(*token, "and" | "then"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let reparsed = normalized
-        .split_whitespace()
-        .try_fold(0i64, |acc, token| {
-            parse_duration_token_seconds(token).map(|seconds| acc.saturating_add(seconds))
-        })
-        .filter(|seconds| *seconds > 0)?;
-    (reparsed == total).then_some(total)
-}
-
 pub(crate) fn safe_cooldown_duration(cooldown_seconds: u64) -> ChronoDuration {
     let seconds = i64::try_from(cooldown_seconds).ok().unwrap_or(i64::MAX);
     safe_duration_from_seconds(seconds)

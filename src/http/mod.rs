@@ -4,6 +4,8 @@ mod timestamp;
 mod transcript;
 mod view;
 
+use crate::state::{ReviewRateLimitRuleUpsert, ReviewRateLimitScope};
+use anyhow::Context;
 use axum::{
     Form, Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -12,14 +14,15 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::error;
 
 pub use status::StatusService;
 use view::{
-    render_history_page, render_mr_history_page, render_run_detail_page, render_skill_detail_page,
-    render_skills_page, render_status_page,
+    render_history_page, render_mr_history_page, render_rate_limits_page, render_run_detail_page,
+    render_skill_detail_page, render_skills_page, render_status_page,
 };
 
 const MAX_SKILL_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
@@ -41,8 +44,22 @@ pub fn app_router(status_service: Arc<StatusService>) -> Router {
             .route("/history/{run_id}", get(run_detail_page))
             .route("/mr/{repo_key}/{iid}/history", get(mr_history_page))
             .route("/skills", get(skills_page))
+            .route("/rate-limits", get(rate_limits_page))
             .route("/skills/{skill_name}", get(skill_detail_page))
             .route("/skills/{skill_name}/delete", post(delete_skill))
+            .route("/rate-limits/create", post(create_rate_limit_rule))
+            .route(
+                "/rate-limits/{rule_id}/update",
+                post(update_rate_limit_rule),
+            )
+            .route(
+                "/rate-limits/{rule_id}/delete",
+                post(delete_rate_limit_rule),
+            )
+            .route(
+                "/rate-limits/{rule_id}/regen",
+                post(regen_rate_limit_bucket_slot),
+            )
             .route("/api/status", get(status_json))
             .route(
                 "/api/feature-flags/{flag_name}",
@@ -192,6 +209,68 @@ async fn skill_detail_page(
     )))
 }
 
+async fn rate_limits_page(
+    State(status_service): State<Arc<StatusService>>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    let snapshot = status_service.review_rate_limit_snapshot().await?;
+    Ok(Html(render_rate_limits_page(
+        &snapshot,
+        Some(status_service.admin_csrf_token()),
+    )))
+}
+
+async fn create_rate_limit_rule(
+    State(status_service): State<Arc<StatusService>>,
+    Form(form): Form<RateLimitRuleForm>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    require_admin_csrf_form_token(Some(&form.csrf_token), status_service.admin_csrf_token())?;
+    let upsert = parse_rate_limit_rule_upsert(form)
+        .with_context(|| "invalid create rate limit rule form")?;
+    status_service
+        .create_review_rate_limit_rule(&upsert)
+        .await?;
+    Ok(Redirect::to("/rate-limits"))
+}
+
+async fn update_rate_limit_rule(
+    State(status_service): State<Arc<StatusService>>,
+    Path(rule_id): Path<String>,
+    Form(form): Form<RateLimitRuleForm>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    require_admin_csrf_form_token(Some(&form.csrf_token), status_service.admin_csrf_token())?;
+    let mut upsert = parse_rate_limit_rule_upsert(form)
+        .with_context(|| "invalid update rate limit rule form")?;
+    upsert.id = Some(rule_id);
+    status_service
+        .update_review_rate_limit_rule(&upsert)
+        .await?;
+    Ok(Redirect::to("/rate-limits"))
+}
+
+async fn delete_rate_limit_rule(
+    State(status_service): State<Arc<StatusService>>,
+    Path(rule_id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    require_admin_csrf_form_token(Some(&form.csrf_token), status_service.admin_csrf_token())?;
+    status_service
+        .delete_review_rate_limit_rule(&rule_id)
+        .await?;
+    Ok(Redirect::to("/rate-limits"))
+}
+
+async fn regen_rate_limit_bucket_slot(
+    State(status_service): State<Arc<StatusService>>,
+    Path(rule_id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    require_admin_csrf_form_token(Some(&form.csrf_token), status_service.admin_csrf_token())?;
+    status_service
+        .refund_one_review_rate_limit_bucket_slot(&rule_id)
+        .await?;
+    Ok(Redirect::to("/rate-limits"))
+}
+
 async fn upload_skill(
     State(status_service): State<Arc<StatusService>>,
     mut multipart: Multipart,
@@ -285,6 +364,48 @@ struct FeatureFlagUpdateJson {
 #[derive(Debug, Deserialize)]
 struct CsrfForm {
     csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitRuleForm {
+    csrf_token: String,
+    label: String,
+    scope: String,
+    scope_repo: String,
+    scope_iid: Option<String>,
+    applies_to_review: Option<bool>,
+    applies_to_security: Option<bool>,
+    capacity: u64,
+    window_seconds: u64,
+}
+
+fn parse_rate_limit_rule_upsert(
+    form: RateLimitRuleForm,
+) -> anyhow::Result<crate::state::ReviewRateLimitRuleUpsert> {
+    let scope_input = form.scope.trim();
+    let scope = ReviewRateLimitScope::from_str(scope_input)
+        .with_context(|| format!("invalid scope: {scope_input}"))?;
+    let scope_iid = form
+        .scope_iid
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .with_context(|| format!("invalid scope_iid: {value}"))
+        })
+        .transpose()?;
+    let capacity = u32::try_from(form.capacity).context("invalid capacity: must fit in u32")?;
+    Ok(ReviewRateLimitRuleUpsert {
+        id: None,
+        label: form.label,
+        scope_repo: form.scope_repo,
+        scope_iid,
+        applies_to_review: form.applies_to_review.unwrap_or(false),
+        applies_to_security: form.applies_to_security.unwrap_or(false),
+        scope,
+        capacity,
+        window_seconds: form.window_seconds,
+    })
 }
 
 fn require_feature_flag_csrf_header(

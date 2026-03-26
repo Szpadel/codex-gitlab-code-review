@@ -17,13 +17,64 @@ use crate::config::{
     ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
 };
 use crate::feature_flags::{FeatureFlagDefaults, FeatureFlagSnapshot};
+use crate::review_lane::ReviewLane;
 use crate::state::{
-    NewRunHistory, ReviewStateStore, RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord,
-    RunHistorySessionUpdate, SecurityReviewContextCacheEntry, TranscriptBackfillState,
+    NewRunHistory, ReviewRateLimitRuleUpsert, ReviewRateLimitScope, ReviewStateStore,
+    RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord, RunHistorySessionUpdate,
+    SecurityReviewContextCacheEntry, TranscriptBackfillState,
 };
 use crate::transcript_backfill::TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR;
+use anyhow::Result;
+use chrono::Utc;
 use serde_json::json;
 use std::sync::Arc;
+
+#[tokio::test]
+async fn review_rate_limit_snapshot_includes_rules_buckets_and_pending() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let rule_id = state
+        .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
+            id: None,
+            label: "Repository cap".to_string(),
+            scope_repo: "group/repo".to_string(),
+            scope_iid: None,
+            applies_to_review: true,
+            applies_to_security: true,
+            scope: ReviewRateLimitScope::Project,
+            capacity: 2,
+            window_seconds: 120,
+        })
+        .await?;
+
+    let now = Utc::now().timestamp();
+    state
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 99, now)
+        .await?;
+    state
+        .upsert_review_rate_limit_pending(
+            ReviewLane::General,
+            "group/repo",
+            99,
+            "abc123",
+            now,
+            now + 120,
+        )
+        .await?;
+
+    let status_service = StatusService::new(test_config(), state, false, None);
+    let snapshot = status_service.review_rate_limit_snapshot().await?;
+    assert_eq!(snapshot.rules.len(), 1);
+    assert_eq!(snapshot.rules[0].id, rule_id);
+    assert_eq!(snapshot.rules[0].scope_subject, "group/repo");
+    assert_eq!(snapshot.active_buckets.len(), 1);
+    assert_eq!(snapshot.active_buckets[0].rule_id, rule_id);
+    assert_eq!(snapshot.active_buckets[0].available_slots, 1.0);
+    assert_eq!(snapshot.pending.len(), 1);
+    assert_eq!(snapshot.pending[0].repo, "group/repo");
+    assert_eq!(snapshot.pending[0].iid, 99);
+    assert_eq!(snapshot.pending[0].last_seen_head_sha, "abc123");
+    Ok(())
+}
 
 #[test]
 fn primary_session_history_defaults_to_auth_host_sessions_dir() {

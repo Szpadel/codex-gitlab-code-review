@@ -281,6 +281,461 @@ async fn sync_security_review_debounce_state_prunes_closed_merge_requests() -> R
     Ok(())
 }
 
+fn review_rate_limit_rule(
+    id: &str,
+    label: &str,
+    scope: ReviewRateLimitScope,
+    scope_repo: &str,
+    scope_iid: Option<u64>,
+    applies_to_review: bool,
+    applies_to_security: bool,
+    capacity: u32,
+    window_seconds: u64,
+) -> ReviewRateLimitRuleUpsert {
+    ReviewRateLimitRuleUpsert {
+        id: Some(id.to_string()),
+        label: label.to_string(),
+        scope_repo: scope_repo.to_string(),
+        scope_iid,
+        applies_to_review,
+        applies_to_security,
+        scope,
+        capacity,
+        window_seconds,
+    }
+}
+
+fn assert_approx_eq(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < 1e-6,
+        "expected {expected}, got {actual}"
+    );
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-crud",
+            "Initial label",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            2,
+            100,
+        ))
+        .await?;
+
+    let rules = store.list_review_rate_limit_rules().await?;
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id, rule_id);
+    assert_eq!(rules[0].label, "Initial label".to_string());
+    assert_eq!(rules[0].scope_repo, "group/repo".to_string());
+    assert_eq!(rules[0].scope_iid, None);
+    assert_eq!(rules[0].scope_subject, "group/repo".to_string());
+    assert_eq!(rules[0].capacity, 2);
+
+    store
+        .update_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-crud",
+            "Updated label",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            true,
+            3,
+            200,
+        ))
+        .await?;
+
+    let rules = store.list_review_rate_limit_rules().await?;
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].label, "Updated label".to_string());
+    assert!(rules[0].applies_to_security);
+    assert_eq!(rules[0].capacity, 3);
+    assert_eq!(rules[0].window_seconds, 200);
+
+    store.delete_review_rate_limit_rule("rule-crud").await?;
+    let rules = store.list_review_rate_limit_rules().await?;
+    assert!(rules.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_refill_math_exposes_fractional_slots() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-refill",
+            "Refill math",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            2,
+            100,
+        ))
+        .await?;
+
+    let started_at = 1_000;
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 7, started_at)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
+            assert_eq!(rule_ids, vec![rule_id.clone()]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+
+    let buckets = store
+        .list_active_review_rate_limit_buckets(started_at + 25)
+        .await?;
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].rule_id, rule_id);
+    assert_eq!(buckets[0].scope_subject, "group/repo".to_string());
+    assert_approx_eq(buckets[0].available_slots, 1.5);
+    assert_eq!(buckets[0].next_slot_at, Some(started_at + 50));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_stacked_rules_block_only_when_every_bucket_is_empty() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let first_rule = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-a",
+            "First",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            1,
+            1_000,
+        ))
+        .await?;
+    let second_rule = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-b",
+            "Second",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            1,
+            1_000,
+        ))
+        .await?;
+
+    let started_at = 2_000;
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 1, started_at)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
+            let mut rule_ids = rule_ids;
+            rule_ids.sort();
+            assert_eq!(rule_ids, vec![first_rule.clone(), second_rule.clone()]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 1, started_at)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Blocked { next_retry_at } => {
+            assert_eq!(next_retry_at, started_at + 1_000);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_project_and_mr_scopes_do_not_cross_apply() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let project_rule = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-project",
+            "Project",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            3,
+            1_000,
+        ))
+        .await?;
+    let mr_rule = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-mr",
+            "MR",
+            ReviewRateLimitScope::MergeRequest,
+            "group/repo",
+            Some(10),
+            true,
+            false,
+            1,
+            1_000,
+        ))
+        .await?;
+
+    let started_at = 3_000;
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 10, started_at)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
+            let mut rule_ids = rule_ids;
+            rule_ids.sort();
+            assert_eq!(rule_ids, vec![mr_rule.clone(), project_rule.clone()]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 11, started_at)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
+            assert_eq!(rule_ids, vec![project_rule.clone()]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_shared_review_and_security_rules_use_one_bucket() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-shared",
+            "Shared",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            true,
+            2,
+            1_000,
+        ))
+        .await?;
+
+    let started_at = 4_000;
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 12, started_at)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
+            assert_eq!(rule_ids, vec![rule_id.clone()]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+    match store
+        .try_consume_review_rate_limits(ReviewLane::Security, "group/repo", 12, started_at)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
+            assert_eq!(rule_ids, vec![rule_id.clone()]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 12, started_at)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Blocked { next_retry_at } => {
+            assert_eq!(next_retry_at, started_at + 500);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_regen_one_slot_is_reflected_in_active_buckets() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-regen",
+            "Regen",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            2,
+            100,
+        ))
+        .await?;
+
+    let started_at = 5_000;
+    store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 13, started_at)
+        .await?;
+    store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 13, started_at)
+        .await?;
+    store
+        .refund_review_rate_limit_rules(std::slice::from_ref(&rule_id), started_at)
+        .await?;
+
+    let buckets = store
+        .list_active_review_rate_limit_buckets(started_at)
+        .await?;
+    assert_eq!(buckets.len(), 1);
+    assert_approx_eq(buckets[0].available_slots, 1.0);
+    assert_eq!(buckets[0].next_slot_at, Some(started_at + 50));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_auto_deletes_full_bucket_rows() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let _rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-auto-delete",
+            "Auto delete",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            1,
+            100,
+        ))
+        .await?;
+
+    let started_at = 6_000;
+    store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 14, started_at)
+        .await?;
+
+    let buckets = store
+        .list_active_review_rate_limit_buckets(started_at + 100)
+        .await?;
+    assert!(buckets.is_empty());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_review_rate_limit_bucket")
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_pending_deduplicates_rows() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    store
+        .upsert_review_rate_limit_pending(ReviewLane::General, "group/repo", 15, "sha-1", 100, 500)
+        .await?;
+    store
+        .upsert_review_rate_limit_pending(ReviewLane::General, "group/repo", 15, "sha-2", 150, 700)
+        .await?;
+
+    let rows = store.list_review_rate_limit_pending().await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].lane, ReviewLane::General);
+    assert_eq!(rows[0].repo, "group/repo".to_string());
+    assert_eq!(rows[0].iid, 15);
+    assert_eq!(rows[0].first_blocked_at, 100);
+    assert_eq!(rows[0].last_blocked_at, 150);
+    assert_eq!(rows[0].last_seen_head_sha, "sha-2".to_string());
+    assert_eq!(rows[0].next_retry_at, 700);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_pending_clear_removes_row() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    store
+        .upsert_review_rate_limit_pending(ReviewLane::Security, "group/repo", 18, "sha-1", 100, 500)
+        .await?;
+
+    store
+        .clear_review_rate_limit_pending(ReviewLane::Security, "group/repo", 18)
+        .await?;
+    assert!(store.list_review_rate_limit_pending().await?.is_empty());
+    assert_eq!(
+        store.earliest_review_rate_limit_pending_retry_at().await?,
+        None
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_earliest_pending_retry_tracks_minimum() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    store
+        .upsert_review_rate_limit_pending(ReviewLane::General, "group/repo", 16, "sha-1", 100, 500)
+        .await?;
+    store
+        .upsert_review_rate_limit_pending(ReviewLane::Security, "group/repo", 17, "sha-2", 120, 300)
+        .await?;
+
+    let earliest = store.earliest_review_rate_limit_pending_retry_at().await?;
+    assert_eq!(earliest, Some(300));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_consume_and_refund_roundtrip() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-roundtrip",
+            "Roundtrip",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            2,
+            1_000,
+        ))
+        .await?;
+
+    let started_at = 7_000;
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 18, started_at)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
+            assert_eq!(rule_ids, vec![rule_id.clone()]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+
+    store
+        .refund_review_rate_limit_rules(std::slice::from_ref(&rule_id), started_at)
+        .await?;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_review_rate_limit_bucket")
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(count, 0);
+
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 18, started_at)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
+            assert_eq!(rule_ids, vec![rule_id]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn finish_review_is_noop_once_row_is_not_in_progress() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;

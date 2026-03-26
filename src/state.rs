@@ -8,6 +8,7 @@ use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
@@ -18,6 +19,7 @@ use uuid::Uuid;
 const AUTH_LIMIT_RESET_KEY_PREFIX: &str = "codex_auth_limit_reset_at::";
 const FEATURE_FLAG_OVERRIDES_KEY: &str = "feature_flag_overrides";
 const SCAN_STATUS_KEY: &str = "scan_status";
+const PROJECT_RATE_LIMIT_SUBJECT_IID: i64 = 0;
 
 pub struct ReviewStateStore {
     pool: SqlitePool,
@@ -243,12 +245,121 @@ pub struct SecurityReviewContextCacheEntry {
     pub expires_at: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRateLimitScope {
+    Project,
+    MergeRequest,
+}
+
+impl ReviewRateLimitScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::MergeRequest => "merge_request",
+        }
+    }
+
+    fn subject_iid(self, iid: Option<u64>) -> i64 {
+        match self {
+            Self::Project => PROJECT_RATE_LIMIT_SUBJECT_IID,
+            Self::MergeRequest => iid
+                .and_then(|value| i64::try_from(value).ok())
+                .unwrap_or(i64::MAX),
+        }
+    }
+
+    fn display_iid(self, subject_iid: i64) -> Option<u64> {
+        match self {
+            Self::Project => None,
+            Self::MergeRequest => u64::try_from(subject_iid).ok(),
+        }
+    }
+}
+
+impl FromStr for ReviewRateLimitScope {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "project" => Ok(Self::Project),
+            "merge_request" => Ok(Self::MergeRequest),
+            other => bail!("invalid review rate limit scope: {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReviewRateLimitRule {
+    pub id: String,
+    pub label: String,
+    pub scope_repo: String,
+    pub scope_iid: Option<u64>,
+    pub scope_subject: String,
+    pub applies_to_review: bool,
+    pub applies_to_security: bool,
+    pub scope: ReviewRateLimitScope,
+    pub capacity: u32,
+    pub window_seconds: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRateLimitRuleUpsert {
+    pub id: Option<String>,
+    pub label: String,
+    pub scope_repo: String,
+    pub scope_iid: Option<u64>,
+    pub applies_to_review: bool,
+    pub applies_to_security: bool,
+    pub scope: ReviewRateLimitScope,
+    pub capacity: u32,
+    pub window_seconds: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityReviewDebounceEntry {
     pub repo: String,
     pub iid: u64,
     pub last_started_at: i64,
     pub next_eligible_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReviewRateLimitBucketSnapshot {
+    pub rule_id: String,
+    pub rule_label: String,
+    pub scope_repo: String,
+    pub scope_iid: Option<u64>,
+    pub scope_subject: String,
+    pub scope: ReviewRateLimitScope,
+    pub repo: String,
+    pub iid: Option<u64>,
+    pub applies_to_review: bool,
+    pub applies_to_security: bool,
+    pub available_slots: f64,
+    pub capacity: u32,
+    pub updated_at: i64,
+    pub next_slot_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReviewRateLimitPendingEntry {
+    pub lane: ReviewLane,
+    pub repo: String,
+    pub iid: u64,
+    pub first_blocked_at: i64,
+    pub last_blocked_at: i64,
+    pub last_seen_head_sha: String,
+    pub next_retry_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewRateLimitAcquireOutcome {
+    Unmatched,
+    Acquired { rule_ids: Vec<String> },
+    Blocked { next_retry_at: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -750,6 +861,510 @@ impl ReviewStateStore {
             .execute(&self.pool)
             .await
             .context("prune closed merge requests from security review debounce state")?;
+        Ok(())
+    }
+
+    pub async fn list_review_rate_limit_rules(&self) -> Result<Vec<ReviewRateLimitRule>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, label, scope_repo, scope_subject_iid, applies_to_review, applies_to_security,
+                   scope, capacity, window_seconds, created_at, updated_at
+            FROM runtime_review_rate_limit_rule
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list runtime review rate limit rules")?;
+
+        rows.into_iter()
+            .map(map_review_rate_limit_rule_row)
+            .collect()
+    }
+
+    pub async fn create_review_rate_limit_rule(
+        &self,
+        rule: &ReviewRateLimitRuleUpsert,
+    ) -> Result<String> {
+        validate_review_rate_limit_rule_upsert(rule)?;
+        let id = rule
+            .id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let now = Utc::now().timestamp();
+        sqlx::query(
+            r#"
+            INSERT INTO runtime_review_rate_limit_rule (
+                id,
+                label,
+                scope_repo,
+                scope_subject_iid,
+                applies_to_review,
+                applies_to_security,
+                scope,
+                capacity,
+                window_seconds,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&id)
+        .bind(&rule.label)
+        .bind(&rule.scope_repo)
+        .bind(rule.scope.subject_iid(rule.scope_iid))
+        .bind(rule.applies_to_review)
+        .bind(rule.applies_to_security)
+        .bind(rule.scope.as_str())
+        .bind(i64::from(rule.capacity))
+        .bind(i64::try_from(rule.window_seconds).context("convert rule window seconds to i64")?)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("insert runtime review rate limit rule")?;
+        Ok(id)
+    }
+
+    pub async fn update_review_rate_limit_rule(
+        &self,
+        rule: &ReviewRateLimitRuleUpsert,
+    ) -> Result<()> {
+        validate_review_rate_limit_rule_upsert(rule)?;
+        let Some(id) = rule.id.as_deref() else {
+            bail!("runtime review rate limit rule id is required for update");
+        };
+        let now = Utc::now().timestamp();
+        let result = sqlx::query(
+            r#"
+            UPDATE runtime_review_rate_limit_rule
+            SET label = ?,
+                scope_repo = ?,
+                scope_subject_iid = ?,
+                applies_to_review = ?,
+                applies_to_security = ?,
+                scope = ?,
+                capacity = ?,
+                window_seconds = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&rule.label)
+        .bind(&rule.scope_repo)
+        .bind(rule.scope.subject_iid(rule.scope_iid))
+        .bind(rule.applies_to_review)
+        .bind(rule.applies_to_security)
+        .bind(rule.scope.as_str())
+        .bind(i64::from(rule.capacity))
+        .bind(i64::try_from(rule.window_seconds).context("convert rule window seconds to i64")?)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("update runtime review rate limit rule")?;
+        if result.rows_affected() == 0 {
+            bail!("runtime review rate limit rule not found: {id}");
+        }
+        Ok(())
+    }
+
+    pub async fn delete_review_rate_limit_rule(&self, id: &str) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("start sqlite transaction")?;
+        sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE rule_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .context("delete runtime review rate limit buckets")?;
+        let result = sqlx::query("DELETE FROM runtime_review_rate_limit_rule WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .context("delete runtime review rate limit rule")?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await.context("rollback sqlite transaction")?;
+            bail!("runtime review rate limit rule not found: {id}");
+        }
+        tx.commit().await.context("commit sqlite transaction")?;
+        Ok(())
+    }
+
+    pub async fn list_active_review_rate_limit_buckets(
+        &self,
+        now: i64,
+    ) -> Result<Vec<ReviewRateLimitBucketSnapshot>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("start sqlite transaction")?;
+        let rows = sqlx::query(
+            r#"
+            SELECT r.id, r.label, r.scope_repo, r.scope_subject_iid, r.applies_to_review,
+                   r.applies_to_security, r.scope, r.capacity, r.window_seconds, r.created_at,
+                   r.updated_at AS rule_updated_at, b.available_slots, b.updated_at AS bucket_updated_at
+            FROM runtime_review_rate_limit_rule r
+            JOIN runtime_review_rate_limit_bucket b ON b.rule_id = r.id
+            ORDER BY r.created_at ASC, r.id ASC
+            "#,
+        )
+        .fetch_all(tx.as_mut())
+        .await
+        .context("list active runtime review rate limit buckets")?;
+
+        let mut active = Vec::with_capacity(rows.len());
+        for row in rows {
+            let materialized = materialize_review_rate_limit_bucket_row(
+                map_review_rate_limit_rule_bucket_row(row)?,
+                now,
+            )?;
+            if materialized.is_full {
+                sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE rule_id = ?")
+                    .bind(materialized.snapshot.rule_id.as_str())
+                    .execute(tx.as_mut())
+                    .await
+                    .context("delete full runtime review rate limit bucket")?;
+            } else {
+                active.push(materialized.snapshot);
+            }
+        }
+        tx.commit().await.context("commit sqlite transaction")?;
+        Ok(active)
+    }
+
+    pub async fn try_consume_review_rate_limits(
+        &self,
+        lane: ReviewLane,
+        repo: &str,
+        iid: u64,
+        now: i64,
+    ) -> Result<ReviewRateLimitAcquireOutcome> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("start sqlite transaction")?;
+        let rows = load_review_rate_limit_rule_bucket_rows(&mut tx, lane, repo, iid)
+            .await
+            .context("load matching runtime review rate limit buckets")?;
+        if rows.is_empty() {
+            tx.commit().await.context("commit sqlite transaction")?;
+            return Ok(ReviewRateLimitAcquireOutcome::Unmatched);
+        }
+
+        let mut materialized = Vec::with_capacity(rows.len());
+        let mut blocked_next_retry_at: Option<i64> = None;
+        for row in rows {
+            let state = materialize_review_rate_limit_bucket_row(row, now)?;
+            if state.is_full {
+                sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE rule_id = ?")
+                    .bind(state.snapshot.rule_id.as_str())
+                    .execute(tx.as_mut())
+                    .await
+                    .context("delete full runtime review rate limit bucket")?;
+            }
+            if state.current_available + REVIEW_RATE_LIMIT_EPSILON < 1.0 {
+                let next_retry_at = next_rate_limit_slot_at(
+                    now,
+                    state.current_available,
+                    state.capacity,
+                    state.window_seconds,
+                    1.0,
+                )?;
+                blocked_next_retry_at = Some(match blocked_next_retry_at {
+                    Some(existing) => existing.max(next_retry_at),
+                    None => next_retry_at,
+                });
+            }
+            materialized.push(state);
+        }
+
+        if let Some(next_retry_at) = blocked_next_retry_at {
+            tx.commit().await.context("commit sqlite transaction")?;
+            return Ok(ReviewRateLimitAcquireOutcome::Blocked { next_retry_at });
+        }
+
+        let mut acquired_rule_ids = Vec::with_capacity(materialized.len());
+        for state in materialized {
+            let new_available = (state.current_available - 1.0).max(0.0);
+            if state.had_bucket_row {
+                if new_available + REVIEW_RATE_LIMIT_EPSILON >= state.capacity as f64 {
+                    sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE rule_id = ?")
+                        .bind(state.snapshot.rule_id.as_str())
+                        .execute(tx.as_mut())
+                        .await
+                        .context("delete full runtime review rate limit bucket after consume")?;
+                } else {
+                    sqlx::query(
+                        r#"
+                        UPDATE runtime_review_rate_limit_bucket
+                        SET available_slots = ?, updated_at = ?
+                        WHERE rule_id = ?
+                        "#,
+                    )
+                    .bind(new_available)
+                    .bind(now)
+                    .bind(state.snapshot.rule_id.as_str())
+                    .execute(tx.as_mut())
+                    .await
+                    .context("update runtime review rate limit bucket after consume")?;
+                }
+            } else {
+                sqlx::query(
+                    r#"
+                    INSERT INTO runtime_review_rate_limit_bucket (rule_id, available_slots, updated_at)
+                    VALUES (?, ?, ?)
+                    "#,
+                )
+                .bind(state.snapshot.rule_id.as_str())
+                .bind(new_available)
+                .bind(now)
+                .execute(tx.as_mut())
+                .await
+                .context("insert runtime review rate limit bucket after consume")?;
+            }
+            acquired_rule_ids.push(state.snapshot.rule_id);
+        }
+
+        tx.commit().await.context("commit sqlite transaction")?;
+        Ok(ReviewRateLimitAcquireOutcome::Acquired {
+            rule_ids: acquired_rule_ids,
+        })
+    }
+
+    pub async fn refund_review_rate_limit_rules(
+        &self,
+        rule_ids: &[String],
+        now: i64,
+    ) -> Result<()> {
+        if rule_ids.is_empty() {
+            return Ok(());
+        }
+
+        let unique_rule_ids = unique_review_rate_limit_rule_ids(rule_ids)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("start sqlite transaction")?;
+        for rule_id in unique_rule_ids {
+            let row = sqlx::query(
+                r#"
+                SELECT r.capacity, r.window_seconds, b.available_slots, b.updated_at
+                FROM runtime_review_rate_limit_rule r
+                LEFT JOIN runtime_review_rate_limit_bucket b ON b.rule_id = r.id
+                WHERE r.id = ?
+                "#,
+            )
+            .bind(rule_id.as_str())
+            .fetch_optional(tx.as_mut())
+            .await
+            .context("load runtime review rate limit rule for refund")?;
+            let Some(row) = row else {
+                continue;
+            };
+
+            let capacity_raw: i64 = row.try_get("capacity").context("read rule capacity")?;
+            let capacity = u32::try_from(capacity_raw).context("convert rule capacity")?;
+            let window_seconds: i64 = row
+                .try_get("window_seconds")
+                .context("read rule window seconds")?;
+            let Some(available_slots_raw) = row
+                .try_get::<Option<f64>, _>("available_slots")
+                .context("read bucket available slots")?
+            else {
+                continue;
+            };
+            let Some(bucket_updated_at) = row
+                .try_get::<Option<i64>, _>("updated_at")
+                .context("read bucket updated_at")?
+            else {
+                continue;
+            };
+
+            let current_available = materialize_rate_limit_available_slots(
+                Some(available_slots_raw),
+                Some(bucket_updated_at),
+                capacity,
+                u64::try_from(window_seconds).context("convert rule window seconds")?,
+                now,
+            )?;
+            let new_available = (current_available + 1.0).min(capacity as f64);
+            if new_available + REVIEW_RATE_LIMIT_EPSILON >= capacity as f64 {
+                sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE rule_id = ?")
+                    .bind(rule_id.as_str())
+                    .execute(tx.as_mut())
+                    .await
+                    .context("delete full runtime review rate limit bucket after refund")?;
+            } else {
+                sqlx::query(
+                    r#"
+                    UPDATE runtime_review_rate_limit_bucket
+                    SET available_slots = ?, updated_at = ?
+                    WHERE rule_id = ?
+                    "#,
+                )
+                .bind(new_available)
+                .bind(now)
+                .bind(rule_id.as_str())
+                .execute(tx.as_mut())
+                .await
+                .context("update runtime review rate limit bucket after refund")?;
+            }
+        }
+        tx.commit().await.context("commit sqlite transaction")?;
+        Ok(())
+    }
+
+    pub async fn upsert_review_rate_limit_pending(
+        &self,
+        lane: ReviewLane,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        blocked_at: i64,
+        next_retry_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO runtime_review_rate_limit_pending (
+                lane,
+                repo,
+                iid,
+                first_blocked_at,
+                last_blocked_at,
+                last_seen_head_sha,
+                next_retry_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(lane, repo, iid) DO UPDATE SET
+                first_blocked_at = MIN(runtime_review_rate_limit_pending.first_blocked_at, excluded.first_blocked_at),
+                last_blocked_at = MAX(runtime_review_rate_limit_pending.last_blocked_at, excluded.last_blocked_at),
+                last_seen_head_sha = excluded.last_seen_head_sha,
+                next_retry_at = excluded.next_retry_at
+            "#,
+        )
+        .bind(lane.as_str())
+        .bind(repo)
+        .bind(iid as i64)
+        .bind(blocked_at)
+        .bind(blocked_at)
+        .bind(head_sha)
+        .bind(next_retry_at)
+        .execute(&self.pool)
+        .await
+        .context("upsert runtime review rate limit pending row")?;
+        Ok(())
+    }
+
+    pub async fn clear_review_rate_limit_pending(
+        &self,
+        lane: ReviewLane,
+        repo: &str,
+        iid: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM runtime_review_rate_limit_pending
+            WHERE lane = ? AND repo = ? AND iid = ?
+            "#,
+        )
+        .bind(lane.as_str())
+        .bind(repo)
+        .bind(iid as i64)
+        .execute(&self.pool)
+        .await
+        .context("clear runtime review rate limit pending row")?;
+        Ok(())
+    }
+
+    pub async fn list_review_rate_limit_pending(&self) -> Result<Vec<ReviewRateLimitPendingEntry>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT lane, repo, iid, first_blocked_at, last_blocked_at, last_seen_head_sha, next_retry_at
+            FROM runtime_review_rate_limit_pending
+            ORDER BY first_blocked_at ASC, lane ASC, repo ASC, iid ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("list runtime review rate limit pending rows")?;
+
+        rows.into_iter()
+            .map(map_review_rate_limit_pending_row)
+            .collect()
+    }
+
+    pub async fn earliest_review_rate_limit_pending_retry_at(&self) -> Result<Option<i64>> {
+        let next_retry_at = sqlx::query_scalar::<_, Option<i64>>(
+            r#"
+            SELECT MIN(next_retry_at)
+            FROM runtime_review_rate_limit_pending
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("load earliest runtime review rate limit pending retry time")?;
+        Ok(next_retry_at)
+    }
+
+    pub async fn repo_has_due_review_rate_limit_pending(
+        &self,
+        repo: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM runtime_review_rate_limit_pending
+                WHERE repo = ?
+                  AND next_retry_at <= ?
+            )
+            "#,
+        )
+        .bind(repo)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .context("check due runtime review rate limit pending rows")?;
+        Ok(exists != 0)
+    }
+
+    pub async fn sync_review_rate_limit_pending_rows(
+        &self,
+        repo: &str,
+        open_iids: &[u64],
+    ) -> Result<()> {
+        if open_iids.is_empty() {
+            sqlx::query("DELETE FROM runtime_review_rate_limit_pending WHERE repo = ?")
+                .bind(repo)
+                .execute(&self.pool)
+                .await
+                .context("clear runtime review rate limit pending rows for closed repo")?;
+            return Ok(());
+        }
+
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "DELETE FROM runtime_review_rate_limit_pending WHERE repo = ",
+        );
+        builder.push_bind(repo);
+        builder.push(" AND iid NOT IN (");
+        let mut separated = builder.separated(", ");
+        for iid in open_iids {
+            separated.push_bind(*iid as i64);
+        }
+        separated.push_unseparated(")");
+        builder
+            .build()
+            .execute(&self.pool)
+            .await
+            .context("prune closed merge requests from runtime review rate limit pending rows")?;
         Ok(())
     }
 
@@ -2397,6 +3012,354 @@ fn map_security_review_debounce_entry(
             .try_get("next_eligible_at")
             .context("read security review debounce next_eligible_at")?,
     })
+}
+
+const REVIEW_RATE_LIMIT_EPSILON: f64 = 1e-9;
+
+#[derive(Debug, Clone)]
+struct ReviewRateLimitRuleBucketRow {
+    rule_id: String,
+    label: String,
+    scope_repo: String,
+    scope_subject_iid: i64,
+    applies_to_review: bool,
+    applies_to_security: bool,
+    scope: ReviewRateLimitScope,
+    capacity: u32,
+    window_seconds: u64,
+    available_slots: Option<f64>,
+    bucket_updated_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct MaterializedReviewRateLimitBucketRow {
+    snapshot: ReviewRateLimitBucketSnapshot,
+    current_available: f64,
+    capacity: u32,
+    window_seconds: u64,
+    had_bucket_row: bool,
+    is_full: bool,
+}
+
+fn validate_review_rate_limit_rule_upsert(rule: &ReviewRateLimitRuleUpsert) -> Result<()> {
+    if rule.label.trim().is_empty() {
+        bail!("runtime review rate limit rule label must not be empty");
+    }
+    if rule.scope_repo.trim().is_empty() {
+        bail!("runtime review rate limit rule scope_repo must not be empty");
+    }
+    if !rule.applies_to_review && !rule.applies_to_security {
+        bail!("runtime review rate limit rule must cover at least one lane");
+    }
+    if rule.capacity == 0 {
+        bail!("runtime review rate limit rule capacity must be greater than zero");
+    }
+    if rule.window_seconds == 0 {
+        bail!("runtime review rate limit rule window_seconds must be greater than zero");
+    }
+    match rule.scope {
+        ReviewRateLimitScope::Project if rule.scope_iid.is_some() => {
+            bail!("project-scoped runtime review rate limit rules cannot set scope_iid")
+        }
+        ReviewRateLimitScope::MergeRequest => match rule.scope_iid {
+            Some(iid) if iid > 0 => Ok(()),
+            Some(_) => {
+                bail!("merge-request-scoped runtime review rate limit rules require scope_iid > 0")
+            }
+            None => bail!("merge-request-scoped runtime review rate limit rules require scope_iid"),
+        },
+        _ => Ok(()),
+    }
+}
+
+fn unique_review_rate_limit_rule_ids(rule_ids: &[String]) -> Result<Vec<String>> {
+    let mut unique = BTreeSet::new();
+    for rule_id in rule_ids {
+        let rule_id = rule_id.trim();
+        if rule_id.is_empty() {
+            bail!("runtime review rate limit rule id must not be empty");
+        }
+        unique.insert(rule_id.to_string());
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn scope_subject_display(
+    scope: ReviewRateLimitScope,
+    repo: &str,
+    scope_iid: Option<u64>,
+) -> String {
+    match scope {
+        ReviewRateLimitScope::Project => repo.to_string(),
+        ReviewRateLimitScope::MergeRequest => match scope_iid {
+            Some(iid) => format!("{repo} !{iid}"),
+            None => format!("{repo} !unknown"),
+        },
+    }
+}
+
+async fn load_review_rate_limit_rule_bucket_rows(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    lane: ReviewLane,
+    repo: &str,
+    iid: u64,
+) -> Result<Vec<ReviewRateLimitRuleBucketRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT r.id, r.label, r.scope_repo, r.scope_subject_iid, r.applies_to_review,
+               r.applies_to_security, r.scope, r.capacity, r.window_seconds,
+               b.available_slots, b.updated_at AS bucket_updated_at
+        FROM runtime_review_rate_limit_rule r
+        LEFT JOIN runtime_review_rate_limit_bucket b ON b.rule_id = r.id
+        WHERE (
+            (r.scope = 'project' AND r.scope_repo = ?)
+            OR (r.scope = 'merge_request' AND r.scope_repo = ? AND r.scope_subject_iid = ?)
+        )
+        AND (
+            (? = 'general' AND r.applies_to_review = 1)
+            OR (? = 'security' AND r.applies_to_security = 1)
+        )
+        ORDER BY r.created_at ASC, r.id ASC
+        "#,
+    )
+    .bind(repo)
+    .bind(repo)
+    .bind(i64::try_from(iid).context("convert iid to i64")?)
+    .bind(lane.as_str())
+    .bind(lane.as_str())
+    .fetch_all(tx.as_mut())
+    .await
+    .context("load runtime review rate limit rule buckets")?;
+
+    rows.into_iter()
+        .map(map_review_rate_limit_rule_bucket_row)
+        .collect()
+}
+
+fn map_review_rate_limit_rule_row(row: sqlx::sqlite::SqliteRow) -> Result<ReviewRateLimitRule> {
+    let scope = ReviewRateLimitScope::from_str(
+        row.try_get::<String, _>("scope")
+            .context("read runtime review rate limit rule scope")?
+            .as_str(),
+    )?;
+    let scope_repo: String = row
+        .try_get("scope_repo")
+        .context("read runtime review rate limit rule scope_repo")?;
+    let scope_subject_iid = row
+        .try_get::<i64, _>("scope_subject_iid")
+        .context("read runtime review rate limit rule scope_subject_iid")?;
+    let scope_iid = scope.display_iid(scope_subject_iid);
+    Ok(ReviewRateLimitRule {
+        id: row
+            .try_get("id")
+            .context("read runtime review rate limit rule id")?,
+        label: row
+            .try_get("label")
+            .context("read runtime review rate limit rule label")?,
+        scope_repo: scope_repo.clone(),
+        scope_iid,
+        scope_subject: scope_subject_display(scope, scope_repo.as_str(), scope_iid),
+        applies_to_review: row
+            .try_get::<i64, _>("applies_to_review")
+            .context("read runtime review rate limit rule applies_to_review")?
+            != 0,
+        applies_to_security: row
+            .try_get::<i64, _>("applies_to_security")
+            .context("read runtime review rate limit rule applies_to_security")?
+            != 0,
+        scope,
+        capacity: u32::try_from(
+            row.try_get::<i64, _>("capacity")
+                .context("read runtime review rate limit rule capacity")?,
+        )
+        .context("convert runtime review rate limit rule capacity to u32")?,
+        window_seconds: u64::try_from(
+            row.try_get::<i64, _>("window_seconds")
+                .context("read runtime review rate limit rule window_seconds")?,
+        )
+        .context("convert runtime review rate limit rule window_seconds to u64")?,
+        created_at: row
+            .try_get("created_at")
+            .context("read runtime review rate limit rule created_at")?,
+        updated_at: row
+            .try_get("updated_at")
+            .context("read runtime review rate limit rule updated_at")?,
+    })
+}
+
+fn map_review_rate_limit_pending_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<ReviewRateLimitPendingEntry> {
+    Ok(ReviewRateLimitPendingEntry {
+        lane: parse_review_lane(
+            row.try_get::<String, _>("lane")
+                .context("read runtime review rate limit pending lane")?
+                .as_str(),
+        )?,
+        repo: row
+            .try_get("repo")
+            .context("read runtime review rate limit pending repo")?,
+        iid: u64::try_from(
+            row.try_get::<i64, _>("iid")
+                .context("read runtime review rate limit pending iid")?,
+        )
+        .context("convert runtime review rate limit pending iid to u64")?,
+        first_blocked_at: row
+            .try_get("first_blocked_at")
+            .context("read runtime review rate limit pending first_blocked_at")?,
+        last_blocked_at: row
+            .try_get("last_blocked_at")
+            .context("read runtime review rate limit pending last_blocked_at")?,
+        last_seen_head_sha: row
+            .try_get("last_seen_head_sha")
+            .context("read runtime review rate limit pending last_seen_head_sha")?,
+        next_retry_at: row
+            .try_get("next_retry_at")
+            .context("read runtime review rate limit pending next_retry_at")?,
+    })
+}
+
+fn map_review_rate_limit_rule_bucket_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<ReviewRateLimitRuleBucketRow> {
+    let scope = ReviewRateLimitScope::from_str(
+        row.try_get::<String, _>("scope")
+            .context("read runtime review rate limit rule scope")?
+            .as_str(),
+    )?;
+    Ok(ReviewRateLimitRuleBucketRow {
+        rule_id: row
+            .try_get("id")
+            .context("read runtime review rate limit rule id")?,
+        label: row
+            .try_get("label")
+            .context("read runtime review rate limit rule label")?,
+        scope_repo: row
+            .try_get("scope_repo")
+            .context("read runtime review rate limit rule scope_repo")?,
+        scope_subject_iid: row
+            .try_get("scope_subject_iid")
+            .context("read runtime review rate limit rule scope_subject_iid")?,
+        applies_to_review: row
+            .try_get::<i64, _>("applies_to_review")
+            .context("read runtime review rate limit rule applies_to_review")?
+            != 0,
+        applies_to_security: row
+            .try_get::<i64, _>("applies_to_security")
+            .context("read runtime review rate limit rule applies_to_security")?
+            != 0,
+        scope,
+        capacity: u32::try_from(
+            row.try_get::<i64, _>("capacity")
+                .context("read runtime review rate limit rule capacity")?,
+        )
+        .context("convert runtime review rate limit rule capacity to u32")?,
+        window_seconds: u64::try_from(
+            row.try_get::<i64, _>("window_seconds")
+                .context("read runtime review rate limit rule window_seconds")?,
+        )
+        .context("convert runtime review rate limit rule window_seconds to u64")?,
+        available_slots: row
+            .try_get("available_slots")
+            .context("read runtime review rate limit bucket available_slots")?,
+        bucket_updated_at: row
+            .try_get("bucket_updated_at")
+            .context("read runtime review rate limit bucket updated_at")?,
+    })
+}
+
+fn materialize_review_rate_limit_bucket_row(
+    raw: ReviewRateLimitRuleBucketRow,
+    now: i64,
+) -> Result<MaterializedReviewRateLimitBucketRow> {
+    let current_available = materialize_rate_limit_available_slots(
+        raw.available_slots,
+        raw.bucket_updated_at,
+        raw.capacity,
+        raw.window_seconds,
+        now,
+    )?;
+    let snapshot = ReviewRateLimitBucketSnapshot {
+        rule_id: raw.rule_id.clone(),
+        rule_label: raw.label.clone(),
+        scope_repo: raw.scope_repo.clone(),
+        scope_iid: raw.scope.display_iid(raw.scope_subject_iid),
+        scope_subject: scope_subject_display(
+            raw.scope,
+            raw.scope_repo.as_str(),
+            raw.scope.display_iid(raw.scope_subject_iid),
+        ),
+        scope: raw.scope,
+        repo: raw.scope_repo.clone(),
+        iid: raw.scope.display_iid(raw.scope_subject_iid),
+        applies_to_review: raw.applies_to_review,
+        applies_to_security: raw.applies_to_security,
+        available_slots: current_available,
+        capacity: raw.capacity,
+        updated_at: raw.bucket_updated_at.unwrap_or(now),
+        next_slot_at: Some(next_rate_limit_slot_at(
+            now,
+            current_available,
+            raw.capacity,
+            raw.window_seconds,
+            next_rate_limit_ui_target(current_available, raw.capacity),
+        )?),
+    };
+    Ok(MaterializedReviewRateLimitBucketRow {
+        is_full: current_available + REVIEW_RATE_LIMIT_EPSILON >= raw.capacity as f64,
+        had_bucket_row: raw.available_slots.is_some(),
+        capacity: raw.capacity,
+        window_seconds: raw.window_seconds,
+        current_available,
+        snapshot,
+    })
+}
+
+fn materialize_rate_limit_available_slots(
+    available_slots: Option<f64>,
+    bucket_updated_at: Option<i64>,
+    capacity: u32,
+    window_seconds: u64,
+    now: i64,
+) -> Result<f64> {
+    let Some(available_slots) = available_slots else {
+        return Ok(capacity as f64);
+    };
+    let Some(bucket_updated_at) = bucket_updated_at else {
+        return Ok(available_slots.min(capacity as f64));
+    };
+    let elapsed = now.saturating_sub(bucket_updated_at).max(0) as f64;
+    let refill_rate = capacity as f64 / window_seconds as f64;
+    let refilled = available_slots + (elapsed * refill_rate);
+    Ok(refilled.min(capacity as f64))
+}
+
+fn next_rate_limit_ui_target(current_available: f64, capacity: u32) -> f64 {
+    let capacity = capacity as f64;
+    if current_available + REVIEW_RATE_LIMIT_EPSILON >= capacity {
+        capacity
+    } else if current_available < 1.0 {
+        1.0
+    } else {
+        let next_whole = current_available.floor() + 1.0;
+        next_whole.min(capacity)
+    }
+}
+
+fn next_rate_limit_slot_at(
+    now: i64,
+    current_available: f64,
+    capacity: u32,
+    window_seconds: u64,
+    target_available: f64,
+) -> Result<i64> {
+    if target_available <= current_available + REVIEW_RATE_LIMIT_EPSILON {
+        return Ok(now);
+    }
+    let refill_rate = capacity as f64 / window_seconds as f64;
+    let delta = (target_available - current_available) / refill_rate;
+    let delta = delta.max(0.0).ceil() as i64;
+    Ok(now.saturating_add(delta))
 }
 
 fn sqlite_url(path: &str) -> String {

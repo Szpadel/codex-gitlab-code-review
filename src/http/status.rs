@@ -10,9 +10,11 @@ use crate::feature_flags::{
 use crate::skills::{SkillListSnapshot, SkillPreviewSnapshot, SkillsManager};
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
-    ProjectCatalogSummary, ReviewStateStore, RunHistoryCursor, RunHistoryEventRecord,
-    RunHistoryKind, RunHistoryListItem, RunHistoryListQuery, RunHistoryRecord, ScanMode,
-    ScanOutcome, ScanState, TranscriptBackfillState, merge_rewritten_turn_events,
+    ProjectCatalogSummary, ReviewRateLimitBucketSnapshot, ReviewRateLimitPendingEntry,
+    ReviewRateLimitRule, ReviewRateLimitRuleUpsert, ReviewStateStore, RunHistoryCursor,
+    RunHistoryEventRecord, RunHistoryKind, RunHistoryListItem, RunHistoryListQuery,
+    RunHistoryRecord, ScanMode, ScanOutcome, ScanState, TranscriptBackfillState,
+    merge_rewritten_turn_events,
 };
 use crate::transcript_backfill::{
     REVIEW_MISSING_CHILD_TURN_IDS_KEY, SessionHistoryBackfillSource,
@@ -42,7 +44,7 @@ const TRANSCRIPT_BACKFILL_STALE_SOURCE_UNAVAILABLE_ERROR: &str =
 const TRANSCRIPT_BACKFILL_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
 const TRANSCRIPT_BACKFILL_MISSING_HISTORY_RETRY_WINDOW: Duration = Duration::from_secs(300);
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct StatusSnapshot {
     pub generated_at: String,
     pub config: StatusConfigSnapshot,
@@ -51,6 +53,14 @@ pub struct StatusSnapshot {
     pub in_progress_mentions: Vec<InProgressMentionCommand>,
     pub auth_limit_resets: Vec<AuthLimitResetEntry>,
     pub project_catalogs: Vec<ProjectCatalogSummary>,
+    pub rate_limits: StatusRateLimitSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct StatusRateLimitSnapshot {
+    pub rules: Vec<ReviewRateLimitRule>,
+    pub active_buckets: Vec<ReviewRateLimitBucketSnapshot>,
+    pub pending: Vec<ReviewRateLimitPendingEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -213,6 +223,7 @@ impl StatusService {
         let created_after = self.state.get_created_after().await?;
         let scan = self.state.get_scan_status().await?;
         let overrides = self.state.get_runtime_feature_flag_overrides().await?;
+        let rate_limits = self.review_rate_limit_snapshot().await?;
         Ok(StatusSnapshot {
             generated_at: Utc::now().to_rfc3339(),
             config: StatusConfigSnapshot {
@@ -238,7 +249,44 @@ impl StatusService {
             in_progress_mentions: self.state.list_in_progress_mention_commands().await?,
             auth_limit_resets: self.state.list_auth_limit_reset_entries().await?,
             project_catalogs: self.state.list_project_catalog_summaries().await?,
+            rate_limits,
         })
+    }
+
+    pub async fn review_rate_limit_snapshot(&self) -> Result<StatusRateLimitSnapshot> {
+        let now = Utc::now().timestamp();
+        Ok(StatusRateLimitSnapshot {
+            rules: self.state.list_review_rate_limit_rules().await?,
+            active_buckets: self
+                .state
+                .list_active_review_rate_limit_buckets(now)
+                .await?,
+            pending: self.state.list_review_rate_limit_pending().await?,
+        })
+    }
+
+    pub async fn create_review_rate_limit_rule(
+        &self,
+        rule: &ReviewRateLimitRuleUpsert,
+    ) -> Result<String> {
+        self.state.create_review_rate_limit_rule(rule).await
+    }
+
+    pub async fn update_review_rate_limit_rule(
+        &self,
+        rule: &ReviewRateLimitRuleUpsert,
+    ) -> Result<()> {
+        self.state.update_review_rate_limit_rule(rule).await
+    }
+
+    pub async fn delete_review_rate_limit_rule(&self, rule_id: &str) -> Result<()> {
+        self.state.delete_review_rate_limit_rule(rule_id).await
+    }
+
+    pub async fn refund_one_review_rate_limit_bucket_slot(&self, rule_id: &str) -> Result<()> {
+        self.state
+            .refund_review_rate_limit_rules(&[rule_id.to_string()], Utc::now().timestamp())
+            .await
     }
 
     pub async fn update_runtime_feature_flag(

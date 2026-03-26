@@ -73,10 +73,6 @@ review:
   additional_developer_instructions: null
   # Optional. Dedicated security review lane configuration.
   security:
-    # Optional. Debounce window for rerunning security reviews on still-open MRs.
-    # The next rerun becomes eligible on the first scheduled scan at or after
-    # the configured duration since the last started security review.
-    debounce: null
     # Optional. TTL for cached base-branch security context entries in seconds.
     context_ttl_seconds: 1209600
     # Optional. Minimum confidence required before a security finding is emitted.

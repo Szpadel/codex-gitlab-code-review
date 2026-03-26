@@ -26,6 +26,18 @@ use codex_gitlab_code_review::state::{ReviewStateStore, ScanMode, ScanOutcome};
 const STARTUP_DOCKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_DOCKER_READY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduledWakeReason {
+    Cron,
+    PendingRateLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScheduledWake {
+    at: DateTime<Utc>,
+    reason: ScheduledWakeReason,
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Codex GitLab review service")]
 struct Cli {
@@ -482,6 +494,11 @@ async fn run_schedule_loop(
     tz: chrono_tz::Tz,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut next_cron_at = schedule
+        .upcoming(tz)
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("cron has no future times"))?
+        .with_timezone(&Utc);
     loop {
         if *shutdown_rx.borrow() {
             if let Err(err) = status_service.clear_next_scan_at().await {
@@ -491,17 +508,22 @@ async fn run_schedule_loop(
             return Ok(());
         }
         let now = Utc::now().with_timezone(&tz);
-        let mut upcoming = schedule.upcoming(tz);
-        let next = upcoming
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("cron has no future times"))?;
+        let next_pending_retry_at = match service.next_pending_rate_limit_retry_at().await {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(error = %err, "failed to load next pending review wake time");
+                None
+            }
+        };
+        let scheduled_wake =
+            select_next_wake(now.with_timezone(&Utc), next_cron_at, next_pending_retry_at);
         if let Err(err) = status_service
-            .set_next_scan_at(Some(next.with_timezone(&Utc)))
+            .set_next_scan_at(Some(scheduled_wake.at))
             .await
         {
             warn!(error = %err, "failed to persist next scheduled scan status");
         }
-        let delay = (next - now)
+        let delay = (scheduled_wake.at.with_timezone(&tz) - now)
             .to_std()
             .unwrap_or_else(|_| Duration::from_secs(0));
         let sleep = tokio::time::sleep(delay);
@@ -527,15 +549,57 @@ async fn run_schedule_loop(
             info!("stopping schedule loop: shutdown requested");
             return Ok(());
         }
-        if let Err(err) = run_tracked_scan(
-            status_service,
-            ScanMode::Incremental,
-            service.scan_once_incremental(),
-        )
-        .await
-        {
-            warn!(error = %err, "scheduled scan failed");
+        let scan_result = match scheduled_wake.reason {
+            ScheduledWakeReason::Cron => {
+                run_tracked_scan(
+                    status_service,
+                    ScanMode::Incremental,
+                    service.scan_once_incremental(),
+                )
+                .await
+            }
+            ScheduledWakeReason::PendingRateLimit => {
+                run_tracked_scan(
+                    status_service,
+                    ScanMode::Incremental,
+                    service.process_due_pending_rate_limit_reviews(),
+                )
+                .await
+            }
+        };
+        if let Err(err) = scan_result {
+            warn!(error = %err, "scheduled wake failed");
         }
+        if matches!(scheduled_wake.reason, ScheduledWakeReason::Cron) {
+            next_cron_at = schedule
+                .upcoming(tz)
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("cron has no future times"))?
+                .with_timezone(&Utc);
+        }
+    }
+}
+
+fn select_next_wake(
+    now: DateTime<Utc>,
+    next_cron_at: DateTime<Utc>,
+    next_pending_retry_at: Option<DateTime<Utc>>,
+) -> ScheduledWake {
+    if next_cron_at <= now {
+        return ScheduledWake {
+            at: next_cron_at,
+            reason: ScheduledWakeReason::Cron,
+        };
+    }
+    match next_pending_retry_at {
+        Some(next_pending_retry_at) if next_pending_retry_at < next_cron_at => ScheduledWake {
+            at: next_pending_retry_at,
+            reason: ScheduledWakeReason::PendingRateLimit,
+        },
+        _ => ScheduledWake {
+            at: next_cron_at,
+            reason: ScheduledWakeReason::Cron,
+        },
     }
 }
 
@@ -611,6 +675,7 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use async_trait::async_trait;
+    use chrono::TimeZone;
     use codex_gitlab_code_review::codex_runner::{
         CodexResult, MentionCommandContext, MentionCommandResult, ReviewContext,
     };
@@ -646,6 +711,42 @@ mod tests {
 
         assert!(executed.load(Ordering::SeqCst));
         Ok(())
+    }
+
+    #[test]
+    fn select_next_wake_prefers_pending_retry_before_cron() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 25, 12, 0, 0).unwrap();
+        let cron_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 30, 0).unwrap();
+        let pending_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 20, 0).unwrap();
+
+        let wake = select_next_wake(now, cron_at, Some(pending_at));
+
+        assert_eq!(wake.at, pending_at);
+        assert_eq!(wake.reason, ScheduledWakeReason::PendingRateLimit);
+    }
+
+    #[test]
+    fn select_next_wake_keeps_cron_when_pending_retry_is_later() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 25, 12, 0, 0).unwrap();
+        let cron_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 30, 0).unwrap();
+        let pending_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 40, 0).unwrap();
+
+        let wake = select_next_wake(now, cron_at, Some(pending_at));
+
+        assert_eq!(wake.at, cron_at);
+        assert_eq!(wake.reason, ScheduledWakeReason::Cron);
+    }
+
+    #[test]
+    fn select_next_wake_prefers_due_cron_over_pending_retry() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 25, 12, 31, 0).unwrap();
+        let cron_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 30, 0).unwrap();
+        let pending_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 20, 0).unwrap();
+
+        let wake = select_next_wake(now, cron_at, Some(pending_at));
+
+        assert_eq!(wake.at, cron_at);
+        assert_eq!(wake.reason, ScheduledWakeReason::Cron);
     }
 
     struct WarmupRunner {

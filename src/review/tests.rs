@@ -15,6 +15,7 @@ use crate::gitlab::{
     AwardEmoji, DiscussionNote, GitLabUser, GitLabUserDetail, MergeRequestDiff,
     MergeRequestDiffDiscussion, MergeRequestDiffVersion, MergeRequestDiscussion, Note,
 };
+use crate::state::{ReviewRateLimitRuleUpsert, ReviewRateLimitScope};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -1085,6 +1086,30 @@ fn mr_with_created_at(iid: u64, sha: &str, created_at: DateTime<Utc>) -> MergeRe
         source_project_id: Some(1),
         target_project_id: Some(1),
         diff_refs: None,
+    }
+}
+
+fn review_rate_limit_rule(
+    id: &str,
+    label: &str,
+    scope: ReviewRateLimitScope,
+    scope_repo: &str,
+    scope_iid: Option<u64>,
+    applies_to_review: bool,
+    applies_to_security: bool,
+    capacity: u32,
+    window_seconds: u64,
+) -> ReviewRateLimitRuleUpsert {
+    ReviewRateLimitRuleUpsert {
+        id: Some(id.to_string()),
+        label: label.to_string(),
+        scope,
+        scope_repo: scope_repo.to_string(),
+        scope_iid,
+        applies_to_review,
+        applies_to_security,
+        capacity,
+        window_seconds,
     }
 }
 
@@ -3856,6 +3881,7 @@ async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes()
         retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
         bot_user_id: 1,
         shutdown,
+        acquired_rate_limit_rule_ids: Vec::new(),
     };
 
     review_context
@@ -3956,6 +3982,7 @@ async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_
         retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
         bot_user_id: 1,
         shutdown,
+        acquired_rate_limit_rule_ids: Vec::new(),
     };
 
     review_context
@@ -4056,6 +4083,7 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
         retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
         bot_user_id: 1,
         shutdown,
+        acquired_rate_limit_rule_ids: Vec::new(),
     };
 
     review_context
@@ -4213,6 +4241,7 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
         retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
         bot_user_id: 1,
         shutdown: Arc::new(AtomicBool::new(false)),
+        acquired_rate_limit_rule_ids: Vec::new(),
     };
 
     review_context
@@ -4313,6 +4342,7 @@ async fn security_review_pass_stays_silent() -> Result<()> {
         retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
         bot_user_id: 1,
         shutdown: Arc::new(AtomicBool::new(false)),
+        acquired_rate_limit_rule_ids: Vec::new(),
     };
 
     review_context
@@ -4350,11 +4380,9 @@ async fn security_review_pass_stays_silent() -> Result<()> {
 }
 
 #[tokio::test]
-async fn security_flow_skips_same_sha_until_debounce_expires() -> Result<()> {
-    let mut config = test_config();
-    config.feature_flags.security_review = true;
-    config.review.security.debounce = Some(3_600);
-    let gitlab = fake_gitlab(vec![mr(26, "sha26")]);
+async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() -> Result<()> {
+    let config = test_config();
+    let gitlab = fake_gitlab(Vec::new());
     let runner = Arc::new(CapturingReviewRunner {
         result: Mutex::new(Some(CodexResult::Pass {
             summary: "ok".to_string(),
@@ -4362,6 +4390,19 @@ async fn security_flow_skips_same_sha_until_debounce_expires() -> Result<()> {
         review_contexts: Mutex::new(Vec::new()),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let rule_id = state
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "general-only",
+            "General only",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            1,
+            3_600,
+        ))
+        .await?;
     let service = ReviewService::new(
         config,
         gitlab,
@@ -4372,201 +4413,59 @@ async fn security_flow_skips_same_sha_until_debounce_expires() -> Result<()> {
     );
 
     let first = service
-        .security_review_flow
-        .run_for_mr("group/repo", mr(26, "sha26"), "sha26")
+        .general_review_flow
+        .run_for_mr("group/repo", mr(26, "sha26-old"), "sha26-old")
         .await?;
     let second = service
-        .security_review_flow
-        .run_for_mr("group/repo", mr(26, "sha26"), "sha26")
+        .general_review_flow
+        .run_for_mr("group/repo", mr(26, "sha26-new"), "sha26-new")
+        .await?;
+    let third = service
+        .general_review_flow
+        .run_for_mr("group/repo", mr(26, "sha26-newer"), "sha26-newer")
         .await?;
 
     assert_eq!(first, crate::flow::review::ReviewScheduleOutcome::Scheduled);
     assert_eq!(
         second,
-        crate::flow::review::ReviewScheduleOutcome::SkippedDebounce
+        crate::flow::review::ReviewScheduleOutcome::SkippedRateLimit
     );
     assert_eq!(
-        runner
-            .review_contexts
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
-            .count(),
-        1
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn security_flow_ignores_existing_marker_after_debounce_expires() -> Result<()> {
-    let mut config = test_config();
-    config.feature_flags.security_review = true;
-    config.review.security.debounce = Some(3_600);
-    let gitlab = fake_gitlab(vec![mr(27, "sha27")]);
-    let runner = Arc::new(CapturingReviewRunner {
-        result: Mutex::new(Some(CodexResult::Pass {
-            summary: "ok".to_string(),
-        })),
-        review_contexts: Mutex::new(Vec::new()),
-    });
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let service = ReviewService::new(
-        config,
-        gitlab.clone(),
-        state.clone(),
-        runner.clone(),
-        1,
-        default_created_after(),
+        third,
+        crate::flow::review::ReviewScheduleOutcome::SkippedRateLimit
     );
 
-    let first = service
-        .security_review_flow
-        .run_for_mr("group/repo", mr(27, "sha27"), "sha27")
-        .await?;
-    assert_eq!(first, crate::flow::review::ReviewScheduleOutcome::Scheduled);
+    let pending = state.list_review_rate_limit_pending().await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].lane, crate::review_lane::ReviewLane::General);
+    assert_eq!(pending[0].repo, "group/repo".to_string());
+    assert_eq!(pending[0].iid, 26);
+    assert_eq!(pending[0].last_seen_head_sha, "sha26-newer".to_string());
+    assert!(pending[0].first_blocked_at <= pending[0].last_blocked_at);
+    assert!(pending[0].next_retry_at > pending[0].last_blocked_at);
 
     state
-        .upsert_security_review_debounce("group/repo", 27, 0, 0)
+        .refund_review_rate_limit_rules(std::slice::from_ref(&rule_id), Utc::now().timestamp())
         .await?;
-    gitlab.notes.lock().unwrap().insert(
-        ("group/repo".to_string(), 27),
-        vec![Note {
-            id: 1,
-            body: "Security review\n\n<!-- codex-security-review:sha=sha27 -->".to_string(),
-            author: GitLabUser {
-                id: 1,
-                username: Some("bot".to_string()),
-                name: Some("Bot".to_string()),
-            },
-        }],
-    );
 
-    let second = service
-        .security_review_flow
-        .run_for_mr("group/repo", mr(27, "sha27"), "sha27")
+    let fourth = service
+        .general_review_flow
+        .run_for_mr("group/repo", mr(26, "sha26-final"), "sha26-final")
         .await?;
     assert_eq!(
-        second,
+        fourth,
         crate::flow::review::ReviewScheduleOutcome::Scheduled
     );
-    assert_eq!(
-        runner
-            .review_contexts
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
-            .count(),
-        2
-    );
+    assert!(state.list_review_rate_limit_pending().await?.is_empty());
+    assert_eq!(runner.review_contexts.lock().unwrap().len(), 2);
     Ok(())
 }
 
 #[tokio::test]
-async fn security_flow_skips_new_sha_until_debounce_expires() -> Result<()> {
+async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Result<()> {
     let mut config = test_config();
     config.feature_flags.security_review = true;
-    config.review.security.debounce = Some(3_600);
-    let gitlab = fake_gitlab(vec![mr(271, "sha271-new")]);
-    let runner = Arc::new(CapturingReviewRunner {
-        result: Mutex::new(Some(CodexResult::Pass {
-            summary: "ok".to_string(),
-        })),
-        review_contexts: Mutex::new(Vec::new()),
-    });
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let service = ReviewService::new(
-        config,
-        gitlab,
-        state,
-        runner.clone(),
-        1,
-        default_created_after(),
-    );
-
-    let first = service
-        .security_review_flow
-        .run_for_mr("group/repo", mr(271, "sha271-old"), "sha271-old")
-        .await?;
-    let second = service
-        .security_review_flow
-        .run_for_mr("group/repo", mr(271, "sha271-new"), "sha271-new")
-        .await?;
-
-    assert_eq!(first, crate::flow::review::ReviewScheduleOutcome::Scheduled);
-    assert_eq!(
-        second,
-        crate::flow::review::ReviewScheduleOutcome::SkippedDebounce
-    );
-    assert_eq!(
-        runner
-            .review_contexts
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
-            .count(),
-        1
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn failed_security_run_arms_debounce_state() -> Result<()> {
-    let mut config = test_config();
-    config.feature_flags.security_review = true;
-    config.review.security.debounce = Some(3_600);
     let gitlab = fake_gitlab(Vec::new());
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    state
-        .begin_review_for_lane(
-            "group/repo",
-            272,
-            "sha272",
-            crate::review_lane::ReviewLane::Security,
-        )
-        .await?;
-    let review_context = ReviewRunContext {
-        lane: crate::review_lane::ReviewLane::Security,
-        config,
-        gitlab,
-        codex: Arc::new(FailingRunner {
-            calls: Mutex::new(0),
-        }),
-        state: state.clone(),
-        retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
-        bot_user_id: 1,
-        shutdown: Arc::new(AtomicBool::new(false)),
-    };
-
-    review_context
-        .run(
-            "group/repo",
-            mr(272, "sha272"),
-            "sha272",
-            crate::feature_flags::FeatureFlagSnapshot {
-                security_review: true,
-                ..crate::feature_flags::FeatureFlagSnapshot::default()
-            },
-            0,
-        )
-        .await?;
-
-    let debounce = state
-        .get_security_review_debounce("group/repo", 272)
-        .await?
-        .expect("debounce state");
-    assert!(debounce.next_eligible_at > debounce.last_started_at);
-    Ok(())
-}
-
-#[tokio::test]
-async fn incremental_scans_unchanged_repo_when_security_debounce_is_due() -> Result<()> {
-    let mut config = test_config();
-    config.feature_flags.security_review = true;
-    config.review.security.debounce = Some(3_600);
-    let gitlab = fake_gitlab(vec![mr(28, "sha28")]);
     let runner = Arc::new(CapturingReviewRunner {
         result: Mutex::new(Some(CodexResult::Pass {
             summary: "ok".to_string(),
@@ -4574,65 +4473,160 @@ async fn incremental_scans_unchanged_repo_when_security_debounce_is_due() -> Res
         review_contexts: Mutex::new(Vec::new()),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let general_only = state
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "general-only",
+            "General only",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            2,
+            3_600,
+        ))
+        .await?;
+    let security_only = state
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "security-only",
+            "Security only",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            false,
+            true,
+            2,
+            3_600,
+        ))
+        .await?;
+    let shared = state
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "shared",
+            "Shared",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            true,
+            2,
+            3_600,
+        ))
+        .await?;
     let service = ReviewService::new(
         config,
-        gitlab.clone(),
+        gitlab,
         state.clone(),
         runner.clone(),
         1,
         default_created_after(),
     );
 
-    service.scan_once().await?;
-    let list_open_calls_before = *gitlab.list_open_calls.lock().unwrap();
-    state
-        .upsert_security_review_debounce("group/repo", 28, 0, 0)
-        .await?;
-    gitlab.awards.lock().unwrap().insert(
-        ("group/repo".to_string(), 28),
-        vec![AwardEmoji {
-            id: 1,
-            name: "thumbsup".to_string(),
-            user: GitLabUser {
-                id: 1,
-                username: Some("bot".to_string()),
-                name: Some("Bot".to_string()),
-            },
-        }],
+    assert_eq!(
+        service
+            .general_review_flow
+            .run_for_mr("group/repo", mr(30, "sha30"), "sha30")
+            .await?,
+        crate::flow::review::ReviewScheduleOutcome::Scheduled
     );
+    let mut active_rule_ids = state
+        .list_active_review_rate_limit_buckets(Utc::now().timestamp())
+        .await?
+        .into_iter()
+        .map(|bucket| bucket.rule_id)
+        .collect::<Vec<_>>();
+    active_rule_ids.sort();
+    assert_eq!(active_rule_ids, vec![general_only.clone(), shared.clone()]);
 
-    service.scan_once_incremental().await?;
-
-    assert!(*gitlab.list_open_calls.lock().unwrap() > list_open_calls_before);
-    for _ in 0..50 {
-        if runner
+    assert_eq!(
+        service
+            .security_review_flow
+            .run_for_mr("group/repo", mr(31, "sha31"), "sha31")
+            .await?,
+        crate::flow::review::ReviewScheduleOutcome::Scheduled
+    );
+    let mut active_rule_ids = state
+        .list_active_review_rate_limit_buckets(Utc::now().timestamp())
+        .await?
+        .into_iter()
+        .map(|bucket| bucket.rule_id)
+        .collect::<Vec<_>>();
+    active_rule_ids.sort();
+    assert_eq!(active_rule_ids, vec![general_only, security_only, shared]);
+    assert_eq!(
+        runner
             .review_contexts
             .lock()
             .unwrap()
-            .iter()
-            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
-            .count()
-            == 2
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let review_contexts = runner.review_contexts.lock().unwrap();
-    assert_eq!(
-        review_contexts
             .iter()
             .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::General)
             .count(),
         1
     );
     assert_eq!(
-        review_contexts
+        runner
+            .review_contexts
+            .lock()
+            .unwrap()
             .iter()
             .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
             .count(),
-        2
+        1
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_refunds_on_startup_failure() -> Result<()> {
+    let config = test_config();
+    let gitlab = fake_gitlab(Vec::new());
+    let runner = Arc::new(CapturingReviewRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        review_contexts: Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    state
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "startup-failure",
+            "Startup failure",
+            ReviewRateLimitScope::Project,
+            "group/repo",
+            None,
+            true,
+            false,
+            1,
+            3_600,
+        ))
+        .await?;
+    sqlx::query("DROP TABLE run_history")
+        .execute(state.pool())
+        .await?;
+    let service = ReviewService::new(
+        config,
+        gitlab,
+        state.clone(),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    assert!(
+        service
+            .general_review_flow
+            .run_for_mr("group/repo", mr(32, "sha32"), "sha32")
+            .await
+            .is_err()
+    );
+    assert!(state.list_review_rate_limit_pending().await?.is_empty());
+    assert!(
+        state
+            .list_active_review_rate_limit_buckets(Utc::now().timestamp())
+            .await?
+            .is_empty()
+    );
+    assert!(state.list_in_progress_reviews().await?.is_empty());
+    assert!(runner.review_contexts.lock().unwrap().is_empty());
     Ok(())
 }
 

@@ -1,16 +1,18 @@
 use super::markdown::render_safe_markdown;
 use super::status::{
     HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, SecurityContextPreview,
-    StatusFeatureFlagSnapshot, StatusSnapshot, ThreadItemSnapshot, ThreadSnapshot,
-    TranscriptBackfillSnapshot,
+    StatusFeatureFlagSnapshot, StatusRateLimitSnapshot, StatusSnapshot, ThreadItemSnapshot,
+    ThreadSnapshot, TranscriptBackfillSnapshot,
 };
 use super::timestamp::{self, UiTimestamp};
+use crate::review_lane::ReviewLane;
 use crate::skills::{
     SkillAccountSnapshot, SkillListSnapshot, SkillPreviewSnapshot, SkillSyncState,
 };
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, ProjectCatalogSummary,
-    RunHistoryKind, RunHistoryListItem, RunHistoryRecord,
+    ReviewRateLimitBucketSnapshot, ReviewRateLimitPendingEntry, ReviewRateLimitRule,
+    ReviewRateLimitScope, RunHistoryKind, RunHistoryListItem, RunHistoryRecord,
 };
 use serde::Deserialize;
 use urlencoding::encode;
@@ -236,6 +238,26 @@ pub(super) fn render_skill_detail_page(
         render_csrf_hidden_input(csrf_token),
     );
     render_shell("Skill Preview", NavItem::Skills, body, csrf_token)
+}
+
+pub(super) fn render_rate_limits_page(
+    snapshot: &StatusRateLimitSnapshot,
+    csrf_token: Option<&str>,
+) -> String {
+    let body = format!(
+        "<section class=\"hero\"><h1>Review rate limits</h1><p class=\"muted\">Manage project and merge-request scoped review throughput.</p></section>\
+         <section class=\"grid\">\
+         <article class=\"card\"><h2>Create rule</h2>{}</article>\
+         <article class=\"card\">{}</article>\
+         </section>\
+         <section class=\"card\">{}</section>\
+         <section class=\"card\">{}</section>",
+        render_rate_limit_create_form(csrf_token),
+        render_rate_limit_rules_section(&snapshot.rules, csrf_token),
+        render_rate_limit_buckets_section(&snapshot.active_buckets),
+        render_rate_limit_pending_section(&snapshot.pending),
+    );
+    render_shell("Review Rate Limits", NavItem::RateLimits, body, csrf_token)
 }
 
 pub(super) fn encode_repo_key(repo: &str) -> String {
@@ -1718,6 +1740,7 @@ fn render_nav(active: NavItem) -> String {
     let items = [
         (NavItem::Status, "/status", "Status"),
         (NavItem::History, "/history", "History"),
+        (NavItem::RateLimits, "/rate-limits", "Rate limits"),
         (NavItem::Skills, "/skills", "Skills"),
     ];
     let links = items
@@ -1803,11 +1826,235 @@ fn feature_flag_script() -> &'static str {
 enum NavItem {
     Status,
     History,
+    RateLimits,
     Skills,
 }
 
 fn page_style() -> &'static str {
     PAGE_STYLE
+}
+
+fn render_rate_limit_create_form(csrf_token: Option<&str>) -> String {
+    format!(
+        "<form class=\"filters\" method=\"post\" action=\"/rate-limits/create\">\
+         {}\
+         <label class=\"filter-field\"><span>Label</span><input name=\"label\" required></label>\
+         <label class=\"filter-field\"><span>Scope</span>\
+         <select name=\"scope\">\
+         <option value=\"project\">project</option>\
+         <option value=\"merge_request\">merge_request</option>\
+         </select>\
+         </label>\
+         <label class=\"filter-field\"><span>Scope repo</span><input name=\"scope_repo\" required></label>\
+         <label class=\"filter-field\"><span>Scope iid</span><input name=\"scope_iid\" placeholder=\"optional\"></label>\
+         <label class=\"filter-field\"><span>Capacity</span><input name=\"capacity\" type=\"number\" min=\"1\" required></label>\
+         <label class=\"filter-field\"><span>Window seconds</span><input name=\"window_seconds\" type=\"number\" min=\"1\" required></label>\
+         <label class=\"filter-field\"><span>Applies to</span>\
+         <label><input type=\"checkbox\" name=\"applies_to_review\" value=\"true\" checked> Review</label>\
+         <label><input type=\"checkbox\" name=\"applies_to_security\" value=\"true\"> Security</label>\
+         </label>\
+         <div class=\"filter-actions\"><button type=\"submit\">Create</button></div>\
+         </form>",
+        render_csrf_hidden_input(csrf_token),
+    )
+}
+
+fn render_rate_limit_rules_section(
+    rules: &[ReviewRateLimitRule],
+    csrf_token: Option<&str>,
+) -> String {
+    render_table_section(
+        "Existing rules",
+        if rules.is_empty() {
+            "<p class=\"empty\">No rules configured.</p>".to_string()
+        } else {
+            let rows = rules
+                .iter()
+                .map(|rule| {
+                    let scope_iid = rule
+                        .scope_iid
+                        .map(|iid| iid.to_string())
+                        .unwrap_or_default();
+                    let rule_id = escape_html(&rule.id);
+                    let csrf = render_csrf_hidden_input(csrf_token);
+                    format!(
+                        "<tr>\
+                         <td>{0}</td>\
+                         <td>{1}</td>\
+                         <td>{2}</td>\
+                         <td>{3}</td>\
+                         <td>{4}</td>\
+                         <td>\
+                         <form class=\"filters\" method=\"post\" action=\"/rate-limits/{5}/update\">\
+                         {6}\
+                         <label class=\"filter-field\"><span>Label</span><input name=\"label\" value=\"{7}\" required></label>\
+                         <label class=\"filter-field\"><span>Scope</span><select name=\"scope\">{8}</select></label>\
+                         <label class=\"filter-field\"><span>Scope repo</span><input name=\"scope_repo\" value=\"{9}\" required></label>\
+                         <label class=\"filter-field\"><span>Scope iid</span><input name=\"scope_iid\" value=\"{10}\"></label>\
+                         <label class=\"filter-field\"><span>Capacity</span><input name=\"capacity\" type=\"number\" value=\"{11}\" min=\"1\" required></label>\
+                         <label class=\"filter-field\"><span>Window seconds</span><input name=\"window_seconds\" type=\"number\" value=\"{12}\" min=\"1\" required></label>\
+                         <label class=\"filter-field\"><span>Applies to</span>\
+                         <label><input type=\"checkbox\" name=\"applies_to_review\" value=\"true\" {13}> Review</label>\
+                         <label><input type=\"checkbox\" name=\"applies_to_security\" value=\"true\" {14}> Security</label>\
+                         </label>\
+                         <div class=\"filter-actions\"><button type=\"submit\">Save</button></div>\
+                         </form>\
+                         <form class=\"filter-actions\" method=\"post\" action=\"/rate-limits/{5}/delete\">{6}\
+                         <button class=\"danger-button\" type=\"submit\">Delete</button></form>\
+                         <form class=\"filter-actions\" method=\"post\" action=\"/rate-limits/{5}/regen\">{6}\
+                         <button type=\"submit\">Regen</button></form>\
+                         </td>\
+                         </tr>",
+                        escape_html(&rule.label),
+                        escape_html(&rule.scope_subject),
+                        render_rate_limit_applies(rule.applies_to_review, rule.applies_to_security),
+                        rule.capacity,
+                        rule.window_seconds,
+                        rule_id,
+                        csrf,
+                        escape_html(&rule.label),
+                        render_rate_limit_scope_options(rule.scope),
+                        escape_html(&rule.scope_repo),
+                        scope_iid,
+                        rule.capacity,
+                        rule.window_seconds,
+                        if rule.applies_to_review { "checked" } else { "" },
+                        if rule.applies_to_security {
+                            "checked"
+                        } else {
+                            ""
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            format!(
+                "<table><thead><tr><th>Label</th><th>Scope</th><th>Applies</th><th>Capacity</th><th>Window</th><th>Actions</th></tr></thead><tbody>{}</tbody></table>",
+                rows
+            )
+        },
+    )
+}
+
+fn render_rate_limit_buckets_section(active_buckets: &[ReviewRateLimitBucketSnapshot]) -> String {
+    render_table_section(
+        "Active buckets",
+        if active_buckets.is_empty() {
+            "<p class=\"empty\">No active buckets.</p>".to_string()
+        } else {
+            let rows = active_buckets
+                .iter()
+                .map(|bucket| {
+                    format!(
+                        "<tr>\
+                         <td>{0}</td>\
+                         <td>{1}</td>\
+                         <td>{2}</td>\
+                         <td>{3}</td>\
+                         <td>{4}</td>\
+                         <td>{5}</td>\
+                         <td>{6:.3}</td>\
+                         <td>{7}</td>\
+                         <td>{8}</td>\
+                         <td>{9}</td>\
+                         </tr>",
+                        escape_html(&bucket.rule_id),
+                        escape_html(&bucket.rule_label),
+                        escape_html(&bucket.scope_subject),
+                        escape_html(&bucket.repo),
+                        bucket
+                            .iid
+                            .map(|iid| iid.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        bucket.capacity,
+                        bucket.available_slots,
+                        render_unix_timestamp(bucket.updated_at),
+                        bucket
+                            .next_slot_at
+                            .map(render_unix_timestamp)
+                            .unwrap_or_else(|| "-".to_string()),
+                        render_rate_limit_applies(
+                            bucket.applies_to_review,
+                            bucket.applies_to_security
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            format!(
+                "<table><thead><tr><th>Rule ID</th><th>Rule</th><th>Scope</th><th>Repo</th><th>IID</th><th>Capacity</th><th>Slots</th><th>Updated</th><th>Next slot</th><th>Applies</th></tr></thead><tbody>{}</tbody></table>",
+                rows
+            )
+        },
+    )
+}
+
+fn render_rate_limit_pending_section(pending: &[ReviewRateLimitPendingEntry]) -> String {
+    render_table_section(
+        "Pending queue",
+        if pending.is_empty() {
+            "<p class=\"empty\">No pending review items.</p>".to_string()
+        } else {
+            let rows = pending
+                .iter()
+                .map(|item| {
+                    format!(
+                        "<tr>\
+                         <td>{}</td>\
+                         <td>{}</td>\
+                         <td>{}</td>\
+                         <td>{}</td>\
+                         <td>{}</td>\
+                         <td>{}</td>\
+                         <td>{}</td>\
+                         </tr>",
+                        render_review_lane_label(item.lane),
+                        escape_html(&item.repo),
+                        item.iid,
+                        escape_html(&item.last_seen_head_sha),
+                        render_unix_timestamp(item.first_blocked_at),
+                        render_unix_timestamp(item.last_blocked_at),
+                        render_unix_timestamp(item.next_retry_at),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            format!(
+                "<table><thead><tr><th>Lane</th><th>Repo</th><th>IID</th><th>Head SHA</th><th>First blocked</th><th>Last blocked</th><th>Next retry</th></tr></thead><tbody>{}</tbody></table>",
+                rows
+            )
+        },
+    )
+}
+
+fn render_rate_limit_applies(review: bool, security: bool) -> &'static str {
+    match (review, security) {
+        (true, true) => "review + security",
+        (true, false) => "review",
+        (false, true) => "security",
+        (false, false) => "-",
+    }
+}
+
+fn render_rate_limit_scope_options(selected: ReviewRateLimitScope) -> String {
+    let project = if matches!(selected, ReviewRateLimitScope::Project) {
+        " selected"
+    } else {
+        ""
+    };
+    let merge_request = if matches!(selected, ReviewRateLimitScope::MergeRequest) {
+        " selected"
+    } else {
+        ""
+    };
+    format!(
+        "<option value=\"project\"{project}>project</option>\
+         <option value=\"merge_request\"{merge_request}>merge_request</option>"
+    )
+}
+
+fn render_review_lane_label(lane: ReviewLane) -> &'static str {
+    lane.review_label()
 }
 
 #[cfg(test)]

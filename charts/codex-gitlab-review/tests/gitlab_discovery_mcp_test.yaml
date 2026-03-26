@@ -23,6 +23,9 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: "(?m)^    allow: \\[\\]$"
+      - notContains:
+          path: data["config.yaml"]
+          content: "debounce:"
   - it: leaves advertise_url empty in config so the service can derive the runtime default
     template: templates/configmap.yaml
     asserts:
