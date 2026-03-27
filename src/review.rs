@@ -1100,9 +1100,9 @@ mod pending_rate_limit_tests {
     use crate::codex_runner::{CodexResult, ReviewContext};
     use crate::config::{
         BrowserMcpConfig, CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
-        McpServerOverridesConfig, ReasoningEffortOverridesConfig, ReasoningSummaryOverridesConfig,
-        ReviewConfig, ReviewMentionCommandsConfig, ReviewSecurityConfig, ScheduleConfig,
-        ServerConfig, TargetSelector,
+        McpServerOverridesConfig, ReasoningSummaryOverridesConfig, ReviewConfig,
+        ReviewMentionCommandsConfig, ReviewSecurityConfig, ScheduleConfig, ServerConfig,
+        SessionOverridesConfig, TargetSelector,
     };
     use crate::feature_flags::FeatureFlagDefaults;
     use crate::gitlab::GitLabUser;
@@ -1304,7 +1304,7 @@ mod pending_rate_limit_tests {
                 browser_mcp: BrowserMcpConfig::default(),
                 gitlab_discovery_mcp: Default::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
-                reasoning_effort: ReasoningEffortOverridesConfig::default(),
+                session_overrides: SessionOverridesConfig::default(),
                 reasoning_summary: ReasoningSummaryOverridesConfig::default(),
             },
             docker: DockerConfig::default(),

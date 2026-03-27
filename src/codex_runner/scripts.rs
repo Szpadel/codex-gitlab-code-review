@@ -19,6 +19,12 @@ pub(crate) struct AppServerCommandOptions<'a> {
     pub(crate) browser_mcp: Option<&'a BrowserMcpConfig>,
     pub(crate) gitlab_discovery_mcp: Option<&'a GitLabDiscoveryMcpRuntimeConfig>,
     pub(crate) mcp_server_overrides: &'a BTreeMap<String, bool>,
+    pub(crate) session_override: ConfiguredSessionOverride<'a>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ConfiguredSessionOverride<'a> {
+    pub(crate) model: Option<&'a str>,
     pub(crate) reasoning_summary: Option<&'a str>,
     pub(crate) reasoning_effort: Option<&'a str>,
 }
@@ -100,7 +106,6 @@ impl DockerCodexRunner {
         &self,
         ctx: &ReviewContext,
         app_server: AppServerCommandOptions<'_>,
-        reasoning_effort: Option<&str>,
     ) -> Result<String> {
         let clone_url = self.clone_url(&ctx.repo)?;
         let mcp_server_overrides = self.effective_mcp_server_overrides_for_run(
@@ -126,10 +131,7 @@ impl DockerCodexRunner {
                 browser_mcp: app_server.browser_mcp,
                 gitlab_discovery_mcp: app_server.gitlab_discovery_mcp,
                 mcp_server_overrides: &mcp_server_overrides,
-                reasoning_summary: self
-                    .review_reasoning_summary()
-                    .or(app_server.reasoning_summary),
-                reasoning_effort: reasoning_effort.or(app_server.reasoning_effort),
+                session_override: app_server.session_override,
             },
         ))
     }
@@ -138,16 +140,74 @@ impl DockerCodexRunner {
         configured_reasoning_summary(self.codex.reasoning_summary.review.as_deref())
     }
 
-    pub(crate) fn review_reasoning_effort(&self) -> Option<&str> {
-        configured_reasoning_effort(self.codex.reasoning_effort.review.as_deref())
+    pub(crate) fn review_session_override(&self) -> ConfiguredSessionOverride<'_> {
+        ConfiguredSessionOverride {
+            model: configured_model(self.codex.session_overrides.review.model.as_deref()),
+            reasoning_summary: self.review_reasoning_summary(),
+            reasoning_effort: configured_reasoning_effort(
+                self.codex
+                    .session_overrides
+                    .review
+                    .reasoning_effort
+                    .as_deref(),
+            ),
+        }
     }
 
-    pub(crate) fn security_context_reasoning_effort(&self) -> Option<&str> {
-        configured_reasoning_effort(self.codex.reasoning_effort.security_context.as_deref())
+    pub(crate) fn security_context_session_override(&self) -> ConfiguredSessionOverride<'_> {
+        ConfiguredSessionOverride {
+            model: configured_model(
+                self.codex
+                    .session_overrides
+                    .security_context
+                    .model
+                    .as_deref(),
+            ),
+            reasoning_summary: self.review_reasoning_summary(),
+            reasoning_effort: configured_reasoning_effort(
+                self.codex
+                    .session_overrides
+                    .security_context
+                    .reasoning_effort
+                    .as_deref(),
+            ),
+        }
     }
 
-    pub(crate) fn security_review_reasoning_effort(&self) -> Option<&str> {
-        configured_reasoning_effort(self.codex.reasoning_effort.security_review.as_deref())
+    pub(crate) fn security_review_session_override(&self) -> ConfiguredSessionOverride<'_> {
+        ConfiguredSessionOverride {
+            model: configured_model(
+                self.codex
+                    .session_overrides
+                    .security_review
+                    .model
+                    .as_deref(),
+            ),
+            reasoning_summary: self.review_reasoning_summary(),
+            reasoning_effort: configured_reasoning_effort(
+                self.codex
+                    .session_overrides
+                    .security_review
+                    .reasoning_effort
+                    .as_deref(),
+            ),
+        }
+    }
+
+    pub(crate) fn mention_session_override(&self) -> ConfiguredSessionOverride<'_> {
+        ConfiguredSessionOverride {
+            model: configured_model(self.codex.session_overrides.mention.model.as_deref()),
+            reasoning_summary: configured_reasoning_summary(
+                self.codex.reasoning_summary.mention.as_deref(),
+            ),
+            reasoning_effort: configured_reasoning_effort(
+                self.codex
+                    .session_overrides
+                    .mention
+                    .reasoning_effort
+                    .as_deref(),
+            ),
+        }
     }
 
     pub(crate) fn browser_mcp(&self) -> Option<&BrowserMcpConfig> {
@@ -185,8 +245,7 @@ impl DockerCodexRunner {
             app_server.browser_mcp,
             app_server.gitlab_discovery_mcp,
             app_server.mcp_server_overrides,
-            app_server.reasoning_summary,
-            app_server.reasoning_effort,
+            app_server.session_override,
         );
         render_template(
             MENTION_COMMAND_TEMPLATE,
@@ -236,8 +295,7 @@ run_git fetch git fetch --unshallow\n"
             app_server.browser_mcp,
             app_server.gitlab_discovery_mcp,
             app_server.mcp_server_overrides,
-            app_server.reasoning_summary,
-            app_server.reasoning_effort,
+            app_server.session_override,
         );
         render_template(
             REVIEW_COMMAND_TEMPLATE,
@@ -417,6 +475,10 @@ pub(crate) fn browser_wait_script(browser_mcp: Option<&BrowserMcpConfig>) -> Str
     render_template(BROWSER_WAIT_TEMPLATE, &[("@@PORT@@", &port)])
 }
 
+pub(crate) fn configured_model(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 pub(crate) fn configured_reasoning_effort(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -429,27 +491,31 @@ pub(crate) fn codex_app_server_exec_command(
     browser_mcp: Option<&BrowserMcpConfig>,
     gitlab_discovery_mcp: Option<&GitLabDiscoveryMcpRuntimeConfig>,
     mcp_server_overrides: &BTreeMap<String, bool>,
-    reasoning_summary: Option<&str>,
-    reasoning_effort: Option<&str>,
+    session_override: ConfiguredSessionOverride<'_>,
 ) -> String {
     if browser_mcp.is_none()
         && gitlab_discovery_mcp.is_none()
         && mcp_server_overrides.is_empty()
-        && reasoning_summary.is_none()
-        && reasoning_effort.is_none()
+        && session_override.model.is_none()
+        && session_override.reasoning_summary.is_none()
+        && session_override.reasoning_effort.is_none()
     {
         return "exec codex app-server".to_string();
     }
 
     let mut cmd_parts = vec!["exec codex".to_string()];
-    if let Some(reasoning_summary) = reasoning_summary {
+    if let Some(model) = session_override.model {
+        let override_value = format!("model={}", toml_basic_string(model));
+        cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
+    }
+    if let Some(reasoning_summary) = session_override.reasoning_summary {
         let override_value = format!(
             "model_reasoning_summary={}",
             toml_basic_string(reasoning_summary)
         );
         cmd_parts.push(format!("-c {}", shell_quote(&override_value)));
     }
-    if let Some(reasoning_effort) = reasoning_effort {
+    if let Some(reasoning_effort) = session_override.reasoning_effort {
         let override_value = format!(
             "model_reasoning_effort={}",
             toml_basic_string(reasoning_effort)

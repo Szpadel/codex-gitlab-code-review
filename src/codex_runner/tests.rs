@@ -1,6 +1,22 @@
+use super::app_server::{
+    TurnHistoryCapture, TurnNotificationContext, item_is_successful_gitlab_discovery_call,
+    with_recent_runner_errors,
+};
+use super::auth::{auth_account_state_key, parse_usage_limit_reset_at, should_clear_limit_reset};
 use super::browser_mcp::{
     BrowserContainerDiagnostics, BrowserContainerStateSnapshot, BrowserLaunchConfig,
     BrowserLogTail, browser_container_cmd, browser_container_has_exited, browser_logs_report_ready,
+};
+use super::container::{
+    ContainerExecOutput, auxiliary_git_exec_command, validate_container_exec_result,
+};
+use super::gitlab_discovery::{
+    gitlab_discovery_mcp_probe_exec_command, gitlab_discovery_mcp_startup_failure_events,
+};
+use super::review_flow::{ReviewTargetRequest, parse_review_output};
+use super::scripts::{
+    BuildCommandScriptInput, ConfiguredSessionOverride, browser_mcp_prereq_script,
+    browser_wait_script, codex_app_server_exec_command, git_bootstrap_auth_setup_script,
 };
 use super::test_support::{
     ExecContainerCommandRequest, FakeGitLabDiscoveryHandle, FakeRunnerHarness,
@@ -13,6 +29,7 @@ use crate::composer_install::{
 };
 use crate::config::{
     DepsConfig, FallbackAuthAccountConfig, GitLabTargets, McpServerOverridesConfig,
+    SessionOverridesConfig,
 };
 use crate::state::{NewRunHistory, RunHistoryKind};
 use anyhow::Context;
@@ -1079,7 +1096,7 @@ fn build_auth_accounts_keeps_primary_first_then_fallback_order() {
         browser_mcp: BrowserMcpConfig::default(),
         gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
         mcp_server_overrides: McpServerOverridesConfig::default(),
-        reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+        session_overrides: SessionOverridesConfig::default(),
         reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
     };
 
@@ -1132,7 +1149,7 @@ fn runner_env_vars_do_not_include_proxy_settings() {
             browser_mcp: BrowserMcpConfig::default(),
             gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
-            reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+            session_overrides: SessionOverridesConfig::default(),
             reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
         },
         gitlab_discovery_mcp: None,
@@ -1299,14 +1316,16 @@ fn app_server_cmd_uses_bash_login_args() {
 #[test]
 fn codex_app_server_exec_command_without_mcp_overrides_is_plain() {
     let overrides = BTreeMap::new();
-    let cmd = codex_app_server_exec_command(None, None, &overrides, None, None);
+    let cmd =
+        codex_app_server_exec_command(None, None, &overrides, ConfiguredSessionOverride::default());
     assert_eq!(cmd, "exec codex app-server");
 }
 
 #[test]
 fn codex_app_server_exec_command_renders_sorted_mcp_overrides() {
     let overrides = BTreeMap::from([("serena".to_string(), false), ("github".to_string(), true)]);
-    let cmd = codex_app_server_exec_command(None, None, &overrides, None, None);
+    let cmd =
+        codex_app_server_exec_command(None, None, &overrides, ConfiguredSessionOverride::default());
     assert_eq!(
         cmd,
         "exec codex -c 'mcp_servers.github.enabled=true' -c 'mcp_servers.serena.enabled=false' app-server"
@@ -1315,7 +1334,15 @@ fn codex_app_server_exec_command_renders_sorted_mcp_overrides() {
 
 #[test]
 fn codex_app_server_exec_command_includes_reasoning_effort_override() {
-    let cmd = codex_app_server_exec_command(None, None, &BTreeMap::new(), None, Some("high"));
+    let cmd = codex_app_server_exec_command(
+        None,
+        None,
+        &BTreeMap::new(),
+        ConfiguredSessionOverride {
+            reasoning_effort: Some("high"),
+            ..ConfiguredSessionOverride::default()
+        },
+    );
     assert_eq!(
         cmd,
         "exec codex -c 'model_reasoning_effort=\"high\"' app-server"
@@ -1324,11 +1351,33 @@ fn codex_app_server_exec_command_includes_reasoning_effort_override() {
 
 #[test]
 fn codex_app_server_exec_command_includes_reasoning_summary_override() {
-    let cmd = codex_app_server_exec_command(None, None, &BTreeMap::new(), Some("detailed"), None);
+    let cmd = codex_app_server_exec_command(
+        None,
+        None,
+        &BTreeMap::new(),
+        ConfiguredSessionOverride {
+            reasoning_summary: Some("detailed"),
+            ..ConfiguredSessionOverride::default()
+        },
+    );
     assert_eq!(
         cmd,
         "exec codex -c 'model_reasoning_summary=\"detailed\"' app-server"
     );
+}
+
+#[test]
+fn codex_app_server_exec_command_includes_model_override() {
+    let cmd = codex_app_server_exec_command(
+        None,
+        None,
+        &BTreeMap::new(),
+        ConfiguredSessionOverride {
+            model: Some("gpt-5.4"),
+            ..ConfiguredSessionOverride::default()
+        },
+    );
+    assert_eq!(cmd, "exec codex -c 'model=\"gpt-5.4\"' app-server");
 }
 
 #[test]
@@ -1344,8 +1393,7 @@ fn codex_app_server_exec_command_includes_browser_mcp_config() {
         }),
         None,
         &BTreeMap::new(),
-        None,
-        None,
+        ConfiguredSessionOverride::default(),
     );
     assert!(cmd.contains("mcp_servers.chrome-devtools.command=\"npx\""));
     assert!(cmd.contains("chrome-devtools-mcp@latest"));
@@ -1363,8 +1411,7 @@ fn codex_app_server_exec_command_includes_gitlab_discovery_mcp_config() {
             clone_root: "/work/mcp".to_string(),
         }),
         &BTreeMap::new(),
-        None,
-        None,
+        ConfiguredSessionOverride::default(),
     );
     assert!(
         cmd.contains("mcp_servers.gitlab-discovery.url=\"http://gitlab-discovery.internal/mcp\"")
@@ -1387,8 +1434,7 @@ fn codex_app_server_exec_command_allows_mode_overrides_to_disable_browser_mcp() 
         }),
         None,
         &BTreeMap::from([("chrome-devtools".to_string(), false)]),
-        None,
-        None,
+        ConfiguredSessionOverride::default(),
     );
     let expected_enable = "-c 'mcp_servers.chrome-devtools.enabled=true'";
     let expected_disable = "-c 'mcp_servers.chrome-devtools.enabled=false'";
@@ -1400,7 +1446,15 @@ fn codex_app_server_exec_command_allows_mode_overrides_to_disable_browser_mcp() 
 #[test]
 fn codex_app_server_exec_command_places_reasoning_effort_before_mcp_overrides() {
     let overrides = BTreeMap::from([("github".to_string(), false)]);
-    let cmd = codex_app_server_exec_command(None, None, &overrides, None, Some("medium"));
+    let cmd = codex_app_server_exec_command(
+        None,
+        None,
+        &overrides,
+        ConfiguredSessionOverride {
+            reasoning_effort: Some("medium"),
+            ..ConfiguredSessionOverride::default()
+        },
+    );
     let reasoning = "-c 'model_reasoning_effort=\"medium\"'";
     let mcp = "-c 'mcp_servers.github.enabled=false'";
     assert!(cmd.contains(reasoning));
@@ -1409,18 +1463,24 @@ fn codex_app_server_exec_command_places_reasoning_effort_before_mcp_overrides() 
 }
 
 #[test]
-fn codex_app_server_exec_command_places_reasoning_summary_before_effort() {
+fn codex_app_server_exec_command_places_model_before_summary_and_effort() {
     let cmd = codex_app_server_exec_command(
         None,
         None,
         &BTreeMap::new(),
-        Some("detailed"),
-        Some("medium"),
+        ConfiguredSessionOverride {
+            model: Some("gpt-5.4"),
+            reasoning_summary: Some("detailed"),
+            reasoning_effort: Some("medium"),
+        },
     );
+    let model = "-c 'model=\"gpt-5.4\"'";
     let summary = "-c 'model_reasoning_summary=\"detailed\"'";
     let effort = "-c 'model_reasoning_effort=\"medium\"'";
+    assert!(cmd.contains(model));
     assert!(cmd.contains(summary));
     assert!(cmd.contains(effort));
+    assert!(cmd.find(model) < cmd.find(summary));
     assert!(cmd.find(summary) < cmd.find(effort));
 }
 
@@ -1671,8 +1731,7 @@ fn build_command_script_sets_writable_codex_home() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: None,
-            reasoning_effort: None,
+            session_override: ConfiguredSessionOverride::default(),
         },
     );
     assert!(script.contains("export CODEX_HOME=\"/root/.codex\""));
@@ -1697,8 +1756,7 @@ fn build_command_script_fetches_target_branch() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: None,
-            reasoning_effort: None,
+            session_override: ConfiguredSessionOverride::default(),
         },
     );
     assert!(script.contains("git fetch --depth 1 origin \"main\""));
@@ -1723,8 +1781,7 @@ fn build_command_script_updates_submodules() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: None,
-            reasoning_effort: None,
+            session_override: ConfiguredSessionOverride::default(),
         },
     );
     assert!(script.contains("run_git clone git clone --depth 1 --recurse-submodules"));
@@ -1804,8 +1861,7 @@ fn build_command_script_clears_bootstrap_git_auth_before_app_server() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: None,
-            reasoning_effort: None,
+            session_override: ConfiguredSessionOverride::default(),
         },
     );
 
@@ -1847,8 +1903,7 @@ fn build_command_script_includes_prefetch_when_enabled_without_composer_install(
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: None,
-            reasoning_effort: None,
+            session_override: ConfiguredSessionOverride::default(),
         },
     );
     assert!(script.contains("prefetch_deps()"));
@@ -1874,8 +1929,7 @@ fn build_command_script_includes_mcp_server_overrides() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &overrides,
-            reasoning_summary: None,
-            reasoning_effort: None,
+            session_override: ConfiguredSessionOverride::default(),
         },
     );
     assert!(script.contains("exec codex -c 'mcp_servers.github.enabled=false' app-server"));
@@ -2008,11 +2062,39 @@ fn build_command_script_includes_reasoning_effort_override() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: None,
-            reasoning_effort: Some("high"),
+            session_override: ConfiguredSessionOverride {
+                reasoning_effort: Some("high"),
+                ..ConfiguredSessionOverride::default()
+            },
         },
     );
     assert!(script.contains("exec codex -c 'model_reasoning_effort=\"high\"' app-server"));
+}
+
+#[test]
+fn build_command_script_includes_model_override() {
+    let script = DockerCodexRunner::build_command_script(
+        BuildCommandScriptInput {
+            clone_url: "https://example.com/repo.git",
+            gitlab_token: "token",
+            repo: "repo",
+            project_path: "repo",
+            head_sha: "abc",
+            auth_mount_path: "/root/.codex",
+            target_branch: None,
+            deps_enabled: false,
+        },
+        AppServerCommandOptions {
+            browser_mcp: None,
+            gitlab_discovery_mcp: None,
+            mcp_server_overrides: &BTreeMap::new(),
+            session_override: ConfiguredSessionOverride {
+                model: Some("gpt-5.4"),
+                ..ConfiguredSessionOverride::default()
+            },
+        },
+    );
+    assert!(script.contains("exec codex -c 'model=\"gpt-5.4\"' app-server"));
 }
 
 #[test]
@@ -2032,11 +2114,39 @@ fn build_command_script_includes_reasoning_summary_override() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: Some("detailed"),
-            reasoning_effort: None,
+            session_override: ConfiguredSessionOverride {
+                reasoning_summary: Some("detailed"),
+                ..ConfiguredSessionOverride::default()
+            },
         },
     );
     assert!(script.contains("exec codex -c 'model_reasoning_summary=\"detailed\"' app-server"));
+}
+
+#[test]
+fn security_context_session_override_uses_security_context_model_and_review_summary() {
+    let mut codex = test_codex_config();
+    codex.session_overrides.security_context.model = Some("gpt-5.4-mini".to_string());
+    let runner = test_runner_with_codex(codex);
+
+    let session_override = runner.security_context_session_override();
+
+    assert_eq!(session_override.model, Some("gpt-5.4-mini"));
+    assert_eq!(session_override.reasoning_summary, Some("detailed"));
+    assert_eq!(session_override.reasoning_effort, Some("xhigh"));
+}
+
+#[test]
+fn security_review_session_override_uses_security_review_model_and_review_summary() {
+    let mut codex = test_codex_config();
+    codex.session_overrides.security_review.model = Some("gpt-5.4".to_string());
+    let runner = test_runner_with_codex(codex);
+
+    let session_override = runner.security_review_session_override();
+
+    assert_eq!(session_override.model, Some("gpt-5.4"));
+    assert_eq!(session_override.reasoning_summary, Some("detailed"));
+    assert_eq!(session_override.reasoning_effort, Some("high"));
 }
 
 #[test]
@@ -2102,10 +2212,8 @@ fn command_skips_static_gitlab_discovery_enable_override_without_injection() {
                 browser_mcp: None,
                 gitlab_discovery_mcp: None,
                 mcp_server_overrides: &runner.codex.mcp_server_overrides.review,
-                reasoning_summary: None,
-                reasoning_effort: None,
+                session_override: runner.review_session_override(),
             },
-            runner.review_reasoning_effort(),
         )
         .expect("command script");
 
@@ -2285,8 +2393,7 @@ fn mention_command_script_clones_repo_and_starts_app_server() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: None,
-            reasoning_effort: None,
+            session_override: ConfiguredSessionOverride::default(),
         },
     );
     assert!(
@@ -2349,8 +2456,7 @@ fn mention_command_script_includes_mcp_server_overrides() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &overrides,
-            reasoning_summary: None,
-            reasoning_effort: None,
+            session_override: ConfiguredSessionOverride::default(),
         },
     );
     assert!(script.contains("exec codex -c 'mcp_servers.playwright.enabled=true' app-server"));
@@ -2397,11 +2503,63 @@ fn mention_command_script_includes_reasoning_effort_override() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: None,
-            reasoning_effort: Some("low"),
+            session_override: ConfiguredSessionOverride {
+                reasoning_effort: Some("low"),
+                ..ConfiguredSessionOverride::default()
+            },
         },
     );
     assert!(script.contains("exec codex -c 'model_reasoning_effort=\"low\"' app-server"));
+}
+
+#[test]
+fn mention_command_script_includes_model_override() {
+    let ctx = MentionCommandContext {
+        repo: "group/repo".to_string(),
+        project_path: "group/repo".to_string(),
+        discussion_project_path: "group/repo".to_string(),
+        mr: MergeRequest {
+            iid: 11,
+            title: Some("Title".to_string()),
+            web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/11".to_string()),
+            draft: false,
+            created_at: None,
+            updated_at: None,
+            sha: Some("abc123".to_string()),
+            source_branch: None,
+            target_branch: Some("main".to_string()),
+            author: None,
+            source_project_id: None,
+            target_project_id: None,
+            diff_refs: None,
+        },
+        head_sha: "abc123".to_string(),
+        discussion_id: "discussion-1".to_string(),
+        trigger_note_id: 77,
+        requester_name: "Alice Example".to_string(),
+        requester_email: "alice@example.com".to_string(),
+        additional_developer_instructions: None,
+        prompt: "Do the change".to_string(),
+        image_uploads: Vec::new(),
+        feature_flags: FeatureFlagSnapshot::default(),
+        run_history_id: None,
+    };
+    let script = DockerCodexRunner::build_mention_command_script(
+        &ctx,
+        "https://oauth2:${GITLAB_TOKEN}@example.com/repo.git",
+        "token",
+        "/root/.codex",
+        AppServerCommandOptions {
+            browser_mcp: None,
+            gitlab_discovery_mcp: None,
+            mcp_server_overrides: &BTreeMap::new(),
+            session_override: ConfiguredSessionOverride {
+                model: Some("gpt-5.4-mini"),
+                ..ConfiguredSessionOverride::default()
+            },
+        },
+    );
+    assert!(script.contains("exec codex -c 'model=\"gpt-5.4-mini\"' app-server"));
 }
 
 #[test]
@@ -2445,8 +2603,10 @@ fn mention_command_script_includes_reasoning_summary_override() {
             browser_mcp: None,
             gitlab_discovery_mcp: None,
             mcp_server_overrides: &BTreeMap::new(),
-            reasoning_summary: Some("detailed"),
-            reasoning_effort: None,
+            session_override: ConfiguredSessionOverride {
+                reasoning_summary: Some("detailed"),
+                ..ConfiguredSessionOverride::default()
+            },
         },
     );
     assert!(script.contains("exec codex -c 'model_reasoning_summary=\"detailed\"' app-server"));
@@ -2702,7 +2862,7 @@ fn test_codex_config() -> CodexConfig {
         browser_mcp: BrowserMcpConfig::default(),
         gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
         mcp_server_overrides: McpServerOverridesConfig::default(),
-        reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+        session_overrides: SessionOverridesConfig::default(),
         reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
     }
 }
@@ -2928,8 +3088,10 @@ async fn run_review_with_fake_runtime_initializes_before_composer_install() -> R
         },
     );
 
-    let runner =
-        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
+    let mut codex = test_codex_config();
+    codex.session_overrides.security_review.model = Some("gpt-5.4".to_string());
+    codex.session_overrides.security_context.model = Some("gpt-5.4-mini".to_string());
+    let runner = test_runner_with_fake_runtime(codex, false, Arc::clone(&harness), None).await;
     let mut ctx = review_context_with_target_branch(Some("main"));
     ctx.feature_flags = FeatureFlagSnapshot {
         composer_install: true,
@@ -3902,9 +4064,11 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
         security_review_json,
     ));
 
-    let runner = Arc::new(
-        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await,
-    );
+    let mut codex = test_codex_config();
+    codex.session_overrides.security_review.model = Some("gpt-5.4".to_string());
+    codex.session_overrides.security_context.model = Some("gpt-5.4-mini".to_string());
+    let runner =
+        Arc::new(test_runner_with_fake_runtime(codex, false, Arc::clone(&harness), None).await);
     let run_history_id_1 = runner
         .state
         .start_run_history(NewRunHistory {

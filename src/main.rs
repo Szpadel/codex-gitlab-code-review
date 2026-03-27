@@ -774,8 +774,8 @@ mod tests {
     use codex_gitlab_code_review::config::{
         BrowserMcpConfig, CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig,
         GitLabDiscoveryMcpConfig, GitLabTargets, McpServerOverridesConfig,
-        ReasoningEffortOverridesConfig, ReasoningSummaryOverridesConfig, ReviewConfig,
-        ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
+        ReasoningSummaryOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
+        ServerConfig, SessionOverridesConfig, TargetSelector,
     };
     use codex_gitlab_code_review::feature_flags::FeatureFlagDefaults;
     use sqlx::Executor;
@@ -990,7 +990,7 @@ mod tests {
                 browser_mcp: BrowserMcpConfig::default(),
                 gitlab_discovery_mcp: GitLabDiscoveryMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
-                reasoning_effort: ReasoningEffortOverridesConfig::default(),
+                session_overrides: SessionOverridesConfig::default(),
                 reasoning_summary: ReasoningSummaryOverridesConfig::default(),
             },
             docker: DockerConfig::default(),

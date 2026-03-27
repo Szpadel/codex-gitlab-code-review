@@ -2,8 +2,8 @@ use super::{
     AppServerCommandOptions, AuthAccount, AuthFailureKind, Context, DockerCodexRunner, Duration,
     Instant, MentionCommandContext, MentionCommandResult, MentionCommandStatus, Result,
     RunHistorySessionUpdate, StartedAppServer, Utc, anyhow, bail, classify_auth_failure,
-    classify_auth_failure_for_account, configured_reasoning_effort, configured_reasoning_summary,
-    info, json, repo_checkout_root, restore_push_remote_url_exec_command, timeout, warn,
+    classify_auth_failure_for_account, info, json, repo_checkout_root,
+    restore_push_remote_url_exec_command, timeout, warn,
 };
 use crate::composer_install::composer_install_timeout_seconds;
 use std::collections::BTreeSet;
@@ -77,10 +77,6 @@ impl DockerCodexRunner {
             gitlab_discovery_mcp.is_some(),
         )
         .await;
-        let reasoning_summary =
-            configured_reasoning_summary(self.codex.reasoning_summary.mention.as_deref());
-        let reasoning_effort =
-            configured_reasoning_effort(self.codex.reasoning_effort.mention.as_deref());
         let effective_mcp_server_overrides = self.effective_mcp_server_overrides_for_run(
             &self.codex.mcp_server_overrides.mention,
             gitlab_discovery_mcp.is_some(),
@@ -96,8 +92,7 @@ impl DockerCodexRunner {
                     .as_ref()
                     .map(|prepared| &prepared.runtime_config),
                 mcp_server_overrides: &effective_mcp_server_overrides,
-                reasoning_summary,
-                reasoning_effort,
+                session_override: self.mention_session_override(),
             },
         );
         let gitlab_discovery_extra_hosts = gitlab_discovery_mcp

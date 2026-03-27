@@ -1018,7 +1018,7 @@ fn test_config() -> Config {
             browser_mcp: crate::config::BrowserMcpConfig::default(),
             gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
-            reasoning_effort: crate::config::ReasoningEffortOverridesConfig::default(),
+            session_overrides: crate::config::SessionOverridesConfig::default(),
             reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
         },
         docker: DockerConfig {

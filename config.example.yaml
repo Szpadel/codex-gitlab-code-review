@@ -189,16 +189,27 @@ codex:
     mention:
       github: false
       playwright: true
-  # Optional. Per-mode reasoning effort overrides for Codex app-server sessions.
-  # When unset, Codex uses the value from config.toml profiles or model defaults.
-  # Supported values: low, medium, high, xhigh.
-  # Each entry becomes:
+  # Optional. Per-session Codex app-server overrides.
+  # These are the actual session types we start today:
+  # review, security_context, security_review, and mention.
+  # model becomes:
+  #   codex -c model="<value>" app-server
+  # reasoning_effort becomes:
   #   codex -c model_reasoning_effort="<value>" app-server
-  reasoning_effort:
-    review: "high"
-    mention: "low"
-    security_context: "xhigh"
-    security_review: "high"
+  # Supported reasoning_effort values: low, medium, high, xhigh.
+  session_overrides:
+    review:
+      model: "gpt-5.4"
+      reasoning_effort: "high"
+    mention:
+      model: "gpt-5.4-mini"
+      reasoning_effort: "low"
+    security_context:
+      model: "gpt-5.4"
+      reasoning_effort: "xhigh"
+    security_review:
+      model: "gpt-5.4"
+      reasoning_effort: "high"
   # Optional. Per-mode reasoning summary overrides for Codex app-server sessions.
   # Defaults restore readable reasoning summaries even if upstream model defaults change.
   # Supported values: none, auto, detailed.

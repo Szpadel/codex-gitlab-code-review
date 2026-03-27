@@ -846,10 +846,8 @@ impl DockerCodexRunner {
                 browser_mcp: request.browser_mcp,
                 gitlab_discovery_mcp: None,
                 mcp_server_overrides: &self.codex.mcp_server_overrides.review,
-                reasoning_summary: None,
-                reasoning_effort: None,
+                session_override: self.security_context_session_override(),
             },
-            self.security_context_reasoning_effort(),
         )?;
         let StartedAppServer {
             container_id,
@@ -948,13 +946,11 @@ impl DockerCodexRunner {
                     .as_ref()
                     .map(|prepared| &prepared.runtime_config),
                 mcp_server_overrides: &self.codex.mcp_server_overrides.review,
-                reasoning_summary: None,
-                reasoning_effort: None,
-            },
-            if ctx.lane.is_security() {
-                self.security_review_reasoning_effort()
-            } else {
-                self.review_reasoning_effort()
+                session_override: if ctx.lane.is_security() {
+                    self.security_review_session_override()
+                } else {
+                    self.review_session_override()
+                },
             },
         )?;
         let gitlab_discovery_extra_hosts = gitlab_discovery_mcp

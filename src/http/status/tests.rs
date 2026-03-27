@@ -13,8 +13,8 @@ use super::{
 use crate::config::{
     BrowserMcpConfig, CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig,
     GitLabDiscoveryMcpConfig, GitLabTargets, McpServerOverridesConfig,
-    ReasoningEffortOverridesConfig, ReasoningSummaryOverridesConfig, ReviewConfig,
-    ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig, TargetSelector,
+    ReasoningSummaryOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
+    ServerConfig, SessionOverridesConfig, TargetSelector,
 };
 use crate::feature_flags::{FeatureFlagDefaults, FeatureFlagSnapshot};
 use crate::review_lane::ReviewLane;
@@ -1607,7 +1607,7 @@ fn test_config() -> Config {
             browser_mcp: BrowserMcpConfig::default(),
             gitlab_discovery_mcp: GitLabDiscoveryMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
-            reasoning_effort: ReasoningEffortOverridesConfig::default(),
+            session_overrides: SessionOverridesConfig::default(),
             reasoning_summary: ReasoningSummaryOverridesConfig::default(),
         },
         docker: DockerConfig::default(),

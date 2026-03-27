@@ -9,6 +9,8 @@ use super::{
 };
 #[cfg(test)]
 use crate::codex_runner::browser_mcp::BrowserLaunchConfig;
+#[cfg(test)]
+use crate::codex_runner::test_support;
 
 #[derive(Clone)]
 pub(crate) struct InFlightImagePull {

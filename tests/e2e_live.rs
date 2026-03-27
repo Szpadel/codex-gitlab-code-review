@@ -74,8 +74,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             gitlab_discovery_mcp:
                 codex_gitlab_code_review::config::GitLabDiscoveryMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
-            reasoning_effort:
-                codex_gitlab_code_review::config::ReasoningEffortOverridesConfig::default(),
+            session_overrides: codex_gitlab_code_review::config::SessionOverridesConfig::default(),
             reasoning_summary:
                 codex_gitlab_code_review::config::ReasoningSummaryOverridesConfig::default(),
         },
@@ -108,7 +107,7 @@ async fn e2e_live_dry_run() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(&config.database.path).await?);
     let review_owner_id = state.get_or_create_review_owner_id().await?;
     let runner = DockerCodexRunner::new(
-        config.docker.clone(),
+        &config.docker,
         config.codex.clone(),
         git_base,
         Arc::clone(&state),

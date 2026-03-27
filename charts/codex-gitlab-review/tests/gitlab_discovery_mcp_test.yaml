@@ -16,16 +16,65 @@ tests:
           value: ConfigMap
       - matchRegex:
           path: data["config.yaml"]
-          pattern: "(?ms)^feature_flags:\\n  gitlab_discovery_mcp: false\\n  gitlab_inline_review_comments: false\\n  composer_install: false\\n  composer_auto_repositories: false\\n  composer_safe_install: false\\n  security_review: false$"
+          pattern: "(?ms)^feature_flags:\\n  gitlab_discovery_mcp: false\\n  gitlab_inline_review_comments: false\\n  security_context_ignore_base_head: false\\n  composer_install: false\\n  composer_auto_repositories: false\\n  composer_safe_install: false\\n  security_review: false$"
       - matchRegex:
           path: data["config.yaml"]
           pattern: "(?m)^  gitlab_discovery_mcp:\\n    enabled: true$"
       - matchRegex:
           path: data["config.yaml"]
           pattern: "(?m)^    allow: \\[\\]$"
-      - notContains:
+      - matchRegex:
           path: data["config.yaml"]
-          content: "debounce:"
+          pattern: '(?m)^  session_overrides:$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    review:$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^      model: null$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    mention:$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    security_context:$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^      reasoning_effort: "xhigh"$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    security_review:$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^      reasoning_effort: "high"$'
+  - it: renders codex session overrides from Helm values
+    template: templates/configmap.yaml
+    set:
+      config.codex.sessionOverrides.review.model: "gpt-5.4"
+      config.codex.sessionOverrides.review.reasoningEffort: "high"
+      config.codex.sessionOverrides.mention.model: "gpt-5.4-mini"
+      config.codex.sessionOverrides.mention.reasoningEffort: "low"
+      config.codex.sessionOverrides.securityContext.model: "gpt-5.4"
+      config.codex.sessionOverrides.securityContext.reasoningEffort: "xhigh"
+      config.codex.sessionOverrides.securityReview.model: "gpt-5.4"
+      config.codex.sessionOverrides.securityReview.reasoningEffort: "medium"
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^      model: "gpt-5.4-mini"$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^      reasoning_effort: "low"$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^      reasoning_effort: "medium"$'
+  - it: rejects legacy codex reasoningEffort Helm values
+    template: templates/deployment.yaml
+    set:
+      config.codex.reasoningEffort.review: "high"
+    asserts:
+      - failedTemplate:
+          errorMessage: config.codex.reasoningEffort has been replaced by config.codex.sessionOverrides.<mode>.reasoningEffort in the Helm chart
   - it: leaves advertise_url empty in config so the service can derive the runtime default
     template: templates/configmap.yaml
     asserts:

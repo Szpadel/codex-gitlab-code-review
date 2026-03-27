@@ -220,7 +220,7 @@ pub struct CodexConfig {
     #[serde(default)]
     pub mcp_server_overrides: McpServerOverridesConfig,
     #[serde(default)]
-    pub reasoning_effort: ReasoningEffortOverridesConfig,
+    pub session_overrides: SessionOverridesConfig,
     #[serde(default)]
     pub reasoning_summary: ReasoningSummaryOverridesConfig,
 }
@@ -281,25 +281,39 @@ pub struct McpServerOverridesConfig {
     pub mention: BTreeMap<String, bool>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct ReasoningEffortOverridesConfig {
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SessionModeOverrideConfig {
     #[serde(default)]
-    pub review: Option<String>,
+    pub model: Option<String>,
     #[serde(default)]
-    pub mention: Option<String>,
-    #[serde(default = "default_security_context_reasoning_effort_override")]
-    pub security_context: Option<String>,
-    #[serde(default = "default_security_review_reasoning_effort_override")]
-    pub security_review: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
-impl Default for ReasoningEffortOverridesConfig {
+#[derive(Clone, Debug, Deserialize)]
+pub struct SessionOverridesConfig {
+    #[serde(default)]
+    pub review: SessionModeOverrideConfig,
+    #[serde(default)]
+    pub mention: SessionModeOverrideConfig,
+    #[serde(
+        default = "default_security_context_session_override",
+        deserialize_with = "deserialize_security_context_session_override"
+    )]
+    pub security_context: SessionModeOverrideConfig,
+    #[serde(
+        default = "default_security_review_session_override",
+        deserialize_with = "deserialize_security_review_session_override"
+    )]
+    pub security_review: SessionModeOverrideConfig,
+}
+
+impl Default for SessionOverridesConfig {
     fn default() -> Self {
         Self {
-            review: None,
-            mention: None,
-            security_context: default_security_context_reasoning_effort_override(),
-            security_review: default_security_review_reasoning_effort_override(),
+            review: SessionModeOverrideConfig::default(),
+            mention: SessionModeOverrideConfig::default(),
+            security_context: default_security_context_session_override(),
+            security_review: default_security_review_session_override(),
         }
     }
 }
@@ -362,6 +376,20 @@ fn default_browser_mcp_args() -> Vec<String> {
 
 fn default_reasoning_summary_override() -> Option<String> {
     default_optional_text("detailed")
+}
+
+fn default_security_context_session_override() -> SessionModeOverrideConfig {
+    SessionModeOverrideConfig {
+        model: None,
+        reasoning_effort: default_security_context_reasoning_effort_override(),
+    }
+}
+
+fn default_security_review_session_override() -> SessionModeOverrideConfig {
+    SessionModeOverrideConfig {
+        model: None,
+        reasoning_effort: default_security_review_reasoning_effort_override(),
+    }
 }
 
 fn default_security_context_reasoning_effort_override() -> Option<String> {
@@ -485,6 +513,7 @@ impl Config {
                 "legacy proxy config detected but ignored; built-in proxy support has been removed"
             );
         }
+        validate_no_legacy_reasoning_effort_config(&cfg)?;
         let mut config: Config = cfg.try_deserialize().context("deserialize config")?;
         if config.codex.auth_host_path.is_empty() {
             config.codex.auth_host_path = config.codex.auth_mount_path.clone();
@@ -499,7 +528,7 @@ impl Config {
         validate_unique_injected_mcp_server_names(&config.codex)?;
         validate_distinct_http_and_gitlab_discovery_bind_addrs(&config)?;
         validate_mcp_server_overrides(&config.codex)?;
-        validate_reasoning_effort_overrides(&config.codex)?;
+        validate_session_overrides(&config.codex)?;
         validate_reasoning_summary_overrides(&config.codex)?;
         Ok(config)
     }
@@ -609,6 +638,15 @@ where
 
 fn legacy_proxy_config_present(cfg: &config::Config) -> bool {
     cfg.get_table("proxy").is_ok_and(|table| !table.is_empty())
+}
+
+fn validate_no_legacy_reasoning_effort_config(cfg: &config::Config) -> Result<()> {
+    anyhow::ensure!(
+        !cfg.get_table("codex.reasoning_effort")
+            .is_ok_and(|table| !table.is_empty()),
+        "codex.reasoning_effort has been replaced by codex.session_overrides.<mode>.reasoning_effort"
+    );
+    Ok(())
 }
 
 fn validate_codex_auth_accounts(codex: &CodexConfig) -> Result<()> {
@@ -857,37 +895,106 @@ fn bind_host_supports_ip(bind_host: &str, ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn validate_reasoning_effort_overrides(codex: &CodexConfig) -> Result<()> {
-    for (field, value) in [
-        ("review", codex.reasoning_effort.review.as_deref()),
-        ("mention", codex.reasoning_effort.mention.as_deref()),
-        (
-            "security_context",
-            codex.reasoning_effort.security_context.as_deref(),
-        ),
-        (
-            "security_review",
-            codex.reasoning_effort.security_review.as_deref(),
-        ),
-    ] {
-        let Some(value) = value else {
-            continue;
-        };
+fn validate_session_mode_override(
+    field: &str,
+    override_config: &SessionModeOverrideConfig,
+) -> Result<()> {
+    if let Some(model) = override_config.model.as_deref() {
         anyhow::ensure!(
-            !value.trim().is_empty(),
-            "codex.reasoning_effort.{field} must not be empty"
+            !model.trim().is_empty(),
+            "codex.session_overrides.{field}.model must not be empty"
         );
         anyhow::ensure!(
-            value.chars().all(|ch| !ch.is_control()),
-            "codex.reasoning_effort.{field} must not contain control characters"
-        );
-        anyhow::ensure!(
-            SUPPORTED_REASONING_EFFORTS.contains(&value),
-            "codex.reasoning_effort.{field} must be one of: {}",
-            SUPPORTED_REASONING_EFFORTS.join(", ")
+            model.chars().all(|ch| !ch.is_control()),
+            "codex.session_overrides.{field}.model must not contain control characters"
         );
     }
+
+    let Some(reasoning_effort) = override_config.reasoning_effort.as_deref() else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        !reasoning_effort.trim().is_empty(),
+        "codex.session_overrides.{field}.reasoning_effort must not be empty"
+    );
+    anyhow::ensure!(
+        reasoning_effort.chars().all(|ch| !ch.is_control()),
+        "codex.session_overrides.{field}.reasoning_effort must not contain control characters"
+    );
+    anyhow::ensure!(
+        SUPPORTED_REASONING_EFFORTS.contains(&reasoning_effort),
+        "codex.session_overrides.{field}.reasoning_effort must be one of: {}",
+        SUPPORTED_REASONING_EFFORTS.join(", ")
+    );
     Ok(())
+}
+
+fn validate_session_overrides(codex: &CodexConfig) -> Result<()> {
+    for (field, override_config) in [
+        ("review", &codex.session_overrides.review),
+        ("mention", &codex.session_overrides.mention),
+        (
+            "security_context",
+            &codex.session_overrides.security_context,
+        ),
+        ("security_review", &codex.session_overrides.security_review),
+    ] {
+        validate_session_mode_override(field, override_config)?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RawSessionModeOverrideConfig {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<Option<String>>,
+}
+
+fn deserialize_session_override_with_default<'de, D>(
+    deserializer: D,
+    default: SessionModeOverrideConfig,
+) -> std::result::Result<SessionModeOverrideConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<RawSessionModeOverrideConfig>::deserialize(deserializer)?;
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+
+    Ok(SessionModeOverrideConfig {
+        model: raw.model.or(default.model),
+        reasoning_effort: match raw.reasoning_effort {
+            Some(reasoning_effort) => reasoning_effort,
+            None => default.reasoning_effort,
+        },
+    })
+}
+
+fn deserialize_security_context_session_override<'de, D>(
+    deserializer: D,
+) -> std::result::Result<SessionModeOverrideConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_session_override_with_default(
+        deserializer,
+        default_security_context_session_override(),
+    )
+}
+
+fn deserialize_security_review_session_override<'de, D>(
+    deserializer: D,
+) -> std::result::Result<SessionModeOverrideConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_session_override_with_default(
+        deserializer,
+        default_security_review_session_override(),
+    )
 }
 
 fn validate_reasoning_summary_overrides(codex: &CodexConfig) -> Result<()> {

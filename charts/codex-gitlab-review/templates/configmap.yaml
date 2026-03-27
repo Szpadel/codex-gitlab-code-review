@@ -2,6 +2,9 @@
 {{- $serverPort := include "codex-gitlab-review.serverBindPort" . -}}
 {{- $mcpHost := include "codex-gitlab-review.gitlabDiscoveryMcpBindHost" . -}}
 {{- $mcpPort := include "codex-gitlab-review.gitlabDiscoveryMcpPort" . -}}
+{{- if hasKey .Values.config.codex "reasoningEffort" -}}
+{{- fail "config.codex.reasoningEffort has been replaced by config.codex.sessionOverrides.<mode>.reasoningEffort in the Helm chart" -}}
+{{- end }}
 {{- if and .Values.config.codex.gitlabDiscoveryMcp.enabled (eq (include "codex-gitlab-review.gitlabDiscoveryMcpBindHostIsWildcard" .) "false") -}}
 {{- fail "config.codex.gitlabDiscoveryMcp.bindAddr must use a wildcard host (0.0.0.0 or [::]) in the Helm chart" -}}
 {{- end }}
@@ -202,26 +205,50 @@ data:
 {{- else }}
           {}
 {{- end }}
-      reasoning_effort:
-{{- if .Values.config.codex.reasoningEffort.review }}
-        review: {{ .Values.config.codex.reasoningEffort.review | quote }}
+      session_overrides:
+        review:
+{{- if .Values.config.codex.sessionOverrides.review.model }}
+          model: {{ .Values.config.codex.sessionOverrides.review.model | quote }}
 {{- else }}
-        review: null
+          model: null
 {{- end }}
-{{- if .Values.config.codex.reasoningEffort.mention }}
-        mention: {{ .Values.config.codex.reasoningEffort.mention | quote }}
+{{- if .Values.config.codex.sessionOverrides.review.reasoningEffort }}
+          reasoning_effort: {{ .Values.config.codex.sessionOverrides.review.reasoningEffort | quote }}
 {{- else }}
-        mention: null
+          reasoning_effort: null
 {{- end }}
-{{- if .Values.config.codex.reasoningEffort.securityContext }}
-        security_context: {{ .Values.config.codex.reasoningEffort.securityContext | quote }}
+        mention:
+{{- if .Values.config.codex.sessionOverrides.mention.model }}
+          model: {{ .Values.config.codex.sessionOverrides.mention.model | quote }}
 {{- else }}
-        security_context: null
+          model: null
 {{- end }}
-{{- if .Values.config.codex.reasoningEffort.securityReview }}
-        security_review: {{ .Values.config.codex.reasoningEffort.securityReview | quote }}
+{{- if .Values.config.codex.sessionOverrides.mention.reasoningEffort }}
+          reasoning_effort: {{ .Values.config.codex.sessionOverrides.mention.reasoningEffort | quote }}
 {{- else }}
-        security_review: null
+          reasoning_effort: null
+{{- end }}
+        security_context:
+{{- if .Values.config.codex.sessionOverrides.securityContext.model }}
+          model: {{ .Values.config.codex.sessionOverrides.securityContext.model | quote }}
+{{- else }}
+          model: null
+{{- end }}
+{{- if .Values.config.codex.sessionOverrides.securityContext.reasoningEffort }}
+          reasoning_effort: {{ .Values.config.codex.sessionOverrides.securityContext.reasoningEffort | quote }}
+{{- else }}
+          reasoning_effort: null
+{{- end }}
+        security_review:
+{{- if .Values.config.codex.sessionOverrides.securityReview.model }}
+          model: {{ .Values.config.codex.sessionOverrides.securityReview.model | quote }}
+{{- else }}
+          model: null
+{{- end }}
+{{- if .Values.config.codex.sessionOverrides.securityReview.reasoningEffort }}
+          reasoning_effort: {{ .Values.config.codex.sessionOverrides.securityReview.reasoningEffort | quote }}
+{{- else }}
+          reasoning_effort: null
 {{- end }}
       reasoning_summary:
 {{- if .Values.config.codex.reasoningSummary.review }}

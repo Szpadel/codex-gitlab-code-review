@@ -2,9 +2,9 @@ use super::*;
 use crate::codex_runner::{CodexResult, CodexRunner, ReviewContext};
 use crate::config::{
     BrowserMcpConfig, CodexConfig, Config, DatabaseConfig, DockerConfig, FallbackAuthAccountConfig,
-    GitLabConfig, GitLabTargets, McpServerOverridesConfig, ReasoningEffortOverridesConfig,
-    ReasoningSummaryOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
-    ServerConfig, TargetSelector,
+    GitLabConfig, GitLabTargets, McpServerOverridesConfig, ReasoningSummaryOverridesConfig,
+    ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig, ServerConfig,
+    SessionOverridesConfig, TargetSelector,
 };
 use crate::dev_mode::DevToolsService;
 use crate::review_lane::ReviewLane;
@@ -7697,7 +7697,7 @@ fn test_config() -> Config {
             browser_mcp: BrowserMcpConfig::default(),
             gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),
-            reasoning_effort: ReasoningEffortOverridesConfig::default(),
+            session_overrides: SessionOverridesConfig::default(),
             reasoning_summary: ReasoningSummaryOverridesConfig::default(),
         },
         docker: DockerConfig {

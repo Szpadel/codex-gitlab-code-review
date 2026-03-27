@@ -165,14 +165,22 @@ config:
     mcpServerOverrides:
       review: {}
       mention: {}
-    # Optional. Per-mode reasoning effort overrides passed to Codex app-server.
-    # When unset, Codex uses the value from config.toml profiles or model defaults.
-    # Supported values: low, medium, high, xhigh.
-    reasoningEffort:
-      review: null
-      mention: null
-      securityContext: "xhigh"
-      securityReview: "high"
+    # Optional. Per-session overrides passed to Codex app-server.
+    # Each session can set a model and/or reasoning effort independently.
+    # Supported reasoning effort values: low, medium, high, xhigh.
+    sessionOverrides:
+      review:
+        model: null
+        reasoningEffort: null
+      mention:
+        model: null
+        reasoningEffort: null
+      securityContext:
+        model: null
+        reasoningEffort: "xhigh"
+      securityReview:
+        model: null
+        reasoningEffort: "high"
     # Per-mode reasoning summary overrides passed to Codex app-server.
     # Defaults restore readable reasoning summaries even if upstream model defaults change.
     # Supported values: none, auto, detailed.

@@ -8,6 +8,8 @@ use super::{
     StartContainerOptionsBuilder, StreamExt, Url, Uuid, anyhow, format_command_for_log, info,
     sleep, warn,
 };
+#[cfg(test)]
+use anyhow::bail;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BrowserLaunchConfig {

@@ -135,14 +135,29 @@ fn defaults_mention_commands_when_missing() {
     assert_eq!(config.codex.usage_limit_fallback_cooldown_seconds, 3600);
     assert!(config.codex.mcp_server_overrides.review.is_empty());
     assert!(config.codex.mcp_server_overrides.mention.is_empty());
-    assert_eq!(config.codex.reasoning_effort.review, None);
-    assert_eq!(config.codex.reasoning_effort.mention, None);
+    assert_eq!(config.codex.session_overrides.review.model, None);
+    assert_eq!(config.codex.session_overrides.review.reasoning_effort, None);
+    assert_eq!(config.codex.session_overrides.mention.model, None);
     assert_eq!(
-        config.codex.reasoning_effort.security_context.as_deref(),
+        config.codex.session_overrides.mention.reasoning_effort,
+        None
+    );
+    assert_eq!(
+        config
+            .codex
+            .session_overrides
+            .security_context
+            .reasoning_effort
+            .as_deref(),
         Some("xhigh")
     );
     assert_eq!(
-        config.codex.reasoning_effort.security_review.as_deref(),
+        config
+            .codex
+            .session_overrides
+            .security_review
+            .reasoning_effort
+            .as_deref(),
         Some("high")
     );
     assert_eq!(
@@ -402,7 +417,7 @@ server:
 }
 
 #[test]
-fn loads_reasoning_effort_overrides() {
+fn loads_session_overrides() {
     let yaml = r#"
 gitlab:
   base_url: "https://gitlab.example.com"
@@ -427,11 +442,19 @@ codex:
   auth_host_path: "/root/.codex"
   auth_mount_path: "/root/.codex"
   exec_sandbox: "danger-full-access"
-  reasoning_effort:
-    review: "high"
-    mention: "low"
-    security_context: "medium"
-    security_review: "xhigh"
+  session_overrides:
+    review:
+      model: "gpt-5.4"
+      reasoning_effort: "high"
+    mention:
+      model: "gpt-5.4-mini"
+      reasoning_effort: "low"
+    security_context:
+      model: "gpt-5.4"
+      reasoning_effort: "medium"
+    security_review:
+      model: "gpt-5.4"
+      reasoning_effort: "xhigh"
 database:
   path: "/tmp/state.sqlite"
 server:
@@ -439,60 +462,67 @@ server:
 "#;
     let config = load_from_yaml(yaml);
     assert_eq!(
-        config.codex.reasoning_effort.review.as_deref(),
+        config.codex.session_overrides.review.model.as_deref(),
+        Some("gpt-5.4")
+    );
+    assert_eq!(
+        config
+            .codex
+            .session_overrides
+            .review
+            .reasoning_effort
+            .as_deref(),
         Some("high")
     );
     assert_eq!(
-        config.codex.reasoning_effort.mention.as_deref(),
+        config.codex.session_overrides.mention.model.as_deref(),
+        Some("gpt-5.4-mini")
+    );
+    assert_eq!(
+        config
+            .codex
+            .session_overrides
+            .mention
+            .reasoning_effort
+            .as_deref(),
         Some("low")
     );
     assert_eq!(
-        config.codex.reasoning_effort.security_context.as_deref(),
+        config
+            .codex
+            .session_overrides
+            .security_context
+            .model
+            .as_deref(),
+        Some("gpt-5.4")
+    );
+    assert_eq!(
+        config
+            .codex
+            .session_overrides
+            .security_context
+            .reasoning_effort
+            .as_deref(),
         Some("medium")
     );
     assert_eq!(
-        config.codex.reasoning_effort.security_review.as_deref(),
+        config
+            .codex
+            .session_overrides
+            .security_review
+            .model
+            .as_deref(),
+        Some("gpt-5.4")
+    );
+    assert_eq!(
+        config
+            .codex
+            .session_overrides
+            .security_review
+            .reasoning_effort
+            .as_deref(),
         Some("xhigh")
     );
-}
-
-#[test]
-fn explicit_null_security_reasoning_effort_overrides_disable_defaults() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
-  reasoning_effort:
-    security_context: null
-    security_review: null
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
-    assert_eq!(config.codex.reasoning_effort.security_context, None);
-    assert_eq!(config.codex.reasoning_effort.security_review, None);
 }
 
 #[test]
@@ -1124,7 +1154,7 @@ server:
 }
 
 #[test]
-fn errors_on_empty_reasoning_effort_override() {
+fn errors_on_empty_session_override_reasoning_effort() {
     let yaml = r#"
 gitlab:
   base_url: "https://gitlab.example.com"
@@ -1149,8 +1179,9 @@ codex:
   auth_host_path: "/root/.codex"
   auth_mount_path: "/root/.codex"
   exec_sandbox: "danger-full-access"
-  reasoning_effort:
-    review: "   "
+  session_overrides:
+    review:
+      reasoning_effort: "   "
 database:
   path: "/tmp/state.sqlite"
 server:
@@ -1159,11 +1190,93 @@ server:
     let result = try_load_from_yaml(yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
-    assert!(msg.contains("codex.reasoning_effort.review must not be empty"));
+    assert!(msg.contains("codex.session_overrides.review.reasoning_effort must not be empty"));
 }
 
 #[test]
-fn errors_on_unsupported_reasoning_effort_override() {
+fn errors_on_unsupported_session_override_reasoning_effort() {
+    let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  session_overrides:
+    mention:
+      reasoning_effort: "fast"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+    let result = try_load_from_yaml(yaml);
+    assert!(result.is_err());
+    let msg = format!("{:#}", result.expect_err("error"));
+    assert!(msg.contains(
+        "codex.session_overrides.mention.reasoning_effort must be one of: low, medium, high, xhigh"
+    ));
+}
+
+#[test]
+fn errors_on_empty_session_override_model() {
+    let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  session_overrides:
+    review:
+      model: "   "
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+    let result = try_load_from_yaml(yaml);
+    assert!(result.is_err());
+    let msg = format!("{:#}", result.expect_err("error"));
+    assert!(msg.contains("codex.session_overrides.review.model must not be empty"));
+}
+
+#[test]
+fn errors_on_legacy_reasoning_effort_block() {
     let yaml = r#"
 gitlab:
   base_url: "https://gitlab.example.com"
@@ -1189,7 +1302,7 @@ codex:
   auth_mount_path: "/root/.codex"
   exec_sandbox: "danger-full-access"
   reasoning_effort:
-    mention: "fast"
+    review: "high"
 database:
   path: "/tmp/state.sqlite"
 server:
@@ -1198,9 +1311,7 @@ server:
     let result = try_load_from_yaml(yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
-    assert!(
-        msg.contains("codex.reasoning_effort.mention must be one of: low, medium, high, xhigh")
-    );
+    assert!(msg.contains("codex.reasoning_effort has been replaced by codex.session_overrides"));
 }
 
 #[test]

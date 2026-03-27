@@ -2,6 +2,7 @@ use super::*;
 use crate::codex_runner::browser_mcp::{
     BrowserContainerDiagnostics, BrowserContainerStateSnapshot, BrowserLaunchConfig, BrowserLogTail,
 };
+use crate::codex_runner::container::ContainerExecOutput;
 use crate::gitlab_discovery_mcp::GitLabDiscoverySessionBinding;
 use bollard::errors::Error as BollardError;
 use futures::StreamExt;

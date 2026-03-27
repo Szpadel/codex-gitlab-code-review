@@ -66,8 +66,8 @@ use self::gitlab_discovery::{
 };
 use self::review_flow::parse_review_output_for_lane;
 use self::scripts::{
-    AppServerCommandOptions, configured_reasoning_effort, configured_reasoning_summary,
-    effective_browser_mcp, restore_push_remote_url_exec_command, shell_quote,
+    AppServerCommandOptions, effective_browser_mcp, restore_push_remote_url_exec_command,
+    shell_quote,
 };
 
 #[derive(Debug, Clone)]
