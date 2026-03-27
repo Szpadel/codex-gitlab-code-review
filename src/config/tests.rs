@@ -120,6 +120,7 @@ fn defaults_mention_commands_when_missing() {
     let yaml = base_config_yaml("");
     let config = load_from_yaml(&yaml);
     assert_eq!(config.review.additional_developer_instructions, None);
+    assert_eq!(config.review.rate_limit_emoji, "hourglass_flowing_sand");
     assert!(!config.review.mention_commands.enabled);
     assert_eq!(config.review.mention_commands.bot_username, None);
     assert_eq!(config.review.mention_commands.eyes_emoji, None);
@@ -153,6 +154,42 @@ fn defaults_mention_commands_when_missing() {
         Some("detailed")
     );
     assert_eq!(config.codex.browser_mcp, BrowserMcpConfig::default());
+}
+
+#[test]
+fn preserves_rate_limit_emoji_override() {
+    let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  rate_limit_emoji: "alarm_clock"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+    let config = load_from_yaml(yaml);
+    assert_eq!(config.review.rate_limit_emoji, "alarm_clock");
 }
 
 #[test]

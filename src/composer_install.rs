@@ -247,29 +247,25 @@ pub fn prepare_composer_auth(
 }
 
 pub fn composer_install_result_from_exec_output(
-    mode: ComposerInstallMode,
-    auth_source: Option<String>,
-    exit_code: i64,
-    stdout: &str,
-    stderr: &str,
-    gitlab_token: Option<&str>,
-    composer_auth: Option<&str>,
-    debug_lines: &[String],
+    input: ComposerInstallExecOutput<'_>,
 ) -> ComposerInstallResult {
-    let auth_source_for_excerpt = auth_source.clone();
-    let redacted_stdout = redact_composer_related_output(stdout, gitlab_token, composer_auth);
-    let redacted_stderr = redact_composer_related_output(stderr, gitlab_token, composer_auth);
-    let redacted_debug_lines = debug_lines
+    let auth_source_for_excerpt = input.auth_source.clone();
+    let redacted_stdout =
+        redact_composer_related_output(input.stdout, input.gitlab_token, input.composer_auth);
+    let redacted_stderr =
+        redact_composer_related_output(input.stderr, input.gitlab_token, input.composer_auth);
+    let redacted_debug_lines = input
+        .debug_lines
         .iter()
-        .map(|line| redact_composer_related_output(line, gitlab_token, composer_auth))
+        .map(|line| redact_composer_related_output(line, input.gitlab_token, input.composer_auth))
         .collect::<Vec<_>>();
-    if exit_code == COMPOSER_SKIP_EXIT_CODE && is_preflight_skip_output(&redacted_stdout) {
-        return ComposerInstallResult::skipped(mode, auth_source);
+    if input.exit_code == COMPOSER_SKIP_EXIT_CODE && is_preflight_skip_output(&redacted_stdout) {
+        return ComposerInstallResult::skipped(input.mode, input.auth_source);
     }
-    if exit_code == 0 {
+    if input.exit_code == 0 {
         return ComposerInstallResult::succeeded(
-            mode,
-            auth_source.clone(),
+            input.mode,
+            input.auth_source.clone(),
             composer_success_log_excerpt(
                 auth_source_for_excerpt.as_deref(),
                 &redacted_debug_lines,
@@ -279,8 +275,8 @@ pub fn composer_install_result_from_exec_output(
         );
     }
     ComposerInstallResult::failed(
-        mode,
-        auth_source,
+        input.mode,
+        input.auth_source,
         composer_failure_log_excerpt(
             auth_source_for_excerpt.as_deref(),
             &redacted_debug_lines,
@@ -288,6 +284,17 @@ pub fn composer_install_result_from_exec_output(
             &redacted_stderr,
         ),
     )
+}
+
+pub struct ComposerInstallExecOutput<'a> {
+    pub mode: ComposerInstallMode,
+    pub auth_source: Option<String>,
+    pub exit_code: i64,
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    pub gitlab_token: Option<&'a str>,
+    pub composer_auth: Option<&'a str>,
+    pub debug_lines: &'a [String],
 }
 
 fn is_preflight_skip_output(stdout: &str) -> bool {
@@ -670,8 +677,7 @@ async fn resolve_project_variable(
             gitlab
                 .list_project_variables(repo_path)
                 .await
-                .unwrap_or_default()
-                .into_iter(),
+                .unwrap_or_default(),
         ),
     }
 }
@@ -683,11 +689,7 @@ async fn resolve_group_variable(gitlab: &dyn GitLabApi, group: &str) -> Option<G
     {
         Ok(variable) => Some(variable),
         Err(_) => select_global_scope_variable(
-            gitlab
-                .list_group_variables(group)
-                .await
-                .unwrap_or_default()
-                .into_iter(),
+            gitlab.list_group_variables(group).await.unwrap_or_default(),
         ),
     }
 }
@@ -1185,16 +1187,16 @@ mod tests {
 
     #[test]
     fn composer_install_result_marks_missing_composer_json_as_skipped() {
-        let result = composer_install_result_from_exec_output(
-            ComposerInstallMode::Full,
-            None,
-            86,
-            "CODEX_COMPOSER_SKIP:missing-composer-json\n",
-            "",
-            None,
-            None,
-            &[],
-        );
+        let result = composer_install_result_from_exec_output(ComposerInstallExecOutput {
+            mode: ComposerInstallMode::Full,
+            auth_source: None,
+            exit_code: 86,
+            stdout: "CODEX_COMPOSER_SKIP:missing-composer-json\n",
+            stderr: "",
+            gitlab_token: None,
+            composer_auth: None,
+            debug_lines: &[],
+        });
 
         assert_eq!(
             result,
@@ -1204,16 +1206,16 @@ mod tests {
 
     #[test]
     fn composer_install_result_does_not_treat_success_log_as_skip_marker() {
-        let result = composer_install_result_from_exec_output(
-            ComposerInstallMode::Full,
-            None,
-            0,
-            "Installing\nCODEX_COMPOSER_SKIP not actually a preflight skip\nDone",
-            "",
-            None,
-            None,
-            &[],
-        );
+        let result = composer_install_result_from_exec_output(ComposerInstallExecOutput {
+            mode: ComposerInstallMode::Full,
+            auth_source: None,
+            exit_code: 0,
+            stdout: "Installing\nCODEX_COMPOSER_SKIP not actually a preflight skip\nDone",
+            stderr: "",
+            gitlab_token: None,
+            composer_auth: None,
+            debug_lines: &[],
+        });
 
         assert!(result.attempted);
         assert!(result.success);
@@ -1221,16 +1223,16 @@ mod tests {
 
     #[test]
     fn composer_install_result_does_not_treat_success_exit_with_marker_line_as_skipped() {
-        let result = composer_install_result_from_exec_output(
-            ComposerInstallMode::Full,
-            None,
-            0,
-            "CODEX_COMPOSER_SKIP:missing-composer-json",
-            "",
-            None,
-            None,
-            &[],
-        );
+        let result = composer_install_result_from_exec_output(ComposerInstallExecOutput {
+            mode: ComposerInstallMode::Full,
+            auth_source: None,
+            exit_code: 0,
+            stdout: "CODEX_COMPOSER_SKIP:missing-composer-json",
+            stderr: "",
+            gitlab_token: None,
+            composer_auth: None,
+            debug_lines: &[],
+        });
 
         assert!(result.attempted);
         assert!(result.success);
@@ -1238,16 +1240,16 @@ mod tests {
 
     #[test]
     fn composer_install_result_treats_skip_marker_line_with_noise_as_skipped() {
-        let result = composer_install_result_from_exec_output(
-            ComposerInstallMode::Full,
-            None,
-            86,
-            "wrapper noise\nCODEX_COMPOSER_SKIP:missing-composer-json\nmore wrapper noise",
-            "",
-            None,
-            None,
-            &[],
-        );
+        let result = composer_install_result_from_exec_output(ComposerInstallExecOutput {
+            mode: ComposerInstallMode::Full,
+            auth_source: None,
+            exit_code: 86,
+            stdout: "wrapper noise\nCODEX_COMPOSER_SKIP:missing-composer-json\nmore wrapper noise",
+            stderr: "",
+            gitlab_token: None,
+            composer_auth: None,
+            debug_lines: &[],
+        });
 
         assert_eq!(
             result,
@@ -1257,19 +1259,19 @@ mod tests {
 
     #[test]
     fn composer_install_result_redacts_failure_excerpt() {
-        let result = composer_install_result_from_exec_output(
-            ComposerInstallMode::Safe,
-            Some("group:team/platform".to_string()),
-            1,
-            "install failed for s3cr3t",
-            "https://oauth2:token@example.com/repo.git",
-            Some("token"),
-            Some(r#"{"http-basic":{"example.com":{"password":"s3cr3t"}}}"#),
-            &[
+        let result = composer_install_result_from_exec_output(ComposerInstallExecOutput {
+            mode: ComposerInstallMode::Safe,
+            auth_source: Some("group:team/platform".to_string()),
+            exit_code: 1,
+            stdout: "install failed for s3cr3t",
+            stderr: "https://oauth2:token@example.com/repo.git",
+            gitlab_token: Some("token"),
+            composer_auth: Some(r#"{"http-basic":{"example.com":{"password":"s3cr3t"}}}"#),
+            debug_lines: &[
                 "checked group:team/platform -> found".to_string(),
                 "derived Composer repository hosts: example.com".to_string(),
             ],
-        );
+        });
 
         assert!(result.attempted);
         assert!(!result.success);
@@ -1283,19 +1285,19 @@ mod tests {
 
     #[test]
     fn composer_install_result_redacts_debug_lines_before_logging() {
-        let result = composer_install_result_from_exec_output(
-            ComposerInstallMode::Safe,
-            Some("group:team/platform".to_string()),
-            1,
-            "install failed",
-            "",
-            Some("token"),
-            Some(r#"{"http-basic":{"example.com":{"password":"s3cr3t"}}}"#),
-            &[
+        let result = composer_install_result_from_exec_output(ComposerInstallExecOutput {
+            mode: ComposerInstallMode::Safe,
+            auth_source: Some("group:team/platform".to_string()),
+            exit_code: 1,
+            stdout: "install failed",
+            stderr: "",
+            gitlab_token: Some("token"),
+            composer_auth: Some(r#"{"http-basic":{"example.com":{"password":"s3cr3t"}}}"#),
+            debug_lines: &[
                 "ignored COMPOSER_AUTH repository entries: 1".to_string(),
                 "derived Composer repository hosts: example.com".to_string(),
             ],
-        );
+        });
 
         let excerpt = result.log_excerpt.expect("failure excerpt");
         assert!(excerpt.contains("ignored COMPOSER_AUTH repository entries: 1"));
@@ -1303,19 +1305,19 @@ mod tests {
 
     #[test]
     fn composer_install_result_keeps_redacted_success_excerpt() {
-        let result = composer_install_result_from_exec_output(
-            ComposerInstallMode::Full,
-            Some("project:group/repo".to_string()),
-            0,
-            "Installing package with s3cr3t",
-            "https://oauth2:token@example.com/repo.git",
-            Some("token"),
-            Some(r#"{"http-basic":{"example.com":{"password":"s3cr3t"}}}"#),
-            &[
+        let result = composer_install_result_from_exec_output(ComposerInstallExecOutput {
+            mode: ComposerInstallMode::Full,
+            auth_source: Some("project:group/repo".to_string()),
+            exit_code: 0,
+            stdout: "Installing package with s3cr3t",
+            stderr: "https://oauth2:token@example.com/repo.git",
+            gitlab_token: Some("token"),
+            composer_auth: Some(r#"{"http-basic":{"example.com":{"password":"s3cr3t"}}}"#),
+            debug_lines: &[
                 "checked project:group/repo -> found".to_string(),
                 "temporary COMPOSER_HOME config: written".to_string(),
             ],
-        );
+        });
 
         assert!(result.attempted);
         assert!(result.success);
@@ -1329,20 +1331,20 @@ mod tests {
 
     #[test]
     fn composer_install_result_without_auth_source_keeps_debug_preamble() {
-        let result = composer_install_result_from_exec_output(
-            ComposerInstallMode::Full,
-            None,
-            0,
-            "Installing dependencies from lock file",
-            "",
-            None,
-            None,
-            &[
+        let result = composer_install_result_from_exec_output(ComposerInstallExecOutput {
+            mode: ComposerInstallMode::Full,
+            auth_source: None,
+            exit_code: 0,
+            stdout: "Installing dependencies from lock file",
+            stderr: "",
+            gitlab_token: None,
+            composer_auth: None,
+            debug_lines: &[
                 "checked project:group/repo -> not found".to_string(),
                 "COMPOSER_AUTH detected: none".to_string(),
                 "COMPOSER_AUTH exported to composer: no".to_string(),
             ],
-        );
+        });
 
         assert!(result.attempted);
         assert!(result.success);
@@ -1356,16 +1358,16 @@ mod tests {
     #[test]
     fn composer_install_result_truncates_notice_and_output_together() {
         let long_output = "x".repeat(8_100);
-        let result = composer_install_result_from_exec_output(
-            ComposerInstallMode::Full,
-            Some("group:team/platform".to_string()),
-            0,
-            &long_output,
-            "",
-            None,
-            None,
-            &["checked group:team/platform -> found".to_string()],
-        );
+        let result = composer_install_result_from_exec_output(ComposerInstallExecOutput {
+            mode: ComposerInstallMode::Full,
+            auth_source: Some("group:team/platform".to_string()),
+            exit_code: 0,
+            stdout: &long_output,
+            stderr: "",
+            gitlab_token: None,
+            composer_auth: None,
+            debug_lines: &["checked group:team/platform -> found".to_string()],
+        });
 
         let excerpt = result.log_excerpt.expect("truncated excerpt");
         assert!(excerpt.starts_with("checked group:team/platform -> found\n"));

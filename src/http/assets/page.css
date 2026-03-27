@@ -61,8 +61,60 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
 .filters input[type="file"] { padding: 7px 10px; }
 .filters button { border: 0; border-radius: 8px; padding: 10px 14px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
 .filters button:hover { background: #1D4ED8; }
+.primary-button { border: 0; border-radius: 8px; padding: 10px 14px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+.primary-button:hover { background: #1D4ED8; }
+.secondary-button, .icon-button { border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; background: var(--surface); color: var(--text-primary); font: inherit; cursor: pointer; }
+.secondary-button:hover, .icon-button:hover { background: var(--surface-subtle); border-color: #C9D4E3; }
+.icon-button-square { width: 40px; height: 40px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 22px; line-height: 1; }
 .danger-button { border: 0; border-radius: 8px; padding: 10px 14px; background: var(--danger); color: #fff; font: inherit; cursor: pointer; }
 .danger-button:hover { background: #991B1B; }
+.hero-actions-bar { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+.hero-toolbar { display: flex; align-items: center; gap: 12px; }
+.table-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.table-actions form { margin: 0; }
+.table-scroll { overflow-x: auto; }
+.table-scroll table { min-width: 100%; }
+.rate-limit-hero { margin-bottom: 16px; }
+.rate-limit-page-stack { display: grid; gap: 16px; }
+.rate-limit-secondary-grid { margin-bottom: 0; align-items: start; }
+.rate-limit-summary { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.summary-chip { display: inline-flex; align-items: baseline; gap: 8px; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }
+.summary-chip strong { font-size: 13px; line-height: 18px; color: var(--text-primary); }
+.summary-chip-label { font-size: 12px; line-height: 16px; color: var(--text-tertiary); font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.target-badge-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.target-badge { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--divider); border-radius: 999px; background: var(--surface-subtle); padding: 4px 10px; font-size: 12px; line-height: 16px; color: var(--text-secondary); }
+.target-badge-kind { color: var(--text-tertiary); font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.rate-limit-modal { width: min(880px, calc(100vw - 48px)); max-height: min(88vh, 920px); border: 1px solid var(--border); border-radius: 12px; padding: 0; background: var(--surface); box-shadow: 0 24px 64px rgba(15, 23, 42, 0.16); overflow: hidden; }
+.rate-limit-modal::backdrop { background: rgba(15, 23, 42, 0.36); }
+.rate-limit-modal-form { margin: 0; max-height: inherit; }
+.rate-limit-modal-shell { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; max-height: inherit; }
+.rate-limit-modal-header, .rate-limit-modal-footer { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 18px 20px; background: var(--surface); border-bottom: 1px solid var(--divider); }
+.rate-limit-modal-header h2 { margin: 4px 0 0; font-size: 18px; line-height: 28px; }
+.rate-limit-modal-heading { display: grid; gap: 4px; min-width: 0; }
+.rate-limit-modal-footer { border-top: 1px solid var(--divider); border-bottom: 0; align-items: center; position: sticky; bottom: 0; }
+.modal-eyebrow { margin: 0; color: var(--text-tertiary); font-size: 12px; line-height: 16px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.rate-limit-modal-body { display: grid; gap: 16px; padding: 20px; background: var(--bg-color); overflow-y: auto; }
+.modal-section { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.modal-section-emphasis { box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }
+.modal-section-header h3 { margin: 0 0 4px; font-size: 16px; line-height: 24px; }
+.modal-grid-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.modal-field { display: grid; gap: 6px; color: var(--text-secondary); font-size: 13px; line-height: 18px; min-width: 0; }
+.modal-field > span { font-size: 12px; line-height: 16px; font-weight: 600; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.03em; }
+.modal-field input, .modal-field select { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--surface); font: inherit; color: var(--text-primary); }
+.modal-field input:focus, .modal-field select:focus { outline: 2px solid transparent; border-color: #93C5FD; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14); }
+.modal-field small { color: var(--text-tertiary); }
+.modal-field input[type="number"] { appearance: textfield; -moz-appearance: textfield; }
+.modal-field input[type="number"]::-webkit-outer-spin-button,
+.modal-field input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.target-composer { display: grid; grid-template-columns: 160px minmax(0, 1fr) auto; gap: 12px; align-items: end; }
+.target-composer-actions { display: flex; align-items: end; }
+.target-chip-list { display: flex; flex-wrap: wrap; gap: 8px; min-height: 32px; padding-top: 4px; }
+.target-chip { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); padding: 6px 10px; color: var(--text-secondary); }
+.target-chip-label { color: var(--text-tertiary); font-size: 12px; line-height: 16px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.target-chip-remove { border: 0; padding: 0; background: transparent; color: var(--accent); cursor: pointer; font: inherit; }
+.target-chip-remove:hover { color: #1D4ED8; text-decoration: underline; }
+.checkbox-row { display: inline-flex; align-items: center; gap: 10px; color: var(--text-primary); }
+.checkbox-stack { display: flex; flex-wrap: wrap; gap: 12px 20px; }
 .pagination { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
 .pagination-links { display: flex; gap: 8px; align-items: center; }
 .pagination-link { display: inline-flex; align-items: center; justify-content: center; min-width: 88px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--accent); text-decoration: none; font-weight: 500; }
@@ -167,6 +219,10 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
   .sidebar { position: static; height: auto; }
   .transcript-header { flex-direction: column; }
   .transcript-thread-meta { justify-content: flex-start; }
+  .hero-actions-bar, .rate-limit-modal-header, .rate-limit-modal-footer { flex-direction: column; }
+  .hero-toolbar { width: 100%; }
+  .hero-toolbar .primary-button { width: 100%; }
+  .modal-grid-two, .target-composer { grid-template-columns: 1fr; }
 }
 @media (max-width: 720px) {
   .content { padding: 16px; }
@@ -174,6 +230,7 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
   .filter-field, .filter-field-wide { flex-basis: 100%; }
   .filter-actions { width: 100%; }
   .filters button { width: 100%; }
+  .secondary-button { width: 100%; }
   .pagination { flex-direction: column; align-items: stretch; }
   .pagination-links { width: 100%; }
   .pagination-link { flex: 1 1 0; }
@@ -182,4 +239,7 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
   .entry-summary::before { display: none; }
   .entry-summary-content, .entry-summary-meta { grid-column: auto; grid-row: auto; }
   .entry-meta-cluster, .meta-pills { justify-content: flex-start; }
+  .rate-limit-modal { width: min(100vw - 24px, 100%); }
+  .rate-limit-modal-body, .rate-limit-modal-header, .rate-limit-modal-footer { padding: 16px; }
+  .table-actions { align-items: stretch; }
 }

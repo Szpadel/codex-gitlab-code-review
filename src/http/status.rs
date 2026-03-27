@@ -11,10 +11,10 @@ use crate::skills::{SkillListSnapshot, SkillPreviewSnapshot, SkillsManager};
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
     ProjectCatalogSummary, ReviewRateLimitBucketSnapshot, ReviewRateLimitPendingEntry,
-    ReviewRateLimitRule, ReviewRateLimitRuleUpsert, ReviewStateStore, RunHistoryCursor,
-    RunHistoryEventRecord, RunHistoryKind, RunHistoryListItem, RunHistoryListQuery,
-    RunHistoryRecord, ScanMode, ScanOutcome, ScanState, TranscriptBackfillState,
-    merge_rewritten_turn_events,
+    ReviewRateLimitRule, ReviewRateLimitRuleUpsert, ReviewRateLimitTarget,
+    ReviewRateLimitTargetKind, ReviewStateStore, RunHistoryCursor, RunHistoryEventRecord,
+    RunHistoryKind, RunHistoryListItem, RunHistoryListQuery, RunHistoryRecord, ScanMode,
+    ScanOutcome, ScanState, TranscriptBackfillState, merge_rewritten_turn_events,
 };
 use crate::transcript_backfill::{
     REVIEW_MISSING_CHILD_TURN_IDS_KEY, SessionHistoryBackfillSource,
@@ -65,7 +65,9 @@ pub struct StatusRateLimitSnapshot {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StatusConfigSnapshot {
+    pub runtime_mode: String,
     pub gitlab_base_url: String,
+    pub database_path: String,
     pub bind_addr: String,
     pub run_once: bool,
     pub dry_run: bool,
@@ -117,7 +119,9 @@ pub struct StatusService {
 
 #[derive(Clone)]
 struct StatusConfig {
+    runtime_mode: String,
     gitlab_base_url: String,
+    database_path: String,
     bind_addr: String,
     status_ui_enabled: bool,
     run_once: bool,
@@ -130,8 +134,10 @@ struct StatusConfig {
     schedule_timezone: String,
     repo_targets: usize,
     repo_targets_all: bool,
+    repo_target_paths: Vec<String>,
     group_targets: usize,
     group_targets_all: bool,
+    group_target_paths: Vec<String>,
     feature_flag_defaults: FeatureFlagDefaults,
     feature_flag_availability: FeatureFlagAvailability,
 }
@@ -164,7 +170,9 @@ impl StatusService {
         );
         Self {
             config: StatusConfig {
+                runtime_mode: "normal".to_string(),
                 gitlab_base_url: config.gitlab.base_url,
+                database_path: config.database.path,
                 bind_addr: config.server.bind_addr,
                 status_ui_enabled: config.server.status_ui_enabled,
                 run_once,
@@ -180,8 +188,10 @@ impl StatusService {
                     .unwrap_or_else(|| "UTC".to_string()),
                 repo_targets: config.gitlab.targets.repos.list().len(),
                 repo_targets_all: config.gitlab.targets.repos.is_all(),
+                repo_target_paths: config.gitlab.targets.repos.list().to_vec(),
                 group_targets: config.gitlab.targets.groups.list().len(),
                 group_targets_all: config.gitlab.targets.groups.is_all(),
+                group_target_paths: config.gitlab.targets.groups.list().to_vec(),
                 feature_flag_defaults: config.feature_flags.clone(),
                 feature_flag_availability,
             },
@@ -207,6 +217,11 @@ impl StatusService {
         self
     }
 
+    pub fn with_runtime_mode(mut self, runtime_mode: &str) -> Self {
+        self.config.runtime_mode = runtime_mode.to_string();
+        self
+    }
+
     pub(crate) fn status_ui_enabled(&self) -> bool {
         self.config.status_ui_enabled
     }
@@ -227,7 +242,9 @@ impl StatusService {
         Ok(StatusSnapshot {
             generated_at: Utc::now().to_rfc3339(),
             config: StatusConfigSnapshot {
+                runtime_mode: self.config.runtime_mode.clone(),
                 gitlab_base_url: self.config.gitlab_base_url.clone(),
+                database_path: self.config.database_path.clone(),
                 bind_addr: self.config.bind_addr.clone(),
                 run_once: self.config.run_once,
                 dry_run: self.config.dry_run,
@@ -265,6 +282,34 @@ impl StatusService {
         })
     }
 
+    pub async fn review_rate_limit_target_suggestions(&self) -> Result<Vec<ReviewRateLimitTarget>> {
+        let mut suggestions = Vec::new();
+        for path in &self.config.repo_target_paths {
+            suggestions.push(ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Repo,
+                path: path.clone(),
+            });
+        }
+        for path in &self.config.group_target_paths {
+            suggestions.push(ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Group,
+                path: path.clone(),
+            });
+        }
+        for rule in self.state.list_review_rate_limit_rules().await? {
+            suggestions.extend(rule.targets);
+        }
+
+        let mut deduped = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for suggestion in suggestions {
+            if seen.insert((suggestion.kind, suggestion.path.clone())) {
+                deduped.push(suggestion);
+            }
+        }
+        Ok(deduped)
+    }
+
     pub async fn create_review_rate_limit_rule(
         &self,
         rule: &ReviewRateLimitRuleUpsert,
@@ -283,9 +328,9 @@ impl StatusService {
         self.state.delete_review_rate_limit_rule(rule_id).await
     }
 
-    pub async fn refund_one_review_rate_limit_bucket_slot(&self, rule_id: &str) -> Result<()> {
+    pub async fn refund_one_review_rate_limit_bucket_slot(&self, bucket_id: &str) -> Result<()> {
         self.state
-            .refund_review_rate_limit_rules(&[rule_id.to_string()], Utc::now().timestamp())
+            .refund_review_rate_limit_bucket(bucket_id, Utc::now().timestamp())
             .await
     }
 

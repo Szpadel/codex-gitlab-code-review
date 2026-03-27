@@ -20,6 +20,30 @@ struct ReviewCommentPostingOptions<'a> {
     finding_marker_prefix: &'a str,
 }
 
+pub(crate) struct PostReviewCommentRequest<'a> {
+    pub inline_review_comments_enabled: bool,
+    pub lane: ReviewLane,
+    pub config: &'a Config,
+    pub gitlab: &'a dyn GitLabApi,
+    pub bot_user_id: u64,
+    pub project_path: &'a str,
+    pub repo: &'a str,
+    pub mr: &'a MergeRequest,
+    pub head_sha: &'a str,
+    pub comment: &'a ReviewComment,
+}
+
+struct FallbackNoteRequest<'a> {
+    options: ReviewCommentPostingOptions<'a>,
+    repo: &'a str,
+    iid: u64,
+    head_sha: &'a str,
+    comment: &'a ReviewComment,
+    fallback_findings: &'a [ReviewFinding],
+    project_web_base: &'a str,
+    worktree_root: &'a str,
+}
+
 #[derive(Debug, Clone)]
 struct DiffAnchor {
     old_line: Option<usize>,
@@ -33,32 +57,25 @@ struct DiffFileAnchors {
     anchors_by_new_line: HashMap<usize, DiffAnchor>,
 }
 
-pub(crate) async fn post_review_comment(
-    inline_review_comments_enabled: bool,
-    lane: ReviewLane,
-    config: &Config,
-    gitlab: &dyn GitLabApi,
-    bot_user_id: u64,
-    project_path: &str,
-    repo: &str,
-    mr: &MergeRequest,
-    head_sha: &str,
-    comment: &ReviewComment,
-) -> Result<()> {
-    let options = posting_options(config, lane);
-    let project_web_base = resolve_project_web_base(config, gitlab, repo, mr).await;
-    let worktree_root = repo_checkout_root(project_path);
-    if !inline_review_comments_enabled || comment.findings.is_empty() {
-        let full_body = legacy_note_body(options, head_sha, &comment.body);
-        gitlab.create_note(repo, mr.iid, &full_body).await?;
+pub(crate) async fn post_review_comment(request: PostReviewCommentRequest<'_>) -> Result<()> {
+    let options = posting_options(request.config, request.lane);
+    let project_web_base =
+        resolve_project_web_base(request.config, request.gitlab, request.repo, request.mr).await;
+    let worktree_root = repo_checkout_root(request.project_path);
+    if !request.inline_review_comments_enabled || request.comment.findings.is_empty() {
+        let full_body = legacy_note_body(options, request.head_sha, &request.comment.body);
+        request
+            .gitlab
+            .create_note(request.repo, request.mr.iid, &full_body)
+            .await?;
         return Ok(());
     }
 
     let mut seen_finding_markers = match load_existing_finding_markers(
-        gitlab,
-        repo,
-        mr.iid,
-        bot_user_id,
+        request.gitlab,
+        request.repo,
+        request.mr.iid,
+        request.bot_user_id,
         options.finding_marker_prefix,
     )
     .await
@@ -66,74 +83,87 @@ pub(crate) async fn post_review_comment(
         Ok(markers) => markers,
         Err(err) => {
             warn!(
-                repo,
-                iid = mr.iid,
-                head_sha,
+                request.repo,
+                iid = request.mr.iid,
+                head_sha = request.head_sha,
                 error = %err,
                 "failed to load existing inline review markers; falling back to regular MR note"
             );
             create_fallback_note(
-                options,
-                gitlab,
-                repo,
-                mr.iid,
-                head_sha,
-                comment,
-                &comment.findings,
-                project_web_base.as_str(),
-                worktree_root.as_str(),
+                request.gitlab,
+                FallbackNoteRequest {
+                    options,
+                    repo: request.repo,
+                    iid: request.mr.iid,
+                    head_sha: request.head_sha,
+                    comment: request.comment,
+                    fallback_findings: &request.comment.findings,
+                    project_web_base: project_web_base.as_str(),
+                    worktree_root: worktree_root.as_str(),
+                },
             )
             .await?;
             return Ok(());
         }
     };
-    let (latest_version, anchors_by_path) =
-        match load_inline_review_context(gitlab, repo, mr.iid, head_sha).await {
-            Ok(Some((latest_version, anchors_by_path))) => (Some(latest_version), anchors_by_path),
-            Ok(None) => (None, HashMap::new()),
-            Err(err) => {
-                warn!(
-                    repo,
-                    iid = mr.iid,
-                    head_sha,
-                    error = %err,
-                    "failed to load inline review metadata; falling back to regular MR note"
-                );
-                (None, HashMap::new())
-            }
-        };
+    let (latest_version, anchors_by_path) = match load_inline_review_context(
+        request.gitlab,
+        request.repo,
+        request.mr.iid,
+        request.head_sha,
+    )
+    .await
+    {
+        Ok(Some((latest_version, anchors_by_path))) => (Some(latest_version), anchors_by_path),
+        Ok(None) => (None, HashMap::new()),
+        Err(err) => {
+            warn!(
+                request.repo,
+                iid = request.mr.iid,
+                head_sha = request.head_sha,
+                error = %err,
+                "failed to load inline review metadata; falling back to regular MR note"
+            );
+            (None, HashMap::new())
+        }
+    };
 
     let mut fallback_findings = Vec::new();
-    let mut findings = comment.findings.iter().peekable();
+    let mut findings = request.comment.findings.iter().peekable();
     while let Some(finding) = findings.next() {
-        let marker = finding_marker(options.finding_marker_prefix, head_sha, finding);
+        let marker = finding_marker(options.finding_marker_prefix, request.head_sha, finding);
         if !seen_finding_markers.insert(marker.clone()) {
             continue;
         }
 
-        let Some(request) = build_inline_discussion(
+        let Some(discussion) = build_inline_discussion(
             finding,
             latest_version.as_ref(),
             &anchors_by_path,
             options,
-            head_sha,
+            request.head_sha,
             project_web_base.as_str(),
             worktree_root.as_str(),
         ) else {
             fallback_findings.push(finding.clone());
             continue;
         };
-        if let Err(err) = gitlab.create_diff_discussion(repo, mr.iid, &request).await {
+        if let Err(err) = request
+            .gitlab
+            .create_diff_discussion(request.repo, request.mr.iid, &discussion)
+            .await
+        {
             warn!(
-                repo,
-                iid = mr.iid,
-                head_sha,
+                request.repo,
+                iid = request.mr.iid,
+                head_sha = request.head_sha,
                 error = %err,
                 "failed to post inline review discussion; falling back to regular MR note"
             );
             fallback_findings.push(finding.clone());
             for remaining in findings {
-                let marker = finding_marker(options.finding_marker_prefix, head_sha, remaining);
+                let marker =
+                    finding_marker(options.finding_marker_prefix, request.head_sha, remaining);
                 if seen_finding_markers.insert(marker) {
                     fallback_findings.push(remaining.clone());
                 }
@@ -142,17 +172,19 @@ pub(crate) async fn post_review_comment(
         }
     }
 
-    if !fallback_findings.is_empty() || comment.overall_explanation.is_some() {
+    if !fallback_findings.is_empty() || request.comment.overall_explanation.is_some() {
         create_fallback_note(
-            options,
-            gitlab,
-            repo,
-            mr.iid,
-            head_sha,
-            comment,
-            &fallback_findings,
-            project_web_base.as_str(),
-            worktree_root.as_str(),
+            request.gitlab,
+            FallbackNoteRequest {
+                options,
+                repo: request.repo,
+                iid: request.mr.iid,
+                head_sha: request.head_sha,
+                comment: request.comment,
+                fallback_findings: &fallback_findings,
+                project_web_base: project_web_base.as_str(),
+                worktree_root: worktree_root.as_str(),
+            },
         )
         .await?;
     }
@@ -378,26 +410,19 @@ fn build_fallback_note_body(
 }
 
 async fn create_fallback_note(
-    options: ReviewCommentPostingOptions<'_>,
     gitlab: &dyn GitLabApi,
-    repo: &str,
-    iid: u64,
-    head_sha: &str,
-    comment: &ReviewComment,
-    fallback_findings: &[ReviewFinding],
-    project_web_base: &str,
-    worktree_root: &str,
+    request: FallbackNoteRequest<'_>,
 ) -> Result<()> {
     let body = build_fallback_note_body(
-        options,
-        head_sha,
-        comment,
-        fallback_findings,
-        project_web_base,
-        worktree_root,
+        request.options,
+        request.head_sha,
+        request.comment,
+        request.fallback_findings,
+        request.project_web_base,
+        request.worktree_root,
     )
-    .unwrap_or_else(|| legacy_note_body(options, head_sha, &comment.body));
-    gitlab.create_note(repo, iid, &body).await
+    .unwrap_or_else(|| legacy_note_body(request.options, request.head_sha, &request.comment.body));
+    gitlab.create_note(request.repo, request.iid, &body).await
 }
 
 fn legacy_note_body(

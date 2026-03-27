@@ -9,14 +9,18 @@ use crate::config::{
     McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ReviewSecurityConfig,
     ScheduleConfig, ServerConfig, TargetSelector,
 };
+use crate::dev_mode::{DevToolsService, MockCodexRunner};
 use crate::flow::mention::{contains_mention, extract_parent_chain};
 use crate::flow::review::{RetryKey, ReviewRunContext};
 use crate::gitlab::{
     AwardEmoji, DiscussionNote, GitLabUser, GitLabUserDetail, MergeRequestDiff,
     MergeRequestDiffDiscussion, MergeRequestDiffVersion, MergeRequestDiscussion, Note,
 };
-use crate::state::{ReviewRateLimitRuleUpsert, ReviewRateLimitScope};
-use anyhow::anyhow;
+use crate::state::{
+    ReviewRateLimitBucketMode, ReviewRateLimitRuleUpsert, ReviewRateLimitScope,
+    ReviewRateLimitTarget, ReviewRateLimitTargetKind,
+};
+use anyhow::{Context, anyhow};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use pretty_assertions::assert_eq;
@@ -993,6 +997,7 @@ fn test_config() -> Config {
             max_concurrent: 1,
             eyes_emoji: "eyes".to_string(),
             thumbs_emoji: "thumbsup".to_string(),
+            rate_limit_emoji: "hourglass_flowing_sand".to_string(),
             comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
             stale_in_progress_minutes: 60,
             dry_run: false,
@@ -1092,25 +1097,33 @@ fn mr_with_created_at(iid: u64, sha: &str, created_at: DateTime<Utc>) -> MergeRe
 fn review_rate_limit_rule(
     id: &str,
     label: &str,
+    spec: ReviewRateLimitRuleSpec<'_>,
+) -> ReviewRateLimitRuleUpsert {
+    ReviewRateLimitRuleUpsert {
+        id: Some(id.to_string()),
+        label: label.to_string(),
+        scope: spec.scope,
+        targets: vec![ReviewRateLimitTarget {
+            kind: ReviewRateLimitTargetKind::Repo,
+            path: spec.scope_repo.to_string(),
+        }],
+        bucket_mode: ReviewRateLimitBucketMode::Shared,
+        scope_iid: spec.scope_iid,
+        applies_to_review: spec.applies_to_review,
+        applies_to_security: spec.applies_to_security,
+        capacity: spec.capacity,
+        window_seconds: spec.window_seconds,
+    }
+}
+
+struct ReviewRateLimitRuleSpec<'a> {
     scope: ReviewRateLimitScope,
-    scope_repo: &str,
+    scope_repo: &'a str,
     scope_iid: Option<u64>,
     applies_to_review: bool,
     applies_to_security: bool,
     capacity: u32,
     window_seconds: u64,
-) -> ReviewRateLimitRuleUpsert {
-    ReviewRateLimitRuleUpsert {
-        id: Some(id.to_string()),
-        label: label.to_string(),
-        scope,
-        scope_repo: scope_repo.to_string(),
-        scope_iid,
-        applies_to_review,
-        applies_to_security,
-        capacity,
-        window_seconds,
-    }
 }
 
 #[tokio::test]
@@ -2585,22 +2598,24 @@ async fn security_reviews_use_canonical_project_path_for_runner_context() -> Res
 
     let _ = service.scan_once().await?;
 
-    let contexts = runner.review_contexts.lock().unwrap();
-    assert_eq!(contexts.len(), 2);
-    assert_eq!(
-        contexts
-            .iter()
-            .find(|ctx| ctx.lane == crate::review_lane::ReviewLane::General)
-            .map(|ctx| ctx.project_path.as_str()),
-        Some("forks/source-repo")
-    );
-    assert_eq!(
-        contexts
-            .iter()
-            .find(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
-            .map(|ctx| ctx.project_path.as_str()),
-        Some("target/repo")
-    );
+    {
+        let contexts = runner.review_contexts.lock().unwrap();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts
+                .iter()
+                .find(|ctx| ctx.lane == crate::review_lane::ReviewLane::General)
+                .map(|ctx| ctx.project_path.as_str()),
+            Some("forks/source-repo")
+        );
+        assert_eq!(
+            contexts
+                .iter()
+                .find(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
+                .map(|ctx| ctx.project_path.as_str()),
+            Some("target/repo")
+        );
+    }
     let run_kinds = service
         .state
         .list_run_history_for_mr("target/repo", 12)
@@ -4394,13 +4409,15 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "general-only",
             "General only",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            1,
-            3_600,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                scope_repo: "group/repo",
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 3_600,
+            },
         ))
         .await?;
     let service = ReviewService::new(
@@ -4445,7 +4462,7 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
     assert!(pending[0].next_retry_at > pending[0].last_blocked_at);
 
     state
-        .refund_review_rate_limit_rules(std::slice::from_ref(&rule_id), Utc::now().timestamp())
+        .refund_review_rate_limit_buckets(std::slice::from_ref(&rule_id), Utc::now().timestamp())
         .await?;
 
     let fourth = service
@@ -4458,6 +4475,257 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
     );
     assert!(state.list_review_rate_limit_pending().await?.is_empty());
     assert_eq!(runner.review_contexts.lock().unwrap().len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_block_adds_configured_mr_award() -> Result<()> {
+    let mut config = test_config();
+    config.review.rate_limit_emoji = "hourglass_flowing_sand".to_string();
+    let gitlab = fake_gitlab(Vec::new());
+    let runner = Arc::new(CapturingReviewRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        review_contexts: Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let now = Utc::now().timestamp();
+    state
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "general-only",
+            "General only",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                scope_repo: "group/repo",
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 3_600,
+            },
+        ))
+        .await?;
+    state
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 27, now)
+        .await?;
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner,
+        1,
+        default_created_after(),
+    );
+
+    let outcome = service
+        .general_review_flow
+        .run_for_mr("group/repo", mr(27, "sha27"), "sha27")
+        .await?;
+
+    assert_eq!(
+        outcome,
+        crate::flow::review::ReviewScheduleOutcome::SkippedRateLimit
+    );
+    assert!(
+        gitlab
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "add_award:group/repo:27:hourglass_flowing_sand")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_block_skips_duplicate_mr_award_when_bot_already_has_it() -> Result<()> {
+    let mut config = test_config();
+    config.review.rate_limit_emoji = "hourglass_flowing_sand".to_string();
+    let gitlab = Arc::new(FakeGitLab {
+        bot_user: GitLabUser {
+            id: 1,
+            username: Some("bot".to_string()),
+            name: Some("Bot".to_string()),
+        },
+        mrs: Mutex::new(Vec::new()),
+        awards: Mutex::new(HashMap::from([(
+            ("group/repo".to_string(), 28),
+            vec![AwardEmoji {
+                id: 280,
+                name: "hourglass_flowing_sand".to_string(),
+                user: GitLabUser {
+                    id: 1,
+                    username: Some("bot".to_string()),
+                    name: Some("Bot".to_string()),
+                },
+            }],
+        )])),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::new()),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let runner = Arc::new(CapturingReviewRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        review_contexts: Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let now = Utc::now().timestamp();
+    state
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "general-only",
+            "General only",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                scope_repo: "group/repo",
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 3_600,
+            },
+        ))
+        .await?;
+    state
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 28, now)
+        .await?;
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner,
+        1,
+        default_created_after(),
+    );
+
+    let outcome = service
+        .general_review_flow
+        .run_for_mr("group/repo", mr(28, "sha28"), "sha28")
+        .await?;
+
+    assert_eq!(
+        outcome,
+        crate::flow::review::ReviewScheduleOutcome::SkippedRateLimit
+    );
+    assert!(
+        gitlab
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|call| call != "add_award:group/repo:28:hourglass_flowing_sand")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_clear_removes_configured_mr_award_before_review_resumes() -> Result<()>
+{
+    let mut config = test_config();
+    config.review.rate_limit_emoji = "hourglass_flowing_sand".to_string();
+    let gitlab = Arc::new(FakeGitLab {
+        bot_user: GitLabUser {
+            id: 1,
+            username: Some("bot".to_string()),
+            name: Some("Bot".to_string()),
+        },
+        mrs: Mutex::new(Vec::new()),
+        awards: Mutex::new(HashMap::from([(
+            ("group/repo".to_string(), 29),
+            vec![AwardEmoji {
+                id: 290,
+                name: "hourglass_flowing_sand".to_string(),
+                user: GitLabUser {
+                    id: 1,
+                    username: Some("bot".to_string()),
+                    name: Some("Bot".to_string()),
+                },
+            }],
+        )])),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::new()),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let runner = Arc::new(CapturingReviewRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        review_contexts: Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let rule_id = state
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "general-only",
+            "General only",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                scope_repo: "group/repo",
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 3_600,
+            },
+        ))
+        .await?;
+    state
+        .upsert_review_rate_limit_pending(
+            ReviewLane::General,
+            "group/repo",
+            29,
+            "sha29-old",
+            100,
+            0,
+        )
+        .await?;
+    state
+        .refund_review_rate_limit_buckets(std::slice::from_ref(&rule_id), Utc::now().timestamp())
+        .await?;
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state.clone(),
+        runner,
+        1,
+        default_created_after(),
+    );
+
+    let outcome = service
+        .general_review_flow
+        .run_for_mr("group/repo", mr(29, "sha29"), "sha29")
+        .await?;
+
+    assert_eq!(
+        outcome,
+        crate::flow::review::ReviewScheduleOutcome::Scheduled
+    );
+    assert!(
+        gitlab
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "delete_award:group/repo:29:290")
+    );
+    assert!(state.list_review_rate_limit_pending().await?.is_empty());
     Ok(())
 }
 
@@ -4477,39 +4745,45 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "general-only",
             "General only",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            2,
-            3_600,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                scope_repo: "group/repo",
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 2,
+                window_seconds: 3_600,
+            },
         ))
         .await?;
     let security_only = state
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "security-only",
             "Security only",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            false,
-            true,
-            2,
-            3_600,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                scope_repo: "group/repo",
+                scope_iid: None,
+                applies_to_review: false,
+                applies_to_security: true,
+                capacity: 2,
+                window_seconds: 3_600,
+            },
         ))
         .await?;
     let shared = state
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "shared",
             "Shared",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            true,
-            2,
-            3_600,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                scope_repo: "group/repo",
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: true,
+                capacity: 2,
+                window_seconds: 3_600,
+            },
         ))
         .await?;
     let service = ReviewService::new(
@@ -4590,13 +4864,15 @@ async fn runtime_rate_limit_refunds_on_startup_failure() -> Result<()> {
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "startup-failure",
             "Startup failure",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            1,
-            3_600,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                scope_repo: "group/repo",
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 3_600,
+            },
         ))
         .await?;
     sqlx::query("DROP TABLE run_history")
@@ -5831,5 +6107,99 @@ async fn resolves_targets_with_exclusions() -> Result<()> {
         repos,
         vec!["group/include".to_string(), "group/keep".to_string()]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dev_mode_scan_persists_mocked_run_history_for_synthetic_merge_request() -> Result<()> {
+    let config = test_config();
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let dev_tools = Arc::new(DevToolsService::new("/tmp/dev-mode.sqlite"));
+    dev_tools.simulate_new_mr("demo/group/service-a").await?;
+    let first_head_sha = dev_tools
+        .snapshot()
+        .await
+        .repos
+        .into_iter()
+        .find(|repo| repo.repo_path == "demo/group/service-a")
+        .and_then(|repo| repo.active_head_sha)
+        .context("missing synthetic head sha")?;
+    let dynamic_repo_source: Arc<dyn DynamicRepoSource> = dev_tools.clone();
+    let service = ReviewService::new(
+        config,
+        dev_tools.gitlab_api(),
+        Arc::clone(&state),
+        Arc::new(MockCodexRunner::new(Arc::clone(&state))),
+        1,
+        default_created_after(),
+    )
+    .with_dynamic_repo_source(dynamic_repo_source);
+
+    service.scan_once().await?;
+
+    let runs = state
+        .list_run_history_for_mr("demo/group/service-a", 1)
+        .await?;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].head_sha, first_head_sha);
+    assert_eq!(runs[0].auth_account_name.as_deref(), Some("dev-mode"));
+
+    let events = state.list_run_history_events(runs[0].id).await?;
+    assert!(!events.is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "turn_completed")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dev_mode_incremental_scan_detects_new_commit_on_existing_synthetic_merge_request()
+-> Result<()> {
+    let config = test_config();
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let dev_tools = Arc::new(DevToolsService::new("/tmp/dev-mode.sqlite"));
+    dev_tools.simulate_new_mr("demo/group/service-a").await?;
+    let first_head_sha = dev_tools
+        .snapshot()
+        .await
+        .repos
+        .into_iter()
+        .find(|repo| repo.repo_path == "demo/group/service-a")
+        .and_then(|repo| repo.active_head_sha)
+        .context("missing initial synthetic head sha")?;
+    let dynamic_repo_source: Arc<dyn DynamicRepoSource> = dev_tools.clone();
+    let service = ReviewService::new(
+        config,
+        dev_tools.gitlab_api(),
+        Arc::clone(&state),
+        Arc::new(MockCodexRunner::new(Arc::clone(&state))),
+        1,
+        default_created_after(),
+    )
+    .with_dynamic_repo_source(dynamic_repo_source);
+
+    service.scan_once().await?;
+    dev_tools
+        .simulate_new_commit("demo/group/service-a")
+        .await?;
+    let second_head_sha = dev_tools
+        .snapshot()
+        .await
+        .repos
+        .into_iter()
+        .find(|repo| repo.repo_path == "demo/group/service-a")
+        .and_then(|repo| repo.active_head_sha)
+        .context("missing updated synthetic head sha")?;
+
+    service.scan_once_incremental().await?;
+
+    let runs = state
+        .list_run_history_for_mr("demo/group/service-a", 1)
+        .await?;
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].head_sha, second_head_sha);
+    assert_eq!(runs[1].head_sha, first_head_sha);
     Ok(())
 }

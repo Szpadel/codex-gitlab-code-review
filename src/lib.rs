@@ -3,6 +3,7 @@ pub mod codex_runner;
 pub mod composer_install;
 pub mod config;
 pub mod demo_history;
+pub mod dev_mode;
 pub mod docker_utils;
 mod duration;
 pub mod feature_flags;

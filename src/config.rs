@@ -142,6 +142,8 @@ pub struct ReviewConfig {
     pub max_concurrent: usize,
     pub eyes_emoji: String,
     pub thumbs_emoji: String,
+    #[serde(default = "default_review_rate_limit_emoji")]
+    pub rate_limit_emoji: String,
     pub comment_marker_prefix: String,
     pub stale_in_progress_minutes: u64,
     #[serde(default)]
@@ -329,6 +331,10 @@ fn default_docker_host() -> String {
 
 fn default_usage_limit_fallback_cooldown_seconds() -> u64 {
     3600
+}
+
+fn default_review_rate_limit_emoji() -> String {
+    "hourglass_flowing_sand".to_string()
 }
 
 fn default_browser_mcp_server_name() -> String {

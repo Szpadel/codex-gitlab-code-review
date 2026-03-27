@@ -284,24 +284,44 @@ async fn sync_security_review_debounce_state_prunes_closed_merge_requests() -> R
 fn review_rate_limit_rule(
     id: &str,
     label: &str,
+    spec: ReviewRateLimitRuleSpec,
+) -> ReviewRateLimitRuleUpsert {
+    ReviewRateLimitRuleUpsert {
+        id: Some(id.to_string()),
+        label: label.to_string(),
+        targets: spec.targets,
+        bucket_mode: spec.bucket_mode,
+        scope_iid: spec.scope_iid,
+        applies_to_review: spec.applies_to_review,
+        applies_to_security: spec.applies_to_security,
+        scope: spec.scope,
+        capacity: spec.capacity,
+        window_seconds: spec.window_seconds,
+    }
+}
+
+struct ReviewRateLimitRuleSpec {
     scope: ReviewRateLimitScope,
-    scope_repo: &str,
+    targets: Vec<ReviewRateLimitTarget>,
+    bucket_mode: ReviewRateLimitBucketMode,
     scope_iid: Option<u64>,
     applies_to_review: bool,
     applies_to_security: bool,
     capacity: u32,
     window_seconds: u64,
-) -> ReviewRateLimitRuleUpsert {
-    ReviewRateLimitRuleUpsert {
-        id: Some(id.to_string()),
-        label: label.to_string(),
-        scope_repo: scope_repo.to_string(),
-        scope_iid,
-        applies_to_review,
-        applies_to_security,
-        scope,
-        capacity,
-        window_seconds,
+}
+
+fn repo_target(path: &str) -> ReviewRateLimitTarget {
+    ReviewRateLimitTarget {
+        kind: ReviewRateLimitTargetKind::Repo,
+        path: path.to_string(),
+    }
+}
+
+fn group_target(path: &str) -> ReviewRateLimitTarget {
+    ReviewRateLimitTarget {
+        kind: ReviewRateLimitTargetKind::Group,
+        path: path.to_string(),
     }
 }
 
@@ -319,13 +339,16 @@ async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-crud",
             "Initial label",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            2,
-            100,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 2,
+                window_seconds: 100,
+            },
         ))
         .await?;
 
@@ -333,7 +356,8 @@ async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].id, rule_id);
     assert_eq!(rules[0].label, "Initial label".to_string());
-    assert_eq!(rules[0].scope_repo, "group/repo".to_string());
+    assert_eq!(rules[0].targets, vec![repo_target("group/repo")]);
+    assert_eq!(rules[0].bucket_mode, ReviewRateLimitBucketMode::Shared);
     assert_eq!(rules[0].scope_iid, None);
     assert_eq!(rules[0].scope_subject, "group/repo".to_string());
     assert_eq!(rules[0].capacity, 2);
@@ -342,19 +366,27 @@ async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
         .update_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-crud",
             "Updated label",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            true,
-            3,
-            200,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo"), group_target("group/platform")],
+                bucket_mode: ReviewRateLimitBucketMode::Independent,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: true,
+                capacity: 3,
+                window_seconds: 200,
+            },
         ))
         .await?;
 
     let rules = store.list_review_rate_limit_rules().await?;
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].label, "Updated label".to_string());
+    assert_eq!(
+        rules[0].targets,
+        vec![repo_target("group/repo"), group_target("group/platform")]
+    );
+    assert_eq!(rules[0].bucket_mode, ReviewRateLimitBucketMode::Independent);
     assert!(rules[0].applies_to_security);
     assert_eq!(rules[0].capacity, 3);
     assert_eq!(rules[0].window_seconds, 200);
@@ -372,13 +404,16 @@ async fn runtime_rate_limit_refill_math_exposes_fractional_slots() -> Result<()>
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-refill",
             "Refill math",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            2,
-            100,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 2,
+                window_seconds: 100,
+            },
         ))
         .await?;
 
@@ -387,8 +422,8 @@ async fn runtime_rate_limit_refill_math_exposes_fractional_slots() -> Result<()>
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 7, started_at)
         .await?
     {
-        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
-            assert_eq!(rule_ids, vec![rule_id.clone()]);
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            assert_eq!(bucket_ids, vec![rule_id.clone()]);
         }
         other => panic!("unexpected consume outcome: {other:?}"),
     }
@@ -411,26 +446,32 @@ async fn runtime_rate_limit_stacked_rules_block_only_when_every_bucket_is_empty(
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-a",
             "First",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            1,
-            1_000,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 1_000,
+            },
         ))
         .await?;
     let second_rule = store
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-b",
             "Second",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            1,
-            1_000,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 1_000,
+            },
         ))
         .await?;
 
@@ -439,10 +480,10 @@ async fn runtime_rate_limit_stacked_rules_block_only_when_every_bucket_is_empty(
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 1, started_at)
         .await?
     {
-        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
-            let mut rule_ids = rule_ids;
-            rule_ids.sort();
-            assert_eq!(rule_ids, vec![first_rule.clone(), second_rule.clone()]);
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            let mut bucket_ids = bucket_ids;
+            bucket_ids.sort();
+            assert_eq!(bucket_ids, vec![first_rule.clone(), second_rule.clone()]);
         }
         other => panic!("unexpected consume outcome: {other:?}"),
     }
@@ -466,26 +507,32 @@ async fn runtime_rate_limit_project_and_mr_scopes_do_not_cross_apply() -> Result
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-project",
             "Project",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            3,
-            1_000,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 3,
+                window_seconds: 1_000,
+            },
         ))
         .await?;
     let mr_rule = store
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-mr",
             "MR",
-            ReviewRateLimitScope::MergeRequest,
-            "group/repo",
-            Some(10),
-            true,
-            false,
-            1,
-            1_000,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::MergeRequest,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 1_000,
+            },
         ))
         .await?;
 
@@ -494,10 +541,13 @@ async fn runtime_rate_limit_project_and_mr_scopes_do_not_cross_apply() -> Result
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 10, started_at)
         .await?
     {
-        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
-            let mut rule_ids = rule_ids;
-            rule_ids.sort();
-            assert_eq!(rule_ids, vec![mr_rule.clone(), project_rule.clone()]);
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            let mut bucket_ids = bucket_ids;
+            bucket_ids.sort();
+            assert_eq!(
+                bucket_ids,
+                vec![format!("{mr_rule}:mr:group/repo:10"), project_rule.clone()]
+            );
         }
         other => panic!("unexpected consume outcome: {other:?}"),
     }
@@ -506,8 +556,13 @@ async fn runtime_rate_limit_project_and_mr_scopes_do_not_cross_apply() -> Result
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 11, started_at)
         .await?
     {
-        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
-            assert_eq!(rule_ids, vec![project_rule.clone()]);
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            let mut bucket_ids = bucket_ids;
+            bucket_ids.sort();
+            assert_eq!(
+                bucket_ids,
+                vec![format!("{mr_rule}:mr:group/repo:11"), project_rule.clone()]
+            );
         }
         other => panic!("unexpected consume outcome: {other:?}"),
     }
@@ -521,13 +576,16 @@ async fn runtime_rate_limit_shared_review_and_security_rules_use_one_bucket() ->
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-shared",
             "Shared",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            true,
-            2,
-            1_000,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: true,
+                capacity: 2,
+                window_seconds: 1_000,
+            },
         ))
         .await?;
 
@@ -536,8 +594,8 @@ async fn runtime_rate_limit_shared_review_and_security_rules_use_one_bucket() ->
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 12, started_at)
         .await?
     {
-        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
-            assert_eq!(rule_ids, vec![rule_id.clone()]);
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            assert_eq!(bucket_ids, vec![rule_id.clone()]);
         }
         other => panic!("unexpected consume outcome: {other:?}"),
     }
@@ -545,8 +603,8 @@ async fn runtime_rate_limit_shared_review_and_security_rules_use_one_bucket() ->
         .try_consume_review_rate_limits(ReviewLane::Security, "group/repo", 12, started_at)
         .await?
     {
-        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
-            assert_eq!(rule_ids, vec![rule_id.clone()]);
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            assert_eq!(bucket_ids, vec![rule_id.clone()]);
         }
         other => panic!("unexpected consume outcome: {other:?}"),
     }
@@ -569,13 +627,16 @@ async fn runtime_rate_limit_regen_one_slot_is_reflected_in_active_buckets() -> R
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-regen",
             "Regen",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            2,
-            100,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 2,
+                window_seconds: 100,
+            },
         ))
         .await?;
 
@@ -587,7 +648,7 @@ async fn runtime_rate_limit_regen_one_slot_is_reflected_in_active_buckets() -> R
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 13, started_at)
         .await?;
     store
-        .refund_review_rate_limit_rules(std::slice::from_ref(&rule_id), started_at)
+        .refund_review_rate_limit_buckets(std::slice::from_ref(&rule_id), started_at)
         .await?;
 
     let buckets = store
@@ -606,13 +667,16 @@ async fn runtime_rate_limit_auto_deletes_full_bucket_rows() -> Result<()> {
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-auto-delete",
             "Auto delete",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            1,
-            100,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 100,
+            },
         ))
         .await?;
 
@@ -661,9 +725,11 @@ async fn runtime_rate_limit_pending_clear_removes_row() -> Result<()> {
         .upsert_review_rate_limit_pending(ReviewLane::Security, "group/repo", 18, "sha-1", 100, 500)
         .await?;
 
-    store
-        .clear_review_rate_limit_pending(ReviewLane::Security, "group/repo", 18)
-        .await?;
+    assert!(
+        store
+            .clear_review_rate_limit_pending(ReviewLane::Security, "group/repo", 18)
+            .await?
+    );
     assert!(store.list_review_rate_limit_pending().await?.is_empty());
     assert_eq!(
         store.earliest_review_rate_limit_pending_retry_at().await?,
@@ -694,13 +760,16 @@ async fn runtime_rate_limit_consume_and_refund_roundtrip() -> Result<()> {
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-roundtrip",
             "Roundtrip",
-            ReviewRateLimitScope::Project,
-            "group/repo",
-            None,
-            true,
-            false,
-            2,
-            1_000,
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 2,
+                window_seconds: 1_000,
+            },
         ))
         .await?;
 
@@ -709,14 +778,14 @@ async fn runtime_rate_limit_consume_and_refund_roundtrip() -> Result<()> {
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 18, started_at)
         .await?
     {
-        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
-            assert_eq!(rule_ids, vec![rule_id.clone()]);
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            assert_eq!(bucket_ids, vec![rule_id.clone()]);
         }
         other => panic!("unexpected consume outcome: {other:?}"),
     }
 
     store
-        .refund_review_rate_limit_rules(std::slice::from_ref(&rule_id), started_at)
+        .refund_review_rate_limit_buckets(std::slice::from_ref(&rule_id), started_at)
         .await?;
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_review_rate_limit_bucket")
@@ -728,11 +797,233 @@ async fn runtime_rate_limit_consume_and_refund_roundtrip() -> Result<()> {
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 18, started_at)
         .await?
     {
-        ReviewRateLimitAcquireOutcome::Acquired { rule_ids } => {
-            assert_eq!(rule_ids, vec![rule_id]);
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            assert_eq!(bucket_ids, vec![rule_id]);
         }
         other => panic!("unexpected consume outcome: {other:?}"),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_group_targets_match_nested_repositories() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-group",
+            "Group cap",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![group_target("group/platform")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 300,
+            },
+        ))
+        .await?;
+
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/platform/service-a", 21, 8_000)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            assert_eq!(bucket_ids, vec![rule_id]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_global_rules_apply_without_targets() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-global",
+            "Global cap",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: Vec::new(),
+                bucket_mode: ReviewRateLimitBucketMode::Independent,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 600,
+            },
+        ))
+        .await?;
+
+    let rules = store.list_review_rate_limit_rules().await?;
+    assert_eq!(rules.len(), 1);
+    assert!(rules[0].targets.is_empty());
+    assert_eq!(rules[0].scope_subject, "Global".to_string());
+    assert_eq!(rules[0].bucket_mode, ReviewRateLimitBucketMode::Shared);
+
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/service-a", 41, 9_500)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            assert_eq!(bucket_ids, vec![rule_id.clone()]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/service-b", 42, 9_500)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Blocked { next_retry_at } => {
+            assert_eq!(next_retry_at, 10_100);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+
+    let buckets = store.list_active_review_rate_limit_buckets(9_500).await?;
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].scope_subject, "Global".to_string());
+    assert_eq!(buckets[0].target_path, "*".to_string());
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_independent_bucket_mode_tracks_each_target_separately() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-independent",
+            "Independent",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![
+                    repo_target("group/service-a"),
+                    repo_target("group/service-b"),
+                ],
+                bucket_mode: ReviewRateLimitBucketMode::Independent,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 600,
+            },
+        ))
+        .await?;
+
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/service-a", 31, 9_000)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            assert_eq!(bucket_ids, vec![format!("{rule_id}:repo:group/service-a")]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+
+    match store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/service-b", 32, 9_000)
+        .await?
+    {
+        ReviewRateLimitAcquireOutcome::Acquired { bucket_ids } => {
+            assert_eq!(bucket_ids, vec![format!("{rule_id}:repo:group/service-b")]);
+        }
+        other => panic!("unexpected consume outcome: {other:?}"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_bucket_refund_only_restores_requested_bucket() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-bucket-refund",
+            "Bucket refund",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![
+                    repo_target("group/service-a"),
+                    repo_target("group/service-b"),
+                ],
+                bucket_mode: ReviewRateLimitBucketMode::Independent,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 600,
+            },
+        ))
+        .await?;
+
+    let started_at = 10_000;
+    store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/service-a", 51, started_at)
+        .await?;
+    store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/service-b", 52, started_at)
+        .await?;
+
+    store
+        .refund_review_rate_limit_bucket(&format!("{rule_id}:repo:group/service-a"), started_at)
+        .await?;
+
+    let mut buckets = store
+        .list_active_review_rate_limit_buckets(started_at)
+        .await?;
+    buckets.sort_by(|left, right| left.target_path.cmp(&right.target_path));
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].target_path, "group/service-b".to_string());
+    assert_eq!(buckets[0].available_slots, 0.0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_rate_limit_label_update_preserves_existing_bucket_state() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let rule_id = store
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-preserve-update",
+            "Original label",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 600,
+            },
+        ))
+        .await?;
+
+    store
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 61, 11_000)
+        .await?;
+    store
+        .update_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-preserve-update",
+            "Renamed",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 600,
+            },
+        ))
+        .await?;
+
+    let buckets = store.list_active_review_rate_limit_buckets(11_000).await?;
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].rule_id, rule_id);
+    assert_eq!(buckets[0].available_slots, 0.0);
     Ok(())
 }
 

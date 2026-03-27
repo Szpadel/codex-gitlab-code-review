@@ -5,22 +5,29 @@ use super::status::{
     ThreadSnapshot, TranscriptBackfillSnapshot,
 };
 use super::timestamp::{self, UiTimestamp};
+use crate::dev_mode::DevelopmentSnapshot;
 use crate::review_lane::ReviewLane;
 use crate::skills::{
     SkillAccountSnapshot, SkillListSnapshot, SkillPreviewSnapshot, SkillSyncState,
 };
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, ProjectCatalogSummary,
-    ReviewRateLimitBucketSnapshot, ReviewRateLimitPendingEntry, ReviewRateLimitRule,
-    ReviewRateLimitScope, RunHistoryKind, RunHistoryListItem, RunHistoryRecord,
+    ReviewRateLimitBucketMode, ReviewRateLimitBucketSnapshot, ReviewRateLimitPendingEntry,
+    ReviewRateLimitRule, ReviewRateLimitScope, ReviewRateLimitTarget, ReviewRateLimitTargetKind,
+    RunHistoryKind, RunHistoryListItem, RunHistoryRecord,
 };
 use serde::Deserialize;
 use urlencoding::encode;
 
 const FEATURE_FLAG_SCRIPT: &str = include_str!("assets/feature_flag.js");
 const PAGE_STYLE: &str = include_str!("assets/page.css");
+const RATE_LIMITS_SCRIPT: &str = include_str!("assets/rate_limits.js");
 
-pub(super) fn render_status_page(snapshot: &StatusSnapshot, csrf_token: Option<&str>) -> String {
+pub(super) fn render_status_page(
+    snapshot: &StatusSnapshot,
+    csrf_token: Option<&str>,
+    development_enabled: bool,
+) -> String {
     let scan = &snapshot.scan;
     let config = &snapshot.config;
     let scan_summary = vec![
@@ -51,7 +58,9 @@ pub(super) fn render_status_page(snapshot: &StatusSnapshot, csrf_token: Option<&
         ),
     ];
     let config_summary = vec![
+        ("Mode".to_string(), escape_html(&config.runtime_mode)),
         ("GitLab".to_string(), escape_html(&config.gitlab_base_url)),
+        ("Database".to_string(), escape_html(&config.database_path)),
         ("Bind".to_string(), escape_html(&config.bind_addr)),
         (
             "Run once".to_string(),
@@ -114,10 +123,20 @@ pub(super) fn render_status_page(snapshot: &StatusSnapshot, csrf_token: Option<&
         render_auth_section(&snapshot.auth_limit_resets),
         render_catalog_section(&snapshot.project_catalogs),
     );
-    render_shell("Status", NavItem::Status, body, csrf_token)
+    render_shell(
+        "Status",
+        NavItem::Status,
+        body,
+        csrf_token,
+        development_enabled,
+    )
 }
 
-pub(super) fn render_history_page(snapshot: &HistorySnapshot, csrf_token: Option<&str>) -> String {
+pub(super) fn render_history_page(
+    snapshot: &HistorySnapshot,
+    csrf_token: Option<&str>,
+    development_enabled: bool,
+) -> String {
     let filters = &snapshot.filters;
     let body = format!(
         "<section class=\"hero\"><h1>Run history</h1><p class=\"muted\">Append-only review and mention sessions.</p></section>\
@@ -128,12 +147,19 @@ pub(super) fn render_history_page(snapshot: &HistorySnapshot, csrf_token: Option
         render_history_run_table("All runs", &snapshot.runs),
         render_history_pagination(snapshot)
     );
-    render_shell("History", NavItem::History, body, csrf_token)
+    render_shell(
+        "History",
+        NavItem::History,
+        body,
+        csrf_token,
+        development_enabled,
+    )
 }
 
 pub(super) fn render_mr_history_page(
     snapshot: &MrHistorySnapshot,
     csrf_token: Option<&str>,
+    development_enabled: bool,
 ) -> String {
     let body = format!(
         "<section class=\"hero\"><h1>MR history</h1><p class=\"muted\">{} !{} has {} recorded session(s).</p></section>{}",
@@ -142,13 +168,20 @@ pub(super) fn render_mr_history_page(
         snapshot.runs.len(),
         render_record_run_table("Sessions for this MR", &snapshot.runs)
     );
-    render_shell("MR History", NavItem::History, body, csrf_token)
+    render_shell(
+        "MR History",
+        NavItem::History,
+        body,
+        csrf_token,
+        development_enabled,
+    )
 }
 
 pub(super) fn render_run_detail_page(
     snapshot: &RunDetailSnapshot,
     gitlab_base_url: &str,
     csrf_token: Option<&str>,
+    development_enabled: bool,
 ) -> String {
     let run = &snapshot.run;
     let body = format!(
@@ -173,10 +206,20 @@ pub(super) fn render_run_detail_page(
             gitlab_base_url,
         ),
     );
-    render_shell("Run Detail", NavItem::History, body, csrf_token)
+    render_shell(
+        "Run Detail",
+        NavItem::History,
+        body,
+        csrf_token,
+        development_enabled,
+    )
 }
 
-pub(super) fn render_skills_page(snapshot: &SkillListSnapshot, csrf_token: Option<&str>) -> String {
+pub(super) fn render_skills_page(
+    snapshot: &SkillListSnapshot,
+    csrf_token: Option<&str>,
+    development_enabled: bool,
+) -> String {
     let body = format!(
         "<section class=\"hero\"><h1>Skills</h1><p class=\"muted\">Upload, preview, and delete user-managed Codex skills.</p></section>\
          <section class=\"card\"><h2>Upload skill archive</h2>\
@@ -189,12 +232,19 @@ pub(super) fn render_skills_page(snapshot: &SkillListSnapshot, csrf_token: Optio
         render_csrf_hidden_input(csrf_token),
         render_skill_table(snapshot)
     );
-    render_shell("Skills", NavItem::Skills, body, csrf_token)
+    render_shell(
+        "Skills",
+        NavItem::Skills,
+        body,
+        csrf_token,
+        development_enabled,
+    )
 }
 
 pub(super) fn render_skill_detail_page(
     snapshot: &SkillPreviewSnapshot,
     csrf_token: Option<&str>,
+    development_enabled: bool,
 ) -> String {
     let metadata = vec![
         ("Name".to_string(), escape_html(&snapshot.name)),
@@ -237,27 +287,127 @@ pub(super) fn render_skill_detail_page(
         escape_html(&snapshot.name),
         render_csrf_hidden_input(csrf_token),
     );
-    render_shell("Skill Preview", NavItem::Skills, body, csrf_token)
+    render_shell(
+        "Skill Preview",
+        NavItem::Skills,
+        body,
+        csrf_token,
+        development_enabled,
+    )
 }
 
 pub(super) fn render_rate_limits_page(
     snapshot: &StatusRateLimitSnapshot,
+    target_suggestions: &[ReviewRateLimitTarget],
+    csrf_token: Option<&str>,
+    development_enabled: bool,
+) -> String {
+    let summary = format!(
+        "<div class=\"rate-limit-summary\">\
+         <div class=\"summary-chip\"><span class=\"summary-chip-label\">Rules</span><strong>{}</strong></div>\
+         <div class=\"summary-chip\"><span class=\"summary-chip-label\">Active buckets</span><strong>{}</strong></div>\
+         <div class=\"summary-chip\"><span class=\"summary-chip-label\">Queued</span><strong>{}</strong></div>\
+         </div>",
+        snapshot.rules.len(),
+        snapshot.active_buckets.len(),
+        snapshot.pending.len(),
+    );
+    let body = format!(
+        "<section class=\"hero hero-actions-bar rate-limit-hero\"><div><h1>Review rate limits</h1><p class=\"muted\">Manage project and merge-request scoped review throughput without exposing raw-second configuration.</p>{}</div><div class=\"hero-toolbar\"><button class=\"primary-button\" type=\"button\" data-open-rate-limit-modal=\"create\" aria-label=\"Open create rule modal\">Create rule</button></div></section>\
+         <section class=\"rate-limit-page-stack\">\
+         {}\
+         {}\
+         {}\
+         </section>\
+         {}",
+        summary,
+        render_rate_limit_rules_section(&snapshot.rules, csrf_token),
+        render_rate_limit_buckets_section(&snapshot.active_buckets, csrf_token),
+        render_rate_limit_pending_section(&snapshot.pending),
+        render_rate_limit_modal(snapshot.rules.as_slice(), target_suggestions, csrf_token),
+    );
+    render_shell(
+        "Review Rate Limits",
+        NavItem::RateLimits,
+        body,
+        csrf_token,
+        development_enabled,
+    )
+}
+
+pub(super) fn render_development_page(
+    snapshot: &DevelopmentSnapshot,
     csrf_token: Option<&str>,
 ) -> String {
-    let body = format!(
-        "<section class=\"hero\"><h1>Review rate limits</h1><p class=\"muted\">Manage project and merge-request scoped review throughput.</p></section>\
-         <section class=\"grid\">\
-         <article class=\"card\"><h2>Create rule</h2>{}</article>\
-         <article class=\"card\">{}</article>\
-         </section>\
-         <section class=\"card\">{}</section>\
-         <section class=\"card\">{}</section>",
-        render_rate_limit_create_form(csrf_token),
-        render_rate_limit_rules_section(&snapshot.rules, csrf_token),
-        render_rate_limit_buckets_section(&snapshot.active_buckets),
-        render_rate_limit_pending_section(&snapshot.pending),
+    let add_repo_form = format!(
+        "<section class=\"card\"><h2>Add repository</h2>\
+         <form class=\"filters\" method=\"post\" action=\"/development/repos/create\">\
+         {}\
+         <label class=\"filter-field filter-field-wide\"><span>Repo path</span><input name=\"repo_path\" required placeholder=\"group/project\"></label>\
+         <div class=\"filter-actions\"><button type=\"submit\">Add repo</button></div>\
+         </form></section>",
+        render_csrf_hidden_input(csrf_token),
     );
-    render_shell("Review Rate Limits", NavItem::RateLimits, body, csrf_token)
+    let repo_rows = snapshot
+        .repos
+        .iter()
+        .map(|repo| {
+            let repo_key = encode_repo_key(&repo.repo_path);
+            let active_mr = repo
+                .active_mr_iid
+                .map(|iid| format!("Active MR !{iid}"))
+                .unwrap_or_else(|| "No active synthetic MR.".to_string());
+            let revision = repo
+                .active_revision
+                .map(|revision| format!("Revision {revision}"))
+                .unwrap_or_else(|| "-".to_string());
+            let head_sha = repo
+                .active_head_sha
+                .as_deref()
+                .map(|head_sha| format!("<code>{}</code>", escape_html(head_sha)))
+                .unwrap_or_else(|| "-".to_string());
+            let updated_at = render_rfc3339_timestamp(repo.updated_at.as_deref());
+            let csrf = render_csrf_hidden_input(csrf_token);
+            format!(
+                "<tr>\
+                 <td>\
+                 <form class=\"filters\" method=\"post\" action=\"/development/repos/{repo_key}/update\">\
+                 {csrf}\
+                 <label class=\"filter-field filter-field-wide\"><span>Repo path</span><input name=\"repo_path\" value=\"{repo_path}\" required></label>\
+                 <div class=\"filter-actions\"><button type=\"submit\">Rename</button></div>\
+                 </form>\
+                 </td>\
+                 <td>{active_mr}</td>\
+                 <td>{revision}</td>\
+                 <td>{head_sha}</td>\
+                 <td>{updated_at}</td>\
+                 <td>\
+                 <form class=\"filter-actions\" method=\"post\" action=\"/development/repos/{repo_key}/simulate-mr\">{csrf}<button type=\"submit\">New MR</button></form>\
+                 <form class=\"filter-actions\" method=\"post\" action=\"/development/repos/{repo_key}/simulate-commit\">{csrf}<button type=\"submit\">New commit</button></form>\
+                 <form class=\"filter-actions\" method=\"post\" action=\"/development/repos/{repo_key}/delete\">{csrf}<button class=\"danger-button\" type=\"submit\">Delete</button></form>\
+                 </td>\
+                 </tr>",
+                repo_path = escape_html(&repo.repo_path),
+                active_mr = escape_html(&active_mr),
+                revision = escape_html(&revision),
+                head_sha = head_sha,
+                updated_at = updated_at,
+                csrf = csrf,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let repo_table = format!(
+        "<section class=\"card\"><h2>Repositories</h2>\
+         <p class=\"muted\">Synthetic repos live in memory only. Restarting dev mode resets them to defaults.</p>\
+         <table><thead><tr><th>Repo</th><th>Active MR</th><th>Revision</th><th>Head SHA</th><th>Updated</th><th>Actions</th></tr></thead><tbody>{repo_rows}</tbody></table>\
+         </section>"
+    );
+    let body = format!(
+        "<section class=\"hero\"><h1>Development tools</h1><p class=\"muted\">Mocked GitLab and mocked Codex are active. Runtime state database: <code>{}</code>.</p></section>{add_repo_form}{repo_table}",
+        escape_html(&snapshot.database_path),
+    );
+    render_shell("Development", NavItem::Development, body, csrf_token, true)
 }
 
 pub(super) fn encode_repo_key(repo: &str) -> String {
@@ -1694,7 +1844,13 @@ fn pretty_print_json(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-fn render_shell(title: &str, active: NavItem, content: String, csrf_token: Option<&str>) -> String {
+fn render_shell(
+    title: &str,
+    active: NavItem,
+    content: String,
+    csrf_token: Option<&str>,
+    development_enabled: bool,
+) -> String {
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -1703,15 +1859,16 @@ fn render_shell(title: &str, active: NavItem, content: String, csrf_token: Optio
          <aside class=\"sidebar\"><div class=\"brand\">Codex GitLab Review</div>{}</aside>\
          <main class=\"content\">{}</main>\
          </div>{}\
-         <script>{}</script></body></html>",
+         <script>{}</script><script>{}</script></body></html>",
         escape_html(title),
         render_feature_flag_csrf_meta_tag(csrf_token),
         page_style(),
         timestamp::style_fragment(),
-        render_nav(active),
+        render_nav(active, development_enabled),
         content,
         timestamp::script_tag(),
         feature_flag_script(),
+        RATE_LIMITS_SCRIPT,
     )
 }
 
@@ -1736,13 +1893,16 @@ fn render_optional_unix_timestamp(timestamp: Option<i64>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn render_nav(active: NavItem) -> String {
-    let items = [
+fn render_nav(active: NavItem, development_enabled: bool) -> String {
+    let mut items = vec![
         (NavItem::Status, "/status", "Status"),
         (NavItem::History, "/history", "History"),
         (NavItem::RateLimits, "/rate-limits", "Rate limits"),
         (NavItem::Skills, "/skills", "Skills"),
     ];
+    if development_enabled {
+        items.push((NavItem::Development, "/development", "Development"));
+    }
     let links = items
         .iter()
         .map(|(item, href, label)| {
@@ -1828,35 +1988,84 @@ enum NavItem {
     History,
     RateLimits,
     Skills,
+    Development,
 }
 
 fn page_style() -> &'static str {
     PAGE_STYLE
 }
 
-fn render_rate_limit_create_form(csrf_token: Option<&str>) -> String {
+const GLOBAL_RATE_LIMIT_TARGET_UI_PATH: &str = "*";
+
+fn render_rate_limit_modal(
+    rules: &[ReviewRateLimitRule],
+    target_suggestions: &[ReviewRateLimitTarget],
+    csrf_token: Option<&str>,
+) -> String {
+    let rules_json =
+        json_script_content(&serde_json::to_string(rules).unwrap_or_else(|_| "[]".to_string()));
+    let suggestions_json = json_script_content(
+        &serde_json::to_string(target_suggestions).unwrap_or_else(|_| "[]".to_string()),
+    );
     format!(
-        "<form class=\"filters\" method=\"post\" action=\"/rate-limits/create\">\
-         {}\
-         <label class=\"filter-field\"><span>Label</span><input name=\"label\" required></label>\
-         <label class=\"filter-field\"><span>Scope</span>\
-         <select name=\"scope\">\
-         <option value=\"project\">project</option>\
-         <option value=\"merge_request\">merge_request</option>\
-         </select>\
-         </label>\
-         <label class=\"filter-field\"><span>Scope repo</span><input name=\"scope_repo\" required></label>\
-         <label class=\"filter-field\"><span>Scope iid</span><input name=\"scope_iid\" placeholder=\"optional\"></label>\
-         <label class=\"filter-field\"><span>Capacity</span><input name=\"capacity\" type=\"number\" min=\"1\" required></label>\
-         <label class=\"filter-field\"><span>Window seconds</span><input name=\"window_seconds\" type=\"number\" min=\"1\" required></label>\
-         <label class=\"filter-field\"><span>Applies to</span>\
-         <label><input type=\"checkbox\" name=\"applies_to_review\" value=\"true\" checked> Review</label>\
-         <label><input type=\"checkbox\" name=\"applies_to_security\" value=\"true\"> Security</label>\
-         </label>\
-         <div class=\"filter-actions\"><button type=\"submit\">Create</button></div>\
-         </form>",
-        render_csrf_hidden_input(csrf_token),
+        "<script id=\"rate-limit-rules-json\" type=\"application/json\">{rules_json}</script>\
+         <script id=\"rate-limit-target-suggestions-json\" type=\"application/json\">{suggestions_json}</script>\
+         <dialog class=\"rate-limit-modal\" data-role=\"rate-limit-modal\">\
+         <form class=\"rate-limit-modal-form\" method=\"post\" action=\"/rate-limits/create\" data-role=\"rate-limit-form\">\
+         <div class=\"rate-limit-modal-shell\">\
+         <header class=\"rate-limit-modal-header\">\
+         <div class=\"rate-limit-modal-heading\"><p class=\"modal-eyebrow\">Runtime control</p><h2 data-role=\"rate-limit-modal-title\">Create rule</h2><p class=\"muted\">Define throughput limits without forcing one-target rules or raw-second inputs.</p></div>\
+         <button class=\"icon-button icon-button-square\" type=\"button\" data-close-rate-limit-modal aria-label=\"Close\">&times;</button>\
+         </header>\
+         <div class=\"rate-limit-modal-body\">\
+         <input type=\"hidden\" name=\"csrf_token\" value=\"{}\">\
+         <input type=\"hidden\" name=\"targets_json\" value=\"[]\" data-role=\"rate-limit-targets-json\">\
+         <input type=\"hidden\" name=\"bucket_mode\" value=\"shared\" data-role=\"rate-limit-bucket-mode\">\
+         <section class=\"modal-section modal-section-emphasis\">\
+         <label class=\"modal-field\"><span>Label</span><input name=\"label\" required data-role=\"rate-limit-label\"></label>\
+         <label class=\"modal-field\"><span>Scope</span><select name=\"scope\" data-role=\"rate-limit-scope\"><option value=\"project\">Per project</option><option value=\"merge_request\">Per merge request</option></select><small>Per merge request creates an independent pool for every matching MR.</small></label>\
+         </section>\
+         <section class=\"modal-section modal-section-emphasis\">\
+         <div class=\"modal-section-header\"><div><h3>Targets</h3><p class=\"muted\">Add repositories or groups to scope the rule. Leave the list empty to make it global.</p></div></div>\
+         <div class=\"target-composer\">\
+         <label class=\"modal-field target-kind-field\"><span>Target type</span><select data-role=\"rate-limit-target-kind\"><option value=\"repo\">Repository</option><option value=\"group\">Group</option></select></label>\
+         <label class=\"modal-field target-value-field\"><span>Target path</span><input list=\"rate-limit-target-suggestions\" placeholder=\"group/repo or group/subgroup\" data-role=\"rate-limit-target-input\"></label>\
+         <div class=\"target-composer-actions\"><button class=\"secondary-button\" type=\"button\" data-role=\"rate-limit-add-target\">Add target</button></div>\
+         </div>\
+         <datalist id=\"rate-limit-target-suggestions\"></datalist>\
+         <div class=\"target-chip-list\" data-role=\"rate-limit-target-list\"></div>\
+         </section>\
+         <section class=\"modal-section\">\
+         <div class=\"modal-section-header\"><div><h3>Bucket behavior</h3><p class=\"muted\">Choose whether all selected targets share one pool or each target keeps its own pool.</p></div></div>\
+         <label class=\"checkbox-row\"><input type=\"checkbox\" checked data-role=\"rate-limit-shared-toggle\"><span>Share one bucket across all selected targets</span></label>\
+         </section>\
+         <section class=\"modal-section modal-section-emphasis\">\
+         <div class=\"modal-grid-two\">\
+         <label class=\"modal-field\"><span>Capacity</span><input name=\"capacity\" type=\"number\" min=\"1\" required data-role=\"rate-limit-capacity\"><small>Whole reviews allowed in each scope window.</small></label>\
+         <label class=\"modal-field\"><span>Time window</span><input name=\"window_text\" required placeholder=\"2h 15m\" data-role=\"rate-limit-window-text\"><small>Examples: 45m, 2h, 2h 15m.</small></label>\
+         </div>\
+         </section>\
+         <section class=\"modal-section modal-section-emphasis\">\
+         <div class=\"modal-section-header\"><div><h3>Applies to</h3><p class=\"muted\">Enable review, security, or both lanes for this rule.</p></div></div>\
+         <div class=\"checkbox-stack\">\
+         <label class=\"checkbox-row\"><input type=\"checkbox\" name=\"applies_to_review\" value=\"true\" checked data-role=\"rate-limit-review\"><span>Review lane</span></label>\
+         <label class=\"checkbox-row\"><input type=\"checkbox\" name=\"applies_to_security\" value=\"true\" data-role=\"rate-limit-security\"><span>Security lane</span></label>\
+         </div>\
+         </section>\
+         </div>\
+         <footer class=\"rate-limit-modal-footer\">\
+         <button class=\"secondary-button\" type=\"button\" data-close-rate-limit-modal>Cancel</button>\
+         <button class=\"primary-button\" type=\"submit\" data-role=\"rate-limit-submit\">Create rule</button>\
+         </footer>\
+         </div>\
+         </form>\
+         </dialog>",
+        escape_html(csrf_token.unwrap_or_default()),
     )
+}
+
+fn json_script_content(raw: &str) -> String {
+    raw.replace('<', "\\u003c")
 }
 
 fn render_rate_limit_rules_section(
@@ -1871,10 +2080,6 @@ fn render_rate_limit_rules_section(
             let rows = rules
                 .iter()
                 .map(|rule| {
-                    let scope_iid = rule
-                        .scope_iid
-                        .map(|iid| iid.to_string())
-                        .unwrap_or_default();
                     let rule_id = escape_html(&rule.id);
                     let csrf = render_csrf_hidden_input(csrf_token);
                     format!(
@@ -1884,59 +2089,103 @@ fn render_rate_limit_rules_section(
                          <td>{2}</td>\
                          <td>{3}</td>\
                          <td>{4}</td>\
+                         <td>{5}</td>\
+                         <td>{6}</td>\
                          <td>\
-                         <form class=\"filters\" method=\"post\" action=\"/rate-limits/{5}/update\">\
-                         {6}\
-                         <label class=\"filter-field\"><span>Label</span><input name=\"label\" value=\"{7}\" required></label>\
-                         <label class=\"filter-field\"><span>Scope</span><select name=\"scope\">{8}</select></label>\
-                         <label class=\"filter-field\"><span>Scope repo</span><input name=\"scope_repo\" value=\"{9}\" required></label>\
-                         <label class=\"filter-field\"><span>Scope iid</span><input name=\"scope_iid\" value=\"{10}\"></label>\
-                         <label class=\"filter-field\"><span>Capacity</span><input name=\"capacity\" type=\"number\" value=\"{11}\" min=\"1\" required></label>\
-                         <label class=\"filter-field\"><span>Window seconds</span><input name=\"window_seconds\" type=\"number\" value=\"{12}\" min=\"1\" required></label>\
-                         <label class=\"filter-field\"><span>Applies to</span>\
-                         <label><input type=\"checkbox\" name=\"applies_to_review\" value=\"true\" {13}> Review</label>\
-                         <label><input type=\"checkbox\" name=\"applies_to_security\" value=\"true\" {14}> Security</label>\
-                         </label>\
-                         <div class=\"filter-actions\"><button type=\"submit\">Save</button></div>\
-                         </form>\
-                         <form class=\"filter-actions\" method=\"post\" action=\"/rate-limits/{5}/delete\">{6}\
-                         <button class=\"danger-button\" type=\"submit\">Delete</button></form>\
-                         <form class=\"filter-actions\" method=\"post\" action=\"/rate-limits/{5}/regen\">{6}\
-                         <button type=\"submit\">Regen</button></form>\
-                         </td>\
+                        <div class=\"table-actions\">\
+                         <button class=\"secondary-button\" type=\"button\" data-open-rate-limit-modal=\"edit\" data-rule-id=\"{7}\">Edit</button>\
+                         <form method=\"post\" action=\"/rate-limits/{7}/delete\">{8}<button class=\"danger-button\" type=\"submit\">Delete</button></form>\
+                         </div>\
+                        </td>\
                          </tr>",
                         escape_html(&rule.label),
-                        escape_html(&rule.scope_subject),
+                        escape_html(&render_rate_limit_scope_label(rule)),
+                        render_rate_limit_target_badges(&rule.targets),
+                        render_rate_limit_bucket_mode_badge(rule.bucket_mode),
                         render_rate_limit_applies(rule.applies_to_review, rule.applies_to_security),
                         rule.capacity,
-                        rule.window_seconds,
+                        escape_html(&format_duration_compact(rule.window_seconds)),
                         rule_id,
                         csrf,
-                        escape_html(&rule.label),
-                        render_rate_limit_scope_options(rule.scope),
-                        escape_html(&rule.scope_repo),
-                        scope_iid,
-                        rule.capacity,
-                        rule.window_seconds,
-                        if rule.applies_to_review { "checked" } else { "" },
-                        if rule.applies_to_security {
-                            "checked"
-                        } else {
-                            ""
-                        },
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("");
             format!(
-                "<table><thead><tr><th>Label</th><th>Scope</th><th>Applies</th><th>Capacity</th><th>Window</th><th>Actions</th></tr></thead><tbody>{}</tbody></table>",
+                "<div class=\"table-scroll\"><table><thead><tr><th>Label</th><th>Scope</th><th>Targets</th><th>Bucket mode</th><th>Applies</th><th>Capacity</th><th>Window</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div>",
                 rows
             )
         },
     )
 }
 
-fn render_rate_limit_buckets_section(active_buckets: &[ReviewRateLimitBucketSnapshot]) -> String {
+fn render_rate_limit_target_badges(targets: &[ReviewRateLimitTarget]) -> String {
+    if targets.is_empty() {
+        return render_rate_limit_target_badge(None, None);
+    }
+    let badges = targets
+        .iter()
+        .map(|target| render_rate_limit_target_badge(Some(target.kind), Some(&target.path)))
+        .collect::<Vec<_>>()
+        .join("");
+    format!("<div class=\"target-badge-list\">{badges}</div>")
+}
+
+fn render_rate_limit_target_badge(
+    kind: Option<ReviewRateLimitTargetKind>,
+    path: Option<&str>,
+) -> String {
+    if path.is_none_or(|value| value == GLOBAL_RATE_LIMIT_TARGET_UI_PATH) {
+        return "<span class=\"target-badge\"><span class=\"target-badge-kind\">Scope</span>Global</span>"
+            .to_string();
+    }
+    let kind_label = match kind.unwrap_or(ReviewRateLimitTargetKind::Repo) {
+        ReviewRateLimitTargetKind::Repo => "Repo",
+        ReviewRateLimitTargetKind::Group => "Group",
+    };
+    format!(
+        "<span class=\"target-badge\"><span class=\"target-badge-kind\">{}</span>{}</span>",
+        escape_html(kind_label),
+        escape_html(path.unwrap_or_default())
+    )
+}
+
+fn render_rate_limit_bucket_mode_badge(bucket_mode: ReviewRateLimitBucketMode) -> String {
+    let label = match bucket_mode {
+        ReviewRateLimitBucketMode::Shared => "Shared",
+        ReviewRateLimitBucketMode::Independent => "Independent",
+    };
+    format!("<span class=\"badge\">{}</span>", escape_html(label))
+}
+
+fn render_rate_limit_scope_label(rule: &ReviewRateLimitRule) -> String {
+    match rule.scope {
+        ReviewRateLimitScope::Project => "Per project".to_string(),
+        ReviewRateLimitScope::MergeRequest => "Per merge request".to_string(),
+    }
+}
+
+fn format_duration_compact(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    let mut parts = Vec::new();
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if secs > 0 || parts.is_empty() {
+        parts.push(format!("{secs}s"));
+    }
+    parts.join(" ")
+}
+
+fn render_rate_limit_buckets_section(
+    active_buckets: &[ReviewRateLimitBucketSnapshot],
+    csrf_token: Option<&str>,
+) -> String {
     render_table_section(
         "Active buckets",
         if active_buckets.is_empty() {
@@ -1945,6 +2194,7 @@ fn render_rate_limit_buckets_section(active_buckets: &[ReviewRateLimitBucketSnap
             let rows = active_buckets
                 .iter()
                 .map(|bucket| {
+                    let csrf = render_csrf_hidden_input(csrf_token);
                     format!(
                         "<tr>\
                          <td>{0}</td>\
@@ -1953,22 +2203,22 @@ fn render_rate_limit_buckets_section(active_buckets: &[ReviewRateLimitBucketSnap
                          <td>{3}</td>\
                          <td>{4}</td>\
                          <td>{5}</td>\
-                         <td>{6:.3}</td>\
+                         <td>{6}</td>\
                          <td>{7}</td>\
-                         <td>{8}</td>\
-                         <td>{9}</td>\
+                         <td><form method=\"post\" action=\"/rate-limits/buckets/regen\">{8}<input type=\"hidden\" name=\"bucket_id\" value=\"{9}\"><button class=\"secondary-button\" type=\"submit\">Regen 1 slot</button></form></td>\
                          </tr>",
-                        escape_html(&bucket.rule_id),
                         escape_html(&bucket.rule_label),
                         escape_html(&bucket.scope_subject),
-                        escape_html(&bucket.repo),
-                        bucket
-                            .iid
-                            .map(|iid| iid.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        bucket.capacity,
-                        bucket.available_slots,
-                        render_unix_timestamp(bucket.updated_at),
+                        render_rate_limit_target_badge(
+                            Some(bucket.target_kind),
+                            Some(&bucket.target_path),
+                        ),
+                        render_rate_limit_bucket_mode_badge(bucket.bucket_mode),
+                        escape_html(&format_duration_compact(bucket.window_seconds)),
+                        escape_html(&format!(
+                            "{:.2} / {}",
+                            bucket.available_slots, bucket.capacity
+                        )),
                         bucket
                             .next_slot_at
                             .map(render_unix_timestamp)
@@ -1977,12 +2227,14 @@ fn render_rate_limit_buckets_section(active_buckets: &[ReviewRateLimitBucketSnap
                             bucket.applies_to_review,
                             bucket.applies_to_security
                         ),
+                        csrf,
+                        escape_html(&bucket.bucket_id),
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("");
             format!(
-                "<table><thead><tr><th>Rule ID</th><th>Rule</th><th>Scope</th><th>Repo</th><th>IID</th><th>Capacity</th><th>Slots</th><th>Updated</th><th>Next slot</th><th>Applies</th></tr></thead><tbody>{}</tbody></table>",
+                "<div class=\"table-scroll\"><table><thead><tr><th>Rule</th><th>Scope</th><th>Target</th><th>Bucket mode</th><th>Window</th><th>Slots</th><th>Next slot</th><th>Applies</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div>",
                 rows
             )
         },
@@ -2020,7 +2272,7 @@ fn render_rate_limit_pending_section(pending: &[ReviewRateLimitPendingEntry]) ->
                 .collect::<Vec<_>>()
                 .join("");
             format!(
-                "<table><thead><tr><th>Lane</th><th>Repo</th><th>IID</th><th>Head SHA</th><th>First blocked</th><th>Last blocked</th><th>Next retry</th></tr></thead><tbody>{}</tbody></table>",
+                "<div class=\"table-scroll\"><table><thead><tr><th>Lane</th><th>Repo</th><th>IID</th><th>Head SHA</th><th>First blocked</th><th>Last blocked</th><th>Next retry</th></tr></thead><tbody>{}</tbody></table></div>",
                 rows
             )
         },
@@ -2034,23 +2286,6 @@ fn render_rate_limit_applies(review: bool, security: bool) -> &'static str {
         (false, true) => "security",
         (false, false) => "-",
     }
-}
-
-fn render_rate_limit_scope_options(selected: ReviewRateLimitScope) -> String {
-    let project = if matches!(selected, ReviewRateLimitScope::Project) {
-        " selected"
-    } else {
-        ""
-    };
-    let merge_request = if matches!(selected, ReviewRateLimitScope::MergeRequest) {
-        " selected"
-    } else {
-        ""
-    };
-    format!(
-        "<option value=\"project\"{project}>project</option>\
-         <option value=\"merge_request\"{merge_request}>merge_request</option>"
-    )
 }
 
 fn render_review_lane_label(lane: ReviewLane) -> &'static str {
@@ -2116,7 +2351,8 @@ mod tests {
             transcript_backfill: None,
         };
 
-        let html = render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None);
+        let html =
+            render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None, false);
 
         assert!(html.contains("Reused cached security context from"));
         assert!(html.contains("/history/42"));
@@ -2143,7 +2379,8 @@ mod tests {
             transcript_backfill: None,
         };
 
-        let html = render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None);
+        let html =
+            render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None, false);
 
         assert!(html.contains("Security context"));
         assert!(html.contains("main"));
@@ -2168,7 +2405,8 @@ mod tests {
             transcript_backfill: None,
         };
 
-        let html = render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None);
+        let html =
+            render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None, false);
 
         assert!(html.contains("trigger-note-body"));
         assert!(html.contains("<img"));

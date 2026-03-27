@@ -19,9 +19,10 @@ use crate::config::{
 use crate::feature_flags::{FeatureFlagDefaults, FeatureFlagSnapshot};
 use crate::review_lane::ReviewLane;
 use crate::state::{
-    NewRunHistory, ReviewRateLimitRuleUpsert, ReviewRateLimitScope, ReviewStateStore,
-    RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord, RunHistorySessionUpdate,
-    SecurityReviewContextCacheEntry, TranscriptBackfillState,
+    NewRunHistory, ReviewRateLimitBucketMode, ReviewRateLimitRuleUpsert, ReviewRateLimitScope,
+    ReviewRateLimitTarget, ReviewRateLimitTargetKind, ReviewStateStore, RunHistoryEventRecord,
+    RunHistoryKind, RunHistoryRecord, RunHistorySessionUpdate, SecurityReviewContextCacheEntry,
+    TranscriptBackfillState,
 };
 use crate::transcript_backfill::TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR;
 use anyhow::Result;
@@ -36,7 +37,11 @@ async fn review_rate_limit_snapshot_includes_rules_buckets_and_pending() -> Resu
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
             id: None,
             label: "Repository cap".to_string(),
-            scope_repo: "group/repo".to_string(),
+            targets: vec![ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Repo,
+                path: "group/repo".to_string(),
+            }],
+            bucket_mode: ReviewRateLimitBucketMode::Shared,
             scope_iid: None,
             applies_to_review: true,
             applies_to_security: true,
@@ -1576,6 +1581,7 @@ fn test_config() -> Config {
             max_concurrent: 2,
             eyes_emoji: "eyes".to_string(),
             thumbs_emoji: "thumbsup".to_string(),
+            rate_limit_emoji: "hourglass_flowing_sand".to_string(),
             comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
             stale_in_progress_minutes: 120,
             dry_run: true,

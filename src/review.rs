@@ -2,12 +2,13 @@ use crate::codex_runner::CodexRunner;
 use crate::config::Config;
 use crate::flow::FlowShared;
 use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
-use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome};
+use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome, remove_bot_award};
 use crate::flow::{ActiveTaskRegistry, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::review_lane::ReviewLane;
 use crate::state::{ReviewRateLimitPendingEntry, ReviewStateStore};
 use anyhow::Result;
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use futures::future::join_all;
 use std::collections::{HashMap, HashSet};
@@ -29,6 +30,11 @@ enum ScanMode {
 pub enum ScanRunStatus {
     Completed,
     Interrupted,
+}
+
+#[async_trait]
+pub trait DynamicRepoSource: Send + Sync {
+    async fn list_repos(&self) -> Result<Vec<String>>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,7 +72,9 @@ pub struct ReviewService {
     gitlab: Arc<dyn GitLabApi>,
     state: Arc<ReviewStateStore>,
     codex: Arc<dyn CodexRunner>,
+    dynamic_repo_source: Option<Arc<dyn DynamicRepoSource>>,
     created_after: DateTime<Utc>,
+    bot_user_id: u64,
     general_review_flow: ReviewFlow,
     security_review_flow: ReviewFlow,
     mention_flow: MentionFlow,
@@ -111,13 +119,23 @@ impl ReviewService {
             gitlab,
             state,
             codex,
+            dynamic_repo_source: None,
             created_after,
+            bot_user_id,
             general_review_flow,
             security_review_flow,
             mention_flow,
             shutdown,
             active_tasks,
         }
+    }
+
+    pub fn with_dynamic_repo_source(
+        mut self,
+        dynamic_repo_source: Arc<dyn DynamicRepoSource>,
+    ) -> Self {
+        self.dynamic_repo_source = Some(dynamic_repo_source);
+        self
     }
 
     pub async fn scan_once(&self) -> Result<ScanRunStatus> {
@@ -285,9 +303,18 @@ impl ReviewService {
                     error = %err,
                     "merge request lookup failed while retrying pending review; clearing pending row"
                 );
-                self.state
+                if self
+                    .state
                     .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
-                    .await?;
+                    .await?
+                {
+                    self.remove_rate_limit_award_after_pending_clear(
+                        pending.lane,
+                        &pending.repo,
+                        pending.iid,
+                    )
+                    .await;
+                }
                 return Ok(ReviewScheduleOutcome::SkippedCompleted);
             }
             Err(err) => {
@@ -323,9 +350,18 @@ impl ReviewService {
                     lane = pending.lane.as_str(),
                     "missing head sha while retrying pending review; clearing pending row"
                 );
-                self.state
+                if self
+                    .state
                     .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
-                    .await?;
+                    .await?
+                {
+                    self.remove_rate_limit_award_after_pending_clear(
+                        pending.lane,
+                        &pending.repo,
+                        pending.iid,
+                    )
+                    .await;
+                }
                 return Ok(ReviewScheduleOutcome::SkippedCompleted);
             }
         };
@@ -358,12 +394,77 @@ impl ReviewService {
         if !matches!(
             outcome,
             ReviewScheduleOutcome::SkippedRateLimit | ReviewScheduleOutcome::Interrupted
-        ) {
-            self.state
-                .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
-                .await?;
+        ) && self
+            .state
+            .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
+            .await?
+        {
+            self.remove_rate_limit_award_after_pending_clear(
+                pending.lane,
+                &pending.repo,
+                pending.iid,
+            )
+            .await;
         }
         Ok(outcome)
+    }
+
+    async fn remove_rate_limit_award_after_pending_clear(
+        &self,
+        lane: ReviewLane,
+        repo: &str,
+        iid: u64,
+    ) {
+        if lane.is_security() || self.config.review.dry_run {
+            return;
+        }
+        if let Err(err) = remove_bot_award(
+            self.gitlab.as_ref(),
+            repo,
+            iid,
+            self.bot_user_id,
+            &self.config.review.rate_limit_emoji,
+        )
+        .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                lane = lane.as_str(),
+                error = %err,
+                "failed to remove rate-limit award after pending state cleared"
+            );
+        }
+    }
+
+    async fn remove_rate_limit_awards_for_closed_pending_mrs(
+        &self,
+        repo: &str,
+        open_iids: &[u64],
+    ) -> Result<()> {
+        let open_iids_set = open_iids.iter().copied().collect::<HashSet<_>>();
+        let pending_to_clear = self
+            .state
+            .list_review_rate_limit_pending()
+            .await?
+            .into_iter()
+            .filter(|pending| pending.repo == repo && !open_iids_set.contains(&pending.iid))
+            .collect::<Vec<_>>();
+        if pending_to_clear.is_empty() {
+            return Ok(());
+        }
+        self.state
+            .sync_review_rate_limit_pending_rows(repo, open_iids)
+            .await?;
+        for pending in pending_to_clear {
+            self.remove_rate_limit_award_after_pending_clear(
+                pending.lane,
+                pending.repo.as_str(),
+                pending.iid,
+            )
+            .await;
+        }
+        Ok(())
     }
 
     fn apply_review_outcome(
@@ -644,6 +745,13 @@ impl ReviewService {
     }
 
     async fn resolve_repos(&self, mode: ScanMode) -> Result<Vec<String>> {
+        if let Some(dynamic_repo_source) = self.dynamic_repo_source.as_ref() {
+            let mut repos = dynamic_repo_source.list_repos().await?;
+            repos.sort();
+            repos.dedup();
+            return Ok(repos);
+        }
+
         let targets = &self.config.gitlab.targets;
         let include_all = targets.repos.is_all() || targets.groups.is_all();
         let mut included = HashSet::new();
@@ -795,8 +903,7 @@ impl ReviewService {
         counters.total_mrs += mrs.len();
         info!(repo = repo, count = mrs.len(), "loaded open MRs");
         let open_iids = mrs.iter().map(|mr| mr.iid).collect::<Vec<_>>();
-        self.state
-            .sync_review_rate_limit_pending_rows(repo, &open_iids)
+        self.remove_rate_limit_awards_for_closed_pending_mrs(repo, &open_iids)
             .await?;
         for mr in mrs {
             if self.shutdown_requested() {
@@ -988,6 +1095,8 @@ mod pending_rate_limit_tests {
         bot_user: GitLabUser,
         open_mrs: Mutex<Vec<MergeRequest>>,
         mrs_by_iid: Mutex<HashMap<u64, MergeRequest>>,
+        awards: Mutex<HashMap<(String, u64), Vec<crate::gitlab::AwardEmoji>>>,
+        calls: Mutex<Vec<String>>,
         mr_lookup_error: Mutex<Option<String>>,
         list_open_calls: Mutex<u32>,
     }
@@ -1003,6 +1112,8 @@ mod pending_rate_limit_tests {
                 },
                 open_mrs: Mutex::new(open_mrs),
                 mrs_by_iid: Mutex::new(mrs_by_iid),
+                awards: Mutex::new(HashMap::new()),
+                calls: Mutex::new(Vec::new()),
                 mr_lookup_error: Mutex::new(None),
                 list_open_calls: Mutex::new(0),
             }
@@ -1075,17 +1186,31 @@ mod pending_rate_limit_tests {
 
         async fn list_awards(
             &self,
-            _project: &str,
-            _iid: u64,
+            project: &str,
+            iid: u64,
         ) -> Result<Vec<crate::gitlab::AwardEmoji>> {
-            Ok(Vec::new())
+            Ok(self
+                .awards
+                .lock()
+                .unwrap()
+                .get(&(project.to_string(), iid))
+                .cloned()
+                .unwrap_or_default())
         }
 
-        async fn add_award(&self, _project: &str, _iid: u64, _name: &str) -> Result<()> {
+        async fn add_award(&self, project: &str, iid: u64, name: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("add_award:{project}:{iid}:{name}"));
             Ok(())
         }
 
-        async fn delete_award(&self, _project: &str, _iid: u64, _award_id: u64) -> Result<()> {
+        async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("delete_award:{project}:{iid}:{award_id}"));
             Ok(())
         }
 
@@ -1137,6 +1262,7 @@ mod pending_rate_limit_tests {
                 max_concurrent: 1,
                 eyes_emoji: "eyes".to_string(),
                 thumbs_emoji: "thumbsup".to_string(),
+                rate_limit_emoji: "hourglass_flowing_sand".to_string(),
                 comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
                 stale_in_progress_minutes: 60,
                 dry_run: false,
@@ -1245,7 +1371,7 @@ mod pending_rate_limit_tests {
         let runner = Arc::new(CapturingRunner::default());
         let service = ReviewService::new(
             test_config(),
-            gitlab,
+            gitlab.clone(),
             state.clone(),
             runner.clone(),
             1,
@@ -1254,10 +1380,12 @@ mod pending_rate_limit_tests {
 
         service.process_due_pending_rate_limit_reviews().await?;
 
-        let review_contexts = runner.review_contexts.lock().unwrap();
-        assert_eq!(review_contexts.len(), 1);
-        assert_eq!(review_contexts[0].lane, ReviewLane::General);
-        assert_eq!(review_contexts[0].head_sha, "sha82-new");
+        {
+            let review_contexts = runner.review_contexts.lock().unwrap();
+            assert_eq!(review_contexts.len(), 1);
+            assert_eq!(review_contexts[0].lane, ReviewLane::General);
+            assert_eq!(review_contexts[0].head_sha, "sha82-new");
+        }
         assert!(state.list_review_rate_limit_pending().await?.is_empty());
         Ok(())
     }
@@ -1265,6 +1393,14 @@ mod pending_rate_limit_tests {
     #[tokio::test]
     async fn pending_rate_limit_wake_clears_rows_when_mr_lookup_reports_missing() -> Result<()> {
         let gitlab = Arc::new(TestGitLab::new(Vec::new()));
+        gitlab.awards.lock().unwrap().insert(
+            ("group/repo".to_string(), 91),
+            vec![crate::gitlab::AwardEmoji {
+                id: 910,
+                name: "hourglass_flowing_sand".to_string(),
+                user: gitlab.bot_user.clone(),
+            }],
+        );
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         state
             .upsert_review_rate_limit_pending(
@@ -1279,7 +1415,7 @@ mod pending_rate_limit_tests {
         let runner = Arc::new(CapturingRunner::default());
         let service = ReviewService::new(
             test_config(),
-            gitlab,
+            gitlab.clone(),
             state.clone(),
             runner.clone(),
             1,
@@ -1290,6 +1426,14 @@ mod pending_rate_limit_tests {
 
         assert!(runner.review_contexts.lock().unwrap().is_empty());
         assert!(state.list_review_rate_limit_pending().await?.is_empty());
+        assert!(
+            gitlab
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call == "delete_award:group/repo:91:910")
+        );
         Ok(())
     }
 

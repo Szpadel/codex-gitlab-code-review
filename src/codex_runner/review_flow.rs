@@ -55,6 +55,26 @@ struct SecurityContextPayloadResolution {
     build_guard: Option<SecurityContextBuildCompletionGuard>,
 }
 
+struct SecurityContextPayloadRequest<'a> {
+    client: &'a mut AppServerClient,
+    gitlab_discovery_server_name: Option<&'a str>,
+    thread_id: &'a str,
+    turn_cwd: &'a str,
+    base_branch: &'a str,
+    base_head_sha: &'a str,
+}
+
+type ExtraSecurityContextSessionContainer = Arc<Mutex<Option<(String, Option<String>)>>>;
+
+struct SeparateSecurityContextSessionRequest<'a> {
+    account: &'a AuthAccount,
+    browser_mcp: Option<&'a BrowserMcpConfig>,
+    repo_path: &'a str,
+    base_branch: &'a str,
+    base_head_sha: &'a str,
+    extra_session_container: ExtraSecurityContextSessionContainer,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewTargetRequest {
     NativeBaseBranch { branch: String },
@@ -491,25 +511,21 @@ impl DockerCodexRunner {
     async fn build_security_context_payload(
         &self,
         ctx: &ReviewContext,
-        client: &mut AppServerClient,
-        gitlab_discovery_server_name: Option<&str>,
-        thread_id: &str,
-        turn_cwd: &str,
-        base_branch: &str,
-        base_head_sha: &str,
+        request: SecurityContextPayloadRequest<'_>,
     ) -> Result<String> {
-        let turn_response = client
+        let turn_response = request
+            .client
             .request(
                 "turn/start",
                 json!({
-                    "threadId": thread_id,
-                    "cwd": turn_cwd,
+                    "threadId": request.thread_id,
+                    "cwd": request.turn_cwd,
                     "input": [
                         {
                             "type": "text",
                             "text": format!(
                                 "$security-threat-model Build a concise repository-grounded threat model for the base branch.\nReturn only JSON matching the provided output schema.\nFocus on runtime behavior on branch {} at commit {}.\nKeep the result compact and evidence-based.",
-                                base_branch, base_head_sha
+                                request.base_branch, request.base_head_sha
                             ),
                         },
                         {
@@ -531,11 +547,12 @@ impl DockerCodexRunner {
             .and_then(|id| id.as_str())
             .ok_or_else(|| anyhow!("turn/start missing turn id for security context"))?
             .to_string();
-        let output = client
+        let output = request
+            .client
             .stream_turn_message(
-                thread_id,
+                request.thread_id,
                 &turn_id,
-                gitlab_discovery_server_name,
+                request.gitlab_discovery_server_name,
                 |events| async move {
                     self.append_run_history_events(ctx.run_history_id, &events)
                         .await;
@@ -591,8 +608,8 @@ impl DockerCodexRunner {
                 build_guard: None,
             });
         }
-        if ctx.feature_flags.security_context_ignore_base_head {
-            if let Some(entry) = self
+        if ctx.feature_flags.security_context_ignore_base_head
+            && let Some(entry) = self
                 .state
                 .get_latest_security_review_context_cache_for_branch(
                     cache_repo_key,
@@ -601,18 +618,17 @@ impl DockerCodexRunner {
                     now,
                 )
                 .await?
-            {
-                return Ok(SecurityContextPayloadResolution {
-                    payload_json: Some(entry.payload_json),
-                    source_run_history_id: (entry.source_run_history_id > 0)
-                        .then_some(entry.source_run_history_id),
-                    base_head_sha: Some(entry.base_head_sha),
-                    build_base_head_sha: Some(base_head_sha),
-                    generated_at: Some(entry.generated_at),
-                    expires_at: Some(entry.expires_at),
-                    build_guard: None,
-                });
-            }
+        {
+            return Ok(SecurityContextPayloadResolution {
+                payload_json: Some(entry.payload_json),
+                source_run_history_id: (entry.source_run_history_id > 0)
+                    .then_some(entry.source_run_history_id),
+                base_head_sha: Some(entry.base_head_sha),
+                build_base_head_sha: Some(base_head_sha),
+                generated_at: Some(entry.generated_at),
+                expires_at: Some(entry.expires_at),
+                build_guard: None,
+            });
         }
         let build_key = SecurityContextBuildKey {
             repo: cache_repo_key.to_string(),
@@ -646,8 +662,8 @@ impl DockerCodexRunner {
                         build_guard: None,
                     });
                 }
-                if ctx.feature_flags.security_context_ignore_base_head {
-                    if let Some(entry) = self
+                if ctx.feature_flags.security_context_ignore_base_head
+                    && let Some(entry) = self
                         .state
                         .get_latest_security_review_context_cache_for_branch(
                             cache_repo_key,
@@ -656,19 +672,18 @@ impl DockerCodexRunner {
                             now,
                         )
                         .await?
-                    {
-                        build_guard.complete();
-                        return Ok(SecurityContextPayloadResolution {
-                            payload_json: Some(entry.payload_json),
-                            source_run_history_id: (entry.source_run_history_id > 0)
-                                .then_some(entry.source_run_history_id),
-                            base_head_sha: Some(entry.base_head_sha),
-                            build_base_head_sha: Some(base_head_sha.clone()),
-                            generated_at: Some(entry.generated_at),
-                            expires_at: Some(entry.expires_at),
-                            build_guard: None,
-                        });
-                    }
+                {
+                    build_guard.complete();
+                    return Ok(SecurityContextPayloadResolution {
+                        payload_json: Some(entry.payload_json),
+                        source_run_history_id: (entry.source_run_history_id > 0)
+                            .then_some(entry.source_run_history_id),
+                        base_head_sha: Some(entry.base_head_sha),
+                        build_base_head_sha: Some(base_head_sha.clone()),
+                        generated_at: Some(entry.generated_at),
+                        expires_at: Some(entry.expires_at),
+                        build_guard: None,
+                    });
                 }
                 Ok(SecurityContextPayloadResolution {
                     payload_json: None,
@@ -712,8 +727,8 @@ impl DockerCodexRunner {
                         build_guard: None,
                     });
                 }
-                if ctx.feature_flags.security_context_ignore_base_head {
-                    if let Some(entry) = self
+                if ctx.feature_flags.security_context_ignore_base_head
+                    && let Some(entry) = self
                         .state
                         .get_latest_security_review_context_cache_for_branch(
                             cache_repo_key,
@@ -722,18 +737,17 @@ impl DockerCodexRunner {
                             now,
                         )
                         .await?
-                    {
-                        return Ok(SecurityContextPayloadResolution {
-                            payload_json: Some(entry.payload_json),
-                            source_run_history_id: (entry.source_run_history_id > 0)
-                                .then_some(entry.source_run_history_id),
-                            base_head_sha: Some(entry.base_head_sha),
-                            build_base_head_sha: Some(base_head_sha.clone()),
-                            generated_at: Some(entry.generated_at),
-                            expires_at: Some(entry.expires_at),
-                            build_guard: None,
-                        });
-                    }
+                {
+                    return Ok(SecurityContextPayloadResolution {
+                        payload_json: Some(entry.payload_json),
+                        source_run_history_id: (entry.source_run_history_id > 0)
+                            .then_some(entry.source_run_history_id),
+                        base_head_sha: Some(entry.base_head_sha),
+                        build_base_head_sha: Some(base_head_sha.clone()),
+                        generated_at: Some(entry.generated_at),
+                        expires_at: Some(entry.expires_at),
+                        build_guard: None,
+                    });
                 }
                 debug!(
                     repo = ctx.repo.as_str(),
@@ -814,17 +828,12 @@ impl DockerCodexRunner {
     async fn build_security_context_with_separate_session(
         &self,
         ctx: &ReviewContext,
-        account: &AuthAccount,
-        browser_mcp: Option<&BrowserMcpConfig>,
-        repo_path: &str,
-        base_branch: &str,
-        base_head_sha: &str,
-        extra_session_container: Arc<Mutex<Option<(String, Option<String>)>>>,
+        request: SeparateSecurityContextSessionRequest<'_>,
     ) -> Result<String> {
         let script = self.command(
             ctx,
             AppServerCommandOptions {
-                browser_mcp,
+                browser_mcp: request.browser_mcp,
                 gitlab_discovery_mcp: None,
                 mcp_server_overrides: &self.codex.mcp_server_overrides.review,
                 reasoning_summary: None,
@@ -839,15 +848,16 @@ impl DockerCodexRunner {
         } = self
             .start_app_server_container(
                 script,
-                &account.auth_host_path,
+                &request.account.auth_host_path,
                 Vec::new(),
                 Vec::new(),
-                browser_mcp,
+                request.browser_mcp,
                 Vec::new(),
             )
             .await?;
         {
-            let mut slot = extra_session_container
+            let mut slot = request
+                .extra_session_container
                 .lock()
                 .expect("security context extra session lock poisoned");
             *slot = Some((container_id.clone(), browser_container_id.clone()));
@@ -857,12 +867,16 @@ impl DockerCodexRunner {
             client.initialize().await?;
             client.initialized().await?;
             let worktree_path = self
-                .create_security_context_worktree(&container_id, repo_path, base_head_sha)
+                .create_security_context_worktree(
+                    &container_id,
+                    request.repo_path,
+                    request.base_head_sha,
+                )
                 .await?;
             let thread_response = client
                 .request(
                     "thread/start",
-                    self.thread_start_params(repo_path, None, &[worktree_path.to_string()]),
+                    self.thread_start_params(request.repo_path, None, &[worktree_path.to_string()]),
                 )
                 .await?;
             let thread_id = thread_response
@@ -874,15 +888,17 @@ impl DockerCodexRunner {
             let build_result = self
                 .build_security_context_payload(
                     ctx,
-                    &mut client,
-                    None,
-                    &thread_id,
-                    &worktree_path,
-                    base_branch,
-                    base_head_sha,
+                    SecurityContextPayloadRequest {
+                        client: &mut client,
+                        gitlab_discovery_server_name: None,
+                        thread_id: &thread_id,
+                        turn_cwd: &worktree_path,
+                        base_branch: request.base_branch,
+                        base_head_sha: request.base_head_sha,
+                    },
                 )
                 .await;
-            self.remove_security_context_worktree(&container_id, repo_path, &worktree_path)
+            self.remove_security_context_worktree(&container_id, request.repo_path, &worktree_path)
                 .await;
             build_result
         }
@@ -891,7 +907,8 @@ impl DockerCodexRunner {
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
             .await;
         {
-            let mut slot = extra_session_container
+            let mut slot = request
+                .extra_session_container
                 .lock()
                 .expect("security context extra session lock poisoned");
             *slot = None;
@@ -1115,12 +1132,16 @@ impl DockerCodexRunner {
                         let build_result = self
                             .build_security_context_with_separate_session(
                                 ctx,
-                                account,
-                                browser_mcp,
-                                repo_path.as_str(),
-                                base_branch,
-                                base_head_sha,
-                                Arc::clone(&extra_security_context_session),
+                                SeparateSecurityContextSessionRequest {
+                                    account,
+                                    browser_mcp,
+                                    repo_path: repo_path.as_str(),
+                                    base_branch,
+                                    base_head_sha,
+                                    extra_session_container: Arc::clone(
+                                        &extra_security_context_session,
+                                    ),
+                                },
                             )
                             .await;
                         let mut build_guard = security_context_resolution.build_guard.take();

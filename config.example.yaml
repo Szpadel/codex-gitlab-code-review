@@ -62,6 +62,8 @@ review:
   eyes_emoji: "eyes"
   # Required. GitLab award emoji for "review passed".
   thumbs_emoji: "thumbsup"
+  # Optional. GitLab award emoji for "review queued by runtime rate limiting".
+  rate_limit_emoji: "hourglass_flowing_sand"
   # Required. Prefix used to mark review comments to avoid duplicate processing.
   comment_marker_prefix: "<!-- codex-review:sha="
   # Required. Minutes after which in-progress reviews are treated as stale.

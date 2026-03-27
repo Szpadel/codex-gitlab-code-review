@@ -6,10 +6,12 @@ use crate::config::{
     ReasoningSummaryOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
     ServerConfig, TargetSelector,
 };
+use crate::dev_mode::DevToolsService;
 use crate::review_lane::ReviewLane;
 use crate::state::{
-    NewRunHistory, NewRunHistoryEvent, PersistedScanStatus, ReviewRateLimitRuleUpsert,
-    ReviewRateLimitScope, ReviewStateStore, RunHistoryFinish, RunHistoryKind,
+    NewRunHistory, NewRunHistoryEvent, PersistedScanStatus, ReviewRateLimitBucketMode,
+    ReviewRateLimitRuleUpsert, ReviewRateLimitScope, ReviewRateLimitTarget,
+    ReviewRateLimitTargetKind, ReviewStateStore, RunHistoryFinish, RunHistoryKind,
     RunHistorySessionUpdate, ScanMode, ScanOutcome, ScanState, TranscriptBackfillState,
 };
 use crate::transcript_backfill::{
@@ -112,13 +114,124 @@ async fn status_page_renders_sections_and_escapes_dynamic_content() -> Result<()
 }
 
 #[tokio::test]
+async fn development_page_renders_when_dev_tools_are_enabled() -> Result<()> {
+    let mut config = test_config();
+    config.database.path = "/tmp/codex-gitlab-code-review-dev-test.sqlite".to_string();
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let status_service = Arc::new(StatusService::new(config.clone(), state, false, None));
+    let dev_tools = Arc::new(DevToolsService::new(&config.database.path));
+    let address = spawn_test_server(app_router_with_dev_tools(
+        Arc::clone(&status_service),
+        Some(dev_tools),
+    ))
+    .await?;
+
+    let response = reqwest::get(format!("http://{address}/development")).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await?;
+    assert!(body.contains("Development tools"));
+    assert!(body.contains("demo/group/service-a"));
+    assert!(body.contains("demo/group/service-b"));
+    assert!(body.contains("demo/group/service-c"));
+    assert!(body.contains("/tmp/codex-gitlab-code-review-dev-test.sqlite"));
+    assert!(body.contains("<a class=\"nav-link active\" href=\"/development\""));
+    assert!(body.contains("No active synthetic MR."));
+    Ok(())
+}
+
+#[tokio::test]
+async fn development_page_is_not_mounted_without_dev_tools() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let status_service = Arc::new(StatusService::new(test_config(), state, false, None));
+    let address = spawn_test_server(app_router(status_service)).await?;
+
+    let status_response = reqwest::get(format!("http://{address}/status")).await?;
+    assert_eq!(status_response.status(), StatusCode::OK);
+    let status_body = status_response.text().await?;
+    assert!(!status_body.contains("href=\"/development\""));
+
+    let response = reqwest::get(format!("http://{address}/development")).await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn development_repo_actions_require_csrf_and_update_snapshot() -> Result<()> {
+    let mut config = test_config();
+    config.database.path = "/tmp/codex-gitlab-code-review-dev-test.sqlite".to_string();
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let status_service = Arc::new(StatusService::new(config.clone(), state, false, None));
+    let csrf_token = status_service.admin_csrf_token().to_string();
+    let dev_tools = Arc::new(DevToolsService::new(&config.database.path));
+    let address = spawn_test_server(app_router_with_dev_tools(
+        Arc::clone(&status_service),
+        Some(dev_tools),
+    ))
+    .await?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+
+    let denied = client
+        .post(format!("http://{address}/development/repos/create"))
+        .form(&[
+            ("csrf_token", "wrong"),
+            ("repo_path", "demo/group/service-z"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+
+    let created = client
+        .post(format!("http://{address}/development/repos/create"))
+        .form(&[
+            ("csrf_token", csrf_token.as_str()),
+            ("repo_path", "demo/group/service-z"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+
+    let repo_key = super::view::encode_repo_key("demo/group/service-z");
+    let simulated_mr = client
+        .post(format!(
+            "http://{address}/development/repos/{repo_key}/simulate-mr"
+        ))
+        .form(&[("csrf_token", csrf_token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(simulated_mr.status(), StatusCode::SEE_OTHER);
+
+    let simulated_commit = client
+        .post(format!(
+            "http://{address}/development/repos/{repo_key}/simulate-commit"
+        ))
+        .form(&[("csrf_token", csrf_token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(simulated_commit.status(), StatusCode::SEE_OTHER);
+
+    let response = reqwest::get(format!("http://{address}/development")).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await?;
+    assert!(body.contains("demo/group/service-z"));
+    assert!(body.contains("Active MR !1"));
+    assert!(body.contains("Revision 2"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn rate_limits_page_renders_create_form_and_empty_state() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
             id: None,
             label: "Merge request backlog limit".to_string(),
-            scope_repo: "group/repo".to_string(),
+            targets: vec![ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Repo,
+                path: "group/repo".to_string(),
+            }],
+            bucket_mode: ReviewRateLimitBucketMode::Shared,
             scope_iid: None,
             applies_to_review: true,
             applies_to_security: false,
@@ -136,9 +249,13 @@ async fn rate_limits_page_renders_create_form_and_empty_state() -> Result<()> {
     let body = response.text().await?;
     assert!(body.contains("Review rate limits"));
     assert!(body.contains("Create rule"));
+    assert!(body.contains("Open create rule modal"));
     assert!(body.contains("Existing rules"));
     assert!(body.contains("Merge request backlog limit"));
     assert!(body.contains("group/repo"));
+    assert!(body.contains("data-role=\"rate-limit-modal\""));
+    assert!(body.contains("2h 15m"));
+    assert!(body.contains("\"bucket_mode\":\"shared\""));
     assert!(body.contains("/rate-limits"));
     assert!(body.contains("No active buckets."));
     assert!(body.contains("No pending review items."));
@@ -167,10 +284,11 @@ async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Re
             ("csrf_token", "wrong"),
             ("label", "Create denied"),
             ("scope", "project"),
-            ("scope_repo", "group/repo"),
+            ("targets_json", r#"[{"kind":"repo","path":"group/repo"}]"#),
+            ("bucket_mode", "shared"),
             ("applies_to_review", "true"),
             ("capacity", "1"),
-            ("window_seconds", "120"),
+            ("window_text", "2m"),
         ])
         .send()
         .await?;
@@ -182,10 +300,14 @@ async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Re
             ("csrf_token", csrf_token.as_str()),
             ("label", "Create allowed"),
             ("scope", "project"),
-            ("scope_repo", "group/repo"),
+            (
+                "targets_json",
+                r#"[{"kind":"repo","path":"group/repo"},{"kind":"group","path":"group/platform"}]"#,
+            ),
+            ("bucket_mode", "independent"),
             ("applies_to_review", "true"),
             ("capacity", "1"),
-            ("window_seconds", "120"),
+            ("window_text", "2m"),
         ])
         .send()
         .await?;
@@ -194,6 +316,19 @@ async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Re
     assert_eq!(
         state.list_review_rate_limit_rules().await?[0].label,
         "Create allowed"
+    );
+    assert_eq!(
+        state.list_review_rate_limit_rules().await?[0].targets,
+        vec![
+            ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Repo,
+                path: "group/repo".to_string()
+            },
+            ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Group,
+                path: "group/platform".to_string()
+            }
+        ]
     );
     Ok(())
 }
@@ -205,7 +340,11 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
             id: None,
             label: "Original".to_string(),
-            scope_repo: "group/repo".to_string(),
+            targets: vec![ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Repo,
+                path: "group/repo".to_string(),
+            }],
+            bucket_mode: ReviewRateLimitBucketMode::Shared,
             scope_iid: None,
             applies_to_review: true,
             applies_to_security: false,
@@ -233,9 +372,10 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
             ("csrf_token", "bad"),
             ("label", "Updated"),
             ("scope", "project"),
-            ("scope_repo", "group/repo"),
+            ("targets_json", r#"[{"kind":"repo","path":"group/repo"}]"#),
+            ("bucket_mode", "shared"),
             ("capacity", "5"),
-            ("window_seconds", "300"),
+            ("window_text", "5m"),
         ])
         .send()
         .await?;
@@ -247,9 +387,13 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
             ("csrf_token", csrf_token.as_str()),
             ("label", "Updated"),
             ("scope", "project"),
-            ("scope_repo", "group/repo"),
+            (
+                "targets_json",
+                r#"[{"kind":"group","path":"group/platform"}]"#,
+            ),
+            ("bucket_mode", "independent"),
             ("capacity", "5"),
-            ("window_seconds", "300"),
+            ("window_text", "5m"),
             ("applies_to_review", "true"),
         ])
         .send()
@@ -260,6 +404,14 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
     assert_eq!(rule.len(), 1);
     assert_eq!(rule[0].label, "Updated");
     assert_eq!(rule[0].capacity, 5);
+    assert_eq!(rule[0].bucket_mode, ReviewRateLimitBucketMode::Independent);
+    assert_eq!(
+        rule[0].targets,
+        vec![ReviewRateLimitTarget {
+            kind: ReviewRateLimitTargetKind::Group,
+            path: "group/platform".to_string(),
+        }]
+    );
     Ok(())
 }
 
@@ -270,7 +422,11 @@ async fn delete_rate_limit_rule_endpoint_requires_csrf_and_removes_rule() -> Res
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
             id: None,
             label: "Delete me".to_string(),
-            scope_repo: "group/repo".to_string(),
+            targets: vec![ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Repo,
+                path: "group/repo".to_string(),
+            }],
+            bucket_mode: ReviewRateLimitBucketMode::Shared,
             scope_iid: None,
             applies_to_review: true,
             applies_to_security: false,
@@ -317,7 +473,11 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
             id: None,
             label: "Regenerate".to_string(),
-            scope_repo: "group/repo".to_string(),
+            targets: vec![ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Repo,
+                path: "group/repo".to_string(),
+            }],
+            bucket_mode: ReviewRateLimitBucketMode::Shared,
             scope_iid: None,
             applies_to_review: true,
             applies_to_security: false,
@@ -337,6 +497,7 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
     let before = state.list_active_review_rate_limit_buckets(now).await?;
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].available_slots, 0.0);
+    let bucket_id = before[0].bucket_id.clone();
 
     let status_service = Arc::new(StatusService::new(
         test_config(),
@@ -349,8 +510,11 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
     let response = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?
-        .post(format!("http://{address}/rate-limits/{rule_id}/regen"))
-        .form(&[("csrf_token", csrf_token.as_str())])
+        .post(format!("http://{address}/rate-limits/buckets/regen"))
+        .form(&[
+            ("csrf_token", csrf_token.as_str()),
+            ("bucket_id", bucket_id.as_str()),
+        ])
         .send()
         .await?;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -362,6 +526,114 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
     assert_eq!(after[0].available_slots, 1.0);
     assert_eq!(after[0].rule_id, rule_id);
     Ok(())
+}
+
+#[tokio::test]
+async fn create_rate_limit_rule_endpoint_allows_global_rules_without_targets() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let status_service = Arc::new(StatusService::new(
+        test_config(),
+        Arc::clone(&state),
+        false,
+        None,
+    ));
+    let csrf_token = status_service.admin_csrf_token().to_string();
+    let address = spawn_test_server(app_router(status_service)).await?;
+
+    let response = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(format!("http://{address}/rate-limits/create"))
+        .form(&[
+            ("csrf_token", csrf_token.as_str()),
+            ("label", "Global cap"),
+            ("scope", "project"),
+            ("targets_json", "[]"),
+            ("bucket_mode", "shared"),
+            ("applies_to_review", "true"),
+            ("capacity", "1"),
+            ("window_text", "30m"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let rules = state.list_review_rate_limit_rules().await?;
+    assert_eq!(rules.len(), 1);
+    assert!(rules[0].targets.is_empty());
+    assert_eq!(rules[0].scope_subject, "Global".to_string());
+    Ok(())
+}
+
+#[test]
+fn parse_rate_limit_rule_upsert_accepts_friendly_duration_and_targets() -> Result<()> {
+    let upsert = parse_rate_limit_rule_upsert(RateLimitRuleForm {
+        csrf_token: "csrf".to_string(),
+        label: "Friendly".to_string(),
+        scope: "project".to_string(),
+        targets_json:
+            r#"[{"kind":"repo","path":"group/repo"},{"kind":"group","path":"group/platform"}]"#
+                .to_string(),
+        bucket_mode: "independent".to_string(),
+        applies_to_review: Some(true),
+        applies_to_security: Some(false),
+        capacity: 2,
+        window_text: "2h 15m".to_string(),
+    })?;
+
+    assert_eq!(upsert.window_seconds, 8_100);
+    assert_eq!(upsert.bucket_mode, ReviewRateLimitBucketMode::Independent);
+    assert_eq!(
+        upsert.targets,
+        vec![
+            ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Repo,
+                path: "group/repo".to_string(),
+            },
+            ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Group,
+                path: "group/platform".to_string(),
+            }
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn parse_rate_limit_rule_upsert_accepts_empty_targets_for_global_rules() -> Result<()> {
+    let upsert = parse_rate_limit_rule_upsert(RateLimitRuleForm {
+        csrf_token: "csrf".to_string(),
+        label: "Global".to_string(),
+        scope: "project".to_string(),
+        targets_json: "[]".to_string(),
+        bucket_mode: "shared".to_string(),
+        applies_to_review: Some(true),
+        applies_to_security: Some(false),
+        capacity: 1,
+        window_text: "45m".to_string(),
+    })?;
+
+    assert!(upsert.targets.is_empty());
+    assert_eq!(upsert.window_seconds, 2_700);
+    Ok(())
+}
+
+#[test]
+fn parse_rate_limit_rule_upsert_rejects_invalid_duration_text() {
+    let err = parse_rate_limit_rule_upsert(RateLimitRuleForm {
+        csrf_token: "csrf".to_string(),
+        label: "Bad".to_string(),
+        scope: "project".to_string(),
+        targets_json: r#"[{"kind":"repo","path":"group/repo"}]"#.to_string(),
+        bucket_mode: "shared".to_string(),
+        applies_to_review: Some(true),
+        applies_to_security: Some(false),
+        capacity: 1,
+        window_text: "later".to_string(),
+    })
+    .expect_err("expected invalid duration");
+
+    assert!(err.to_string().contains("window_text"));
 }
 
 #[tokio::test]
@@ -7378,6 +7650,7 @@ fn test_config() -> Config {
             max_concurrent: 2,
             eyes_emoji: "eyes".to_string(),
             thumbs_emoji: "thumbsup".to_string(),
+            rate_limit_emoji: "hourglass_flowing_sand".to_string(),
             comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
             stale_in_progress_minutes: 120,
             dry_run: true,

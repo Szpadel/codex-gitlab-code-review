@@ -1,7 +1,7 @@
 use crate::codex_runner::{CodexResult, ReviewContext};
 use crate::config::Config;
 use crate::feature_flags::FeatureFlagSnapshot;
-use crate::flow::review_comments::post_review_comment;
+use crate::flow::review_comments::{PostReviewCommentRequest, post_review_comment};
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
 use crate::review_lane::ReviewLane;
@@ -194,7 +194,7 @@ impl ReviewFlow {
                         iid = review.iid,
                         "dry run: skipping eyes removal during recovery"
                     );
-                } else if let Err(err) = remove_eyes(
+                } else if let Err(err) = remove_bot_award(
                     self.shared.gitlab.as_ref(),
                     review.repo.as_str(),
                     review.iid,
@@ -345,7 +345,7 @@ impl ReviewFlow {
                 ReviewScheduleOutcome::SkippedLocked,
             ));
         }
-        let acquired_rule_ids = match self
+        let acquired_bucket_ids = match self
             .shared
             .state
             .try_consume_review_rate_limits(self.lane, repo, mr.iid, now)
@@ -357,7 +357,7 @@ impl ReviewFlow {
                 return Err(err);
             }
             Ok(ReviewRateLimitAcquireOutcome::Unmatched) => Vec::new(),
-            Ok(ReviewRateLimitAcquireOutcome::Acquired { rule_ids }) => rule_ids,
+            Ok(ReviewRateLimitAcquireOutcome::Acquired { bucket_ids }) => bucket_ids,
             Ok(ReviewRateLimitAcquireOutcome::Blocked { next_retry_at }) => {
                 self.shared
                     .state
@@ -374,18 +374,19 @@ impl ReviewFlow {
                         next_retry_at,
                     )
                     .await?;
+                self.ensure_rate_limit_award_best_effort(repo, mr.iid).await;
                 return Ok(ReviewGateOutcome::Decision(
                     ReviewScheduleOutcome::SkippedRateLimit,
                 ));
             }
         };
         if self.shared.shutdown_requested() {
-            let refund_err = if acquired_rule_ids.is_empty() {
+            let refund_err = if acquired_bucket_ids.is_empty() {
                 None
             } else {
                 self.shared
                     .state
-                    .refund_review_rate_limit_rules(&acquired_rule_ids, now)
+                    .refund_review_rate_limit_buckets(&acquired_bucket_ids, now)
                     .await
                     .err()
             };
@@ -415,7 +416,7 @@ impl ReviewFlow {
             ));
         }
         Ok(ReviewGateOutcome::Ready(ReviewGateReady {
-            acquired_rule_ids,
+            acquired_rule_ids: acquired_bucket_ids,
         }))
     }
 
@@ -498,7 +499,7 @@ impl ReviewFlow {
             return Err(err);
         }
         if let Err(err) = self
-            .clear_review_rate_limit_pending_if_needed(repo, mr.iid, &acquired_rule_ids)
+            .clear_review_rate_limit_pending_if_needed(repo, mr.iid)
             .await
         {
             self.abort_review_after_setup_failure(
@@ -645,7 +646,7 @@ impl ReviewFlow {
             }
         };
         if let Err(err) = self
-            .clear_review_rate_limit_pending_if_needed(repo, mr.iid, &acquired_rule_ids)
+            .clear_review_rate_limit_pending_if_needed(repo, mr.iid)
             .await
         {
             self.abort_review_after_setup_failure(
@@ -691,19 +692,60 @@ impl ReviewFlow {
         Ok(self.shared.config.resolve_feature_flags(&overrides))
     }
 
-    async fn clear_review_rate_limit_pending_if_needed(
-        &self,
-        repo: &str,
-        iid: u64,
-        acquired_rule_ids: &[String],
-    ) -> Result<()> {
-        if acquired_rule_ids.is_empty() {
-            return Ok(());
-        }
-        self.shared
+    async fn clear_review_rate_limit_pending_if_needed(&self, repo: &str, iid: u64) -> Result<()> {
+        let cleared = self
+            .shared
             .state
             .clear_review_rate_limit_pending(self.lane, repo, iid)
-            .await
+            .await?;
+        if cleared {
+            self.remove_rate_limit_award_best_effort(repo, iid).await;
+        }
+        Ok(())
+    }
+
+    async fn ensure_rate_limit_award_best_effort(&self, repo: &str, iid: u64) {
+        if self.shared.config.review.dry_run || !self.uses_awards() {
+            return;
+        }
+        if let Err(err) = ensure_bot_award(
+            self.shared.gitlab.as_ref(),
+            repo,
+            iid,
+            self.shared.bot_user_id,
+            &self.shared.config.review.rate_limit_emoji,
+        )
+        .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                error = %err,
+                "failed to add rate-limit award"
+            );
+        }
+    }
+
+    async fn remove_rate_limit_award_best_effort(&self, repo: &str, iid: u64) {
+        if self.shared.config.review.dry_run || !self.uses_awards() {
+            return;
+        }
+        if let Err(err) = remove_bot_award(
+            self.shared.gitlab.as_ref(),
+            repo,
+            iid,
+            self.shared.bot_user_id,
+            &self.shared.config.review.rate_limit_emoji,
+        )
+        .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                error = %err,
+                "failed to remove rate-limit award"
+            );
+        }
     }
 
     async fn release_review_lock_after_gate_failure(
@@ -742,7 +784,7 @@ impl ReviewFlow {
             && let Err(recovery_err) = self
                 .shared
                 .state
-                .refund_review_rate_limit_rules(acquired_rule_ids, Utc::now().timestamp())
+                .refund_review_rate_limit_buckets(acquired_rule_ids, Utc::now().timestamp())
                 .await
         {
             warn!(
@@ -897,7 +939,7 @@ impl ReviewRunContext {
             info!(repo = repo, iid = iid, "dry run: skipping eyes removal");
             return;
         }
-        if let Err(err) = remove_eyes(
+        if let Err(err) = remove_bot_award(
             self.gitlab.as_ref(),
             repo,
             iid,
@@ -926,7 +968,7 @@ impl ReviewRunContext {
         self.remove_eyes_best_effort(repo, iid).await;
         if !self.acquired_rate_limit_rule_ids.is_empty() {
             self.state
-                .refund_review_rate_limit_rules(
+                .refund_review_rate_limit_buckets(
                     &self.acquired_rate_limit_rule_ids,
                     Utc::now().timestamp(),
                 )
@@ -961,7 +1003,7 @@ impl ReviewRunContext {
         if !self.acquired_rate_limit_rule_ids.is_empty()
             && let Err(recovery_err) = self
                 .state
-                .refund_review_rate_limit_rules(
+                .refund_review_rate_limit_buckets(
                     &self.acquired_rate_limit_rule_ids,
                     Utc::now().timestamp(),
                 )
@@ -1138,18 +1180,18 @@ impl ReviewRunContext {
                 if self.config.review.dry_run {
                     info!(repo = repo, iid = mr.iid, "dry run: skipping comment");
                 } else {
-                    post_review_comment(
+                    post_review_comment(PostReviewCommentRequest {
                         inline_review_comments_enabled,
-                        self.lane,
-                        &self.config,
-                        self.gitlab.as_ref(),
-                        self.bot_user_id,
-                        &review_project_path,
+                        lane: self.lane,
+                        config: &self.config,
+                        gitlab: self.gitlab.as_ref(),
+                        bot_user_id: self.bot_user_id,
+                        project_path: &review_project_path,
                         repo,
-                        &mr,
+                        mr: &mr,
                         head_sha,
-                        &comment,
-                    )
+                        comment: &comment,
+                    })
                     .await?;
                 }
                 self.retry_backoff.clear(&retry_key);
@@ -1252,16 +1294,40 @@ pub(crate) fn has_inline_review_marker(
         .any(|note| note.author.id == bot_user_id && note.body.contains(&marker_prefix))
 }
 
-pub(crate) async fn remove_eyes(
+pub(crate) async fn ensure_bot_award(
     gitlab: &dyn GitLabApi,
     repo: &str,
     iid: u64,
     bot_user_id: u64,
-    eyes: &str,
+    award_name: &str,
 ) -> Result<()> {
+    if bot_user_id == 0 {
+        return Ok(());
+    }
+    let awards = gitlab.list_awards(repo, iid).await?;
+    if awards
+        .iter()
+        .any(|award| award.user.id == bot_user_id && award.name == award_name)
+    {
+        return Ok(());
+    }
+    gitlab.add_award(repo, iid, award_name).await?;
+    Ok(())
+}
+
+pub(crate) async fn remove_bot_award(
+    gitlab: &dyn GitLabApi,
+    repo: &str,
+    iid: u64,
+    bot_user_id: u64,
+    award_name: &str,
+) -> Result<()> {
+    if bot_user_id == 0 {
+        return Ok(());
+    }
     let awards = gitlab.list_awards(repo, iid).await?;
     for award in awards {
-        if award.user.id == bot_user_id && award.name == eyes {
+        if award.user.id == bot_user_id && award.name == award_name {
             gitlab.delete_award(repo, iid, award.id).await?;
         }
     }

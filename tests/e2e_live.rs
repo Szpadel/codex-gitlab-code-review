@@ -52,6 +52,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             max_concurrent: 1,
             eyes_emoji: "eyes".to_string(),
             thumbs_emoji: "thumbsup".to_string(),
+            rate_limit_emoji: "hourglass_flowing_sand".to_string(),
             comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
             stale_in_progress_minutes: 60,
             dry_run: true,

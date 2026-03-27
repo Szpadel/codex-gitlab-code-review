@@ -4,9 +4,10 @@ use super::{
     ResolvedGitLabDiscoveryAllowList, resolve_allow_list,
 };
 use crate::composer_install::{
-    ComposerInstallMode, ComposerInstallResult, DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
-    composer_debug_lines, composer_install_exec_command, composer_install_result_from_exec_output,
-    prepare_composer_auth, redact_composer_related_output, resolve_composer_auth,
+    ComposerInstallExecOutput, ComposerInstallMode, ComposerInstallResult,
+    DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS, composer_debug_lines, composer_install_exec_command,
+    composer_install_result_from_exec_output, prepare_composer_auth,
+    redact_composer_related_output, resolve_composer_auth,
 };
 use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig};
 use crate::docker_utils::connect_docker;
@@ -369,24 +370,28 @@ impl GitLabDiscoveryMcpService {
             .await
         {
             Ok(output) => Some(composer_install_result_from_exec_output(
-                mode,
-                auth_lookup.source,
-                output.exit_code,
-                &output.stdout,
-                &output.stderr,
-                Some(&self.gitlab_token),
-                composer_auth.as_deref(),
-                &debug_lines,
+                ComposerInstallExecOutput {
+                    mode,
+                    auth_source: auth_lookup.source,
+                    exit_code: output.exit_code,
+                    stdout: &output.stdout,
+                    stderr: &output.stderr,
+                    gitlab_token: Some(&self.gitlab_token),
+                    composer_auth: composer_auth.as_deref(),
+                    debug_lines: &debug_lines,
+                },
             )),
             Err(err) => Some(composer_install_result_from_exec_output(
-                mode,
-                auth_lookup.source,
-                1,
-                "",
-                &err.to_string(),
-                Some(&self.gitlab_token),
-                composer_auth.as_deref(),
-                &debug_lines,
+                ComposerInstallExecOutput {
+                    mode,
+                    auth_source: auth_lookup.source,
+                    exit_code: 1,
+                    stdout: "",
+                    stderr: &err.to_string(),
+                    gitlab_token: Some(&self.gitlab_token),
+                    composer_auth: composer_auth.as_deref(),
+                    debug_lines: &debug_lines,
+                },
             )),
         }
     }

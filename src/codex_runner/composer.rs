@@ -1,8 +1,8 @@
 use super::*;
 use crate::composer_install::{
-    COMPOSER_INSTALL_TURN_ID, ComposerAuthLookup, ComposerInstallMode, ComposerInstallResult,
-    composer_debug_lines, composer_install_exec_command, composer_install_result_from_exec_output,
-    prepare_composer_auth, resolve_composer_auth,
+    COMPOSER_INSTALL_TURN_ID, ComposerAuthLookup, ComposerInstallExecOutput, ComposerInstallMode,
+    ComposerInstallResult, composer_debug_lines, composer_install_exec_command,
+    composer_install_result_from_exec_output, prepare_composer_auth, resolve_composer_auth,
 };
 use crate::gitlab::GitLabClient;
 
@@ -48,26 +48,26 @@ impl DockerCodexRunner {
             )
             .await
         {
-            Ok(output) => composer_install_result_from_exec_output(
+            Ok(output) => composer_install_result_from_exec_output(ComposerInstallExecOutput {
                 mode,
-                auth_lookup.source,
-                output.exit_code,
-                &output.stdout,
-                &output.stderr,
-                Some(&self.gitlab_token),
-                composer_auth.as_deref(),
-                &debug_lines,
-            ),
-            Err(err) => composer_install_result_from_exec_output(
+                auth_source: auth_lookup.source,
+                exit_code: output.exit_code,
+                stdout: &output.stdout,
+                stderr: &output.stderr,
+                gitlab_token: Some(&self.gitlab_token),
+                composer_auth: composer_auth.as_deref(),
+                debug_lines: &debug_lines,
+            }),
+            Err(err) => composer_install_result_from_exec_output(ComposerInstallExecOutput {
                 mode,
-                auth_lookup.source,
-                1,
-                "",
-                &err.to_string(),
-                Some(&self.gitlab_token),
-                composer_auth.as_deref(),
-                &debug_lines,
-            ),
+                auth_source: auth_lookup.source,
+                exit_code: 1,
+                stdout: "",
+                stderr: &err.to_string(),
+                gitlab_token: Some(&self.gitlab_token),
+                composer_auth: composer_auth.as_deref(),
+                debug_lines: &debug_lines,
+            }),
         };
 
         if result.attempted {

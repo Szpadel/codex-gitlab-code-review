@@ -611,9 +611,7 @@ fn strip_common_wrapper(mut files: Vec<ArchiveFileEntry>) -> Vec<ArchiveFileEntr
 fn shared_first_component(files: &[ArchiveFileEntry]) -> Option<String> {
     let mut first_components = BTreeSet::new();
     for file in files {
-        let Some(component) = file.relative_path.iter().next() else {
-            return None;
-        };
+        let component = file.relative_path.iter().next()?;
         first_components.insert(component.to_string_lossy().to_string());
     }
     if first_components.len() == 1 {
