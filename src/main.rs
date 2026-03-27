@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     if let Some(command) = cli.command {
         match command {
             Command::Auth(auth_cmd) => {
-                let runner = AuthRunner::new(config.docker.clone(), config.codex.clone())?;
+                let runner = AuthRunner::new(&config.docker, config.codex.clone())?;
                 let action = match auth_cmd.action {
                     AuthSubcommand::Login => RunnerAuthAction::Login,
                     AuthSubcommand::Status => RunnerAuthAction::Status,
@@ -462,7 +462,7 @@ async fn build_normal_runtime(
         tokio::spawn(Arc::clone(service).run(listener));
     }
     let runner = Arc::new(DockerCodexRunner::new(
-        config.docker.clone(),
+        &config.docker,
         config.codex.clone(),
         git_base,
         Arc::clone(&state),
@@ -512,8 +512,8 @@ async fn resolve_created_after(config: &Config, state: &ReviewStateStore) -> Res
         state.set_created_after(&normalized).await?;
         return Ok(value.to_owned());
     }
-    match state.get_created_after().await? {
-        Some(raw) => match DateTime::parse_from_rfc3339(&raw) {
+    if let Some(raw) = state.get_created_after().await? {
+        match DateTime::parse_from_rfc3339(&raw) {
             Ok(parsed) => Ok(parsed.with_timezone(&Utc)),
             Err(err) => {
                 warn!(
@@ -525,19 +525,17 @@ async fn resolve_created_after(config: &Config, state: &ReviewStateStore) -> Res
                 state.set_created_after(&now.to_rfc3339()).await?;
                 Ok(now)
             }
-        },
-        None => {
-            let now = Utc::now();
-            state.set_created_after(&now.to_rfc3339()).await?;
-            Ok(now)
         }
+    } else {
+        let now = Utc::now();
+        state.set_created_after(&now.to_rfc3339()).await?;
+        Ok(now)
     }
 }
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
-        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+        .is_ok_and(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 fn mention_commands_active(config: &Config) -> bool {
@@ -623,7 +621,7 @@ async fn run_schedule_loop(
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
         tokio::select! {
-            _ = &mut sleep => {}
+            () = &mut sleep => {}
             changed = shutdown_rx.changed() => match changed {
                 Ok(()) if *shutdown_rx.borrow() => {
                     if let Err(err) = status_service.clear_next_scan_at().await {

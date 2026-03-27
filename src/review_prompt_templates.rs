@@ -44,6 +44,7 @@ pub fn build_commit_review_prompt(sha: &str, title: Option<&str>) -> String {
     }
 }
 
+#[must_use]
 pub fn append_additional_review_instructions(
     prompt: &str,
     additional_instructions: &str,
@@ -54,10 +55,12 @@ pub fn append_additional_review_instructions(
     )
 }
 
+#[must_use]
 pub fn upstream_review_prompt_source_path() -> &'static str {
     SOURCE_PATH
 }
 
+#[must_use]
 pub fn upstream_review_prompt_source_commit() -> &'static str {
     SOURCE_COMMIT
 }

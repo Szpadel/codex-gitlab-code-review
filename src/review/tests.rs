@@ -4462,7 +4462,10 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
     assert!(pending[0].next_retry_at > pending[0].last_blocked_at);
 
     state
-        .refund_review_rate_limit_buckets(std::slice::from_ref(&rule_id), Utc::now().timestamp())
+        .refund_review_rate_limit_buckets(
+            &[format!("{rule_id}:repo:group/repo")],
+            Utc::now().timestamp(),
+        )
         .await?;
 
     let fourth = service
@@ -4697,7 +4700,10 @@ async fn runtime_rate_limit_clear_removes_configured_mr_award_before_review_resu
         )
         .await?;
     state
-        .refund_review_rate_limit_buckets(std::slice::from_ref(&rule_id), Utc::now().timestamp())
+        .refund_review_rate_limit_buckets(
+            &[format!("{rule_id}:repo:group/repo")],
+            Utc::now().timestamp(),
+        )
         .await?;
     let service = ReviewService::new(
         config,

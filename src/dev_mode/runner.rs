@@ -11,6 +11,7 @@ pub struct MockCodexRunner {
 }
 
 impl MockCodexRunner {
+    #[must_use]
     pub fn new(state: Arc<ReviewStateStore>) -> Self {
         Self { state }
     }

@@ -66,6 +66,7 @@ pub struct FeatureFlagAvailability {
 }
 
 impl FeatureFlagSnapshot {
+    #[must_use]
     pub fn resolve(
         defaults: &FeatureFlagDefaults,
         availability: &FeatureFlagAvailability,

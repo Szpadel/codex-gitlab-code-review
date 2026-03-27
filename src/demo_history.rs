@@ -6,6 +6,7 @@ use crate::state::{
 use anyhow::{Context, Result};
 use chrono::{Duration, SecondsFormat, TimeZone, Utc};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 #[cfg(test)]
 use std::fs;
 use uuid::Uuid;
@@ -65,6 +66,9 @@ struct SeededTranscript {
     events: Vec<NewRunHistoryEvent>,
 }
 
+/// # Errors
+///
+/// Returns an error if demo state initialization or history persistence fails.
 pub async fn seed_example_history(config: &Config) -> Result<SeedExampleHistoryReport> {
     let state = ReviewStateStore::new(&config.database.path).await?;
     seed_example_history_with_store(&state, &config.database.path).await
@@ -295,11 +299,11 @@ fn seed_transcript(kind: DemoTranscriptKind) -> SeededTranscript {
     match kind {
         DemoTranscriptKind::ReviewRich => review_rich_events(&mut events, &mut sequence, &push),
         DemoTranscriptKind::ReviewFailure => {
-            review_failure_events(&mut events, &mut sequence, &push)
+            review_failure_events(&mut events, &mut sequence, &push);
         }
         DemoTranscriptKind::MentionRich => mention_rich_events(&mut events, &mut sequence, &push),
         DemoTranscriptKind::MentionMcpHeavy => {
-            mention_mcp_heavy_events(&mut events, &mut sequence, &push)
+            mention_mcp_heavy_events(&mut events, &mut sequence, &push);
         }
     }
     SeededTranscript {
@@ -707,7 +711,7 @@ fn agent_message_item(message: &str, phase: &str) -> Value {
 fn encode_repo_key(repo: &str) -> String {
     let mut output = String::with_capacity(repo.len() * 2);
     for byte in repo.as_bytes() {
-        output.push_str(&format!("{byte:02x}"));
+        let _ = write!(output, "{byte:02x}");
     }
     output
 }

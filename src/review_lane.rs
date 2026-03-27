@@ -9,6 +9,7 @@ pub enum ReviewLane {
 }
 
 impl ReviewLane {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::General => "general",
@@ -16,10 +17,12 @@ impl ReviewLane {
         }
     }
 
+    #[must_use]
     pub const fn is_security(self) -> bool {
         matches!(self, Self::Security)
     }
 
+    #[must_use]
     pub const fn review_label(self) -> &'static str {
         match self {
             Self::General => "Review",

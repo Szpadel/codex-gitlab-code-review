@@ -147,7 +147,7 @@ fn find_session_file(root: &Path, thread_id: &str) -> Result<Option<PathBuf>> {
                 .is_some_and(|name| session_file_name_matches(name, thread_id))
         })
         .collect::<Vec<_>>();
-    select_newest_session_file(candidates)
+    Ok(select_newest_session_file(candidates))
 }
 
 fn collect_session_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -180,7 +180,10 @@ fn collect_session_files(root: &Path) -> Result<Vec<PathBuf>> {
             let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if name.ends_with(".jsonl") {
+            if Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
                 candidates.push(candidate);
             }
         }
@@ -188,7 +191,7 @@ fn collect_session_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(candidates)
 }
 
-fn select_newest_session_file(mut candidates: Vec<PathBuf>) -> Result<Option<PathBuf>> {
+fn select_newest_session_file(mut candidates: Vec<PathBuf>) -> Option<PathBuf> {
     candidates.sort_by(|left, right| {
         let left_modified = fs::metadata(left)
             .and_then(|metadata| metadata.modified())
@@ -200,7 +203,7 @@ fn select_newest_session_file(mut candidates: Vec<PathBuf>) -> Result<Option<Pat
             .cmp(&left_modified)
             .then_with(|| left.cmp(right))
     });
-    Ok(candidates.into_iter().next())
+    candidates.into_iter().next()
 }
 
 #[cfg(test)]
@@ -316,7 +319,7 @@ fn parse_session_file_details(
                             }
                         }
                     }
-                    Some("task_complete") | Some("turn_complete") => {
+                    Some("task_complete" | "turn_complete") => {
                         if let Some(turn_id) = payload
                             .get("turn_id")
                             .and_then(Value::as_str)
@@ -855,7 +858,7 @@ fn parent_turn_item_can_carry_missing_review_child_marker(event: &NewRunHistoryE
                 && event
                     .payload
                     .get("phase")
-                    .is_none_or(|phase| phase.is_null())
+                    .is_none_or(serde_json::Value::is_null)
         }
         _ => false,
     }

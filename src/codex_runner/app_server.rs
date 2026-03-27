@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    AsyncWriteExt, Future, HashMap, LogOutput, NewRunHistoryEvent, Pin, RefCell, Result,
+    SecondsFormat, StreamExt, Utc, Uuid, Value, VecDeque, anyhow, debug, info, json, warn,
+};
 
 pub(crate) struct TurnNotificationContext<'a> {
     pub(crate) thread_id: &'a str,
@@ -244,7 +247,7 @@ impl AppServerClient {
                 |item| {
                     if matches!(
                         item.get("type").and_then(|value| value.as_str()),
-                        Some("agentMessage") | Some("AgentMessage")
+                        Some("agentMessage" | "AgentMessage")
                     ) {
                         let item_id = item
                             .get("id")
@@ -522,8 +525,9 @@ impl AppServerClient {
                             .get("status")
                             .and_then(|value| value.as_str())
                             .unwrap_or("<unknown>");
-                        let exit_code = item.get("exitCode").and_then(|value| value.as_i64());
-                        let duration_ms = item.get("durationMs").and_then(|value| value.as_i64());
+                        let exit_code = item.get("exitCode").and_then(serde_json::Value::as_i64);
+                        let duration_ms =
+                            item.get("durationMs").and_then(serde_json::Value::as_i64);
                         info!(
                             item_id,
                             command, cwd, status, exit_code, duration_ms, "codex command completed"
@@ -558,7 +562,7 @@ impl AppServerClient {
                         .and_then(|value| value.get("message"))
                         .and_then(|value| value.as_str())
                         .unwrap_or("unknown error");
-                    return Err(anyhow!("codex turn failed: {}", error_message));
+                    return Err(anyhow!("codex turn failed: {error_message}"));
                 }
                 return Ok(TurnStreamNotificationOutcome::TurnCompleted);
             }
@@ -600,7 +604,7 @@ impl AppServerClient {
             }
             if message_id == Some(&id) {
                 if let Some(error) = message.get("error") {
-                    return Err(anyhow!("codex app-server error: {}", error));
+                    return Err(anyhow!("codex app-server error: {error}"));
                 }
                 if let Some(result) = message.get("result") {
                     return Ok(result.clone());
@@ -641,14 +645,7 @@ impl AppServerClient {
     ) -> Result<()> {
         debug!(method, params = ?params, "codex app-server request");
         match method {
-            "item/commandExecution/requestApproval" => {
-                self.send_json(&json!({
-                    "id": id,
-                    "result": { "decision": "accept" }
-                }))
-                .await
-            }
-            "item/fileChange/requestApproval" => {
+            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                 self.send_json(&json!({
                     "id": id,
                     "result": { "decision": "accept" }
@@ -708,20 +705,16 @@ impl AppServerClient {
                     self.push_runner_error(trimmed);
                     continue;
                 }
-                match serde_json::from_str::<Value>(trimmed) {
-                    Ok(value) => {
-                        if self.log_all_json {
-                            debug!(json = %trimmed, "codex app-server message");
-                        }
-                        return Ok(value);
+                if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                    if self.log_all_json {
+                        debug!(json = %trimmed, "codex app-server message");
                     }
-                    Err(_) => {
-                        if self.log_all_json {
-                            debug!(line = %trimmed, "codex app-server non-json output");
-                        }
-                        continue;
-                    }
+                    return Ok(value);
                 }
+                if self.log_all_json {
+                    debug!(line = %trimmed, "codex app-server non-json output");
+                }
+                continue;
             }
 
             match self.output.next().await {
@@ -765,13 +758,11 @@ pub(crate) fn matches_thread_turn(params: Option<&Value>, thread_id: &str, turn_
     let thread_matches = params
         .get("threadId")
         .and_then(|value| value.as_str())
-        .map(|value| value == thread_id)
-        .unwrap_or(true);
+        .is_none_or(|value| value == thread_id);
     let turn_matches = params
         .get("turnId")
         .and_then(|value| value.as_str())
-        .map(|value| value == turn_id)
-        .unwrap_or(true);
+        .is_none_or(|value| value == turn_id);
     thread_matches && turn_matches
 }
 
@@ -804,27 +795,27 @@ pub(crate) fn enrich_reasoning_item(
     let Some(object) = enriched.as_object_mut() else {
         return enriched;
     };
-    let summary_fallback = if !summary.trim().is_empty() {
-        summary
-    } else {
+    let summary_fallback = if summary.trim().is_empty() {
         text
+    } else {
+        summary
     };
-    let content_fallback = if !text.trim().is_empty() {
-        text
-    } else {
+    let content_fallback = if text.trim().is_empty() {
         summary
+    } else {
+        text
     };
     if object
         .get("summary")
         .and_then(|value| value.as_array())
-        .is_none_or(|value| value.is_empty())
+        .is_none_or(std::vec::Vec::is_empty)
     {
         object.insert("summary".to_string(), json!([summary_fallback]));
     }
     if object
         .get("content")
         .and_then(|value| value.as_array())
-        .is_none_or(|value| value.is_empty())
+        .is_none_or(std::vec::Vec::is_empty)
     {
         object.insert("content".to_string(), json!([content_fallback]));
     }

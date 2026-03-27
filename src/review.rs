@@ -130,6 +130,7 @@ impl ReviewService {
         }
     }
 
+    #[must_use]
     pub fn with_dynamic_repo_source(
         mut self,
         dynamic_repo_source: Arc<dyn DynamicRepoSource>,
@@ -138,14 +139,23 @@ impl ReviewService {
         self
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn scan_once(&self) -> Result<ScanRunStatus> {
         self.scan(ScanMode::Full).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn scan_once_incremental(&self) -> Result<ScanRunStatus> {
         self.scan(ScanMode::Incremental).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn next_pending_rate_limit_retry_at(&self) -> Result<Option<DateTime<Utc>>> {
         Ok(self
             .state
@@ -154,6 +164,9 @@ impl ReviewService {
             .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single()))
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn process_due_pending_rate_limit_reviews(&self) -> Result<ScanRunStatus> {
         if self.shutdown_requested() {
             info!("pending retry skipped: shutdown requested");
@@ -194,6 +207,9 @@ impl ReviewService {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn recover_in_progress_reviews(&self) -> Result<()> {
         if let Err(err) = self.codex.stop_active_reviews().await {
             warn!(error = %err, "failed to stop active codex review containers");
@@ -341,29 +357,28 @@ impl ReviewService {
                 return Ok(ReviewScheduleOutcome::SkippedRateLimit);
             }
         };
-        let head_sha = match mr.head_sha() {
-            Some(value) => value,
-            None => {
-                warn!(
-                    repo = pending.repo.as_str(),
-                    iid = pending.iid,
-                    lane = pending.lane.as_str(),
-                    "missing head sha while retrying pending review; clearing pending row"
-                );
-                if self
-                    .state
-                    .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
-                    .await?
-                {
-                    self.remove_rate_limit_award_after_pending_clear(
-                        pending.lane,
-                        &pending.repo,
-                        pending.iid,
-                    )
-                    .await;
-                }
-                return Ok(ReviewScheduleOutcome::SkippedCompleted);
+        let head_sha = if let Some(value) = mr.head_sha() {
+            value
+        } else {
+            warn!(
+                repo = pending.repo.as_str(),
+                iid = pending.iid,
+                lane = pending.lane.as_str(),
+                "missing head sha while retrying pending review; clearing pending row"
+            );
+            if self
+                .state
+                .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
+                .await?
+            {
+                self.remove_rate_limit_award_after_pending_clear(
+                    pending.lane,
+                    &pending.repo,
+                    pending.iid,
+                )
+                .await;
             }
+            return Ok(ReviewScheduleOutcome::SkippedCompleted);
         };
         let outcome = self
             .review_flow_for_lane(pending.lane)
@@ -468,14 +483,13 @@ impl ReviewService {
     }
 
     fn apply_review_outcome(
-        &self,
         lane: ReviewLane,
         repo: &str,
         iid: u64,
         outcome: ReviewScheduleOutcome,
         counters: &mut ScanCounters,
         pending_same_mr_work: &mut bool,
-    ) -> Result<Option<RepoScanStatus>> {
+    ) -> Option<RepoScanStatus> {
         match (lane, outcome) {
             (_, ReviewScheduleOutcome::Scheduled) => {
                 if lane.is_security() {
@@ -564,7 +578,7 @@ impl ReviewService {
                 );
             }
             (_, ReviewScheduleOutcome::Interrupted) => {
-                return Ok(Some(RepoScanStatus::Interrupted));
+                return Some(RepoScanStatus::Interrupted);
             }
             (ReviewLane::Security, ReviewScheduleOutcome::SkippedAward) => {
                 debug!(
@@ -574,7 +588,7 @@ impl ReviewService {
                 );
             }
         }
-        Ok(None)
+        None
     }
 
     async fn scan(&self, mode: ScanMode) -> Result<ScanRunStatus> {
@@ -721,9 +735,10 @@ impl ReviewService {
 
     async fn load_latest_mr_activity_marker(&self, repo: &str) -> Option<String> {
         match self.gitlab.get_latest_open_mr_activity(repo).await {
-            Ok(Some(mr)) => match mr.updated_at {
-                Some(updated_at) => Some(format!("{}|{}", updated_at.to_rfc3339(), mr.iid)),
-                None => {
+            Ok(Some(mr)) => {
+                if let Some(updated_at) = mr.updated_at {
+                    Some(format!("{}|{}", updated_at.to_rfc3339(), mr.iid))
+                } else {
                     warn!(
                         repo = repo,
                         iid = mr.iid,
@@ -731,7 +746,7 @@ impl ReviewService {
                     );
                     None
                 }
-            },
+            }
             Ok(None) => Some(NO_OPEN_MRS_MARKER.to_string()),
             Err(err) => {
                 warn!(
@@ -781,7 +796,7 @@ impl ReviewService {
             .iter()
             .map(|group| group.trim_end_matches('/'))
             .filter(|group| !group.is_empty())
-            .map(|group| format!("{}/", group))
+            .map(|group| format!("{group}/"))
             .collect();
 
         let mut repos: Vec<String> = included
@@ -914,13 +929,12 @@ impl ReviewService {
             if mr.head_sha().is_none() || mr.created_at.is_none() {
                 mr = self.gitlab.get_mr(repo, mr.iid).await?;
             }
-            let head_sha = match mr.head_sha() {
-                Some(value) => value,
-                None => {
-                    counters.missing_sha += 1;
-                    warn!(repo = repo, iid = mr.iid, "missing head sha, skipping");
-                    continue;
-                }
+            let head_sha = if let Some(value) = mr.head_sha() {
+                value
+            } else {
+                counters.missing_sha += 1;
+                warn!(repo = repo, iid = mr.iid, "missing head sha, skipping");
+                continue;
             };
             let mention_outcome = self
                 .schedule_mention_commands_for_mr(repo, &mr, &head_sha, counters, tasks)
@@ -936,13 +950,12 @@ impl ReviewService {
                 );
                 continue;
             }
-            let created_at = match mr.created_at.as_ref() {
-                Some(value) => value,
-                None => {
-                    counters.skipped_created_before += 1;
-                    warn!(repo = repo, iid = mr.iid, "missing created_at, skipping");
-                    continue;
-                }
+            let created_at = if let Some(value) = mr.created_at.as_ref() {
+                value
+            } else {
+                counters.skipped_created_before += 1;
+                warn!(repo = repo, iid = mr.iid, "missing created_at, skipping");
+                continue;
             };
             if created_at <= &self.created_after {
                 counters.skipped_created_before += 1;
@@ -960,28 +973,28 @@ impl ReviewService {
                 .general_review_flow
                 .schedule_for_scan(repo, mr.clone(), &head_sha, tasks)
                 .await?;
-            if let Some(status) = self.apply_review_outcome(
+            if let Some(status) = Self::apply_review_outcome(
                 ReviewLane::General,
                 repo,
                 mr_iid,
                 review_outcome,
                 counters,
                 &mut pending_same_mr_work,
-            )? {
+            ) {
                 return Ok(status);
             }
             let security_review_outcome = self
                 .security_review_flow
                 .schedule_for_scan(repo, mr, &head_sha, tasks)
                 .await?;
-            if let Some(status) = self.apply_review_outcome(
+            if let Some(status) = Self::apply_review_outcome(
                 ReviewLane::Security,
                 repo,
                 mr_iid,
                 security_review_outcome,
                 counters,
                 &mut pending_same_mr_work,
-            )? {
+            ) {
                 return Ok(status);
             }
         }
@@ -992,6 +1005,9 @@ impl ReviewService {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn review_mr(&self, repo: &str, iid: u64) -> Result<()> {
         if self.shutdown_requested() {
             info!(repo = repo, iid = iid, "skip: shutdown requested");
@@ -999,12 +1015,11 @@ impl ReviewService {
         }
         self.mention_flow.clear_stale_in_progress().await?;
         let mut mr = self.gitlab.get_mr(repo, iid).await?;
-        let mut head_sha = match mr.head_sha() {
-            Some(value) => value,
-            None => {
-                warn!(repo = repo, iid = iid, "missing head sha, skipping");
-                return Ok(());
-            }
+        let mut head_sha = if let Some(value) = mr.head_sha() {
+            value
+        } else {
+            warn!(repo = repo, iid = iid, "missing head sha, skipping");
+            return Ok(());
         };
         let mut mention_tasks = Vec::new();
         let mut counters = ScanCounters::default();
@@ -1028,24 +1043,22 @@ impl ReviewService {
         }
         if mention_outcome.scheduled > 0 {
             mr = self.gitlab.get_mr(repo, iid).await?;
-            head_sha = match mr.head_sha() {
-                Some(value) => value,
-                None => {
-                    warn!(
-                        repo = repo,
-                        iid = iid,
-                        "missing head sha after mention commands, skipping review"
-                    );
-                    return Ok(());
-                }
+            head_sha = if let Some(value) = mr.head_sha() {
+                value
+            } else {
+                warn!(
+                    repo = repo,
+                    iid = iid,
+                    "missing head sha after mention commands, skipping review"
+                );
+                return Ok(());
             };
         }
-        let created_at = match mr.created_at.as_ref() {
-            Some(value) => value,
-            None => {
-                warn!(repo = repo, iid = iid, "missing created_at, skipping");
-                return Ok(());
-            }
+        let created_at = if let Some(value) = mr.created_at.as_ref() {
+            value
+        } else {
+            warn!(repo = repo, iid = iid, "missing created_at, skipping");
+            return Ok(());
         };
         if created_at <= &self.created_after {
             debug!(

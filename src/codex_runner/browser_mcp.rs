@@ -1,4 +1,13 @@
-use super::*;
+use super::{
+    BROWSER_CONTAINER_LOG_FETCH_TAIL, BROWSER_CONTAINER_LOG_LINE_LIMIT,
+    BROWSER_CONTAINER_LOG_LINE_MAX_CHARS, BROWSER_CONTAINER_NAME_PREFIX,
+    BROWSER_CONTAINER_READY_TIMEOUT, BROWSER_CONTAINER_RUNNING_GRACE_PERIOD,
+    BROWSER_MCP_REMOTE_DEBUGGING_PORT, BrowserMcpConfig, ContainerCreateBody,
+    ContainerInspectResponse, Context, CreateContainerOptionsBuilder, DockerCodexRunner, Duration,
+    HostConfig, Instant, LogOutput, LogsOptionsBuilder, Result, RunnerRuntime,
+    StartContainerOptionsBuilder, StreamExt, Url, Uuid, anyhow, format_command_for_log, info,
+    sleep, warn,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BrowserLaunchConfig {
@@ -79,17 +88,11 @@ impl BrowserContainerDiagnostics {
                 "  state status={} running={} exit_code={} oom_killed={} started_at={} finished_at={} error={}",
                 state.status.as_deref().unwrap_or("<unknown>"),
                 state
-                    .running
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string()),
+                    .running.map_or_else(|| "<unknown>".to_string(), |value| value.to_string()),
                 state
-                    .exit_code
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string()),
+                    .exit_code.map_or_else(|| "<unknown>".to_string(), |value| value.to_string()),
                 state
-                    .oom_killed
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string()),
+                    .oom_killed.map_or_else(|| "<unknown>".to_string(), |value| value.to_string()),
                 state.started_at.as_deref().unwrap_or("<unknown>"),
                 state.finished_at.as_deref().unwrap_or("<unknown>"),
                 state.error.as_deref().unwrap_or("<none>")
@@ -98,24 +101,23 @@ impl BrowserContainerDiagnostics {
             (None, None) => lines.push("  state unavailable: <unknown>".to_string()),
         }
 
-        match &self.log_collection_error {
-            Some(err) => lines.push(format!("  log tail unavailable: {err}")),
-            None => {
-                if self.log_tail.stdout.is_empty() {
-                    lines.push("  stdout tail: <empty>".to_string());
-                } else {
-                    lines.push("  stdout tail:".to_string());
-                    for line in &self.log_tail.stdout {
-                        lines.push(format!("    {line}"));
-                    }
+        if let Some(err) = &self.log_collection_error {
+            lines.push(format!("  log tail unavailable: {err}"))
+        } else {
+            if self.log_tail.stdout.is_empty() {
+                lines.push("  stdout tail: <empty>".to_string());
+            } else {
+                lines.push("  stdout tail:".to_string());
+                for line in &self.log_tail.stdout {
+                    lines.push(format!("    {line}"));
                 }
-                if self.log_tail.stderr.is_empty() {
-                    lines.push("  stderr tail: <empty>".to_string());
-                } else {
-                    lines.push("  stderr tail:".to_string());
-                    for line in &self.log_tail.stderr {
-                        lines.push(format!("    {line}"));
-                    }
+            }
+            if self.log_tail.stderr.is_empty() {
+                lines.push("  stderr tail: <empty>".to_string());
+            } else {
+                lines.push("  stderr tail:".to_string());
+                for line in &self.log_tail.stderr {
+                    lines.push(format!("    {line}"));
                 }
             }
         }
@@ -157,8 +159,7 @@ impl DockerCodexRunner {
                 Some(format!(
                     "{:#}",
                     anyhow!(err).context(format!(
-                        "inspect docker browser container {}",
-                        browser_container_id
+                        "inspect docker browser container {browser_container_id}"
                     ))
                 )),
             ),
@@ -211,10 +212,7 @@ impl DockerCodexRunner {
 
         while let Some(message) = stream.next().await {
             match message.with_context(|| {
-                format!(
-                    "read docker browser container logs for {}",
-                    browser_container_id
-                )
+                format!("read docker browser container logs for {browser_container_id}")
             })? {
                 LogOutput::StdOut { message } | LogOutput::Console { message } => {
                     stdout.push_str(String::from_utf8_lossy(&message).as_ref());
@@ -302,8 +300,7 @@ impl DockerCodexRunner {
                     "browser container exited before readiness"
                 );
                 return Err(anyhow!(
-                    "browser container exited before reporting readiness on port {}",
-                    BROWSER_MCP_REMOTE_DEBUGGING_PORT
+                    "browser container exited before reporting readiness on port {BROWSER_MCP_REMOTE_DEBUGGING_PORT}"
                 )
                 .context(formatted));
             }
@@ -373,16 +370,13 @@ impl DockerCodexRunner {
             )
             .await
             .with_context(|| {
-                format!(
-                    "create docker browser container {} with image {}",
-                    name, image_ref
-                )
+                format!("create docker browser container {name} with image {image_ref}")
             })?;
         let id = create.id;
         let start_result = docker
             .start_container(&id, Some(StartContainerOptionsBuilder::new().build()))
             .await
-            .with_context(|| format!("start docker browser container {}", id));
+            .with_context(|| format!("start docker browser container {id}"));
         if let Err(err) = start_result {
             let err = self
                 .enrich_error_with_browser_diagnostics(err, Some(&id), Some(browser_mcp))

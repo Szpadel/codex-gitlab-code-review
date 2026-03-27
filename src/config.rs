@@ -77,10 +77,12 @@ impl Default for TargetSelector {
 }
 
 impl TargetSelector {
+    #[must_use]
     pub fn is_all(&self) -> bool {
         matches!(self, Self::All)
     }
 
+    #[must_use]
     pub fn list(&self) -> &[String] {
         match self {
             Self::All => &[],
@@ -108,8 +110,7 @@ impl<'de> Deserialize<'de> for TargetSelector {
                     Ok(TargetSelector::All)
                 } else {
                     Err(de::Error::custom(format!(
-                        "expected \"all\" or list, got \"{}\"",
-                        value
+                        "expected \"all\" or list, got \"{value}\""
                     )))
                 }
             }
@@ -120,10 +121,12 @@ impl<'de> Deserialize<'de> for TargetSelector {
 }
 
 impl GitLabTargets {
+    #[must_use]
     pub fn cache_key_for_all(&self) -> String {
         "all".to_string()
     }
 
+    #[must_use]
     pub fn cache_key_for_groups(&self) -> String {
         let mut groups = self.groups.list().to_vec();
         groups.sort();
@@ -358,15 +361,19 @@ fn default_browser_mcp_args() -> Vec<String> {
 }
 
 fn default_reasoning_summary_override() -> Option<String> {
-    Some("detailed".to_string())
+    default_optional_text("detailed")
 }
 
 fn default_security_context_reasoning_effort_override() -> Option<String> {
-    Some("xhigh".to_string())
+    default_optional_text("xhigh")
 }
 
 fn default_security_review_reasoning_effort_override() -> Option<String> {
-    Some("high".to_string())
+    default_optional_text("high")
+}
+
+fn default_optional_text(value: &'static str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn default_gitlab_discovery_mcp_server_name() -> String {
@@ -461,6 +468,10 @@ pub struct DepsConfig {
 }
 
 impl Config {
+    /// # Errors
+    ///
+    /// Returns an error if configuration files or environment overrides cannot
+    /// be loaded or parsed.
     pub fn load() -> Result<Self> {
         let path = env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
         let builder = config::Config::builder()
@@ -468,7 +479,7 @@ impl Config {
             .add_source(config::Environment::with_prefix("CODEX_REVIEW").separator("__"));
         let cfg = builder
             .build()
-            .with_context(|| format!("load config from {}", path))?;
+            .with_context(|| format!("load config from {path}"))?;
         if legacy_proxy_config_present(&cfg) {
             tracing::warn!(
                 "legacy proxy config detected but ignored; built-in proxy support has been removed"
@@ -493,6 +504,7 @@ impl Config {
         Ok(config)
     }
 
+    #[must_use]
     pub fn feature_flag_availability(&self) -> FeatureFlagAvailability {
         FeatureFlagAvailability {
             gitlab_discovery_mcp: self.codex.gitlab_discovery_mcp.enabled
@@ -506,6 +518,7 @@ impl Config {
         }
     }
 
+    #[must_use]
     pub fn resolve_feature_flags(
         &self,
         overrides: &RuntimeFeatureFlagOverrides,
@@ -538,39 +551,36 @@ fn apply_gitlab_discovery_mcp_runtime_defaults(config: &mut Config) -> Result<()
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    match pod_ip {
-        Some(pod_ip) => {
-            anyhow::ensure!(
-                is_wildcard_host(&bind_host),
-                "codex.gitlab_discovery_mcp.advertise_url cannot default from POD_IP when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
-            );
-            let pod_ip = pod_ip
-                .parse::<std::net::IpAddr>()
-                .context("parse POD_IP for gitlab discovery MCP advertise_url default")?;
-            if bind_host_supports_ip(&bind_host, pod_ip) {
-                let host = match pod_ip {
-                    std::net::IpAddr::V4(ip) => ip.to_string(),
-                    std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-                };
-                config.codex.gitlab_discovery_mcp.advertise_url =
-                    format!("http://{host}:{port}/mcp");
-            } else {
-                config.codex.gitlab_discovery_mcp.advertise_url =
-                    format!("http://host.docker.internal:{port}/mcp");
-            }
-        }
-        None => {
-            anyhow::ensure!(
-                is_wildcard_host(&bind_host),
-                "codex.gitlab_discovery_mcp.advertise_url cannot default to host.docker.internal when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
-            );
+    if let Some(pod_ip) = pod_ip {
+        anyhow::ensure!(
+            is_wildcard_host(&bind_host),
+            "codex.gitlab_discovery_mcp.advertise_url cannot default from POD_IP when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
+        );
+        let pod_ip = pod_ip
+            .parse::<std::net::IpAddr>()
+            .context("parse POD_IP for gitlab discovery MCP advertise_url default")?;
+        if bind_host_supports_ip(&bind_host, pod_ip) {
+            let host = match pod_ip {
+                std::net::IpAddr::V4(ip) => ip.to_string(),
+                std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+            };
+            config.codex.gitlab_discovery_mcp.advertise_url = format!("http://{host}:{port}/mcp");
+        } else {
             config.codex.gitlab_discovery_mcp.advertise_url =
                 format!("http://host.docker.internal:{port}/mcp");
         }
+    } else {
+        anyhow::ensure!(
+            is_wildcard_host(&bind_host),
+            "codex.gitlab_discovery_mcp.advertise_url cannot default to host.docker.internal when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
+        );
+        config.codex.gitlab_discovery_mcp.advertise_url =
+            format!("http://host.docker.internal:{port}/mcp");
     }
     Ok(())
 }
 
+#[must_use]
 pub fn gitlab_discovery_mcp_uses_cluster_service_advertise_url(codex: &CodexConfig) -> bool {
     if !codex.gitlab_discovery_mcp.enabled {
         return false;
@@ -598,9 +608,7 @@ where
 }
 
 fn legacy_proxy_config_present(cfg: &config::Config) -> bool {
-    cfg.get_table("proxy")
-        .map(|table| !table.is_empty())
-        .unwrap_or(false)
+    cfg.get_table("proxy").is_ok_and(|table| !table.is_empty())
 }
 
 fn validate_codex_auth_accounts(codex: &CodexConfig) -> Result<()> {
@@ -691,8 +699,7 @@ fn validate_browser_mcp(codex: &CodexConfig) -> Result<()> {
     );
     anyhow::ensure!(
         codex.browser_mcp.remote_debugging_port == BROWSER_MCP_REMOTE_DEBUGGING_PORT,
-        "codex.browser_mcp.remote_debugging_port must be {}",
-        BROWSER_MCP_REMOTE_DEBUGGING_PORT
+        "codex.browser_mcp.remote_debugging_port must be {BROWSER_MCP_REMOTE_DEBUGGING_PORT}"
     );
     for arg in &codex.browser_mcp.browser_args {
         let trimmed = arg.trim();

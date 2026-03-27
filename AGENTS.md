@@ -32,6 +32,7 @@ This service scans configured GitLab projects/groups for open merge requests, ru
 - Required env vars: `E2E_GITLAB_BASE_URL`, `E2E_GITLAB_REPO`, `E2E_GITLAB_TOKEN`.
 - Optional env vars: `E2E_GITLAB_MR_IID`, `E2E_DOCKER_HOST`, `E2E_CODEX_AUTH_HOST_PATH`.
 - Keep live runs in `dry_run` mode unless intentionally writing to GitLab.
+- When the changed behavior is reachable through the local dev UI/runtime, default to an additional manual verification pass using `cargo run -- --dev-mode` plus Chrome MCP after automated checks. If this is not applicable or not possible, say so explicitly in the final summary.
 
 ## Configuration & Operations
 - Default config path is `config.yaml`; override with `CONFIG_PATH`.

@@ -92,7 +92,7 @@ impl ResolvedCheckoutTarget {
                 "git".to_string(),
                 "checkout".to_string(),
                 "-B".to_string(),
-                branch_name.to_string(),
+                branch_name.clone(),
                 format!("refs/remotes/origin/{branch_name}"),
             ],
             Self::Tag { tag_name, .. } => vec![
@@ -105,13 +105,16 @@ impl ResolvedCheckoutTarget {
                 "git".to_string(),
                 "checkout".to_string(),
                 "--detach".to_string(),
-                commit_sha.to_string(),
+                commit_sha.clone(),
             ],
         }
     }
 }
 
 impl GitLabDiscoveryMcpService {
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub fn new(
         docker_cfg: DockerConfig,
         gitlab_cfg: &GitLabConfig,
@@ -131,26 +134,34 @@ impl GitLabDiscoveryMcpService {
         })
     }
 
+    #[must_use]
     pub fn registry(&self) -> Arc<GitLabDiscoverySessionRegistry> {
         Arc::clone(&self.registry)
     }
 
+    #[must_use]
     pub fn advertise_url(&self) -> &str {
         &self.config.advertise_url
     }
 
+    #[must_use]
     pub fn server_name(&self) -> &str {
         &self.config.server_name
     }
 
+    #[must_use]
     pub fn clone_root(&self) -> &str {
         &self.config.clone_root
     }
 
+    #[must_use]
     pub fn resolve_allow_list(&self, source_repo: &str) -> ResolvedGitLabDiscoveryAllowList {
         resolve_allow_list(source_repo, &self.config.allow)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn bind_listener(&self) -> Result<TcpListener> {
         TcpListener::bind(&self.config.bind_addr)
             .await
@@ -163,7 +174,7 @@ impl GitLabDiscoveryMcpService {
     }
 
     pub async fn run(self: Arc<Self>, listener: TcpListener) {
-        let app = build_router(Arc::clone(&self));
+        let app = build_router(&self);
         if let Err(err) = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -438,13 +449,13 @@ impl GitLabDiscoveryMcpService {
                 },
             )
             .await
-            .with_context(|| format!("create docker exec for container {}", container_id))?;
+            .with_context(|| format!("create docker exec for container {container_id}"))?;
 
         let start = self
             .docker
             .start_exec(&exec.id, None::<StartExecOptions>)
             .await
-            .with_context(|| format!("start docker exec for container {}", container_id))?;
+            .with_context(|| format!("start docker exec for container {container_id}"))?;
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -516,10 +527,7 @@ impl GitLabDiscoveryMcpService {
         {
             Ok(())
         } else {
-            bail!(
-                "commit '{}' was not fetched for the cloned repository",
-                commit_sha
-            );
+            bail!("commit '{commit_sha}' was not fetched for the cloned repository");
         }
     }
 
@@ -584,10 +592,7 @@ fn ensure_contains(values: &[String], wanted: &str, label: &str) -> Result<()> {
     if values.iter().any(|value| value == wanted) {
         Ok(())
     } else {
-        bail!(
-            "{label} '{}' was not fetched for the cloned repository",
-            wanted
-        )
+        bail!("{label} '{wanted}' was not fetched for the cloned repository")
     }
 }
 
@@ -639,10 +644,7 @@ pub(crate) fn resolve_checkout_target(
         let tag_exists = tags.iter().any(|tag| tag == checkout_ref);
         match (branch_exists, tag_exists) {
             (true, true) => bail!(
-                "checkout_ref '{}' is ambiguous; use refs/heads/{} or refs/tags/{}",
-                checkout_ref,
-                checkout_ref,
-                checkout_ref
+                "checkout_ref '{checkout_ref}' is ambiguous; use refs/heads/{checkout_ref} or refs/tags/{checkout_ref}"
             ),
             (true, false) => Ok(ResolvedCheckoutTarget::Branch {
                 requested_ref: checkout_ref.to_string(),
@@ -652,10 +654,9 @@ pub(crate) fn resolve_checkout_target(
                 requested_ref: checkout_ref.to_string(),
                 tag_name: checkout_ref.to_string(),
             }),
-            (false, false) => bail!(
-                "checkout_ref '{}' does not match any fetched branch or tag",
-                checkout_ref
-            ),
+            (false, false) => {
+                bail!("checkout_ref '{checkout_ref}' does not match any fetched branch or tag")
+            }
         }
     }
 }

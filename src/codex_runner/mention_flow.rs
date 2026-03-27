@@ -1,4 +1,10 @@
-use super::*;
+use super::{
+    AppServerCommandOptions, AuthAccount, AuthFailureKind, Context, DockerCodexRunner, Duration,
+    Instant, MentionCommandContext, MentionCommandResult, MentionCommandStatus, Result,
+    RunHistorySessionUpdate, StartedAppServer, Utc, anyhow, bail, classify_auth_failure,
+    classify_auth_failure_for_account, configured_reasoning_effort, configured_reasoning_summary,
+    info, json, repo_checkout_root, restore_push_remote_url_exec_command, timeout, warn,
+};
 use crate::composer_install::composer_install_timeout_seconds;
 use std::collections::BTreeSet;
 
@@ -11,8 +17,7 @@ fn git_status_paths(status_output: &str) -> BTreeSet<String> {
         let path = &line[3..];
         let normalized = path
             .rsplit_once(" -> ")
-            .map(|(_, target)| target)
-            .unwrap_or(path)
+            .map_or(path, |(_, target)| target)
             .trim();
         if !normalized.is_empty() {
             paths.insert(normalized.to_string());
@@ -134,8 +139,7 @@ impl DockerCodexRunner {
                         ctx.run_history_id,
                         gitlab_discovery_mcp
                             .as_ref()
-                            .map(|prepared| prepared.runtime_config.advertise_url.as_str())
-                            .unwrap_or("<unknown>"),
+                            .map_or("<unknown>", |prepared| prepared.runtime_config.advertise_url.as_str()),
                         "failed to register MCP session binding",
                     )
                     .await;
@@ -320,7 +324,21 @@ impl DockerCodexRunner {
                         .stdout
                         .trim()
                         .to_string();
-                    let (status, commit_sha) = if after_sha != before_sha {
+                    let (status, commit_sha) = if after_sha == before_sha {
+                        let worktree_state = self
+                            .exec_container_git_command(
+                                &container_id,
+                                &["status".to_string(), "--porcelain".to_string()],
+                                Some(repo_dir.as_str()),
+                            )
+                            .await?;
+                        if worktree_state.stdout != baseline_worktree_state {
+                            bail!(
+                                "mention command left uncommitted changes without creating a commit"
+                            );
+                        }
+                        (MentionCommandStatus::NoChanges, None)
+                    } else {
                         let source_branch = ctx
                             .mr
                             .source_branch
@@ -359,8 +377,7 @@ impl DockerCodexRunner {
                             .parse::<u64>()
                             .with_context(|| {
                                 format!(
-                                    "parse commit count for mention command range {}..{}",
-                                    before_sha, after_sha
+                                    "parse commit count for mention command range {before_sha}..{after_sha}"
                                 )
                             })?;
                         if commit_count == 0 {
@@ -414,20 +431,6 @@ impl DockerCodexRunner {
                         )
                         .await?;
                         (MentionCommandStatus::Committed, Some(after_sha))
-                    } else {
-                        let worktree_state = self
-                            .exec_container_git_command(
-                                &container_id,
-                                &["status".to_string(), "--porcelain".to_string()],
-                                Some(repo_dir.as_str()),
-                            )
-                            .await?;
-                        if worktree_state.stdout != baseline_worktree_state {
-                            bail!(
-                                "mention command left uncommitted changes without creating a commit"
-                            );
-                        }
-                        (MentionCommandStatus::NoChanges, None)
                     };
 
                     Ok::<MentionCommandResult, anyhow::Error>(MentionCommandResult {

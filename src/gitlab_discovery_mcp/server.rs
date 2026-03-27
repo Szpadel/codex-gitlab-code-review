@@ -52,7 +52,7 @@ impl GitLabDiscoveryMcpServer {
         Parameters(request): Parameters<ListGitLabPathsRequest>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<McpJson<ListGitLabPathsResponse>, McpError> {
-        let binding = self.binding_from_parts(&parts).await?;
+        let binding = Self::binding_from_parts(&parts)?;
         let current_path = request
             .path
             .as_deref()
@@ -77,7 +77,7 @@ impl GitLabDiscoveryMcpServer {
         Parameters(request): Parameters<InspectGitLabRepoRequest>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<McpJson<InspectGitLabRepoResponse>, McpError> {
-        let binding = self.binding_from_parts(&parts).await?;
+        let binding = Self::binding_from_parts(&parts)?;
         let repo_path = validated_repo_path(&request.repo_path)?;
         let response =
             inspect_repo_for_path(&self.service.gitlab, &binding.allow, repo_path).await?;
@@ -94,7 +94,7 @@ impl GitLabDiscoveryMcpServer {
         Parameters(request): Parameters<CloneGitLabRepoRequest>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<McpJson<CloneGitLabRepoResponse>, McpError> {
-        let binding = self.binding_from_parts(&parts).await?;
+        let binding = Self::binding_from_parts(&parts)?;
         let repo_path = validated_repo_path(&request.repo_path)?;
         ensure_allowed_repo_path(&binding.allow, repo_path)?;
 
@@ -306,8 +306,7 @@ fn map_repo_lookup_error(repo_path: &str, err: anyhow::Error) -> McpError {
 }
 
 impl GitLabDiscoveryMcpServer {
-    async fn binding_from_parts(
-        &self,
+    fn binding_from_parts(
         parts: &axum::http::request::Parts,
     ) -> Result<GitLabDiscoverySessionBinding, McpError> {
         parts
@@ -318,7 +317,7 @@ impl GitLabDiscoveryMcpServer {
     }
 }
 
-pub(crate) fn build_router(service: Arc<GitLabDiscoveryMcpService>) -> Router {
+pub(crate) fn build_router(service: &Arc<GitLabDiscoveryMcpService>) -> Router {
     let server = GitLabDiscoveryMcpServer {
         tool_router: GitLabDiscoveryMcpServer::tool_router(),
         service: Arc::clone(&service),
@@ -407,8 +406,7 @@ fn canonical_peer_ip(ip: IpAddr) -> String {
         IpAddr::V4(v4) => v4.to_string(),
         IpAddr::V6(v6) => v6
             .to_ipv4_mapped()
-            .map(|mapped| mapped.to_string())
-            .unwrap_or_else(|| v6.to_string()),
+            .map_or_else(|| v6.to_string(), |mapped| mapped.to_string()),
     }
 }
 
@@ -445,7 +443,8 @@ mod tests {
             GitLabDiscoveryMcpConfig::default(),
         )
         .expect("service");
-        let _router = build_router(Arc::new(service));
+        let service = Arc::new(service);
+        let _router = build_router(&service);
     }
 
     #[test]

@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    BROWSER_MCP_REMOTE_DEBUGGING_PORT, BTreeMap, BrowserMcpConfig, DockerCodexRunner,
+    GitLabDiscoveryMcpRuntimeConfig, MentionCommandContext, Result, ReviewContext, Url, anyhow,
+    repo_checkout_root,
+};
+use std::fmt::Write as _;
 
 const MENTION_COMMAND_TEMPLATE: &str = include_str!("assets/mention_command.sh");
 const REVIEW_COMMAND_TEMPLATE: &str = include_str!("assets/review_command.sh");
@@ -48,20 +53,19 @@ impl DockerCodexRunner {
         let port = self.git_base.port();
         let mut host_port = host.to_string();
         if let Some(port) = port {
-            host_port = format!("{}:{}", host, port);
+            host_port = format!("{host}:{port}");
         }
         let base_path = self.git_base.path().trim_end_matches('/');
         let repo_path = if base_path.is_empty() {
-            format!("/{}.git", repo)
+            format!("/{repo}.git")
         } else {
-            format!("{}/{}.git", base_path, repo)
+            format!("{base_path}/{repo}.git")
         };
         if self.gitlab_token.is_empty() {
-            Ok(format!("{}://{}{}", scheme, host_port, repo_path))
+            Ok(format!("{scheme}://{host_port}{repo_path}"))
         } else {
             Ok(format!(
-                "{}://oauth2:${{GITLAB_TOKEN}}@{}{}",
-                scheme, host_port, repo_path
+                "{scheme}://oauth2:${{GITLAB_TOKEN}}@{host_port}{repo_path}"
             ))
         }
     }
@@ -296,11 +300,10 @@ fn git_url_rewrites(clone_url: &str, repo: &str) -> Vec<(String, String)> {
     };
     let host_endpoint = authority
         .rsplit_once('@')
-        .map(|(_, value)| value)
-        .unwrap_or(authority);
+        .map_or(authority, |(_, value)| value);
 
-    let path = format!("/{}", path_with_slash);
-    let repo_suffix = format!("/{}.git", repo);
+    let path = format!("/{path_with_slash}");
+    let repo_suffix = format!("/{repo}.git");
     let base_path = path
         .strip_suffix(&repo_suffix)
         .unwrap_or("")
@@ -359,11 +362,12 @@ pub(crate) fn git_bootstrap_auth_setup_script(
         shell_quote(&rewrites.len().to_string())
     );
     for (index, (key, value)) in rewrites.into_iter().enumerate() {
-        script.push_str(&format!(
+        let _ = write!(
+            script,
             "export GIT_CONFIG_KEY_{index}={}\nexport GIT_CONFIG_VALUE_{index}={}\n",
             shell_quote(&key),
             shell_quote(&value)
-        ));
+        );
     }
     script
 }
@@ -465,8 +469,7 @@ pub(crate) fn codex_app_server_exec_command(
                 .iter()
                 .map(|arg| toml_basic_string(arg))
                 .chain(std::iter::once(toml_basic_string(&format!(
-                    "--browserUrl=http://127.0.0.1:{}",
-                    BROWSER_MCP_REMOTE_DEBUGGING_PORT
+                    "--browserUrl=http://127.0.0.1:{BROWSER_MCP_REMOTE_DEBUGGING_PORT}"
                 ))))
                 .collect::<Vec<_>>()
                 .join(",")

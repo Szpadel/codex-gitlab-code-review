@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -79,6 +80,7 @@ struct DevMergeRequest {
 }
 
 impl DevToolsService {
+    #[must_use]
     pub fn new(database_path: &str) -> Self {
         let mut state = DevToolsState::default();
         for repo_path in DEFAULT_REPOS {
@@ -90,10 +92,12 @@ impl DevToolsService {
         }
     }
 
+    #[must_use]
     pub fn database_path(&self) -> &str {
         &self.database_path
     }
 
+    #[must_use]
     pub fn gitlab_api(&self) -> Arc<dyn GitLabApi> {
         Arc::new(DevGitLabApi {
             state: Arc::clone(&self.state),
@@ -119,6 +123,9 @@ impl DevToolsService {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the synthetic repository catalog cannot be updated.
     pub async fn create_repo(&self, repo_path: &str) -> Result<()> {
         let normalized = normalize_repo_path(repo_path)?;
         let mut state = self.state.write().await;
@@ -128,6 +135,10 @@ impl DevToolsService {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the synthetic repository cannot be renamed or the
+    /// backing state cannot be updated.
     pub async fn update_repo(&self, existing_repo_path: &str, repo_path: &str) -> Result<()> {
         let existing = normalize_repo_path(existing_repo_path)?;
         let replacement = normalize_repo_path(repo_path)?;
@@ -147,6 +158,10 @@ impl DevToolsService {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the synthetic repository cannot be removed from the
+    /// backing state.
     pub async fn delete_repo(&self, repo_path: &str) -> Result<()> {
         let normalized = normalize_repo_path(repo_path)?;
         let removed = self.state.write().await.repos.remove(&normalized);
@@ -156,6 +171,10 @@ impl DevToolsService {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the synthetic merge request cannot be created or
+    /// persisted.
     pub async fn simulate_new_mr(&self, repo_path: &str) -> Result<()> {
         let normalized = normalize_repo_path(repo_path)?;
         let mut state = self.state.write().await;
@@ -182,6 +201,10 @@ impl DevToolsService {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the synthetic repository state cannot be advanced or
+    /// persisted.
     pub async fn simulate_new_commit(&self, repo_path: &str) -> Result<()> {
         let normalized = normalize_repo_path(repo_path)?;
         let mut state = self.state.write().await;
@@ -407,7 +430,7 @@ fn synthetic_sha(repo_path: &str, iid: u64, revision: u64) -> String {
         iid.hash(&mut hasher);
         revision.hash(&mut hasher);
         salt.hash(&mut hasher);
-        hex.push_str(&format!("{:016x}", hasher.finish()));
+        let _ = write!(hex, "{:016x}", hasher.finish());
     }
     hex.truncate(40);
     hex

@@ -90,12 +90,12 @@ pub(crate) fn seconds_from_numeric_value(value: f64, unit_seconds: i64) -> i64 {
     if !value.is_finite() || value <= 0.0 {
         return 0;
     }
-    let total = value * unit_seconds as f64;
-    if total >= i64::MAX as f64 {
-        i64::MAX
-    } else {
-        total.ceil() as i64
-    }
+    let seconds = u32::try_from(unit_seconds).ok().unwrap_or(u32::MAX);
+    let total = std::time::Duration::from_secs_f64(value * f64::from(seconds));
+    let rounded_up = total
+        .as_secs()
+        .saturating_add(u64::from(total.subsec_nanos() > 0));
+    i64::try_from(rounded_up).ok().unwrap_or(i64::MAX)
 }
 
 pub(crate) fn safe_cooldown_duration(cooldown_seconds: u64) -> ChronoDuration {

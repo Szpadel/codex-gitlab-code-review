@@ -54,12 +54,21 @@ mod scripts;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use self::app_server::*;
-use self::auth::*;
-use self::container::*;
-use self::gitlab_discovery::*;
-use self::review_flow::*;
-use self::scripts::*;
+use self::app_server::{
+    AppServerClient, GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID, annotate_event_payload,
+};
+use self::auth::{
+    AuthAccount, AuthFailureKind, classify_auth_failure, classify_auth_failure_for_account,
+};
+use self::container::{InFlightImagePull, format_command_for_log};
+use self::gitlab_discovery::{
+    GitLabDiscoveryHandle, GitLabDiscoveryMcpRuntimeConfig, PreparedGitLabDiscoveryMcp,
+};
+use self::review_flow::parse_review_output_for_lane;
+use self::scripts::{
+    AppServerCommandOptions, configured_reasoning_effort, configured_reasoning_summary,
+    effective_browser_mcp, restore_push_remote_url_exec_command, shell_quote,
+};
 
 #[derive(Debug, Clone)]
 pub struct ReviewContext {
@@ -438,15 +447,18 @@ impl DockerCodexRunner {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if connecting to Docker fails.
     pub fn new(
-        docker_cfg: DockerConfig,
+        docker_cfg: &DockerConfig,
         codex: CodexConfig,
         git_base: Url,
         state: Arc<ReviewStateStore>,
         gitlab_discovery_mcp: Option<Arc<GitLabDiscoveryMcpService>>,
         runtime: RunnerRuntimeOptions,
     ) -> Result<Self> {
-        let docker = connect_docker(&docker_cfg)?;
+        let docker = connect_docker(docker_cfg)?;
         let auth_accounts = Self::build_auth_accounts(&codex);
         Ok(Self {
             runtime: RunnerRuntime::Docker {

@@ -52,7 +52,7 @@ pub fn build_mock_review_transcript(
         &mut sequence,
         Some(primary_turn_id.as_str()),
         "item_completed",
-        user_message_item(format!(
+        user_message_item(&format!(
             "Mock {} {} !{} for synthetic development-mode validation.",
             lane.review_label().to_lowercase(),
             repo,
@@ -65,7 +65,7 @@ pub fn build_mock_review_transcript(
         &mut sequence,
         Some(primary_turn_id.as_str()),
         "item_completed",
-        reasoning_item(format!(
+        reasoning_item(&format!(
             "Using a deterministic mocked Codex transcript for {} !{} at {}.",
             repo,
             iid,
@@ -94,7 +94,7 @@ pub fn build_mock_review_transcript(
         &mut sequence,
         Some(primary_turn_id.as_str()),
         "item_completed",
-        agent_message_item(summary.clone(), "final_answer"),
+        agent_message_item(&summary, "final_answer"),
         started_at,
     );
     push_event(
@@ -142,7 +142,7 @@ fn push_event(
     });
 }
 
-fn user_message_item(text: String) -> Value {
+fn user_message_item(text: &str) -> Value {
     json!({
         "type": "message",
         "role": "user",
@@ -150,14 +150,14 @@ fn user_message_item(text: String) -> Value {
     })
 }
 
-fn reasoning_item(text: String) -> Value {
+fn reasoning_item(text: &str) -> Value {
     json!({
         "type": "reasoning",
         "text": text,
     })
 }
 
-fn agent_message_item(text: String, kind: &str) -> Value {
+fn agent_message_item(text: &str, kind: &str) -> Value {
     json!({
         "type": "agentMessage",
         "kind": kind,

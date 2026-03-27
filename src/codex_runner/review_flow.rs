@@ -1,4 +1,14 @@
-use super::*;
+use super::{
+    AppServerClient, AppServerCommandOptions, Arc, AuthAccount, AuthFailureKind, BrowserMcpConfig,
+    CodexResult, Context, Deserialize, DockerCodexRunner, Duration, Instant, Mutex,
+    PreparedGitLabDiscoveryMcp, Result, ReviewCodeLocation, ReviewComment, ReviewContext,
+    ReviewFinding, ReviewLineRange, RunHistorySessionUpdate, SecurityContextBuildCompletionGuard,
+    SecurityContextBuildKey, SecurityContextBuildRegistration, StartedAppServer, Utc, Value,
+    anyhow, append_additional_review_instructions, bail, build_base_branch_review_prompt,
+    build_commit_review_prompt, classify_auth_failure, classify_auth_failure_for_account, debug,
+    info, json, repo_checkout_root, timeout, upstream_review_prompt_source_commit,
+    upstream_review_prompt_source_path, warn,
+};
 use crate::composer_install::composer_install_timeout_seconds;
 use crate::review_lane::ReviewLane;
 
@@ -876,7 +886,7 @@ impl DockerCodexRunner {
             let thread_response = client
                 .request(
                     "thread/start",
-                    self.thread_start_params(request.repo_path, None, &[worktree_path.to_string()]),
+                    self.thread_start_params(request.repo_path, None, &[worktree_path.clone()]),
                 )
                 .await?;
             let thread_id = thread_response
@@ -985,8 +995,9 @@ impl DockerCodexRunner {
                     ctx.run_history_id,
                     gitlab_discovery_mcp
                         .as_ref()
-                        .map(|prepared| prepared.runtime_config.advertise_url.as_str())
-                        .unwrap_or("<unknown>"),
+                        .map_or("<unknown>", |prepared| {
+                            prepared.runtime_config.advertise_url.as_str()
+                        }),
                     "failed to register MCP session binding",
                 )
                 .await;
@@ -1500,7 +1511,7 @@ pub(crate) fn parse_review_output_for_lane(
                 findings: Vec::new(),
                 body: parsed.comment_markdown,
             })),
-            other => Err(anyhow!("unknown verdict: {}", other)),
+            other => Err(anyhow!("unknown verdict: {other}")),
         };
     }
 

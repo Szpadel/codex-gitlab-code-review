@@ -68,10 +68,7 @@ impl RetryBackoff {
 
     pub(crate) fn record_failure(&self, key: RetryKey, now: DateTime<Utc>) -> DateTime<Utc> {
         let mut entries = self.entries.lock().unwrap();
-        let failures = entries
-            .get(&key)
-            .map(|state| state.failures + 1)
-            .unwrap_or(1);
+        let failures = entries.get(&key).map_or(1, |state| state.failures + 1);
         let base_seconds = self.base_delay.num_seconds().max(0);
         let exponent = failures.saturating_sub(1).min(30);
         let multiplier = 1i64 << exponent;
@@ -904,14 +901,15 @@ impl ReviewRunContext {
             .get_project(&source_project_id.to_string())
             .await
         {
-            Ok(project) => match project
-                .path_with_namespace
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                Some(path_with_namespace) => path_with_namespace.to_string(),
-                None => {
+            Ok(project) => {
+                if let Some(path_with_namespace) = project
+                    .path_with_namespace
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    path_with_namespace.to_string()
+                } else {
                     warn!(
                         repo,
                         iid = mr.iid,
@@ -920,7 +918,7 @@ impl ReviewRunContext {
                     );
                     String::new()
                 }
-            },
+            }
             Err(err) => {
                 warn!(
                     repo,
@@ -1272,7 +1270,7 @@ pub(crate) fn has_review_marker(notes: &[Note], bot_user_id: u64, prefix: &str, 
     if bot_user_id == 0 {
         return false;
     }
-    let marker = format!("{}{} -->", prefix, sha);
+    let marker = format!("{prefix}{sha} -->");
     notes
         .iter()
         .any(|note| note.author.id == bot_user_id && note.body.contains(&marker))

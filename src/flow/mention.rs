@@ -8,6 +8,7 @@ use crate::state::{MentionCommandScanState, NewRunHistory, RunHistoryFinish, Run
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
@@ -200,8 +201,7 @@ impl MentionFlow {
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or(fallback_email),
+                .map_or(fallback_email, ToOwned::to_owned),
             Err(err) => {
                 warn!(
                     user_id = author.id,
@@ -728,7 +728,7 @@ impl MentionFlow {
                             let has_sha = message.contains(commit_sha.as_str())
                                 || (!short_sha.is_empty() && message.contains(short_sha.as_str()));
                             if !has_sha {
-                                message.push_str(&format!("\n\nCommit SHA: `{}`", commit_sha));
+                                let _ = write!(message, "\n\nCommit SHA: `{commit_sha}`");
                             }
                         }
                         (
@@ -845,7 +845,7 @@ impl MentionFlow {
                                     "failed to post mention-command completion status; retrying"
                                 );
                                 tokio::time::sleep(std::time::Duration::from_millis(
-                                    100 * attempt as u64,
+                                    100 * u64::try_from(attempt).ok().unwrap_or(u64::MAX),
                                 ))
                                 .await;
                             }
@@ -854,8 +854,7 @@ impl MentionFlow {
                 }
                 if !completion_note_posted {
                     let fallback_message = format!(
-                        "Mention command result for discussion `{}`:\n\n{}",
-                        discussion_id, status_message
+                        "Mention command result for discussion `{discussion_id}`:\n\n{status_message}"
                     );
                     if let Err(err) = gitlab
                         .create_note(&repo_name, mr_copy.iid, &fallback_message)
@@ -910,7 +909,7 @@ impl MentionFlow {
                                     "failed to persist mention-command state; retrying"
                                 );
                                 tokio::time::sleep(std::time::Duration::from_millis(
-                                    100 * attempt as u64,
+                                    100 * u64::try_from(attempt).ok().unwrap_or(u64::MAX),
                                 ))
                                 .await;
                             }

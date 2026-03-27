@@ -59,6 +59,7 @@ pub struct GitLabGroup {
 }
 
 impl MergeRequest {
+    #[must_use]
     pub fn head_sha(&self) -> Option<String> {
         self.diff_refs
             .as_ref()
@@ -364,6 +365,9 @@ pub struct GitLabClient {
 }
 
 impl GitLabClient {
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub fn new(base_url: &str, token: &str) -> Result<Self> {
         ensure_reqwest_rustls_provider();
         let api_base = normalize_api_base(base_url)?;
@@ -390,6 +394,7 @@ impl GitLabClient {
         })
     }
 
+    #[must_use]
     pub fn api_base(&self) -> &str {
         &self.api_base
     }
@@ -436,7 +441,7 @@ impl GitLabClient {
             .get(url)
             .send()
             .await
-            .with_context(|| format!("gitlab GET {}", url))?;
+            .with_context(|| format!("gitlab GET {url}"))?;
         ensure_success(response, "GET", url).await
     }
 
@@ -446,7 +451,7 @@ impl GitLabClient {
             .post(url)
             .send()
             .await
-            .with_context(|| format!("gitlab POST {}", url))?;
+            .with_context(|| format!("gitlab POST {url}"))?;
         ensure_success_empty(response, "POST", url).await
     }
 
@@ -456,7 +461,7 @@ impl GitLabClient {
             .delete(url)
             .send()
             .await
-            .with_context(|| format!("gitlab DELETE {}", url))?;
+            .with_context(|| format!("gitlab DELETE {url}"))?;
         ensure_success_empty(response, "DELETE", url).await
     }
 
@@ -467,7 +472,7 @@ impl GitLabClient {
             .json(&serde_json::json!({ "body": body }))
             .send()
             .await
-            .with_context(|| format!("gitlab POST {}", url))?;
+            .with_context(|| format!("gitlab POST {url}"))?;
         ensure_success::<serde_json::Value>(response, "POST", url).await?;
         Ok(())
     }
@@ -479,7 +484,7 @@ impl GitLabClient {
             .form(form)
             .send()
             .await
-            .with_context(|| format!("gitlab POST {}", url))?;
+            .with_context(|| format!("gitlab POST {url}"))?;
         ensure_success::<serde_json::Value>(response, "POST", url).await?;
         Ok(())
     }
@@ -530,6 +535,9 @@ impl GitLabClient {
         Ok(sorted_unique(refs.into_iter().map(|item| item.name)))
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub fn git_base_url(&self) -> Result<Url> {
         let mut url = Url::parse(&self.api_base)?;
         let path = url.path().trim_end_matches('/').to_string();
@@ -538,6 +546,7 @@ impl GitLabClient {
         Ok(url)
     }
 
+    #[must_use]
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -965,7 +974,7 @@ impl GitLabApi for GitLabClient {
             .get(&url)
             .send()
             .await
-            .with_context(|| format!("gitlab GET {}", url))?;
+            .with_context(|| format!("gitlab GET {url}"))?;
         ensure_success_bytes(response, "GET", &url).await
     }
 }
@@ -1065,14 +1074,14 @@ pub(crate) fn gitlab_error_has_status(err: &anyhow::Error, statuses: &[u16]) -> 
 
 fn normalize_api_base(base_url: &str) -> Result<String> {
     let mut url =
-        Url::parse(base_url).with_context(|| format!("parse gitlab base url {}", base_url))?;
+        Url::parse(base_url).with_context(|| format!("parse gitlab base url {base_url}"))?;
     let path = url.path().trim_end_matches('/');
     let new_path = if path.ends_with("/api/v4") {
         path.to_string()
     } else if path.is_empty() {
         "/api/v4".to_string()
     } else {
-        format!("{}/api/v4", path)
+        format!("{path}/api/v4")
     };
     url.set_path(&new_path);
     Ok(url.to_string().trim_end_matches('/').to_string())

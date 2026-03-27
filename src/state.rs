@@ -21,6 +21,14 @@ const FEATURE_FLAG_OVERRIDES_KEY: &str = "feature_flag_overrides";
 const SCAN_STATUS_KEY: &str = "scan_status";
 const PROJECT_RATE_LIMIT_SUBJECT_IID: i64 = 0;
 
+fn sqlite_i64_from_u64(value: u64, label: &'static str) -> Result<i64> {
+    i64::try_from(value).with_context(|| format!("convert {label} to i64"))
+}
+
+fn sqlite_i64_from_usize(value: usize, label: &'static str) -> Result<i64> {
+    i64::try_from(value).with_context(|| format!("convert {label} to i64"))
+}
+
 pub struct ReviewStateStore {
     pool: SqlitePool,
 }
@@ -146,11 +154,16 @@ pub struct RunHistoryCursor {
 }
 
 impl RunHistoryCursor {
+    #[must_use]
     pub fn encode(self) -> String {
         let raw = format!("{}:{}", self.started_at, self.id);
         encode_hex(raw.as_bytes())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the cursor is not valid hex, UTF-8, or does not
+    /// contain the expected `started_at:id` payload.
     pub fn decode(raw: &str) -> Result<Self> {
         let bytes = decode_hex(raw).context("decode run history cursor hex")?;
         let decoded = String::from_utf8(bytes).context("decode run history cursor utf-8")?;
@@ -188,6 +201,7 @@ pub struct RunHistoryListQuery {
 }
 
 impl RunHistoryListQuery {
+    #[must_use]
     pub fn normalized_limit(&self) -> usize {
         if self.limit == 0 {
             100
@@ -514,6 +528,10 @@ pub struct ProjectCatalogSummary {
 }
 
 impl ReviewStateStore {
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` database cannot be created, opened,
+    /// migrated, or connected.
     pub async fn new(path: &str) -> Result<Self> {
         if path != ":memory:" {
             let path_obj = Path::new(path);
@@ -542,7 +560,7 @@ impl ReviewStateStore {
             .max_connections(max_connections)
             .connect_with(connect_options)
             .await
-            .with_context(|| format!("connect sqlite database at {}", path))?;
+            .with_context(|| format!("connect sqlite database at {path}"))?;
         sqlx::migrate!()
             .run(&pool)
             .await
@@ -550,11 +568,17 @@ impl ReviewStateStore {
         Ok(Self { pool })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the review state cannot be loaded or updated.
     pub async fn begin_review(&self, repo: &str, iid: u64, sha: &str) -> Result<bool> {
         self.begin_review_for_lane(repo, iid, sha, ReviewLane::General)
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the review state cannot be loaded or updated.
     pub async fn begin_review_for_lane(
         &self,
         repo: &str,
@@ -571,7 +595,7 @@ impl ReviewStateStore {
         let row =
             sqlx::query("SELECT status FROM review_state WHERE repo = ? AND iid = ? AND lane = ?")
                 .bind(repo)
-                .bind(iid as i64)
+                .bind(i64::try_from(iid).context("convert review iid to i64")?)
                 .bind(lane.as_str())
                 .fetch_optional(&mut *tx)
                 .await
@@ -584,7 +608,7 @@ impl ReviewStateStore {
             }
         }
         sqlx::query(
-            r#"
+            r"
             INSERT INTO review_state (repo, iid, lane, head_sha, status, started_at, updated_at)
             VALUES (?, ?, ?, ?, 'in_progress', ?, ?)
             ON CONFLICT(repo, iid, lane) DO UPDATE SET
@@ -593,10 +617,10 @@ impl ReviewStateStore {
                 started_at = excluded.started_at,
                 updated_at = excluded.updated_at,
                 result = NULL
-            "#,
+            ",
         )
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .bind(lane.as_str())
         .bind(sha)
         .bind(now)
@@ -608,11 +632,17 @@ impl ReviewStateStore {
         Ok(true)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the persisted review state cannot be updated.
     pub async fn finish_review(&self, repo: &str, iid: u64, sha: &str, result: &str) -> Result<()> {
         self.finish_review_for_lane(repo, iid, sha, ReviewLane::General, result)
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the persisted review state cannot be updated.
     pub async fn finish_review_for_lane(
         &self,
         repo: &str,
@@ -623,17 +653,17 @@ impl ReviewStateStore {
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         sqlx::query(
-            r#"
+            r"
             UPDATE review_state
             SET status = 'done', head_sha = ?, result = ?, updated_at = ?
             WHERE repo = ? AND iid = ? AND lane = ? AND head_sha = ? AND status = 'in_progress'
-            "#,
+            ",
         )
         .bind(sha)
         .bind(result)
         .bind(now)
         .bind(repo)
-        .bind(iid as i64)
+        .bind(i64::try_from(iid).context("convert review iid to i64")?)
         .bind(lane.as_str())
         .bind(sha)
         .execute(&self.pool)
@@ -642,6 +672,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if review history cannot be queried.
     pub async fn has_completed_inline_review(
         &self,
         repo: &str,
@@ -652,6 +685,9 @@ impl ReviewStateStore {
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if review history cannot be queried.
     pub async fn has_completed_inline_review_for_lane(
         &self,
         repo: &str,
@@ -682,7 +718,7 @@ impl ReviewStateStore {
         .bind(run_history_kind_label(kind))
         .bind(lane.as_str())
         .bind(repo)
-        .bind(iid as i64)
+        .bind(i64::try_from(iid).context("convert review iid to i64")?)
         .bind(sha)
         .fetch_optional(&self.pool)
         .await;
@@ -694,11 +730,17 @@ impl ReviewStateStore {
         Ok(row.is_some())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the stored review result cannot be queried.
     pub async fn review_result(&self, repo: &str, iid: u64, sha: &str) -> Result<Option<String>> {
         self.review_result_for_lane(repo, iid, sha, ReviewLane::General)
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the stored review result cannot be queried.
     pub async fn review_result_for_lane(
         &self,
         repo: &str,
@@ -707,7 +749,7 @@ impl ReviewStateStore {
         lane: ReviewLane,
     ) -> Result<Option<String>> {
         let row = sqlx::query(
-            r#"
+            r"
             SELECT result
             FROM review_state
             WHERE repo = ?
@@ -716,10 +758,10 @@ impl ReviewStateStore {
               AND head_sha = ?
               AND status = 'done'
             LIMIT 1
-            "#,
+            ",
         )
         .bind(repo)
-        .bind(iid as i64)
+        .bind(i64::try_from(iid).context("convert review iid to i64")?)
         .bind(lane.as_str())
         .bind(sha)
         .fetch_optional(&self.pool)
@@ -728,14 +770,17 @@ impl ReviewStateStore {
         Ok(row.map(|row| row.get::<String, _>(0)))
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if in-progress review records cannot be loaded.
     pub async fn list_in_progress_reviews(&self) -> Result<Vec<InProgressReview>> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT repo, iid, lane, head_sha
             FROM review_state
             WHERE status = 'in_progress'
             ORDER BY repo, iid, lane
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await
@@ -764,31 +809,35 @@ impl ReviewStateStore {
 
     pub(crate) async fn has_in_progress_review(&self, repo: &str, iid: u64) -> Result<bool> {
         let exists = sqlx::query_scalar::<_, i64>(
-            r#"
+            r"
             SELECT EXISTS(
                 SELECT 1
                 FROM review_state
                 WHERE repo = ? AND iid = ? AND status = 'in_progress'
             )
-            "#,
+            ",
         )
         .bind(repo)
-        .bind(iid as i64)
+        .bind(i64::try_from(iid).context("convert review iid to i64")?)
         .fetch_one(&self.pool)
         .await
         .context("check in-progress review")?;
         Ok(exists != 0)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if stale in-progress review rows cannot be marked.
     pub async fn clear_stale_in_progress(&self, max_age_minutes: u64) -> Result<()> {
-        let cutoff = Utc::now().timestamp() - (max_age_minutes as i64 * 60);
+        let cutoff = Utc::now().timestamp()
+            - (sqlite_i64_from_u64(max_age_minutes, "max_age_minutes")? * 60);
         let now = Utc::now().timestamp();
         sqlx::query(
-            r#"
+            r"
             UPDATE review_state
             SET status = 'stale', updated_at = ?
             WHERE status = 'in_progress' AND updated_at < ?
-            "#,
+            ",
         )
         .bind(now)
         .bind(cutoff)
@@ -798,11 +847,17 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the in-progress review heartbeat cannot be updated.
     pub async fn touch_in_progress_review(&self, repo: &str, iid: u64, sha: &str) -> Result<()> {
         self.touch_in_progress_review_for_lane(repo, iid, sha, ReviewLane::General)
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the in-progress review heartbeat cannot be updated.
     pub async fn touch_in_progress_review_for_lane(
         &self,
         repo: &str,
@@ -812,15 +867,15 @@ impl ReviewStateStore {
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         sqlx::query(
-            r#"
+            r"
             UPDATE review_state
             SET updated_at = ?
             WHERE repo = ? AND iid = ? AND lane = ? AND head_sha = ? AND status = 'in_progress'
-            "#,
+            ",
         )
         .bind(now)
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .bind(lane.as_str())
         .bind(sha)
         .execute(&self.pool)
@@ -829,6 +884,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn upsert_security_review_debounce(
         &self,
         repo: &str,
@@ -837,16 +895,16 @@ impl ReviewStateStore {
         next_eligible_at: i64,
     ) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO security_review_debounce_state (repo, iid, last_started_at, next_eligible_at)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(repo, iid) DO UPDATE SET
                 last_started_at = excluded.last_started_at,
                 next_eligible_at = excluded.next_eligible_at
-            "#,
+            ",
         )
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .bind(last_started_at)
         .bind(next_eligible_at)
         .execute(&self.pool)
@@ -855,34 +913,41 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_security_review_debounce(
         &self,
         repo: &str,
         iid: u64,
     ) -> Result<Option<SecurityReviewDebounceEntry>> {
         let row = sqlx::query(
-            r#"
+            r"
             SELECT repo, iid, last_started_at, next_eligible_at
             FROM security_review_debounce_state
             WHERE repo = ? AND iid = ?
             LIMIT 1
-            "#,
+            ",
         )
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .fetch_optional(&self.pool)
         .await
         .context("load security review debounce state")?;
-        row.map(map_security_review_debounce_entry).transpose()
+        row.map(|row| map_security_review_debounce_entry(&row))
+            .transpose()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn repo_has_due_security_review_debounce(
         &self,
         repo: &str,
         now: i64,
     ) -> Result<bool> {
         let exists = sqlx::query_scalar::<_, i64>(
-            r#"
+            r"
             SELECT EXISTS(
                 SELECT 1
                 FROM security_review_debounce_state debounce
@@ -894,7 +959,7 @@ impl ReviewStateStore {
                   AND debounce.next_eligible_at <= ?
                   AND COALESCE(review.status, 'done') != 'in_progress'
             )
-            "#,
+            ",
         )
         .bind(repo)
         .bind(now)
@@ -904,6 +969,9 @@ impl ReviewStateStore {
         Ok(exists != 0)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn sync_security_review_debounce_rows(
         &self,
         repo: &str,
@@ -924,7 +992,7 @@ impl ReviewStateStore {
         builder.push(" AND iid NOT IN (");
         let mut separated = builder.separated(", ");
         for iid in open_iids {
-            separated.push_bind(*iid as i64);
+            separated.push_bind(sqlite_i64_from_u64(*iid, "iid")?);
         }
         separated.push_unseparated(")");
         builder
@@ -941,14 +1009,17 @@ impl ReviewStateStore {
         load_review_rate_limit_targets_by_rule_id_from_executor(&self.pool).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn list_review_rate_limit_rules(&self) -> Result<Vec<ReviewRateLimitRule>> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT id, label, scope_repo, scope_subject_iid, applies_to_review, applies_to_security,
                    scope, capacity, window_seconds, created_at, updated_at, bucket_mode
             FROM runtime_review_rate_limit_rule
             ORDER BY created_at ASC, id ASC
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await
@@ -962,6 +1033,9 @@ impl ReviewStateStore {
             .collect()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn create_review_rate_limit_rule(
         &self,
         rule: &ReviewRateLimitRuleUpsert,
@@ -973,7 +1047,8 @@ impl ReviewStateStore {
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let now = Utc::now().timestamp();
         let primary_target = rule_primary_target(rule)?;
-        let bucket_mode = effective_review_rate_limit_bucket_mode(&rule.targets, rule.bucket_mode);
+        let bucket_mode =
+            effective_review_rate_limit_bucket_mode(rule.scope, &rule.targets, rule.bucket_mode);
         let scope_repo = if is_global_review_rate_limit_target(&primary_target) {
             ""
         } else {
@@ -985,7 +1060,7 @@ impl ReviewStateStore {
             .await
             .context("start sqlite transaction")?;
         sqlx::query(
-            r#"
+            r"
             INSERT INTO runtime_review_rate_limit_rule (
                 id,
                 label,
@@ -1001,7 +1076,7 @@ impl ReviewStateStore {
                 updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(&id)
         .bind(&rule.label)
@@ -1023,6 +1098,9 @@ impl ReviewStateStore {
         Ok(id)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn update_review_rate_limit_rule(
         &self,
         rule: &ReviewRateLimitRuleUpsert,
@@ -1033,7 +1111,8 @@ impl ReviewStateStore {
         };
         let now = Utc::now().timestamp();
         let primary_target = rule_primary_target(rule)?;
-        let bucket_mode = effective_review_rate_limit_bucket_mode(&rule.targets, rule.bucket_mode);
+        let bucket_mode =
+            effective_review_rate_limit_bucket_mode(rule.scope, &rule.targets, rule.bucket_mode);
         let scope_repo = if is_global_review_rate_limit_target(&primary_target) {
             ""
         } else {
@@ -1045,12 +1124,12 @@ impl ReviewStateStore {
             .await
             .context("start sqlite transaction")?;
         let existing_row = sqlx::query(
-            r#"
+            r"
             SELECT id, label, scope_repo, scope_subject_iid, applies_to_review, applies_to_security,
                    scope, capacity, window_seconds, created_at, updated_at, bucket_mode
             FROM runtime_review_rate_limit_rule
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(id)
         .fetch_optional(tx.as_mut())
@@ -1071,7 +1150,7 @@ impl ReviewStateStore {
         let invalidate_buckets =
             review_rate_limit_rule_update_invalidates_buckets(&existing_rule, rule)?;
         let result = sqlx::query(
-            r#"
+            r"
             UPDATE runtime_review_rate_limit_rule
             SET label = ?,
                 scope_repo = ?,
@@ -1084,7 +1163,7 @@ impl ReviewStateStore {
                 bucket_mode = ?,
                 updated_at = ?
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(&rule.label)
         .bind(scope_repo)
@@ -1121,6 +1200,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn delete_review_rate_limit_rule(&self, id: &str) -> Result<()> {
         let mut tx = self
             .pool
@@ -1150,6 +1232,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn list_active_review_rate_limit_buckets(
         &self,
         now: i64,
@@ -1160,7 +1245,7 @@ impl ReviewStateStore {
             .await
             .context("start sqlite transaction")?;
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT r.id, r.label, r.applies_to_review, r.applies_to_security, r.scope,
                    r.capacity, r.window_seconds, r.created_at,
                    r.updated_at AS rule_updated_at, r.bucket_mode, b.bucket_id, b.target_kind,
@@ -1169,7 +1254,7 @@ impl ReviewStateStore {
             FROM runtime_review_rate_limit_rule r
             JOIN runtime_review_rate_limit_bucket b ON b.rule_id = r.id
             ORDER BY r.created_at ASC, r.id ASC
-            "#,
+            ",
         )
         .fetch_all(tx.as_mut())
         .await
@@ -1177,10 +1262,8 @@ impl ReviewStateStore {
 
         let mut active = Vec::with_capacity(rows.len());
         for row in rows {
-            let materialized = materialize_review_rate_limit_bucket_row(
-                map_review_rate_limit_rule_bucket_row(row)?,
-                now,
-            )?;
+            let raw = map_review_rate_limit_rule_bucket_row(&row)?;
+            let materialized = materialize_review_rate_limit_bucket_row(&raw, now);
             if materialized.is_full {
                 sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE bucket_id = ?")
                     .bind(materialized.snapshot.bucket_id.as_str())
@@ -1195,6 +1278,9 @@ impl ReviewStateStore {
         Ok(active)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn try_consume_review_rate_limits(
         &self,
         lane: ReviewLane,
@@ -1218,7 +1304,7 @@ impl ReviewStateStore {
         let mut materialized = Vec::with_capacity(rows.len());
         let mut blocked_next_retry_at: Option<i64> = None;
         for row in rows {
-            let state = materialize_review_rate_limit_bucket_row(row, now)?;
+            let state = materialize_review_rate_limit_bucket_row(&row, now);
             if state.is_full {
                 sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE bucket_id = ?")
                     .bind(state.snapshot.bucket_id.as_str())
@@ -1233,7 +1319,7 @@ impl ReviewStateStore {
                     state.capacity,
                     state.window_seconds,
                     1.0,
-                )?;
+                );
                 blocked_next_retry_at = Some(match blocked_next_retry_at {
                     Some(existing) => existing.max(next_retry_at),
                     None => next_retry_at,
@@ -1251,7 +1337,7 @@ impl ReviewStateStore {
         for state in materialized {
             let new_available = (state.current_available - 1.0).max(0.0);
             if state.had_bucket_row {
-                if new_available + REVIEW_RATE_LIMIT_EPSILON >= state.capacity as f64 {
+                if new_available + REVIEW_RATE_LIMIT_EPSILON >= f64::from(state.capacity) {
                     sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE bucket_id = ?")
                         .bind(state.snapshot.bucket_id.as_str())
                         .execute(tx.as_mut())
@@ -1259,11 +1345,11 @@ impl ReviewStateStore {
                         .context("delete full runtime review rate limit bucket after consume")?;
                 } else {
                     sqlx::query(
-                        r#"
+                        r"
                         UPDATE runtime_review_rate_limit_bucket
                         SET available_slots = ?, updated_at = ?
                         WHERE bucket_id = ?
-                        "#,
+                        ",
                     )
                     .bind(new_available)
                     .bind(now)
@@ -1274,7 +1360,7 @@ impl ReviewStateStore {
                 }
             } else {
                 sqlx::query(
-                    r#"
+                    r"
                     INSERT INTO runtime_review_rate_limit_bucket (
                         bucket_id,
                         rule_id,
@@ -1286,7 +1372,7 @@ impl ReviewStateStore {
                         updated_at
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    "#,
+                    ",
                 )
                 .bind(state.snapshot.bucket_id.as_str())
                 .bind(state.snapshot.rule_id.as_str())
@@ -1309,6 +1395,9 @@ impl ReviewStateStore {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn refund_review_rate_limit_buckets(
         &self,
         bucket_ids: &[String],
@@ -1326,12 +1415,12 @@ impl ReviewStateStore {
             .context("start sqlite transaction")?;
         for bucket_id in unique_bucket_ids {
             let row = sqlx::query(
-                r#"
+                r"
                 SELECT r.capacity, r.window_seconds, b.available_slots, b.updated_at
                 FROM runtime_review_rate_limit_rule r
                 LEFT JOIN runtime_review_rate_limit_bucket b ON b.rule_id = r.id
                 WHERE b.bucket_id = ?
-                "#,
+                ",
             )
             .bind(bucket_id.as_str())
             .fetch_optional(tx.as_mut())
@@ -1365,9 +1454,9 @@ impl ReviewStateStore {
                 capacity,
                 u64::try_from(window_seconds).context("convert rule window seconds")?,
                 now,
-            )?;
-            let new_available = (current_available + 1.0).min(capacity as f64);
-            if new_available + REVIEW_RATE_LIMIT_EPSILON >= capacity as f64 {
+            );
+            let new_available = (current_available + 1.0).min(f64::from(capacity));
+            if new_available + REVIEW_RATE_LIMIT_EPSILON >= f64::from(capacity) {
                 sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE bucket_id = ?")
                     .bind(bucket_id.as_str())
                     .execute(tx.as_mut())
@@ -1375,11 +1464,11 @@ impl ReviewStateStore {
                     .context("delete full runtime review rate limit bucket after refund")?;
             } else {
                 sqlx::query(
-                    r#"
+                    r"
                     UPDATE runtime_review_rate_limit_bucket
                     SET available_slots = ?, updated_at = ?
                     WHERE bucket_id = ?
-                    "#,
+                    ",
                 )
                 .bind(new_available)
                 .bind(now)
@@ -1393,14 +1482,17 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn refund_review_rate_limit_rule(&self, rule_id: &str, now: i64) -> Result<()> {
         let bucket_ids = sqlx::query_scalar::<_, String>(
-            r#"
+            r"
             SELECT bucket_id
             FROM runtime_review_rate_limit_bucket
             WHERE rule_id = ?
             ORDER BY bucket_id ASC
-            "#,
+            ",
         )
         .bind(rule_id)
         .fetch_all(&self.pool)
@@ -1410,11 +1502,17 @@ impl ReviewStateStore {
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn refund_review_rate_limit_bucket(&self, bucket_id: &str, now: i64) -> Result<()> {
         self.refund_review_rate_limit_buckets(&[bucket_id.to_string()], now)
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn upsert_review_rate_limit_pending(
         &self,
         lane: ReviewLane,
@@ -1425,7 +1523,7 @@ impl ReviewStateStore {
         next_retry_at: i64,
     ) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO runtime_review_rate_limit_pending (
                 lane,
                 repo,
@@ -1441,11 +1539,11 @@ impl ReviewStateStore {
                 last_blocked_at = MAX(runtime_review_rate_limit_pending.last_blocked_at, excluded.last_blocked_at),
                 last_seen_head_sha = excluded.last_seen_head_sha,
                 next_retry_at = excluded.next_retry_at
-            "#,
+            ",
         )
         .bind(lane.as_str())
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .bind(blocked_at)
         .bind(blocked_at)
         .bind(head_sha)
@@ -1456,6 +1554,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn clear_review_rate_limit_pending(
         &self,
         lane: ReviewLane,
@@ -1463,43 +1564,49 @@ impl ReviewStateStore {
         iid: u64,
     ) -> Result<bool> {
         let result = sqlx::query(
-            r#"
+            r"
             DELETE FROM runtime_review_rate_limit_pending
             WHERE lane = ? AND repo = ? AND iid = ?
-            "#,
+            ",
         )
         .bind(lane.as_str())
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .execute(&self.pool)
         .await
         .context("clear runtime review rate limit pending row")?;
         Ok(result.rows_affected() > 0)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn list_review_rate_limit_pending(&self) -> Result<Vec<ReviewRateLimitPendingEntry>> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT lane, repo, iid, first_blocked_at, last_blocked_at, last_seen_head_sha, next_retry_at
             FROM runtime_review_rate_limit_pending
             ORDER BY first_blocked_at ASC, lane ASC, repo ASC, iid ASC
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await
         .context("list runtime review rate limit pending rows")?;
 
         rows.into_iter()
-            .map(map_review_rate_limit_pending_row)
+            .map(|row| map_review_rate_limit_pending_row(&row))
             .collect()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn earliest_review_rate_limit_pending_retry_at(&self) -> Result<Option<i64>> {
         let next_retry_at = sqlx::query_scalar::<_, Option<i64>>(
-            r#"
+            r"
             SELECT MIN(next_retry_at)
             FROM runtime_review_rate_limit_pending
-            "#,
+            ",
         )
         .fetch_one(&self.pool)
         .await
@@ -1507,20 +1614,23 @@ impl ReviewStateStore {
         Ok(next_retry_at)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn repo_has_due_review_rate_limit_pending(
         &self,
         repo: &str,
         now: i64,
     ) -> Result<bool> {
         let exists = sqlx::query_scalar::<_, i64>(
-            r#"
+            r"
             SELECT EXISTS(
                 SELECT 1
                 FROM runtime_review_rate_limit_pending
                 WHERE repo = ?
                   AND next_retry_at <= ?
             )
-            "#,
+            ",
         )
         .bind(repo)
         .bind(now)
@@ -1530,6 +1640,9 @@ impl ReviewStateStore {
         Ok(exists != 0)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn sync_review_rate_limit_pending_rows(
         &self,
         repo: &str,
@@ -1551,7 +1664,7 @@ impl ReviewStateStore {
         builder.push(" AND iid NOT IN (");
         let mut separated = builder.separated(", ");
         for iid in open_iids {
-            separated.push_bind(*iid as i64);
+            separated.push_bind(sqlite_i64_from_u64(*iid, "iid")?);
         }
         separated.push_unseparated(")");
         builder
@@ -1562,6 +1675,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_security_review_context_cache(
         &self,
         repo: &str,
@@ -1573,7 +1689,7 @@ impl ReviewStateStore {
         self.delete_expired_security_review_context_cache(now)
             .await?;
         let row = sqlx::query(
-            r#"
+            r"
             SELECT repo, base_branch, base_head_sha, prompt_version, payload_json, source_run_history_id,
                    generated_at, expires_at
             FROM security_review_context_cache
@@ -1583,7 +1699,7 @@ impl ReviewStateStore {
               AND prompt_version = ?
               AND expires_at > ?
             LIMIT 1
-            "#,
+            ",
         )
         .bind(repo)
         .bind(base_branch)
@@ -1593,9 +1709,13 @@ impl ReviewStateStore {
         .fetch_optional(&self.pool)
         .await
         .context("load security review context cache")?;
-        row.map(map_security_review_context_cache_entry).transpose()
+        row.map(|row| map_security_review_context_cache_entry(&row))
+            .transpose()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn find_security_review_context_cache(
         &self,
         repo: &str,
@@ -1604,7 +1724,7 @@ impl ReviewStateStore {
         prompt_version: &str,
     ) -> Result<Option<SecurityReviewContextCacheEntry>> {
         let row = sqlx::query(
-            r#"
+            r"
             SELECT repo, base_branch, base_head_sha, prompt_version, payload_json, source_run_history_id,
                    generated_at, expires_at
             FROM security_review_context_cache
@@ -1613,7 +1733,7 @@ impl ReviewStateStore {
               AND base_head_sha = ?
               AND prompt_version = ?
             LIMIT 1
-            "#,
+            ",
         )
         .bind(repo)
         .bind(base_branch)
@@ -1622,9 +1742,13 @@ impl ReviewStateStore {
         .fetch_optional(&self.pool)
         .await
         .context("find security review context cache")?;
-        row.map(map_security_review_context_cache_entry).transpose()
+        row.map(|row| map_security_review_context_cache_entry(&row))
+            .transpose()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_latest_security_review_context_cache_for_branch(
         &self,
         repo: &str,
@@ -1635,7 +1759,7 @@ impl ReviewStateStore {
         self.delete_expired_security_review_context_cache(now)
             .await?;
         let row = sqlx::query(
-            r#"
+            r"
             SELECT repo, base_branch, base_head_sha, prompt_version, payload_json, source_run_history_id,
                    generated_at, expires_at
             FROM security_review_context_cache
@@ -1645,7 +1769,7 @@ impl ReviewStateStore {
               AND expires_at > ?
             ORDER BY generated_at DESC, expires_at DESC, base_head_sha DESC
             LIMIT 1
-            "#,
+            ",
         )
         .bind(repo)
         .bind(base_branch)
@@ -1654,9 +1778,13 @@ impl ReviewStateStore {
         .fetch_optional(&self.pool)
         .await
         .context("load latest security review context cache for branch")?;
-        row.map(map_security_review_context_cache_entry).transpose()
+        row.map(|row| map_security_review_context_cache_entry(&row))
+            .transpose()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn upsert_security_review_context_cache(
         &self,
         entry: &SecurityReviewContextCacheEntry,
@@ -1664,7 +1792,7 @@ impl ReviewStateStore {
         self.delete_expired_security_review_context_cache(entry.generated_at)
             .await?;
         sqlx::query(
-            r#"
+            r"
             INSERT INTO security_review_context_cache (
                 repo,
                 base_branch,
@@ -1681,7 +1809,7 @@ impl ReviewStateStore {
                 source_run_history_id = excluded.source_run_history_id,
                 generated_at = excluded.generated_at,
                 expires_at = excluded.expires_at
-            "#,
+            ",
         )
         .bind(&entry.repo)
         .bind(&entry.base_branch)
@@ -1699,10 +1827,10 @@ impl ReviewStateStore {
 
     async fn delete_expired_security_review_context_cache(&self, now: i64) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             DELETE FROM security_review_context_cache
             WHERE expires_at <= ?
-            "#,
+            ",
         )
         .bind(now)
         .execute(&self.pool)
@@ -1711,15 +1839,19 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn clear_stale_in_progress_mentions(&self, max_age_minutes: u64) -> Result<()> {
-        let cutoff = Utc::now().timestamp() - (max_age_minutes as i64 * 60);
+        let cutoff = Utc::now().timestamp()
+            - (sqlite_i64_from_u64(max_age_minutes, "max_age_minutes")? * 60);
         let now = Utc::now().timestamp();
         sqlx::query(
-            r#"
+            r"
             UPDATE mention_command_state
             SET status = 'done', result = 'error', updated_at = ?
             WHERE status = 'in_progress' AND updated_at < ?
-            "#,
+            ",
         )
         .bind(now)
         .bind(cutoff)
@@ -1729,6 +1861,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn touch_in_progress_mention_command(
         &self,
         repo: &str,
@@ -1739,7 +1874,7 @@ impl ReviewStateStore {
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         sqlx::query(
-            r#"
+            r"
             UPDATE mention_command_state
             SET updated_at = ?
             WHERE repo = ?
@@ -1748,13 +1883,13 @@ impl ReviewStateStore {
               AND trigger_note_id = ?
               AND head_sha = ?
               AND status = 'in_progress'
-            "#,
+            ",
         )
         .bind(now)
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .bind(discussion_id)
-        .bind(trigger_note_id as i64)
+        .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
         .bind(head_sha)
         .execute(&self.pool)
         .await
@@ -1762,10 +1897,13 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn reconcile_interrupted_run_history(&self, reason: &str) -> Result<u64> {
         let now = Utc::now().timestamp();
         let result = sqlx::query(
-            r#"
+            r"
             UPDATE run_history
             SET status = 'done',
                 result = 'cancelled',
@@ -1773,7 +1911,7 @@ impl ReviewStateStore {
                 updated_at = ?,
                 error = COALESCE(error, ?)
             WHERE status = 'in_progress'
-            "#,
+            ",
         )
         .bind(now)
         .bind(now)
@@ -1784,6 +1922,9 @@ impl ReviewStateStore {
         Ok(result.rows_affected())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn begin_mention_command(
         &self,
         repo: &str,
@@ -1794,7 +1935,7 @@ impl ReviewStateStore {
     ) -> Result<bool> {
         let now = Utc::now().timestamp();
         let result = sqlx::query(
-            r#"
+            r"
             INSERT INTO mention_command_state (
                 repo,
                 iid,
@@ -1817,12 +1958,12 @@ impl ReviewStateStore {
                   mention_command_state.result = 'cancelled'
                   OR mention_command_state.result IS NULL
               )
-            "#,
+            ",
         )
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .bind(discussion_id)
-        .bind(trigger_note_id as i64)
+        .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
         .bind(head_sha)
         .bind(now)
         .bind(now)
@@ -1832,6 +1973,9 @@ impl ReviewStateStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn finish_mention_command(
         &self,
         repo: &str,
@@ -1843,7 +1987,7 @@ impl ReviewStateStore {
     ) -> Result<()> {
         let now = Utc::now().timestamp();
         sqlx::query(
-            r#"
+            r"
             UPDATE mention_command_state
             SET status = 'done', result = ?, updated_at = ?
             WHERE repo = ?
@@ -1852,14 +1996,14 @@ impl ReviewStateStore {
               AND trigger_note_id = ?
               AND head_sha = ?
               AND status = 'in_progress'
-            "#,
+            ",
         )
         .bind(result)
         .bind(now)
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .bind(discussion_id)
-        .bind(trigger_note_id as i64)
+        .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
         .bind(head_sha)
         .execute(&self.pool)
         .await
@@ -1867,14 +2011,17 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn list_in_progress_mention_commands(&self) -> Result<Vec<InProgressMentionCommand>> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT repo, iid, discussion_id, trigger_note_id, head_sha
             FROM mention_command_state
             WHERE status = 'in_progress'
             ORDER BY repo, iid, discussion_id, trigger_note_id
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await
@@ -1915,16 +2062,16 @@ impl ReviewStateStore {
         iid: u64,
     ) -> Result<bool> {
         let exists = sqlx::query_scalar::<_, i64>(
-            r#"
+            r"
             SELECT EXISTS(
                 SELECT 1
                 FROM mention_command_state
                 WHERE repo = ? AND iid = ? AND status = 'in_progress'
             )
-            "#,
+            ",
         )
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .fetch_one(&self.pool)
         .await
         .context("check in-progress mention command")?;
@@ -1944,16 +2091,16 @@ impl ReviewStateStore {
         trigger_note_id: u64,
     ) -> Result<MentionCommandScanState> {
         let row = sqlx::query(
-            r#"
+            r"
             SELECT status, result
             FROM mention_command_state
             WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
-            "#,
+            ",
         )
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .bind(discussion_id)
-        .bind(trigger_note_id as i64)
+        .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
         .fetch_optional(&self.pool)
         .await
         .context("load mention command scan state")?;
@@ -1978,6 +2125,9 @@ impl ReviewStateStore {
         Ok(MentionCommandScanState::Completed)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn start_run_history(&self, new_run: NewRunHistory) -> Result<i64> {
         let review_lane = match new_run.kind {
             RunHistoryKind::Review => Some(ReviewLane::General),
@@ -1987,6 +2137,9 @@ impl ReviewStateStore {
         self.start_run_history_for_lane(new_run, review_lane).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn start_run_history_for_lane(
         &self,
         new_run: NewRunHistory,
@@ -1994,7 +2147,7 @@ impl ReviewStateStore {
     ) -> Result<i64> {
         let now = Utc::now().timestamp();
         let result = sqlx::query(
-            r#"
+            r"
             INSERT INTO run_history (
                 kind,
                 review_lane,
@@ -2011,17 +2164,22 @@ impl ReviewStateStore {
                 command_repo
             )
             VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(run_history_kind_label(new_run.kind))
         .bind(review_lane.map(ReviewLane::as_str))
         .bind(new_run.repo)
-        .bind(new_run.iid as i64)
+        .bind(sqlite_i64_from_u64(new_run.iid, "iid")?)
         .bind(new_run.head_sha)
         .bind(now)
         .bind(now)
         .bind(new_run.discussion_id)
-        .bind(new_run.trigger_note_id.map(|value| value as i64))
+        .bind(
+            new_run
+                .trigger_note_id
+                .map(|value| sqlite_i64_from_u64(value, "trigger_note_id"))
+                .transpose()?,
+        )
         .bind(new_run.trigger_note_author_name)
         .bind(new_run.trigger_note_body)
         .bind(new_run.command_repo)
@@ -2031,13 +2189,16 @@ impl ReviewStateStore {
         Ok(result.last_insert_rowid())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn update_run_history_session(
         &self,
         run_id: i64,
         update: RunHistorySessionUpdate,
     ) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             UPDATE run_history
             SET thread_id = COALESCE(?, thread_id),
                 turn_id = COALESCE(?, turn_id),
@@ -2052,7 +2213,7 @@ impl ReviewStateStore {
                 security_context_expires_at = COALESCE(?, security_context_expires_at),
                 updated_at = ?
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(update.thread_id)
         .bind(update.turn_id)
@@ -2073,6 +2234,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn set_run_history_feature_flags(
         &self,
         run_id: i64,
@@ -2081,12 +2245,12 @@ impl ReviewStateStore {
         let feature_flags_json =
             serde_json::to_string(feature_flags).context("serialize feature flag snapshot")?;
         sqlx::query(
-            r#"
+            r"
             UPDATE run_history
             SET feature_flags_json = ?,
                 updated_at = ?
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(feature_flags_json)
         .bind(Utc::now().timestamp())
@@ -2097,13 +2261,16 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn update_run_history_head_sha(&self, run_id: i64, head_sha: &str) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             UPDATE run_history
             SET head_sha = ?, updated_at = ?
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(head_sha)
         .bind(Utc::now().timestamp())
@@ -2114,10 +2281,13 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn finish_run_history(&self, run_id: i64, finish: RunHistoryFinish) -> Result<()> {
         let now = Utc::now().timestamp();
         sqlx::query(
-            r#"
+            r"
             UPDATE run_history
             SET status = 'done',
                 result = ?,
@@ -2132,7 +2302,7 @@ impl ReviewStateStore {
                 auth_account_name = COALESCE(?, auth_account_name),
                 commit_sha = ?
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(finish.result)
         .bind(now)
@@ -2152,14 +2322,17 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn mark_run_history_events_incomplete(&self, run_id: i64) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             UPDATE run_history
             SET events_persisted_cleanly = 0,
                 updated_at = ?
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(Utc::now().timestamp())
         .bind(run_id)
@@ -2169,6 +2342,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn append_run_history_events(
         &self,
         run_history_id: i64,
@@ -2184,11 +2360,11 @@ impl ReviewStateStore {
             .await
             .context("start sqlite transaction for run history events")?;
         let sequence_offset = sqlx::query_scalar::<_, i64>(
-            r#"
+            r"
             SELECT COALESCE(MAX(sequence), 0)
             FROM run_history_event
             WHERE run_history_id = ?
-            "#,
+            ",
         )
         .bind(run_history_id)
         .fetch_one(&mut *tx)
@@ -2198,7 +2374,7 @@ impl ReviewStateStore {
             let payload_json =
                 serde_json::to_string(&event.payload).context("serialize run history payload")?;
             sqlx::query(
-                r#"
+                r"
                 INSERT INTO run_history_event (
                     run_history_id,
                     sequence,
@@ -2208,7 +2384,7 @@ impl ReviewStateStore {
                     created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?)
-                "#,
+                ",
             )
             .bind(run_history_id)
             .bind(sequence_offset + event.sequence)
@@ -2226,6 +2402,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn replace_run_history_events(
         &self,
         run_history_id: i64,
@@ -2237,6 +2416,9 @@ impl ReviewStateStore {
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn replace_run_history_events_for_turn(
         &self,
         run_history_id: i64,
@@ -2271,7 +2453,7 @@ impl ReviewStateStore {
             let payload_json =
                 serde_json::to_string(&event.payload).context("serialize run history payload")?;
             sqlx::query(
-                r#"
+                r"
                 INSERT INTO run_history_event (
                     run_history_id,
                     sequence,
@@ -2281,7 +2463,7 @@ impl ReviewStateStore {
                     created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?)
-                "#,
+                ",
             )
             .bind(run_history_id)
             .bind(event.sequence)
@@ -2305,16 +2487,19 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn mark_run_history_transcript_backfill_complete(&self, run_id: i64) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             UPDATE run_history
             SET events_persisted_cleanly = 1,
                 transcript_backfill_state = ?,
                 transcript_backfill_error = NULL,
                 updated_at = ?
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(transcript_backfill_state_label(
             TranscriptBackfillState::Complete,
@@ -2327,6 +2512,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn update_run_history_transcript_backfill(
         &self,
         run_id: i64,
@@ -2334,13 +2522,13 @@ impl ReviewStateStore {
         error: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             UPDATE run_history
             SET transcript_backfill_state = ?,
                 transcript_backfill_error = ?,
                 updated_at = ?
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(transcript_backfill_state_label(state))
         .bind(error)
@@ -2352,32 +2540,40 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn list_run_history_events(
         &self,
         run_history_id: i64,
     ) -> Result<Vec<RunHistoryEventRecord>> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT id, run_history_id, sequence, turn_id, event_type, payload_json, created_at
             FROM run_history_event
             WHERE run_history_id = ?
             ORDER BY sequence ASC, id ASC
-            "#,
+            ",
         )
         .bind(run_history_id)
         .fetch_all(&self.pool)
         .await
         .context("list run history events")?;
-        rows.into_iter().map(map_run_history_event_row).collect()
+        rows.into_iter()
+            .map(|row| map_run_history_event_row(&row))
+            .collect()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn list_run_history_for_mr(
         &self,
         repo: &str,
         iid: u64,
     ) -> Result<Vec<RunHistoryRecord>> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT id, kind, review_lane, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, security_context_source_run_id,
                    security_context_base_branch, security_context_base_head_sha,
@@ -2390,19 +2586,24 @@ impl ReviewStateStore {
             FROM run_history
             WHERE repo = ? AND iid = ?
             ORDER BY started_at DESC, id DESC
-            "#,
+            ",
         )
         .bind(repo)
-        .bind(iid as i64)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
         .fetch_all(&self.pool)
         .await
         .context("list run history for MR")?;
-        rows.into_iter().map(map_run_history_row).collect()
+        rows.into_iter()
+            .map(|row| map_run_history_row(&row))
+            .collect()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_run_history(&self, run_id: i64) -> Result<Option<RunHistoryRecord>> {
         let row = sqlx::query(
-            r#"
+            r"
             SELECT id, kind, review_lane, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
                    thread_id, turn_id, review_thread_id, security_context_source_run_id,
                    security_context_base_branch, security_context_base_head_sha,
@@ -2414,15 +2615,18 @@ impl ReviewStateStore {
                    transcript_backfill_state, transcript_backfill_error
             FROM run_history
             WHERE id = ?
-            "#,
+            ",
         )
         .bind(run_id)
         .fetch_optional(&self.pool)
         .await
         .context("get run history")?;
-        row.map(map_run_history_row).transpose()
+        row.map(|row| map_run_history_row(&row)).transpose()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn list_run_history(
         &self,
         query: &RunHistoryListQuery,
@@ -2432,12 +2636,12 @@ impl ReviewStateStore {
         }
 
         let mut builder = QueryBuilder::<Sqlite>::new(
-            r#"
+            r"
             SELECT id, kind, review_lane, repo, iid, status, result, started_at, preview, summary
             FROM run_history
-            "#,
+            ",
         );
-        let mut has_where = append_run_history_filters(&mut builder, query);
+        let mut has_where = append_run_history_filters(&mut builder, query)?;
 
         let limit = query.normalized_limit();
         if let Some(cursor) = query.after {
@@ -2478,7 +2682,7 @@ impl ReviewStateStore {
 
         let mut runs = runs
             .into_iter()
-            .map(map_run_history_list_item_row)
+            .map(|row| map_run_history_list_item_row(&row))
             .collect::<Result<Vec<_>>>()?;
         if ordered_before {
             runs.reverse();
@@ -2490,9 +2694,8 @@ impl ReviewStateStore {
             (None, None) => false,
         };
         let has_next = match (query.after, query.before) {
-            (Some(_), _) => has_extra,
             (None, Some(_)) => !runs.is_empty(),
-            (None, None) => has_extra,
+            (Some(_), _) | (None, None) => has_extra,
         };
 
         Ok(RunHistoryListPage {
@@ -2512,6 +2715,9 @@ impl ReviewStateStore {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_project_last_mr_activity(&self, repo: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT last_activity_at FROM project_state WHERE repo = ?")
             .bind(repo)
@@ -2529,18 +2735,21 @@ impl ReviewStateStore {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn set_project_last_mr_activity(
         &self,
         repo: &str,
         last_activity_at: &str,
     ) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO project_state (repo, last_activity_at)
             VALUES (?, ?)
             ON CONFLICT(repo) DO UPDATE SET
                 last_activity_at = excluded.last_activity_at
-            "#,
+            ",
         )
         .bind(repo)
         .bind(last_activity_at)
@@ -2550,6 +2759,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn load_project_catalog(&self, key: &str) -> Result<Option<ProjectCatalog>> {
         let row =
             sqlx::query("SELECT fetched_at, projects FROM project_catalog WHERE cache_key = ?")
@@ -2573,30 +2785,36 @@ impl ReviewStateStore {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn save_project_catalog(&self, key: &str, projects: &[String]) -> Result<()> {
         let now = Utc::now().timestamp();
         let projects_json =
             serde_json::to_string(projects).context("serialize catalog projects")?;
         sqlx::query(
-            r#"
+            r"
             INSERT INTO project_catalog (cache_key, fetched_at, projects, project_count)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(cache_key) DO UPDATE SET
                 fetched_at = excluded.fetched_at,
                 projects = excluded.projects,
                 project_count = excluded.project_count
-            "#,
+            ",
         )
         .bind(key)
         .bind(now)
         .bind(projects_json)
-        .bind(projects.len() as i64)
+        .bind(sqlite_i64_from_usize(projects.len(), "project_count")?)
         .execute(&self.pool)
         .await
         .context("upsert project catalog")?;
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_created_after(&self) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
             .bind("created_after")
@@ -2612,14 +2830,17 @@ impl ReviewStateStore {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn set_created_after(&self, value: &str) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO service_state (key, value)
             VALUES ('created_after', ?)
             ON CONFLICT(key) DO UPDATE SET
                 value = excluded.value
-            "#,
+            ",
         )
         .bind(value)
         .execute(&self.pool)
@@ -2628,13 +2849,16 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_or_create_review_owner_id(&self) -> Result<String> {
         let candidate = Uuid::new_v4().to_string();
         sqlx::query(
-            r#"
+            r"
             INSERT OR IGNORE INTO service_state (key, value)
             VALUES ('review_owner_id', ?)
-            "#,
+            ",
         )
         .bind(candidate)
         .execute(&self.pool)
@@ -2650,6 +2874,9 @@ impl ReviewStateStore {
         Ok(owner_id)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_auth_limit_reset_at(&self, account_name: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
             .bind(auth_limit_reset_key(account_name))
@@ -2669,9 +2896,12 @@ impl ReviewStateStore {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn set_auth_limit_reset_at(&self, account_name: &str, value: &str) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO service_state (key, value)
             VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET
@@ -2681,7 +2911,7 @@ impl ReviewStateStore {
                     WHEN julianday(excluded.value) > julianday(service_state.value) THEN excluded.value
                     ELSE service_state.value
                 END
-            "#,
+            ",
         )
         .bind(auth_limit_reset_key(account_name))
         .bind(value)
@@ -2693,6 +2923,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn clear_auth_limit_reset_at(&self, account_name: &str) -> Result<()> {
         sqlx::query("DELETE FROM service_state WHERE key = ?")
             .bind(auth_limit_reset_key(account_name))
@@ -2704,6 +2937,9 @@ impl ReviewStateStore {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_scan_status(&self) -> Result<PersistedScanStatus> {
         let raw = self.get_service_state_value(SCAN_STATUS_KEY).await?;
         match raw {
@@ -2718,17 +2954,26 @@ impl ReviewStateStore {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn set_scan_status(&self, status: &PersistedScanStatus) -> Result<()> {
         let raw = serde_json::to_string(status).context("serialize scan status")?;
         self.set_service_state_value(SCAN_STATUS_KEY, &raw).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn clear_next_scan_at(&self) -> Result<()> {
         let mut status = self.get_scan_status().await?;
         status.next_scan_at = None;
         self.set_scan_status(&status).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn list_auth_limit_reset_entries(&self) -> Result<Vec<AuthLimitResetEntry>> {
         let rows =
             sqlx::query("SELECT key, value FROM service_state WHERE key LIKE ? ORDER BY key ASC")
@@ -2754,13 +2999,16 @@ impl ReviewStateStore {
             .collect()
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn list_project_catalog_summaries(&self) -> Result<Vec<ProjectCatalogSummary>> {
         let rows = sqlx::query(
-            r#"
+            r"
             SELECT cache_key, fetched_at, project_count
             FROM project_catalog
             ORDER BY cache_key ASC
-            "#,
+            ",
         )
         .fetch_all(&self.pool)
         .await
@@ -2787,10 +3035,14 @@ impl ReviewStateStore {
         Ok(summaries)
     }
 
+    #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_runtime_feature_flag_overrides(&self) -> Result<RuntimeFeatureFlagOverrides> {
         let raw = self
             .get_service_state_value(FEATURE_FLAG_OVERRIDES_KEY)
@@ -2801,6 +3053,9 @@ impl ReviewStateStore {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub async fn set_runtime_feature_flag_overrides(
         &self,
         overrides: &RuntimeFeatureFlagOverrides,
@@ -2822,12 +3077,12 @@ impl ReviewStateStore {
 
     async fn set_service_state_value(&self, key: &str, value: &str) -> Result<()> {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO service_state (key, value)
             VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET
                 value = excluded.value
-            "#,
+            ",
         )
         .bind(key)
         .bind(value)
@@ -2850,7 +3105,7 @@ impl ReviewStateStore {
         sqlx::query(
             "UPDATE project_catalog SET project_count = ? WHERE cache_key = ? AND project_count IS NULL",
         )
-        .bind(project_count as i64)
+        .bind(sqlite_i64_from_usize(project_count, "project_count")?)
         .bind(key)
         .execute(&self.pool)
         .await
@@ -2874,14 +3129,14 @@ fn run_history_kind_label(kind: RunHistoryKind) -> &'static str {
 fn append_run_history_filters<'args>(
     builder: &mut QueryBuilder<'args, Sqlite>,
     query: &'args RunHistoryListQuery,
-) -> bool {
+) -> Result<bool> {
     let mut has_where = false;
     let mut push_where = |builder: &mut QueryBuilder<'args, Sqlite>| {
-        if !has_where {
+        if has_where {
+            builder.push(" AND ");
+        } else {
             builder.push(" WHERE ");
             has_where = true;
-        } else {
-            builder.push(" AND ");
         }
     };
 
@@ -2891,7 +3146,9 @@ fn append_run_history_filters<'args>(
     }
     if let Some(iid) = query.iid {
         push_where(builder);
-        builder.push("iid = ").push_bind(iid as i64);
+        builder
+            .push("iid = ")
+            .push_bind(sqlite_i64_from_u64(iid, "iid")?);
     }
     if let Some(kind) = query.kind {
         push_where(builder);
@@ -2922,7 +3179,7 @@ fn append_run_history_filters<'args>(
         builder.push(")");
     }
 
-    has_where
+    Ok(has_where)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2931,17 +3188,17 @@ enum CursorDirection {
     Before,
 }
 
-fn append_run_history_cursor_clause<'args>(
-    builder: &mut QueryBuilder<'args, Sqlite>,
+fn append_run_history_cursor_clause(
+    builder: &mut QueryBuilder<'_, Sqlite>,
     has_where: &mut bool,
     cursor: RunHistoryCursor,
     direction: CursorDirection,
 ) {
-    if !*has_where {
+    if *has_where {
+        builder.push(" AND ");
+    } else {
         builder.push(" WHERE ");
         *has_where = true;
-    } else {
-        builder.push(" AND ");
     }
     builder.push("(");
     match direction {
@@ -3001,7 +3258,7 @@ fn parse_transcript_backfill_state(value: &str) -> Result<TranscriptBackfillStat
     }
 }
 
-fn map_run_history_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord> {
+fn map_run_history_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord> {
     let iid_raw: i64 = row.try_get("iid").context("read run history iid")?;
     let trigger_note_id_raw: Option<i64> = row
         .try_get("trigger_note_id")
@@ -3101,7 +3358,7 @@ fn map_run_history_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord>
     })
 }
 
-fn map_run_history_event_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryEventRecord> {
+fn map_run_history_event_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunHistoryEventRecord> {
     let payload_json: String = row
         .try_get("payload_json")
         .context("read run history event payload_json")?;
@@ -3127,7 +3384,7 @@ fn map_run_history_event_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryE
     })
 }
 
-fn map_run_history_list_item_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHistoryListItem> {
+fn map_run_history_list_item_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunHistoryListItem> {
     let iid_raw: i64 = row.try_get("iid").context("read run history list iid")?;
     Ok(RunHistoryListItem {
         id: row.try_get("id").context("read run history list id")?,
@@ -3157,7 +3414,7 @@ fn map_run_history_list_item_row(row: sqlx::sqlite::SqliteRow) -> Result<RunHist
 }
 
 fn map_security_review_context_cache_entry(
-    row: sqlx::sqlite::SqliteRow,
+    row: &sqlx::sqlite::SqliteRow,
 ) -> Result<SecurityReviewContextCacheEntry> {
     Ok(SecurityReviewContextCacheEntry {
         repo: row
@@ -3188,7 +3445,7 @@ fn map_security_review_context_cache_entry(
 }
 
 fn map_security_review_debounce_entry(
-    row: sqlx::sqlite::SqliteRow,
+    row: &sqlx::sqlite::SqliteRow,
 ) -> Result<SecurityReviewDebounceEntry> {
     Ok(SecurityReviewDebounceEntry {
         repo: row
@@ -3319,10 +3576,24 @@ fn is_global_review_rate_limit_target(target: &ReviewRateLimitTarget) -> bool {
 }
 
 fn effective_review_rate_limit_bucket_mode(
+    scope: ReviewRateLimitScope,
     targets: &[ReviewRateLimitTarget],
     bucket_mode: ReviewRateLimitBucketMode,
 ) -> ReviewRateLimitBucketMode {
-    if targets.is_empty() {
+    if scope == ReviewRateLimitScope::Project || targets.is_empty() {
+        ReviewRateLimitBucketMode::Shared
+    } else {
+        bucket_mode
+    }
+}
+
+fn effective_review_rate_limit_bucket_mode_for_bucket_row(
+    scope: ReviewRateLimitScope,
+    target_path: &str,
+    bucket_mode: ReviewRateLimitBucketMode,
+) -> ReviewRateLimitBucketMode {
+    if scope == ReviewRateLimitScope::Project || target_path == GLOBAL_REVIEW_RATE_LIMIT_TARGET_PATH
+    {
         ReviewRateLimitBucketMode::Shared
     } else {
         bucket_mode
@@ -3363,6 +3634,7 @@ fn review_rate_limit_rule_update_invalidates_buckets(
         || existing.targets != normalized_targets
         || existing.bucket_mode
             != effective_review_rate_limit_bucket_mode(
+                updated.scope,
                 normalized_targets.as_slice(),
                 updated.bucket_mode,
             )
@@ -3417,10 +3689,7 @@ fn rate_limit_bucket_id(
     target: &ReviewRateLimitTarget,
 ) -> String {
     match (scope, bucket_mode) {
-        (ReviewRateLimitScope::Project, ReviewRateLimitBucketMode::Shared) => rule_id.to_string(),
-        (ReviewRateLimitScope::Project, ReviewRateLimitBucketMode::Independent) => {
-            format!("{rule_id}:{}:{}", target.kind.as_str(), target.path)
-        }
+        (ReviewRateLimitScope::Project, _) => format!("{rule_id}:repo:{scope_repo}"),
         (ReviewRateLimitScope::MergeRequest, ReviewRateLimitBucketMode::Shared) => {
             let iid = scope_iid.unwrap_or_default();
             format!("{rule_id}:mr:{scope_repo}:{iid}")
@@ -3447,7 +3716,7 @@ async fn insert_review_rate_limit_rule_targets(
         .enumerate()
     {
         sqlx::query(
-            r#"
+            r"
             INSERT INTO runtime_review_rate_limit_rule_target (
                 rule_id,
                 sort_order,
@@ -3456,7 +3725,7 @@ async fn insert_review_rate_limit_rule_targets(
                 created_at
             )
             VALUES (?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(rule_id)
         .bind(
@@ -3480,11 +3749,11 @@ where
     E: sqlx::Executor<'a, Database = Sqlite>,
 {
     let rows = sqlx::query(
-        r#"
+        r"
         SELECT rule_id, target_kind, target_path
         FROM runtime_review_rate_limit_rule_target
         ORDER BY rule_id ASC, sort_order ASC, created_at ASC, target_kind ASC, target_path ASC
-        "#,
+        ",
     )
     .fetch_all(executor)
     .await
@@ -3517,7 +3786,7 @@ async fn load_review_rate_limit_rule_bucket_rows(
     iid: u64,
 ) -> Result<Vec<ReviewRateLimitRuleBucketRow>> {
     let rule_rows = sqlx::query(
-        r#"
+        r"
         SELECT id, label, scope_repo, scope_subject_iid, applies_to_review,
                applies_to_security, scope, capacity, window_seconds, bucket_mode,
                created_at, updated_at
@@ -3527,7 +3796,7 @@ async fn load_review_rate_limit_rule_bucket_rows(
             OR (? = 'security' AND applies_to_security = 1)
         )
         ORDER BY created_at ASC, id ASC
-        "#,
+        ",
     )
     .bind(lane.as_str())
     .bind(lane.as_str())
@@ -3553,18 +3822,20 @@ async fn load_review_rate_limit_rule_bucket_rows(
         if matched_targets.is_empty() {
             continue;
         }
-        let materialized_targets = match rule.bucket_mode {
-            ReviewRateLimitBucketMode::Shared => vec![rule_primary_target_from_rule(&rule)?],
-            ReviewRateLimitBucketMode::Independent => matched_targets,
+        let bucket_mode =
+            effective_review_rate_limit_bucket_mode(rule.scope, &rule.targets, rule.bucket_mode);
+        let materialized_targets = match rule.scope {
+            ReviewRateLimitScope::Project => vec![ReviewRateLimitTarget {
+                kind: ReviewRateLimitTargetKind::Repo,
+                path: repo.to_string(),
+            }],
+            ReviewRateLimitScope::MergeRequest => match bucket_mode {
+                ReviewRateLimitBucketMode::Shared => vec![rule_primary_target_from_rule(&rule)?],
+                ReviewRateLimitBucketMode::Independent => matched_targets,
+            },
         };
         for target in materialized_targets {
-            let scope_repo = match rule.scope {
-                ReviewRateLimitScope::Project if is_global_review_rate_limit_target(&target) => {
-                    String::new()
-                }
-                ReviewRateLimitScope::Project => target.path.clone(),
-                ReviewRateLimitScope::MergeRequest => repo.to_string(),
-            };
+            let scope_repo = repo.to_string();
             let scope_iid = match rule.scope {
                 ReviewRateLimitScope::Project => None,
                 ReviewRateLimitScope::MergeRequest => Some(iid),
@@ -3574,14 +3845,14 @@ async fn load_review_rate_limit_rule_bucket_rows(
                 rule.scope,
                 scope_repo.as_str(),
                 scope_iid,
-                rule.bucket_mode,
+                bucket_mode,
                 &target,
             );
             rows.push(ReviewRateLimitRuleBucketRow {
                 bucket_id: bucket_id.clone(),
                 rule_id: rule.id.clone(),
                 label: rule.label.clone(),
-                bucket_mode: rule.bucket_mode,
+                bucket_mode,
                 target_kind: target.kind,
                 target_path: target.path.clone(),
                 scope_repo,
@@ -3703,6 +3974,7 @@ fn map_review_rate_limit_rule_row(
         scope_subject_display(scope, target_label.as_str(), scope_iid)
     };
     let bucket_mode = effective_review_rate_limit_bucket_mode(
+        scope,
         rule_targets.as_slice(),
         ReviewRateLimitBucketMode::from_str(
             row.try_get::<String, _>("bucket_mode")
@@ -3749,7 +4021,7 @@ fn map_review_rate_limit_rule_row(
 }
 
 fn map_review_rate_limit_pending_row(
-    row: sqlx::sqlite::SqliteRow,
+    row: &sqlx::sqlite::SqliteRow,
 ) -> Result<ReviewRateLimitPendingEntry> {
     Ok(ReviewRateLimitPendingEntry {
         lane: parse_review_lane(
@@ -3781,7 +4053,7 @@ fn map_review_rate_limit_pending_row(
 }
 
 fn map_review_rate_limit_rule_bucket_row(
-    row: sqlx::sqlite::SqliteRow,
+    row: &sqlx::sqlite::SqliteRow,
 ) -> Result<ReviewRateLimitRuleBucketRow> {
     let scope = ReviewRateLimitScope::from_str(
         row.try_get::<String, _>("scope")
@@ -3796,11 +4068,11 @@ fn map_review_rate_limit_rule_bucket_row(
             .context("read runtime review rate limit bucket mode")?
             .as_str(),
     )?;
-    let bucket_mode = if target_path == GLOBAL_REVIEW_RATE_LIMIT_TARGET_PATH {
-        ReviewRateLimitBucketMode::Shared
-    } else {
-        requested_bucket_mode
-    };
+    let bucket_mode = effective_review_rate_limit_bucket_mode_for_bucket_row(
+        scope,
+        &target_path,
+        requested_bucket_mode,
+    );
     Ok(ReviewRateLimitRuleBucketRow {
         bucket_id: row
             .try_get("bucket_id")
@@ -3853,16 +4125,16 @@ fn map_review_rate_limit_rule_bucket_row(
 }
 
 fn materialize_review_rate_limit_bucket_row(
-    raw: ReviewRateLimitRuleBucketRow,
+    raw: &ReviewRateLimitRuleBucketRow,
     now: i64,
-) -> Result<MaterializedReviewRateLimitBucketRow> {
+) -> MaterializedReviewRateLimitBucketRow {
     let current_available = materialize_rate_limit_available_slots(
         raw.available_slots,
         raw.bucket_updated_at,
         raw.capacity,
         raw.window_seconds,
         now,
-    )?;
+    );
     let snapshot = ReviewRateLimitBucketSnapshot {
         bucket_id: raw.bucket_id.clone(),
         rule_id: raw.rule_id.clone(),
@@ -3892,16 +4164,16 @@ fn materialize_review_rate_limit_bucket_row(
             raw.capacity,
             raw.window_seconds,
             next_rate_limit_ui_target(current_available, raw.capacity),
-        )?),
+        )),
     };
-    Ok(MaterializedReviewRateLimitBucketRow {
-        is_full: current_available + REVIEW_RATE_LIMIT_EPSILON >= raw.capacity as f64,
+    MaterializedReviewRateLimitBucketRow {
+        is_full: current_available + REVIEW_RATE_LIMIT_EPSILON >= f64::from(raw.capacity),
         had_bucket_row: raw.available_slots.is_some(),
         capacity: raw.capacity,
         window_seconds: raw.window_seconds,
         current_available,
         snapshot,
-    })
+    }
 }
 
 fn materialize_rate_limit_available_slots(
@@ -3910,21 +4182,22 @@ fn materialize_rate_limit_available_slots(
     capacity: u32,
     window_seconds: u64,
     now: i64,
-) -> Result<f64> {
+) -> f64 {
     let Some(available_slots) = available_slots else {
-        return Ok(capacity as f64);
+        return f64::from(capacity);
     };
     let Some(bucket_updated_at) = bucket_updated_at else {
-        return Ok(available_slots.min(capacity as f64));
+        return available_slots.min(f64::from(capacity));
     };
-    let elapsed = now.saturating_sub(bucket_updated_at).max(0) as f64;
-    let refill_rate = capacity as f64 / window_seconds as f64;
-    let refilled = available_slots + (elapsed * refill_rate);
-    Ok(refilled.min(capacity as f64))
+    let elapsed = u32::try_from(now.saturating_sub(bucket_updated_at).max(0)).unwrap_or(u32::MAX);
+    let window_seconds = u32::try_from(window_seconds).unwrap_or(u32::MAX);
+    let refill_rate = f64::from(capacity) / f64::from(window_seconds);
+    let refilled = available_slots + (f64::from(elapsed) * refill_rate);
+    refilled.min(f64::from(capacity))
 }
 
 fn next_rate_limit_ui_target(current_available: f64, capacity: u32) -> f64 {
-    let capacity = capacity as f64;
+    let capacity = f64::from(capacity);
     if current_available + REVIEW_RATE_LIMIT_EPSILON >= capacity {
         capacity
     } else if current_available < 1.0 {
@@ -3941,14 +4214,16 @@ fn next_rate_limit_slot_at(
     capacity: u32,
     window_seconds: u64,
     target_available: f64,
-) -> Result<i64> {
+) -> i64 {
     if target_available <= current_available + REVIEW_RATE_LIMIT_EPSILON {
-        return Ok(now);
+        return now;
     }
-    let refill_rate = capacity as f64 / window_seconds as f64;
+    let window_seconds = u32::try_from(window_seconds).unwrap_or(u32::MAX);
+    let refill_rate = f64::from(capacity) / f64::from(window_seconds);
     let delta = (target_available - current_available) / refill_rate;
-    let delta = delta.max(0.0).ceil() as i64;
-    Ok(now.saturating_add(delta))
+    let delta = std::time::Duration::from_secs_f64(delta.max(0.0).ceil());
+    let delta = i64::try_from(delta.as_secs()).unwrap_or(i64::MAX);
+    now.saturating_add(delta)
 }
 
 fn sqlite_url(path: &str) -> String {
@@ -3957,7 +4232,7 @@ fn sqlite_url(path: &str) -> String {
     } else if path.starts_with('/') {
         format!("sqlite:///{}", path.trim_start_matches('/'))
     } else {
-        format!("sqlite://{}", path)
+        format!("sqlite://{path}")
     }
 }
 
@@ -4016,17 +4291,17 @@ pub(crate) fn merge_rewritten_turn_events(
         .map(|event| event.sequence)
         .collect::<Vec<_>>();
 
-    let first_target_sequence = target_sequences.first().copied().unwrap_or_else(|| {
-        existing_events
-            .last()
-            .map(|event| event.sequence + 1)
-            .unwrap_or(1)
-    });
+    let first_target_sequence = target_sequences
+        .first()
+        .copied()
+        .unwrap_or_else(|| existing_events.last().map_or(1, |event| event.sequence + 1));
     let last_target_sequence = target_sequences
         .last()
         .copied()
         .unwrap_or(first_target_sequence - 1);
-    let delta = rewritten_events.len() as i64 - target_sequences.len() as i64;
+    let rewritten_len = i64::try_from(rewritten_events.len()).unwrap_or(i64::MAX);
+    let target_len = i64::try_from(target_sequences.len()).unwrap_or(i64::MAX);
+    let delta = rewritten_len.saturating_sub(target_len);
 
     let mut merged_events = Vec::new();
     for event in existing_events {

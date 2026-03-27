@@ -8,6 +8,7 @@ use crate::gitlab_links::gitlab_web_base;
 use crate::review_lane::ReviewLane;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use tracing::warn;
 
 const REVIEW_FINDING_MARKER_PREFIX: &str = "<!-- codex-review-finding:sha=";
@@ -402,10 +403,7 @@ fn build_fallback_note_body(
         ));
         body.push('\n');
     }
-    body.push_str(&format!(
-        "{}{} -->",
-        options.comment_marker_prefix, head_sha
-    ));
+    let _ = write!(body, "{}{} -->", options.comment_marker_prefix, head_sha);
     Some(body)
 }
 
@@ -591,10 +589,10 @@ fn inline_discussion_title(
 }
 
 fn finding_fingerprint(finding: &ReviewFinding) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in canonical_finding_key(finding).bytes() {
         hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     format!("{hash:016x}")
 }
@@ -706,10 +704,10 @@ fn parse_reference_token(
     } else {
         return None;
     };
-    let (start, end) = line_range
-        .split_once('-')
-        .map(|(start, end)| Some((start, end)))
-        .unwrap_or_else(|| Some((line_range, line_range)))?;
+    let (start, end) = line_range.split_once('-').map_or_else(
+        || Some((line_range, line_range)),
+        |(start, end)| Some((start, end)),
+    )?;
     Some((relative_path, start.parse().ok()?, end.parse().ok()?))
 }
 

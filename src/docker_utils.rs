@@ -9,9 +9,17 @@ use std::time::{Duration, Instant};
 use tokio::time::{sleep, timeout as tokio_timeout};
 use tracing::warn;
 
+/// # Errors
+///
+/// Returns an error if the Docker client cannot connect to the configured
+/// socket or host.
 pub fn connect_docker(docker_cfg: &DockerConfig) -> Result<Docker> {
     let host = docker_cfg.host.as_str();
-    if host.starts_with("unix://") || host.ends_with(".sock") {
+    if host.starts_with("unix://")
+        || std::path::Path::new(host)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sock"))
+    {
         Docker::connect_with_unix(host, 120, API_DEFAULT_VERSION)
             .with_context(|| format!("connect to docker unix socket {host}"))
     } else {
@@ -20,6 +28,10 @@ pub fn connect_docker(docker_cfg: &DockerConfig) -> Result<Docker> {
     }
 }
 
+/// # Errors
+///
+/// Returns an error if Docker never becomes reachable before the timeout or if
+/// probing fails with a non-recoverable error.
 pub async fn wait_for_docker_ready(
     docker_cfg: &DockerConfig,
     timeout: Duration,
@@ -71,6 +83,7 @@ pub async fn wait_for_docker_ready(
     })
 }
 
+#[must_use]
 pub fn normalize_image_reference(image: &str) -> String {
     let trimmed = image.trim();
     if trimmed.is_empty() {
@@ -93,6 +106,10 @@ pub fn normalize_image_reference(image: &str) -> String {
     }
 }
 
+/// # Errors
+///
+/// Returns an error if the image cannot be pulled and no usable local copy is
+/// available.
 pub async fn ensure_image(docker: &Docker, image: &str) -> Result<()> {
     let options = CreateImageOptionsBuilder::new().from_image(image).build();
     let mut stream = docker.create_image(Some(options), None, None);

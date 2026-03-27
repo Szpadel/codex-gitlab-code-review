@@ -1,4 +1,9 @@
-use super::*;
+use super::{
+    BTreeMap, ContainerInspectResponse, Context, DockerCodexRunner, FeatureFlagSnapshot,
+    GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID, GitLabDiscoveryMcpService, NewRunHistoryEvent,
+    ResolvedGitLabDiscoveryAllowList, Result, RunnerRuntime, Url, Utc, annotate_event_payload,
+    async_trait, debug, json, shell_quote, warn,
+};
 use crate::gitlab_discovery_mcp::GitLabDiscoverySessionBinding;
 use std::collections::BTreeSet;
 
@@ -252,9 +257,10 @@ impl DockerCodexRunner {
                 } else {
                     warn!(
                         container_id,
-                        network_container_id = registered
-                            .map(|binding| binding.network_container_id.as_str())
-                            .unwrap_or("<unregistered>"),
+                        network_container_id =
+                            registered.map_or("<unregistered>", |binding| binding
+                                .network_container_id
+                                .as_str()),
                         peer_ips = registered
                             .map(|binding| binding
                                 .peer_ips
@@ -294,8 +300,7 @@ impl DockerCodexRunner {
                     container_id,
                     url = prepared.runtime_config.advertise_url.as_str(),
                     network_container_id = registered
-                        .map(|binding| binding.network_container_id.as_str())
-                        .unwrap_or("<unregistered>"),
+                        .map_or("<unregistered>", |binding| binding.network_container_id.as_str()),
                     peer_ips = registered
                         .map(|binding| binding.peer_ips.iter().cloned().collect::<Vec<_>>().join(","))
                         .unwrap_or_default(),
@@ -444,16 +449,16 @@ pub(crate) fn gitlab_discovery_mcp_probe_exec_command(
     let url_q = shell_quote(&runtime_config.advertise_url);
     let mut health_url = parsed.clone();
     let advertise_path = parsed.path();
-    let health_path = advertise_path
-        .strip_suffix("/mcp")
-        .map(|prefix| {
+    let health_path = advertise_path.strip_suffix("/mcp").map_or_else(
+        || "/healthz".to_string(),
+        |prefix| {
             if prefix.is_empty() {
                 "/healthz".to_string()
             } else {
                 format!("{prefix}/healthz")
             }
-        })
-        .unwrap_or_else(|| "/healthz".to_string());
+        },
+    );
     health_url.set_path(&health_path);
     health_url.set_query(None);
     health_url.set_fragment(None);
@@ -681,8 +686,6 @@ else
   printf 'SKIP no curl or python3 available\n'
 fi
 "#,
-        url_q = url_q,
-        health_url_q = health_url_q,
     );
 
     Some(vec!["/bin/bash".to_string(), "-lc".to_string(), script])

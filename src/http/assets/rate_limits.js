@@ -25,14 +25,17 @@
   const submit = dialog.querySelector('[data-role="rate-limit-submit"]');
   const label = dialog.querySelector('[data-role="rate-limit-label"]');
   const scope = dialog.querySelector('[data-role="rate-limit-scope"]');
+  const scopeHelp = dialog.querySelector('[data-role="rate-limit-scope-help"]');
   const targetKind = dialog.querySelector('[data-role="rate-limit-target-kind"]');
   const targetInput = dialog.querySelector('[data-role="rate-limit-target-input"]');
   const targetList = dialog.querySelector('[data-role="rate-limit-target-list"]');
   const targetSuggestions = dialog.querySelector('#rate-limit-target-suggestions');
   const targetsJson = dialog.querySelector('[data-role="rate-limit-targets-json"]');
   const addTargetButton = dialog.querySelector('[data-role="rate-limit-add-target"]');
+  const sharedRow = dialog.querySelector('[data-role="rate-limit-shared-row"]');
   const sharedToggle = dialog.querySelector('[data-role="rate-limit-shared-toggle"]');
   const bucketMode = dialog.querySelector('[data-role="rate-limit-bucket-mode"]');
+  const bucketModeHelp = dialog.querySelector('[data-role="rate-limit-bucket-mode-help"]');
   const capacity = dialog.querySelector('[data-role="rate-limit-capacity"]');
   const windowText = dialog.querySelector('[data-role="rate-limit-window-text"]');
   const review = dialog.querySelector('[data-role="rate-limit-review"]');
@@ -43,13 +46,31 @@
   const normalizePath = (value) => value.trim().replace(/^\/+|\/+$/g, '');
 
   const syncBucketMode = () => {
-    if (currentTargets.length === 0) {
+    if (scope.value === 'project') {
+      sharedRow.hidden = true;
       sharedToggle.checked = true;
       sharedToggle.disabled = true;
+      bucketModeHelp.textContent = 'Project scope always creates one bucket per matched repository.';
     } else {
-      sharedToggle.disabled = false;
+      sharedRow.hidden = false;
+      bucketModeHelp.textContent = 'Choose whether all selected targets share one pool or each target keeps its own pool.';
+      if (currentTargets.length === 0) {
+        sharedToggle.checked = true;
+        sharedToggle.disabled = true;
+      } else {
+        sharedToggle.disabled = false;
+      }
     }
     bucketMode.value = sharedToggle.checked ? 'shared' : 'independent';
+  };
+
+  const syncScopeState = () => {
+    if (scope.value === 'project') {
+      scopeHelp.textContent = 'Per repository creates one bucket per matched repository.';
+    } else {
+      scopeHelp.textContent = 'Per merge request creates an independent pool for every matching MR.';
+    }
+    syncBucketMode();
   };
 
   const syncTargetSuggestions = () => {
@@ -64,7 +85,7 @@
   };
 
   const syncTargetState = () => {
-    syncBucketMode();
+    syncScopeState();
     syncTargets();
   };
 
@@ -74,7 +95,11 @@
     if (currentTargets.length === 0) {
       const empty = document.createElement('p');
       empty.className = 'empty';
-      empty.textContent = 'No targets selected. This rule will apply globally with one shared bucket.';
+      if (scope.value === 'project') {
+        empty.textContent = 'No targets selected. This rule will apply globally with one bucket per matched repository.';
+      } else {
+        empty.textContent = 'No targets selected. This rule will apply globally within the selected scope.';
+      }
       targetList.appendChild(empty);
       return;
     }
@@ -201,6 +226,7 @@
     }
   });
 
+  scope.addEventListener('change', syncTargetState);
   targetKind.addEventListener('change', syncTargetSuggestions);
   sharedToggle.addEventListener('change', syncBucketMode);
   addTargetButton.addEventListener('click', addTarget);

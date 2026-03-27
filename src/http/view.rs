@@ -17,11 +17,23 @@ use crate::state::{
     RunHistoryKind, RunHistoryListItem, RunHistoryRecord,
 };
 use serde::Deserialize;
+use std::fmt::Write as _;
 use urlencoding::encode;
 
 const FEATURE_FLAG_SCRIPT: &str = include_str!("assets/feature_flag.js");
 const PAGE_STYLE: &str = include_str!("assets/page.css");
 const RATE_LIMITS_SCRIPT: &str = include_str!("assets/rate_limits.js");
+
+trait CollectHtml: Iterator<Item = String> + Sized {
+    fn collect_html(self) -> String {
+        self.fold(String::new(), |mut html, part| {
+            html.push_str(&part);
+            html
+        })
+    }
+}
+
+impl<I> CollectHtml for I where I: Iterator<Item = String> {}
 
 pub(super) fn render_status_page(
     snapshot: &StatusSnapshot,
@@ -313,7 +325,7 @@ pub(super) fn render_rate_limits_page(
         snapshot.pending.len(),
     );
     let body = format!(
-        "<section class=\"hero hero-actions-bar rate-limit-hero\"><div><h1>Review rate limits</h1><p class=\"muted\">Manage project and merge-request scoped review throughput without exposing raw-second configuration.</p>{}</div><div class=\"hero-toolbar\"><button class=\"primary-button\" type=\"button\" data-open-rate-limit-modal=\"create\" aria-label=\"Open create rule modal\">Create rule</button></div></section>\
+        "<section class=\"hero hero-actions-bar rate-limit-hero\"><div><h1>Review rate limits</h1><p class=\"muted\">Manage repository- and merge-request scoped review throughput without exposing raw-second configuration.</p>{}</div><div class=\"hero-toolbar\"><button class=\"primary-button\" type=\"button\" data-open-rate-limit-modal=\"create\" aria-label=\"Open create rule modal\">Create rule</button></div></section>\
          <section class=\"rate-limit-page-stack\">\
          {}\
          {}\
@@ -354,18 +366,12 @@ pub(super) fn render_development_page(
         .map(|repo| {
             let repo_key = encode_repo_key(&repo.repo_path);
             let active_mr = repo
-                .active_mr_iid
-                .map(|iid| format!("Active MR !{iid}"))
-                .unwrap_or_else(|| "No active synthetic MR.".to_string());
+                .active_mr_iid.map_or_else(|| "No active synthetic MR.".to_string(), |iid| format!("Active MR !{iid}"));
             let revision = repo
-                .active_revision
-                .map(|revision| format!("Revision {revision}"))
-                .unwrap_or_else(|| "-".to_string());
+                .active_revision.map_or_else(|| "-".to_string(), |revision| format!("Revision {revision}"));
             let head_sha = repo
                 .active_head_sha
-                .as_deref()
-                .map(|head_sha| format!("<code>{}</code>", escape_html(head_sha)))
-                .unwrap_or_else(|| "-".to_string());
+                .as_deref().map_or_else(|| "-".to_string(), |head_sha| format!("<code>{}</code>", escape_html(head_sha)));
             let updated_at = render_rfc3339_timestamp(repo.updated_at.as_deref());
             let csrf = render_csrf_hidden_input(csrf_token);
             format!(
@@ -395,8 +401,7 @@ pub(super) fn render_development_page(
                 csrf = csrf,
             )
         })
-        .collect::<Vec<_>>()
-        .join("");
+        .collect_html();
     let repo_table = format!(
         "<section class=\"card\"><h2>Repositories</h2>\
          <p class=\"muted\">Synthetic repos live in memory only. Restarting dev mode resets them to defaults.</p>\
@@ -413,7 +418,7 @@ pub(super) fn render_development_page(
 pub(super) fn encode_repo_key(repo: &str) -> String {
     let mut output = String::with_capacity(repo.len() * 2);
     for byte in repo.as_bytes() {
-        output.push_str(&format!("{byte:02x}"));
+        let _ = write!(output, "{byte:02x}");
     }
     output
 }
@@ -435,8 +440,7 @@ fn render_reviews_section(reviews: &[InProgressReview]) -> String {
                         escape_html(&review.head_sha)
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect_html();
             format!(
                 "<table><thead><tr><th>Repo</th><th>MR</th><th>Head SHA</th></tr></thead><tbody>{rows}</tbody></table>"
             )
@@ -463,8 +467,7 @@ fn render_mentions_section(mentions: &[InProgressMentionCommand]) -> String {
                         escape_html(&mention.head_sha)
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect_html();
             format!(
                 "<table><thead><tr><th>Repo</th><th>MR</th><th>Discussion</th><th>Trigger note</th><th>Head SHA</th></tr></thead><tbody>{rows}</tbody></table>"
             )
@@ -487,8 +490,7 @@ fn render_auth_section(entries: &[AuthLimitResetEntry]) -> String {
                         render_rfc3339_timestamp(Some(&entry.reset_at))
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect_html();
             format!(
                 "<table><thead><tr><th>Account</th><th>Reset at</th></tr></thead><tbody>{rows}</tbody></table>"
             )
@@ -512,8 +514,7 @@ fn render_catalog_section(catalogs: &[ProjectCatalogSummary]) -> String {
                         render_unix_timestamp(catalog.fetched_at)
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect_html();
             format!(
                 "<table><thead><tr><th>Cache key</th><th>Projects</th><th>Fetched at</th></tr></thead><tbody>{rows}</tbody></table>"
             )
@@ -620,13 +621,9 @@ fn render_kind_options(selected: Option<RunHistoryKind>) -> String {
         .iter()
         .map(|(value, label)| {
             let selected_attr = if *value == selected { " selected" } else { "" };
-            format!(
-                "<option value=\"{}\"{}>{}</option>",
-                label, selected_attr, label
-            )
+            format!("<option value=\"{label}\"{selected_attr}>{label}</option>")
         })
-        .collect::<Vec<_>>()
-        .join("")
+        .collect_html()
 }
 
 fn render_history_run_table(title: &str, runs: &[RunHistoryListItem]) -> String {
@@ -635,11 +632,7 @@ fn render_history_run_table(title: &str, runs: &[RunHistoryListItem]) -> String 
         if runs.is_empty() {
             "<p class=\"empty\">No recorded sessions matched this view.</p>".to_string()
         } else {
-            let rows = runs
-                .iter()
-                .map(render_history_run_row)
-                .collect::<Vec<_>>()
-                .join("");
+            let rows = runs.iter().map(render_history_run_row).collect_html();
             format!(
                 "<table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Result</th><th>Started</th><th>Preview</th></tr></thead><tbody>{rows}</tbody></table>"
             )
@@ -680,11 +673,7 @@ fn render_record_run_table(title: &str, runs: &[RunHistoryRecord]) -> String {
         if runs.is_empty() {
             "<p class=\"empty\">No recorded sessions matched this view.</p>".to_string()
         } else {
-            let rows = runs
-                .iter()
-                .map(render_record_run_row)
-                .collect::<Vec<_>>()
-                .join("");
+            let rows = runs.iter().map(render_record_run_row).collect_html();
             format!(
                 "<table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Result</th><th>Started</th><th>Preview</th></tr></thead><tbody>{rows}</tbody></table>"
             )
@@ -828,8 +817,7 @@ fn render_feature_flags_section(flags: &[StatusFeatureFlagSnapshot]) -> String {
                         render_feature_flag_controls(flag),
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect_html();
             format!(
                 "<p class=\"muted\">Runtime changes apply only to newly started runs.</p>\
                  <table><thead><tr><th>Flag</th><th>Available</th><th>Default</th><th>Runtime override</th><th>Effective</th><th>Controls</th></tr></thead><tbody>{rows}</tbody></table>"
@@ -858,8 +846,7 @@ fn render_skill_table(snapshot: &SkillListSnapshot) -> String {
                         escape_html(&skill.name)
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect_html();
             format!(
                 "<table><thead><tr><th>Name</th><th>Description</th><th>Status</th><th>Accounts</th><th>Preview</th></tr></thead><tbody>{rows}</tbody></table>"
             )
@@ -888,8 +875,7 @@ fn render_skill_account_table(accounts: &[SkillAccountSnapshot]) -> String {
                 escape_html(account.root_path.as_deref().unwrap_or("-"))
             )
         })
-        .collect::<Vec<_>>()
-        .join("");
+        .collect_html();
     format!(
         "<table><thead><tr><th>Account</th><th>Status</th><th>Path</th></tr></thead><tbody>{rows}</tbody></table>"
     )
@@ -902,8 +888,7 @@ fn render_skill_file_list(file_paths: &[String]) -> String {
     let items = file_paths
         .iter()
         .map(|path| format!("<li><code>{}</code></li>", escape_html(path)))
-        .collect::<Vec<_>>()
-        .join("");
+        .collect_html();
     format!("<ul class=\"simple-list monospace-list\">{items}</ul>")
 }
 
@@ -946,8 +931,7 @@ fn render_feature_flag_controls(flag: &StatusFeatureFlagSnapshot) -> String {
             label = label,
         )
     })
-    .collect::<Vec<_>>()
-    .join("")
+    .collect_html()
 }
 
 fn render_related_runs(runs: &[RunHistoryRecord], current_id: i64) -> String {
@@ -988,8 +972,7 @@ fn render_trigger_card(run: &RunHistoryRecord, gitlab_base_url: &str) -> String 
                 "Trigger note".to_string(),
                 escape_html(
                     &run.trigger_note_id
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
                 ),
             ),
             (
@@ -1081,8 +1064,7 @@ fn render_thread_card(
             );
             rendered
         })
-        .collect::<Vec<_>>()
-        .join("");
+        .collect_html();
     format!(
         "<section class=\"card transcript-panel\">\
          <div class=\"transcript-header\">\
@@ -1116,8 +1098,7 @@ fn render_security_context_banner(run: &RunHistoryRecord) -> String {
         return String::new();
     }
     format!(
-        "<div class=\"thread-empty\"><p class=\"empty\">Reused cached security context from <a href=\"/history/{}\">run {}</a>.</p></div>",
-        source_run_id, source_run_id
+        "<div class=\"thread-empty\"><p class=\"empty\">Reused cached security context from <a href=\"/history/{source_run_id}\">run {source_run_id}</a>.</p></div>"
     )
 }
 
@@ -1346,12 +1327,12 @@ fn render_terminal_entry(item: &ThreadItemSnapshot) -> String {
                 .map(|cwd| format!("<div class=\"terminal-path\">{}</div>", escape_html(cwd)))
                 .unwrap_or_default(),
             escape_html(&item.title),
-            item.body
-                .as_deref()
-                .map(|body| format!("<pre class=\"terminal-output\">{}</pre>", escape_html(body)))
-                .unwrap_or_else(|| {
+            item.body.as_deref().map_or_else(
+                || {
                     "<p class=\"terminal-empty\">No aggregated output was captured.</p>".to_string()
-                })
+                },
+                |body| format!("<pre class=\"terminal-output\">{}</pre>", escape_html(body))
+            )
         ),
     )
 }
@@ -1456,6 +1437,10 @@ fn render_static_entry(
     meta_html: String,
     body_html: String,
 ) -> String {
+    let title_html = title_html.into_boxed_str();
+    let preview_html = preview_html.map(String::into_boxed_str);
+    let meta_html = meta_html.into_boxed_str();
+    let body_html = body_html.into_boxed_str();
     format!(
         "<article class=\"transcript-entry {}\">{}{}</article>",
         entry_class,
@@ -1478,6 +1463,10 @@ fn render_expandable_entry(
     meta_html: String,
     body_html: String,
 ) -> String {
+    let title_html = title_html.into_boxed_str();
+    let preview_html = preview_html.map(String::into_boxed_str);
+    let meta_html = meta_html.into_boxed_str();
+    let body_html = body_html.into_boxed_str();
     format!(
         "<details class=\"transcript-entry {}\"{}>\
          <summary class=\"entry-summary {}\">{}\
@@ -1569,8 +1558,7 @@ fn render_meta_pills(meta: &[(String, String)]) -> String {
                 escape_html(&display_meta_value(label, value))
             )
         })
-        .collect::<Vec<_>>()
-        .join("");
+        .collect_html();
     format!("<span class=\"meta-pills\">{pills}</span>")
 }
 
@@ -1629,10 +1617,9 @@ fn render_file_change_stats(item: &ThreadItemSnapshot) -> String {
     }
     format!(
         "<span class=\"meta-pill diff-stats-pill\">\
-         <span class=\"diff-stats-add\">+{}</span>\
-         <span class=\"diff-stats-remove\">-{}\
-         </span></span>",
-        added, removed
+         <span class=\"diff-stats-add\">+{added}</span>\
+         <span class=\"diff-stats-remove\">-{removed}\
+         </span></span>"
     )
 }
 
@@ -1664,8 +1651,7 @@ fn render_colored_diff(body: &str) -> String {
             };
             format!("<div class=\"{}\">{}</div>", class_name, escape_html(line))
         })
-        .collect::<Vec<_>>()
-        .join("");
+        .collect_html();
     format!("<div class=\"diff-view\">{lines}</div>")
 }
 
@@ -1725,8 +1711,7 @@ fn render_mixed_file_change_body(body: &str) -> String {
                 content
             )
         })
-        .collect::<Vec<_>>()
-        .join("")
+        .collect_html()
 }
 
 fn split_reasoning_content(body: Option<&str>) -> (Option<String>, Option<String>) {
@@ -1742,8 +1727,7 @@ fn split_reasoning_content(body: Option<&str>) -> (Option<String>, Option<String
     let summary = body
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
-        .unwrap_or_else(|| body.to_string());
+        .map_or_else(|| body.to_string(), |line| line.trim().to_string());
     let detail = (summary != body).then(|| body.to_string());
     (Some(summary), detail)
 }
@@ -1775,10 +1759,11 @@ fn format_duration_ms(value: &str) -> String {
     if ms < 1_000 {
         return format!("{ms} ms");
     }
-    if ms % 1_000 == 0 {
-        return format!("{} s", ms / 1_000);
+    let rounded_tenths = (ms + 50) / 100;
+    if rounded_tenths % 10 == 0 {
+        return format!("{} s", rounded_tenths / 10);
     }
-    format!("{:.1} s", ms as f64 / 1_000.0)
+    format!("{}.{} s", rounded_tenths / 10, rounded_tenths % 10)
 }
 
 fn activity_label(item_type: &str) -> &'static str {
@@ -1816,6 +1801,7 @@ fn css_token(value: &str) -> String {
 }
 
 fn render_table_section(title: &str, content: String) -> String {
+    let content = content.into_boxed_str();
     format!(
         "<section class=\"card\"><h2>{}</h2>{}</section>",
         escape_html(title),
@@ -1833,8 +1819,7 @@ fn render_definition_list(items: &[(String, String)]) -> String {
                 value
             )
         })
-        .collect::<Vec<_>>()
-        .join("")
+        .collect_html()
 }
 
 fn pretty_print_json(raw: &str) -> String {
@@ -1851,6 +1836,7 @@ fn render_shell(
     csrf_token: Option<&str>,
     development_enabled: bool,
 ) -> String {
+    let content = content.into_boxed_str();
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -1874,23 +1860,23 @@ fn render_shell(
 
 fn render_rfc3339_timestamp(timestamp: Option<&str>) -> String {
     match timestamp {
-        Some(value) => UiTimestamp::from_rfc3339_text(value)
-            .map(|timestamp| timestamp::render(&timestamp, &[]))
-            .unwrap_or_else(|| escape_html(value)),
+        Some(value) => UiTimestamp::from_rfc3339_text(value).map_or_else(
+            || escape_html(value),
+            |timestamp| timestamp::render(&timestamp, &[]),
+        ),
         None => "-".to_string(),
     }
 }
 
 fn render_unix_timestamp(timestamp: i64) -> String {
-    UiTimestamp::from_unix_timestamp(timestamp)
-        .map(|timestamp| timestamp::render(&timestamp, &[]))
-        .unwrap_or_else(|| escape_html(&timestamp.to_string()))
+    UiTimestamp::from_unix_timestamp(timestamp).map_or_else(
+        || escape_html(&timestamp.to_string()),
+        |timestamp| timestamp::render(&timestamp, &[]),
+    )
 }
 
 fn render_optional_unix_timestamp(timestamp: Option<i64>) -> String {
-    timestamp
-        .map(render_unix_timestamp)
-        .unwrap_or_else(|| "-".to_string())
+    timestamp.map_or_else(|| "-".to_string(), render_unix_timestamp)
 }
 
 fn render_nav(active: NavItem, development_enabled: bool) -> String {
@@ -1918,8 +1904,7 @@ fn render_nav(active: NavItem, development_enabled: bool) -> String {
                 escape_html(label)
             )
         })
-        .collect::<Vec<_>>()
-        .join("");
+        .collect_html();
     format!("<nav class=\"nav\">{links}</nav>")
 }
 
@@ -2023,7 +2008,7 @@ fn render_rate_limit_modal(
          <input type=\"hidden\" name=\"bucket_mode\" value=\"shared\" data-role=\"rate-limit-bucket-mode\">\
          <section class=\"modal-section modal-section-emphasis\">\
          <label class=\"modal-field\"><span>Label</span><input name=\"label\" required data-role=\"rate-limit-label\"></label>\
-         <label class=\"modal-field\"><span>Scope</span><select name=\"scope\" data-role=\"rate-limit-scope\"><option value=\"project\">Per project</option><option value=\"merge_request\">Per merge request</option></select><small>Per merge request creates an independent pool for every matching MR.</small></label>\
+         <label class=\"modal-field\"><span>Scope</span><select name=\"scope\" data-role=\"rate-limit-scope\"><option value=\"project\">Per repository</option><option value=\"merge_request\">Per merge request</option></select><small data-role=\"rate-limit-scope-help\">Per repository creates one bucket per matched repository.</small></label>\
          </section>\
          <section class=\"modal-section modal-section-emphasis\">\
          <div class=\"modal-section-header\"><div><h3>Targets</h3><p class=\"muted\">Add repositories or groups to scope the rule. Leave the list empty to make it global.</p></div></div>\
@@ -2036,8 +2021,8 @@ fn render_rate_limit_modal(
          <div class=\"target-chip-list\" data-role=\"rate-limit-target-list\"></div>\
          </section>\
          <section class=\"modal-section\">\
-         <div class=\"modal-section-header\"><div><h3>Bucket behavior</h3><p class=\"muted\">Choose whether all selected targets share one pool or each target keeps its own pool.</p></div></div>\
-         <label class=\"checkbox-row\"><input type=\"checkbox\" checked data-role=\"rate-limit-shared-toggle\"><span>Share one bucket across all selected targets</span></label>\
+         <div class=\"modal-section-header\"><div><h3>Bucket behavior</h3><p class=\"muted\" data-role=\"rate-limit-bucket-mode-help\">Choose whether all selected targets share one pool or each target keeps its own pool.</p></div></div>\
+         <label class=\"checkbox-row\" data-role=\"rate-limit-shared-row\"><input type=\"checkbox\" checked data-role=\"rate-limit-shared-toggle\"><span>Share one bucket across all selected targets</span></label>\
          </section>\
          <section class=\"modal-section modal-section-emphasis\">\
          <div class=\"modal-grid-two\">\
@@ -2109,11 +2094,9 @@ fn render_rate_limit_rules_section(
                         csrf,
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect_html();
             format!(
-                "<div class=\"table-scroll\"><table><thead><tr><th>Label</th><th>Scope</th><th>Targets</th><th>Bucket mode</th><th>Applies</th><th>Capacity</th><th>Window</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div>",
-                rows
+                "<div class=\"table-scroll\"><table><thead><tr><th>Label</th><th>Scope</th><th>Targets</th><th>Bucket mode</th><th>Applies</th><th>Capacity</th><th>Window</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></div>"
             )
         },
     )
@@ -2126,8 +2109,7 @@ fn render_rate_limit_target_badges(targets: &[ReviewRateLimitTarget]) -> String 
     let badges = targets
         .iter()
         .map(|target| render_rate_limit_target_badge(Some(target.kind), Some(&target.path)))
-        .collect::<Vec<_>>()
-        .join("");
+        .collect_html();
     format!("<div class=\"target-badge-list\">{badges}</div>")
 }
 
@@ -2160,7 +2142,7 @@ fn render_rate_limit_bucket_mode_badge(bucket_mode: ReviewRateLimitBucketMode) -
 
 fn render_rate_limit_scope_label(rule: &ReviewRateLimitRule) -> String {
     match rule.scope {
-        ReviewRateLimitScope::Project => "Per project".to_string(),
+        ReviewRateLimitScope::Project => "Per repository".to_string(),
         ReviewRateLimitScope::MergeRequest => "Per merge request".to_string(),
     }
 }
@@ -2220,9 +2202,7 @@ fn render_rate_limit_buckets_section(
                             bucket.available_slots, bucket.capacity
                         )),
                         bucket
-                            .next_slot_at
-                            .map(render_unix_timestamp)
-                            .unwrap_or_else(|| "-".to_string()),
+                            .next_slot_at.map_or_else(|| "-".to_string(), render_unix_timestamp),
                         render_rate_limit_applies(
                             bucket.applies_to_review,
                             bucket.applies_to_security
@@ -2231,11 +2211,9 @@ fn render_rate_limit_buckets_section(
                         escape_html(&bucket.bucket_id),
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect_html();
             format!(
-                "<div class=\"table-scroll\"><table><thead><tr><th>Rule</th><th>Scope</th><th>Target</th><th>Bucket mode</th><th>Window</th><th>Slots</th><th>Next slot</th><th>Applies</th><th>Actions</th></tr></thead><tbody>{}</tbody></table></div>",
-                rows
+                "<div class=\"table-scroll\"><table><thead><tr><th>Rule</th><th>Scope</th><th>Target</th><th>Bucket mode</th><th>Window</th><th>Slots</th><th>Next slot</th><th>Applies</th><th>Actions</th></tr></thead><tbody>{rows}</tbody></table></div>"
             )
         },
     )
@@ -2269,11 +2247,9 @@ fn render_rate_limit_pending_section(pending: &[ReviewRateLimitPendingEntry]) ->
                         render_unix_timestamp(item.next_retry_at),
                     )
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect_html();
             format!(
-                "<div class=\"table-scroll\"><table><thead><tr><th>Lane</th><th>Repo</th><th>IID</th><th>Head SHA</th><th>First blocked</th><th>Last blocked</th><th>Next retry</th></tr></thead><tbody>{}</tbody></table></div>",
-                rows
+                "<div class=\"table-scroll\"><table><thead><tr><th>Lane</th><th>Repo</th><th>IID</th><th>Head SHA</th><th>First blocked</th><th>Last blocked</th><th>Next retry</th></tr></thead><tbody>{rows}</tbody></table></div>"
             )
         },
     )

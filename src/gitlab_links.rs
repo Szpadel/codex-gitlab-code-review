@@ -45,7 +45,7 @@ pub(crate) fn absolutize_root_relative_url(url: &str, gitlab_base: &str) -> Stri
     gitlab_base_url.set_path(&normalized_path);
     gitlab_base_url.set_query(None);
     gitlab_base_url.set_fragment(None);
-    format!("{}{}", gitlab_base_url, suffix)
+    format!("{gitlab_base_url}{suffix}")
 }
 
 pub(crate) fn extract_root_relative_markdown_urls(
@@ -55,8 +55,9 @@ pub(crate) fn extract_root_relative_markdown_urls(
     let mut urls = Vec::new();
     for event in Parser::new_ext(markdown, Options::empty()) {
         let destination = match event {
-            Event::Start(Tag::Link { dest_url, .. })
-            | Event::Start(Tag::Image { dest_url, .. }) => Some(dest_url),
+            Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) => {
+                Some(dest_url)
+            }
             _ => None,
         };
         let Some(destination) = destination else {

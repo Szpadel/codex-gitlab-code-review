@@ -126,6 +126,7 @@ struct ArchiveFileEntry {
 }
 
 impl SkillsManager {
+    #[must_use]
     pub fn new(config: &Config) -> Self {
         let mut accounts = vec![ManagedSkillAccount {
             name: "primary".to_string(),
@@ -142,6 +143,9 @@ impl SkillsManager {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn list_skills(&self) -> Result<SkillListSnapshot> {
         let inner = Arc::clone(&self.inner);
         task::spawn_blocking(move || inner.list_skills_blocking())
@@ -149,6 +153,9 @@ impl SkillsManager {
             .context("join skills list task")?
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn skill_preview(&self, name: &str) -> Result<Option<SkillPreviewSnapshot>> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
@@ -157,6 +164,9 @@ impl SkillsManager {
             .context("join skill preview task")?
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn install_archive(&self, archive_name: &str, bytes: Vec<u8>) -> Result<String> {
         let inner = Arc::clone(&self.inner);
         let archive_name = archive_name.to_string();
@@ -165,6 +175,9 @@ impl SkillsManager {
             .context("join skill install task")?
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn delete_skill(&self, name: &str) -> Result<()> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
@@ -228,8 +241,7 @@ impl SkillsManagerInner {
                         installed: location.is_some(),
                         root_path: location.map(|entry| entry.root_path.display().to_string()),
                         matches_canonical: location
-                            .map(|entry| entry.manifest == *canonical_manifest)
-                            .unwrap_or(false),
+                            .is_some_and(|entry| entry.manifest == *canonical_manifest),
                     }
                 })
                 .collect(),
@@ -342,10 +354,10 @@ impl SkillsManagerInner {
         let resolved_name = resolve_skill_name(archive_name, &metadata, &stripped)?;
         validate_skill_name(&resolved_name)?;
         if is_reserved_skill_name(&resolved_name) {
-            bail!("invalid skill name: {}", resolved_name);
+            bail!("invalid skill name: {resolved_name}");
         }
         if self.scan_installed_skills()?.contains_key(&resolved_name) {
-            bail!("skill already exists: {}", resolved_name);
+            bail!("skill already exists: {resolved_name}");
         }
         let staged_root = temp_workspace_root("skill-stage");
         fs::create_dir_all(&staged_root)
@@ -367,13 +379,13 @@ impl SkillsManagerInner {
             if let Err(err) = fs::create_dir_all(&skills_root)
                 .with_context(|| format!("create {}", skills_root.display()))
             {
-                self.rollback_install(&installed_paths);
+                Self::rollback_install(&installed_paths);
                 return Err(err);
             }
             let final_path = skills_root.join(name);
             if final_path.exists() {
-                self.rollback_install(&installed_paths);
-                bail!("skill already exists: {}", name);
+                Self::rollback_install(&installed_paths);
+                bail!("skill already exists: {name}");
             }
             let temp_path = skills_root.join(format!(".install-{}-{}", name, Uuid::new_v4()));
             if temp_path.exists() {
@@ -384,14 +396,14 @@ impl SkillsManagerInner {
                 .with_context(|| format!("stage install into {}", temp_path.display()))
             {
                 let _ = fs::remove_dir_all(&temp_path);
-                self.rollback_install(&installed_paths);
+                Self::rollback_install(&installed_paths);
                 return Err(err);
             }
             if let Err(err) = fs::rename(&temp_path, &final_path)
                 .with_context(|| format!("install skill into {}", final_path.display()))
             {
                 let _ = fs::remove_dir_all(&temp_path);
-                self.rollback_install(&installed_paths);
+                Self::rollback_install(&installed_paths);
                 return Err(err);
             }
             installed_paths.push(final_path);
@@ -399,7 +411,7 @@ impl SkillsManagerInner {
         Ok(())
     }
 
-    fn rollback_install(&self, installed_paths: &[PathBuf]) {
+    fn rollback_install(installed_paths: &[PathBuf]) {
         for path in installed_paths {
             let _ = fs::remove_dir_all(path);
         }
@@ -476,16 +488,27 @@ fn collect_manifest_files(
 }
 
 fn extract_archive(archive_name: &str, bytes: &[u8]) -> Result<Vec<ArchiveFileEntry>> {
-    if archive_name.ends_with(".zip") {
+    let archive_path = Path::new(archive_name);
+    if archive_path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+    {
         return extract_zip(bytes);
     }
-    if archive_name.ends_with(".tar") {
+    if archive_path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("tar"))
+    {
         return extract_tar(Cursor::new(bytes));
     }
-    if archive_name.ends_with(".tar.gz") || archive_name.ends_with(".tgz") {
+    if archive_name.to_ascii_lowercase().ends_with(".tar.gz")
+        || archive_path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("tgz"))
+    {
         return extract_tar(GzDecoder::new(Cursor::new(bytes)));
     }
-    bail!("unsupported archive type: {}", archive_name);
+    bail!("unsupported archive type: {archive_name}");
 }
 
 fn extract_zip(bytes: &[u8]) -> Result<Vec<ArchiveFileEntry>> {
@@ -523,8 +546,8 @@ fn is_zip_link<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> bool {
     let Some(mode) = entry.unix_mode() else {
         return false;
     };
-    let file_type = mode & 0o170000;
-    file_type == 0o120000 || file_type == 0o100000 && entry.name().ends_with('/')
+    let file_type = mode & 0o170_000;
+    file_type == 0o120_000 || file_type == 0o100_000 && entry.name().ends_with('/')
 }
 
 fn extract_tar<R: Read>(reader: R) -> Result<Vec<ArchiveFileEntry>> {
@@ -569,7 +592,7 @@ fn validate_archive_paths(files: &[ArchiveFileEntry]) -> Result<()> {
     for file in files {
         let key = file.relative_path.to_string_lossy().replace('\\', "/");
         if !seen.insert(key.clone()) {
-            bail!("invalid skill archive: duplicate file {}", key);
+            bail!("invalid skill archive: duplicate file {key}");
         }
         if file
             .relative_path
@@ -822,16 +845,16 @@ fn validate_skill_name(name: &str) -> Result<()> {
         bail!("invalid skill name: empty");
     }
     if trimmed.starts_with('.') {
-        bail!("invalid skill name: {}", name);
+        bail!("invalid skill name: {name}");
     }
     if trimmed.contains('/') || trimmed.contains('\\') {
-        bail!("invalid skill name: {}", name);
+        bail!("invalid skill name: {name}");
     }
     if !trimmed
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     {
-        bail!("invalid skill name: {}", name);
+        bail!("invalid skill name: {name}");
     }
     Ok(())
 }
@@ -850,10 +873,7 @@ fn enforce_archive_size_limits(
     entry_name: &str,
 ) -> Result<()> {
     if entry_size > MAX_ARCHIVE_ENTRY_BYTES {
-        bail!(
-            "invalid skill archive: {} exceeds the per-file limit",
-            entry_name
-        );
+        bail!("invalid skill archive: {entry_name} exceeds the per-file limit");
     }
     *total_bytes = total_bytes.saturating_add(entry_size);
     if *total_bytes > MAX_ARCHIVE_TOTAL_BYTES {
@@ -864,10 +884,7 @@ fn enforce_archive_size_limits(
 
 fn enforce_read_size(read_len: usize, entry_name: &str) -> Result<()> {
     if (read_len as u64) > MAX_ARCHIVE_ENTRY_BYTES {
-        bail!(
-            "invalid skill archive: {} exceeds the per-file limit",
-            entry_name
-        );
+        bail!("invalid skill archive: {entry_name} exceeds the per-file limit");
     }
     Ok(())
 }
@@ -876,7 +893,7 @@ fn enforce_read_size(read_len: usize, entry_name: &str) -> Result<()> {
 fn apply_unix_mode(path: &Path, unix_mode: Option<u32>) -> Result<()> {
     if let Some(mode) = unix_mode {
         fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))
-            .with_context(|| format!("set unix mode {:o}", mode))?;
+            .with_context(|| format!("set unix mode {mode:o}"))?;
     }
     Ok(())
 }

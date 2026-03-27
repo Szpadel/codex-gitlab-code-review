@@ -27,11 +27,19 @@ pub struct AuthRunner {
 }
 
 impl AuthRunner {
-    pub fn new(docker_cfg: DockerConfig, codex: CodexConfig) -> Result<Self> {
-        let docker = connect_docker(&docker_cfg)?;
+    /// # Errors
+    ///
+    /// Returns an error if the Docker client cannot be constructed from the
+    /// provided configuration.
+    pub fn new(docker_cfg: &DockerConfig, codex: CodexConfig) -> Result<Self> {
+        let docker = connect_docker(docker_cfg)?;
         Ok(Self { docker, codex })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if image preparation, container lifecycle management,
+    /// or auth command execution fails.
     pub async fn run(&self, action: AuthAction, debug: bool) -> Result<()> {
         let image_ref = normalize_image_reference(&self.codex.image);
         ensure_image(&self.docker, &image_ref).await?;

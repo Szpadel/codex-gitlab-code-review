@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    AppServerClient, Arc, AttachContainerOptionsBuilder, BROWSER_CONTAINER_NAME_PREFIX, BoxFuture,
+    BrowserMcpConfig, ContainerCreateBody, Context, CreateContainerOptionsBuilder,
+    DockerCodexRunner, ExecConfig, FutureExt, HashMap, HostConfig, ListContainersOptionsBuilder,
+    LogOutput, Ordering, REVIEW_CONTAINER_NAME_PREFIX, REVIEW_OWNER_LABEL_KEY,
+    RemoveContainerOptionsBuilder, Result, RunnerRuntime, Shared, StartContainerOptionsBuilder,
+    StartExecOptions, StartExecResults, StartedAppServer, StreamExt, Uuid, anyhow, bail,
+    effective_browser_mcp, ensure_image, info, normalize_image_reference, shell_quote, warn,
+};
 #[cfg(test)]
 use crate::codex_runner::browser_mcp::BrowserLaunchConfig;
 
@@ -191,7 +199,7 @@ impl DockerCodexRunner {
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     cmd: Some(command.clone()),
-                    working_dir: cwd.map(|value| value.to_string()),
+                    working_dir: cwd.map(std::string::ToString::to_string),
                     env,
                     ..Default::default()
                 },
@@ -199,8 +207,7 @@ impl DockerCodexRunner {
             .await
             .with_context(|| {
                 format!(
-                    "create docker exec command '{}' in container {}",
-                    command_display, container_id
+                    "create docker exec command '{command_display}' in container {container_id}"
                 )
             })?;
 
@@ -208,10 +215,7 @@ impl DockerCodexRunner {
             .start_exec(&exec.id, None::<StartExecOptions>)
             .await
             .with_context(|| {
-                format!(
-                    "start docker exec command '{}' in container {}",
-                    command_display, container_id
-                )
+                format!("start docker exec command '{command_display}' in container {container_id}")
             })?;
 
         let mut stdout = String::new();
@@ -221,8 +225,7 @@ impl DockerCodexRunner {
                 while let Some(message) = output.next().await {
                     match message.with_context(|| {
                         format!(
-                            "read docker exec output for command '{}' in container {}",
-                            command_display, container_id
+                            "read docker exec output for command '{command_display}' in container {container_id}"
                         )
                     })? {
                         LogOutput::StdOut { message } | LogOutput::Console { message } => {
@@ -237,18 +240,13 @@ impl DockerCodexRunner {
             }
             StartExecResults::Detached => {
                 bail!(
-                    "docker exec command '{}' unexpectedly detached in container {}",
-                    command_display,
-                    container_id
+                    "docker exec command '{command_display}' unexpectedly detached in container {container_id}"
                 );
             }
         }
 
         let inspect = docker.inspect_exec(&exec.id).await.with_context(|| {
-            format!(
-                "inspect docker exec command '{}' in container {}",
-                command_display, container_id
-            )
+            format!("inspect docker exec command '{command_display}' in container {container_id}")
         })?;
         let output = ContainerExecOutput {
             exit_code: inspect.exit_code.unwrap_or(-1),
@@ -309,8 +307,7 @@ impl DockerCodexRunner {
     ) -> bool {
         labels
             .and_then(|labels| labels.get(REVIEW_OWNER_LABEL_KEY))
-            .map(|value| value == owner_id)
-            .unwrap_or(false)
+            .is_some_and(|value| value == owner_id)
     }
 
     pub(crate) async fn stop_active_review_containers_best_effort(&self) {
@@ -404,8 +401,7 @@ impl DockerCodexRunner {
                 let container_name = names
                     .iter()
                     .find(|name| Self::is_managed_container_name(name))
-                    .map(|name| name.trim_start_matches('/'))
-                    .unwrap_or("<unknown>");
+                    .map_or("<unknown>", |name| name.trim_start_matches('/'));
                 warn!(
                     container_id = id,
                     container_name,
@@ -519,7 +515,7 @@ impl DockerCodexRunner {
                 config,
             )
             .await
-            .with_context(|| format!("create docker container {} with image {}", name, image_ref))
+            .with_context(|| format!("create docker container {name} with image {image_ref}"))
         {
             Ok(create) => create,
             Err(err) => {
@@ -533,7 +529,7 @@ impl DockerCodexRunner {
         let start_result = docker
             .start_container(&id, Some(StartContainerOptionsBuilder::new().build()))
             .await
-            .with_context(|| format!("start docker container {}", id));
+            .with_context(|| format!("start docker container {id}"));
         if let Err(err) = start_result {
             self.remove_container_best_effort(&id).await;
             if let Some(browser_id) = browser_container_id.as_deref() {
@@ -556,7 +552,7 @@ impl DockerCodexRunner {
                 ),
             )
             .await
-            .with_context(|| format!("attach docker container {}", id))
+            .with_context(|| format!("attach docker container {id}"))
         {
             Ok(attach) => attach,
             Err(err) => {

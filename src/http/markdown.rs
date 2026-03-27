@@ -59,7 +59,7 @@ fn sanitize_tag<'a>(tag: Tag<'a>, gitlab_web_base: &str) -> Tag<'a> {
 }
 
 fn sanitize_link_destination<'a>(dest_url: CowStr<'a>, gitlab_web_base: &str) -> CowStr<'a> {
-    let resolved = absolutize_root_relative_url(dest_url.as_ref(), gitlab_web_base);
+    let resolved = absolutize_root_relative_url(&dest_url, gitlab_web_base);
     if is_safe_link_destination(resolved.as_str()) {
         CowStr::Boxed(resolved.into_boxed_str())
     } else {
@@ -68,9 +68,7 @@ fn sanitize_link_destination<'a>(dest_url: CowStr<'a>, gitlab_web_base: &str) ->
 }
 
 fn sanitize_image_destination<'a>(dest_url: CowStr<'a>, gitlab_web_base: &str) -> CowStr<'a> {
-    if let Some((_, absolute_url)) =
-        normalize_gitlab_upload_image_url(dest_url.as_ref(), gitlab_web_base)
-    {
+    if let Some((_, absolute_url)) = normalize_gitlab_upload_image_url(&dest_url, gitlab_web_base) {
         CowStr::Boxed(absolute_url.into_boxed_str())
     } else {
         CowStr::Boxed("data:,".to_string().into_boxed_str())

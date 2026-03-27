@@ -410,7 +410,7 @@ async fn upload_skill(
     while let Some(field) = multipart.next_field().await.map_err(anyhow::Error::from)? {
         match field.name() {
             Some("csrf_token") => {
-                csrf_token = Some(field.text().await.map_err(anyhow::Error::from)?)
+                csrf_token = Some(field.text().await.map_err(anyhow::Error::from)?);
             }
             Some("archive") => {
                 archive_name = field.file_name().map(ToOwned::to_owned);
@@ -657,7 +657,7 @@ fn parse_duration_text_to_seconds(raw: &str) -> anyhow::Result<u64> {
             chars.next();
         }
         let mut value = String::new();
-        while chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+        while chars.peek().is_some_and(char::is_ascii_digit) {
             value.push(chars.next().expect("peeked digit"));
         }
         if value.is_empty() {
@@ -667,7 +667,7 @@ fn parse_duration_text_to_seconds(raw: &str) -> anyhow::Result<u64> {
             chars.next();
         }
         let mut unit = String::new();
-        while chars.peek().is_some_and(|ch| ch.is_ascii_alphabetic()) {
+        while chars.peek().is_some_and(char::is_ascii_alphabetic) {
             unit.push(chars.next().expect("peeked unit"));
         }
         if unit.is_empty() {

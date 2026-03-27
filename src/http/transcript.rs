@@ -75,8 +75,7 @@ pub fn thread_snapshot_from_events(
     }
     let status = turns
         .last()
-        .map(|turn| turn.status.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |turn| turn.status.clone());
     Some(ThreadSnapshot {
         id: run
             .review_thread_id

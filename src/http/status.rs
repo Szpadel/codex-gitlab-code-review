@@ -42,7 +42,7 @@ const TRANSCRIPT_BACKFILL_STALE_MISSING_HISTORY_ERROR: &str =
 const TRANSCRIPT_BACKFILL_STALE_SOURCE_UNAVAILABLE_ERROR: &str =
     "local Codex session history directory remained unavailable before retry window expired";
 const TRANSCRIPT_BACKFILL_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
-const TRANSCRIPT_BACKFILL_MISSING_HISTORY_RETRY_WINDOW: Duration = Duration::from_secs(300);
+const TRANSCRIPT_BACKFILL_MISSING_HISTORY_RETRY_WINDOW: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct StatusSnapshot {
@@ -143,10 +143,12 @@ struct StatusConfig {
 }
 
 impl StatusService {
+    #[must_use]
     pub fn gitlab_base_url(&self) -> &str {
         &self.config.gitlab_base_url
     }
 
+    #[must_use]
     pub fn new(
         config: Config,
         state: Arc<ReviewStateStore>,
@@ -205,6 +207,7 @@ impl StatusService {
         }
     }
 
+    #[must_use]
     pub fn with_transcript_backfill_source(
         mut self,
         transcript_backfill_source: Arc<dyn TranscriptBackfillSource>,
@@ -217,6 +220,7 @@ impl StatusService {
         self
     }
 
+    #[must_use]
     pub fn with_runtime_mode(mut self, runtime_mode: &str) -> Self {
         self.config.runtime_mode = runtime_mode.to_string();
         self
@@ -234,6 +238,9 @@ impl StatusService {
         &self.admin_csrf_token
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn snapshot(&self) -> Result<StatusSnapshot> {
         let created_after = self.state.get_created_after().await?;
         let scan = self.state.get_scan_status().await?;
@@ -270,6 +277,9 @@ impl StatusService {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn review_rate_limit_snapshot(&self) -> Result<StatusRateLimitSnapshot> {
         let now = Utc::now().timestamp();
         Ok(StatusRateLimitSnapshot {
@@ -282,6 +292,9 @@ impl StatusService {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn review_rate_limit_target_suggestions(&self) -> Result<Vec<ReviewRateLimitTarget>> {
         let mut suggestions = Vec::new();
         for path in &self.config.repo_target_paths {
@@ -310,6 +323,9 @@ impl StatusService {
         Ok(deduped)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn create_review_rate_limit_rule(
         &self,
         rule: &ReviewRateLimitRuleUpsert,
@@ -317,6 +333,9 @@ impl StatusService {
         self.state.create_review_rate_limit_rule(rule).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn update_review_rate_limit_rule(
         &self,
         rule: &ReviewRateLimitRuleUpsert,
@@ -324,16 +343,25 @@ impl StatusService {
         self.state.update_review_rate_limit_rule(rule).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn delete_review_rate_limit_rule(&self, rule_id: &str) -> Result<()> {
         self.state.delete_review_rate_limit_rule(rule_id).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn refund_one_review_rate_limit_bucket_slot(&self, bucket_id: &str) -> Result<()> {
         self.state
             .refund_review_rate_limit_bucket(bucket_id, Utc::now().timestamp())
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn update_runtime_feature_flag(
         &self,
         flag_name: &str,
@@ -346,12 +374,12 @@ impl StatusService {
                     bail!("invalid feature flag request: {flag_name} is unavailable");
                 }
             }
-            "gitlab_inline_review_comments" => {}
-            "security_review" => {}
-            "security_context_ignore_base_head" => {}
-            "composer_install" => {}
-            "composer_auto_repositories" => {}
-            "composer_safe_install" => {}
+            "gitlab_inline_review_comments"
+            | "security_review"
+            | "security_context_ignore_base_head"
+            | "composer_install"
+            | "composer_auto_repositories"
+            | "composer_safe_install" => {}
             other => bail!("invalid feature flag: {other}"),
         }
 
@@ -361,7 +389,7 @@ impl StatusService {
             "gitlab_inline_review_comments" => overrides.gitlab_inline_review_comments = enabled,
             "security_review" => overrides.security_review = enabled,
             "security_context_ignore_base_head" => {
-                overrides.security_context_ignore_base_head = enabled
+                overrides.security_context_ignore_base_head = enabled;
             }
             "composer_install" => overrides.composer_install = enabled,
             "composer_auto_repositories" => overrides.composer_auto_repositories = enabled,
@@ -377,14 +405,23 @@ impl StatusService {
             .ok_or_else(|| anyhow::anyhow!("missing feature flag after update: {flag_name}"))
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn skills_snapshot(&self) -> Result<SkillListSnapshot> {
         self.skills_manager.list_skills().await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn skill_preview_snapshot(&self, name: &str) -> Result<Option<SkillPreviewSnapshot>> {
         self.skills_manager.skill_preview(name).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn install_skill_archive(
         &self,
         archive_name: &str,
@@ -395,6 +432,9 @@ impl StatusService {
             .await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn delete_skill(&self, name: &str) -> Result<()> {
         self.skills_manager.delete_skill(name).await
     }
@@ -476,6 +516,9 @@ impl StatusService {
         ]
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn mark_scan_started(&self, mode: ScanMode) -> Result<()> {
         let mut scan = self.state.get_scan_status().await?;
         scan.state = ScanState::Scanning;
@@ -488,6 +531,9 @@ impl StatusService {
         self.state.set_scan_status(&scan).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn mark_scan_finished(
         &self,
         mode: ScanMode,
@@ -506,16 +552,25 @@ impl StatusService {
         self.state.set_scan_status(&scan).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn set_next_scan_at(&self, next_scan_at: Option<DateTime<Utc>>) -> Result<()> {
         let mut scan = self.state.get_scan_status().await?;
         scan.next_scan_at = next_scan_at.map(|value| value.to_rfc3339());
         self.state.set_scan_status(&scan).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn clear_next_scan_at(&self) -> Result<()> {
         self.state.clear_next_scan_at().await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn recover_startup_status(&self) -> Result<()> {
         self.reconcile_interrupted_run_history().await?;
         let mut scan = self.state.get_scan_status().await?;
@@ -529,6 +584,9 @@ impl StatusService {
         self.state.set_scan_status(&scan).await
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn reconcile_interrupted_run_history(&self) -> Result<()> {
         self.state
             .reconcile_interrupted_run_history("run interrupted by service restart")
@@ -536,6 +594,9 @@ impl StatusService {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn history_snapshot(&self, query: HistoryQuery) -> Result<HistorySnapshot> {
         let list_query = RunHistoryListQuery {
             repo: query.repo.clone(),
@@ -575,6 +636,9 @@ impl StatusService {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn mr_history_snapshot(&self, repo: &str, iid: u64) -> Result<MrHistorySnapshot> {
         let runs = self.state.list_run_history_for_mr(repo, iid).await?;
         Ok(MrHistorySnapshot {
@@ -585,6 +649,9 @@ impl StatusService {
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn run_detail_snapshot(&self, run_id: i64) -> Result<Option<RunDetailSnapshot>> {
         let Some(run) = self.state.get_run_history(run_id).await? else {
             return Ok(None);
@@ -805,7 +872,7 @@ impl StatusService {
                     .get(account_name)
                     .cloned()
             })
-            .or_else(|| self.default_transcript_backfill_source.as_ref().cloned())
+            .or_else(|| self.default_transcript_backfill_source.clone())
     }
 
     async fn backfill_retry_due(&self, run_id: i64) -> bool {
@@ -915,10 +982,10 @@ pub(super) async fn run_transcript_backfill(
         let filtered_turn_ids = if preserve_all_thread_turns {
             turn_ids_from_new_events(&full_thread_events)
         } else if persisted_turn_ids_in_full_thread.is_empty() {
-            run.turn_id
-                .as_deref()
-                .map(|turn_id| HashSet::from([turn_id.to_string()]))
-                .unwrap_or_else(|| turn_ids_from_new_events(&full_thread_events))
+            run.turn_id.as_deref().map_or_else(
+                || turn_ids_from_new_events(&full_thread_events),
+                |turn_id| HashSet::from([turn_id.to_string()]),
+            )
         } else if needs_review_wrapper_missing_target_recovery
             || (target_turn_missing_in_persisted && run.turn_id.is_some())
         {
@@ -1490,12 +1557,7 @@ fn merge_recovered_target_turn_events(
     existing_events.sort_by_key(|event| (event.sequence, event.id));
 
     let insertion_sequence = recovered_turn_insertion_sequence(&existing_events, rewritten_events)
-        .unwrap_or_else(|| {
-            existing_events
-                .last()
-                .map(|event| event.sequence + 1)
-                .unwrap_or(1)
-        });
+        .unwrap_or_else(|| existing_events.last().map_or(1, |event| event.sequence + 1));
     let delta = rewritten_events.len() as i64;
 
     let mut merged_events = Vec::new();
@@ -1644,8 +1706,10 @@ fn fallback_session_history_path(
         .or_else(|| {
             primary_session_history_path.strip_prefix(primary_auth_mount_path.trim_end_matches('/'))
         })
-        .map(|suffix| format!("{fallback_auth_host_path}{suffix}"))
-        .unwrap_or_else(|| format!("{fallback_auth_host_path}/sessions"))
+        .map_or_else(
+            || format!("{fallback_auth_host_path}/sessions"),
+            |suffix| format!("{fallback_auth_host_path}{suffix}"),
+        )
 }
 
 fn is_retryable_transcript_backfill_error(error: &str) -> bool {

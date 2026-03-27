@@ -58,6 +58,7 @@ pub struct PreparedComposerAuth {
 }
 
 impl ComposerInstallMode {
+    #[must_use]
     pub fn for_flags(flags: &FeatureFlagSnapshot) -> Option<Self> {
         if !flags.composer_install {
             return None;
@@ -70,6 +71,7 @@ impl ComposerInstallMode {
         })
     }
 
+    #[must_use]
     pub fn command_label(self) -> &'static str {
         match self {
             Self::Full => "composer install --no-interaction --no-progress --ignore-platform-reqs",
@@ -81,6 +83,7 @@ impl ComposerInstallMode {
 }
 
 impl ComposerInstallResult {
+    #[must_use]
     pub fn skipped(mode: ComposerInstallMode, auth_source: Option<String>) -> Self {
         Self {
             attempted: false,
@@ -91,6 +94,7 @@ impl ComposerInstallResult {
         }
     }
 
+    #[must_use]
     pub fn succeeded(
         mode: ComposerInstallMode,
         auth_source: Option<String>,
@@ -105,6 +109,7 @@ impl ComposerInstallResult {
         }
     }
 
+    #[must_use]
     pub fn failed(
         mode: ComposerInstallMode,
         auth_source: Option<String>,
@@ -120,6 +125,7 @@ impl ComposerInstallResult {
     }
 }
 
+#[must_use]
 pub fn composer_install_exec_command(
     mode: ComposerInstallMode,
     timeout_seconds: u64,
@@ -154,6 +160,7 @@ export COMPOSER_HOME=\"$composer_home\"\n"
     vec!["bash".to_string(), "-lc".to_string(), script]
 }
 
+#[must_use]
 pub fn composer_install_timeout_seconds(remaining: Duration) -> Option<u64> {
     if remaining.is_zero() {
         return None;
@@ -246,6 +253,7 @@ pub fn prepare_composer_auth(
     }
 }
 
+#[must_use]
 pub fn composer_install_result_from_exec_output(
     input: ComposerInstallExecOutput<'_>,
 ) -> ComposerInstallResult {
@@ -306,6 +314,7 @@ fn composer_skip_line() -> String {
     format!("{COMPOSER_SKIP_MARKER}:{COMPOSER_SKIP_REASON_MISSING_JSON}")
 }
 
+#[must_use]
 pub fn redact_composer_related_output(
     input: &str,
     gitlab_token: Option<&str>,
@@ -382,7 +391,7 @@ fn supported_repository_urls(value: &Value) -> ComposerAuthAnalysis {
             if let Some(url) = normalized_composer_repository_url(raw_host) {
                 repository_urls.insert(url);
             } else {
-                ignored_entries.insert(raw_host.to_string());
+                ignored_entries.insert(raw_host.clone());
             }
         }
     }
@@ -539,6 +548,7 @@ fn composer_auth_notice(auth_source: Option<&str>) -> Option<String> {
     Some(format!("COMPOSER_AUTH detected from {auth_source}"))
 }
 
+#[must_use]
 pub fn composer_debug_lines(
     auth_lookup: &ComposerAuthLookup,
     prepared_auth: &PreparedComposerAuth,

@@ -271,6 +271,8 @@ async fn rate_limits_page_renders_create_form_and_empty_state() -> Result<()> {
     assert!(body.contains("data-role=\"rate-limit-modal\""));
     assert!(body.contains("2h 15m"));
     assert!(body.contains("\"bucket_mode\":\"shared\""));
+    assert!(body.contains("Per repository"));
+    assert!(body.contains("one bucket per matched repository"));
     assert!(body.contains("/rate-limits"));
     assert!(body.contains("No active buckets."));
     assert!(body.contains("No pending review items."));
@@ -344,6 +346,10 @@ async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Re
                 path: "group/platform".to_string()
             }
         ]
+    );
+    assert_eq!(
+        state.list_review_rate_limit_rules().await?[0].bucket_mode,
+        ReviewRateLimitBucketMode::Shared
     );
     Ok(())
 }
@@ -419,7 +425,7 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
     assert_eq!(rule.len(), 1);
     assert_eq!(rule[0].label, "Updated");
     assert_eq!(rule[0].capacity, 5);
-    assert_eq!(rule[0].bucket_mode, ReviewRateLimitBucketMode::Independent);
+    assert_eq!(rule[0].bucket_mode, ReviewRateLimitBucketMode::Shared);
     assert_eq!(
         rule[0].targets,
         vec![ReviewRateLimitTarget {

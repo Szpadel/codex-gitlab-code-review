@@ -56,13 +56,16 @@ impl GitLabDiscoverySessionRegistry {
         for peer_ip in &binding.peer_ips {
             state
                 .network_containers_by_peer_ip
-                .insert(peer_ip.to_string(), binding.network_container_id.clone());
+                .insert(peer_ip.clone(), binding.network_container_id.clone());
         }
         state
             .bindings_by_network_container
             .insert(binding.network_container_id.clone(), binding);
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the underlying operation fails.
     pub async fn bind_session(&self, network_container_id: &str, session_id: &str) -> Result<()> {
         let mut state = self.state.write().await;
         if !state
@@ -162,6 +165,7 @@ fn remove_binding_locked(state: &mut RegistryState, network_container_id: &str) 
 }
 
 impl ResolvedGitLabDiscoveryAllowList {
+    #[must_use]
     pub fn is_repo_allowed(&self, repo_path: &str) -> bool {
         self.target_repos.contains(repo_path)
             || self
@@ -170,6 +174,7 @@ impl ResolvedGitLabDiscoveryAllowList {
                 .any(|group| repo_within_group(repo_path, group))
     }
 
+    #[must_use]
     pub fn can_browse_group(&self, group_path: &str) -> bool {
         self.target_groups.iter().any(|group| {
             group == group_path
@@ -181,6 +186,7 @@ impl ResolvedGitLabDiscoveryAllowList {
             .any(|repo| repo_belongs_to_group(repo, group_path))
     }
 
+    #[must_use]
     pub fn has_repo_within_group(&self, group_path: &str) -> bool {
         self.target_repos
             .iter()
@@ -208,7 +214,7 @@ impl ResolvedGitLabDiscoveryAllowList {
         for group in &self.target_groups {
             match current_path {
                 None => {
-                    subgroups.insert(group.to_string());
+                    subgroups.insert(group.clone());
                 }
                 Some(_) => {
                     if let Some(child) = immediate_child_path(current_path, group) {
@@ -260,6 +266,7 @@ impl GitLabPathListing {
     }
 }
 
+#[must_use]
 pub fn resolve_allow_list(
     source_repo: &str,
     rules: &[GitLabDiscoveryAllowRule],
