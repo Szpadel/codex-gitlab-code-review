@@ -30,6 +30,21 @@ use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, sleep};
 use zip::write::SimpleFileOptions;
 
+fn test_client_builder() -> reqwest::ClientBuilder {
+    crate::tls::ensure_reqwest_rustls_provider();
+    reqwest::Client::builder()
+}
+
+fn test_client() -> reqwest::Client {
+    crate::tls::ensure_reqwest_rustls_provider();
+    reqwest::Client::new()
+}
+
+async fn test_get(url: impl reqwest::IntoUrl) -> reqwest::Result<reqwest::Response> {
+    crate::tls::ensure_reqwest_rustls_provider();
+    reqwest::get(url).await
+}
+
 #[tokio::test]
 async fn api_status_returns_scan_and_in_progress_state() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
@@ -57,7 +72,7 @@ async fn api_status_returns_scan_and_in_progress_state() -> Result<()> {
     ));
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response = reqwest::get(format!("http://{address}/api/status")).await?;
+    let response = test_get(format!("http://{address}/api/status")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
     assert!(body.contains("\"scan_state\":\"idle\""));
@@ -94,7 +109,7 @@ async fn status_page_renders_sections_and_escapes_dynamic_content() -> Result<()
     ));
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response = reqwest::get(format!("http://{address}/status")).await?;
+    let response = test_get(format!("http://{address}/status")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
     assert!(body.contains("Service status"));
@@ -126,7 +141,7 @@ async fn development_page_renders_when_dev_tools_are_enabled() -> Result<()> {
     ))
     .await?;
 
-    let response = reqwest::get(format!("http://{address}/development")).await?;
+    let response = test_get(format!("http://{address}/development")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
     assert!(body.contains("Development tools"));
@@ -168,7 +183,7 @@ async fn development_repo_actions_require_csrf_and_update_snapshot() -> Result<(
         Some(dev_tools),
     ))
     .await?;
-    let client = reqwest::Client::builder()
+    let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
@@ -211,7 +226,7 @@ async fn development_repo_actions_require_csrf_and_update_snapshot() -> Result<(
         .await?;
     assert_eq!(simulated_commit.status(), StatusCode::SEE_OTHER);
 
-    let response = reqwest::get(format!("http://{address}/development")).await?;
+    let response = test_get(format!("http://{address}/development")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
     assert!(body.contains("demo/group/service-z"));
@@ -244,7 +259,7 @@ async fn rate_limits_page_renders_create_form_and_empty_state() -> Result<()> {
     let status_service = Arc::new(StatusService::new(test_config(), state, false, None));
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response = reqwest::get(format!("http://{address}/rate-limits")).await?;
+    let response = test_get(format!("http://{address}/rate-limits")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
     assert!(body.contains("Review rate limits"));
@@ -274,7 +289,7 @@ async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Re
     ));
     let csrf_token = status_service.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
-    let client = reqwest::Client::builder()
+    let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
@@ -362,7 +377,7 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
     ));
     let csrf_token = status_service.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
-    let client = reqwest::Client::builder()
+    let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
@@ -444,7 +459,7 @@ async fn delete_rate_limit_rule_endpoint_requires_csrf_and_removes_rule() -> Res
     ));
     let csrf_token = status_service.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
-    let client = reqwest::Client::builder()
+    let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
@@ -507,7 +522,7 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
     ));
     let csrf_token = status_service.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
-    let response = reqwest::Client::builder()
+    let response = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?
         .post(format!("http://{address}/rate-limits/buckets/regen"))
@@ -540,7 +555,7 @@ async fn create_rate_limit_rule_endpoint_allows_global_rules_without_targets() -
     let csrf_token = status_service.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response = reqwest::Client::builder()
+    let response = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?
         .post(format!("http://{address}/rate-limits/create"))
@@ -650,7 +665,7 @@ async fn feature_flag_update_endpoint_persists_runtime_override() -> Result<()> 
     let status_service = Arc::new(StatusService::new(config, Arc::clone(&state), false, None));
     let csrf_token = status_service.feature_flag_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let response = client
         .post(format!(
@@ -683,7 +698,7 @@ async fn feature_flag_update_endpoint_requires_csrf_header() -> Result<()> {
     let status_service = Arc::new(StatusService::new(config, Arc::clone(&state), false, None));
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response = reqwest::Client::new()
+    let response = test_client()
         .post(format!(
             "http://{address}/api/feature-flags/gitlab_discovery_mcp"
         ))
@@ -713,7 +728,7 @@ async fn feature_flag_update_endpoint_rejects_unavailable_flags() -> Result<()> 
     let csrf_token = status_service.feature_flag_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response = reqwest::Client::new()
+    let response = test_client()
         .post(format!(
             "http://{address}/api/feature-flags/gitlab_discovery_mcp"
         ))
@@ -755,7 +770,7 @@ async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()
     let csrf_token = status_service.feature_flag_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response = reqwest::Client::new()
+    let response = test_client()
         .post(format!(
             "http://{address}/api/feature-flags/gitlab_discovery_mcp"
         ))
@@ -786,7 +801,7 @@ async fn feature_flag_update_endpoint_persists_composer_install_override() -> Re
     let csrf_token = status_service.feature_flag_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response = reqwest::Client::new()
+    let response = test_client()
         .post(format!(
             "http://{address}/api/feature-flags/composer_install"
         ))
@@ -817,7 +832,7 @@ async fn feature_flag_update_endpoint_persists_composer_auto_repositories_overri
     let csrf_token = status_service.feature_flag_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
 
-    let response = reqwest::Client::new()
+    let response = test_client()
         .post(format!(
             "http://{address}/api/feature-flags/composer_auto_repositories"
         ))
@@ -7490,7 +7505,7 @@ async fn upload_skill_endpoint_installs_into_primary_and_fallback_auth_homes() -
         ("wrapped/web-skill/scripts/run.sh", b"echo upload\n"),
     ]);
 
-    let client = reqwest::Client::new();
+    let client = test_client();
     let response = client
         .post(format!("http://{address}/skills/upload"))
         .multipart(multipart::Form::new().text("csrf_token", csrf_token).part(
@@ -7520,7 +7535,7 @@ async fn upload_skill_endpoint_rejects_unsupported_archive_type() -> Result<()> 
     let status_service = Arc::new(StatusService::new(config, state, false, None));
     let csrf_token = status_service.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let response = client
         .post(format!("http://{address}/skills/upload"))
@@ -7550,7 +7565,7 @@ async fn delete_skill_endpoint_requires_csrf_and_removes_skill() -> Result<()> {
     let status_service = Arc::new(StatusService::new(config, state, false, None));
     let csrf_token = status_service.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(Arc::clone(&status_service))).await?;
-    let client = reqwest::Client::new();
+    let client = test_client();
 
     let forbidden = client
         .post(format!("http://{address}/skills/delete-skill/delete"))

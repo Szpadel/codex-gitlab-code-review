@@ -954,8 +954,9 @@ impl ReviewStateStore {
         .await
         .context("list runtime review rate limit rules")?;
 
-        let targets_by_rule_id =
-            review_rate_limit_targets_by_rule_id(self.load_review_rate_limit_targets_by_rule_id().await?);
+        let targets_by_rule_id = review_rate_limit_targets_by_rule_id(
+            self.load_review_rate_limit_targets_by_rule_id().await?,
+        );
         rows.into_iter()
             .map(|row| map_review_rate_limit_rule_row(&row, &targets_by_rule_id))
             .collect()
@@ -1064,8 +1065,9 @@ impl ReviewStateStore {
                 .await
                 .context("load runtime review rate limit rule targets before update")?,
         );
-        let existing_rule = map_review_rate_limit_rule_row(&existing_row, &existing_targets_by_rule_id)
-            .context("map runtime review rate limit rule before update")?;
+        let existing_rule =
+            map_review_rate_limit_rule_row(&existing_row, &existing_targets_by_rule_id)
+                .context("map runtime review rate limit rule before update")?;
         let invalidate_buckets =
             review_rate_limit_rule_update_invalidates_buckets(&existing_rule, rule)?;
         let result = sqlx::query(

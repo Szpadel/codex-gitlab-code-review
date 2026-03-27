@@ -1,3 +1,4 @@
+use crate::tls::ensure_reqwest_rustls_provider;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -364,6 +365,7 @@ pub struct GitLabClient {
 
 impl GitLabClient {
     pub fn new(base_url: &str, token: &str) -> Result<Self> {
+        ensure_reqwest_rustls_provider();
         let api_base = normalize_api_base(base_url)?;
         let mut headers = header::HeaderMap::new();
         if !token.is_empty() {
