@@ -320,7 +320,7 @@ impl GitLabDiscoveryMcpServer {
 pub(crate) fn build_router(service: &Arc<GitLabDiscoveryMcpService>) -> Router {
     let server = GitLabDiscoveryMcpServer {
         tool_router: GitLabDiscoveryMcpServer::tool_router(),
-        service: Arc::clone(&service),
+        service: Arc::clone(service),
     };
     let rmcp_service: StreamableHttpService<GitLabDiscoveryMcpServer, LocalSessionManager> =
         StreamableHttpService::new(

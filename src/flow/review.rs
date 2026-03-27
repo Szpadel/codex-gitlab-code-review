@@ -4,6 +4,7 @@ use crate::feature_flags::FeatureFlagSnapshot;
 use crate::flow::review_comments::{PostReviewCommentRequest, post_review_comment};
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
+use crate::lifecycle::ServiceLifecycle;
 use crate::review_lane::ReviewLane;
 use crate::state::{
     NewRunHistory, ReviewRateLimitAcquireOutcome, ReviewStateStore, RunHistoryFinish,
@@ -13,7 +14,6 @@ use anyhow::{Error, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -521,17 +521,18 @@ impl ReviewFlow {
             state: Arc::clone(&self.shared.state),
             retry_backoff: Arc::clone(&self.retry_backoff),
             bot_user_id: self.shared.bot_user_id,
-            shutdown: Arc::clone(&self.shared.shutdown),
+            lifecycle: Arc::clone(&self.shared.lifecycle),
             acquired_rate_limit_rule_ids: acquired_rule_ids.clone(),
         };
         let head_sha = head_sha.to_string();
+        let active_review = active_tasks.track_review(ActiveReviewKey {
+            lane: review_context.lane,
+            repo: repo_name.clone(),
+            iid: mr.iid,
+            head_sha: head_sha.clone(),
+        });
         tasks.push(tokio::spawn(async move {
-            let _active_review = active_tasks.track_review(ActiveReviewKey {
-                lane: review_context.lane,
-                repo: repo_name.clone(),
-                iid: mr.iid,
-                head_sha: head_sha.clone(),
-            });
+            let _active_review = active_review;
             let Ok(_permit) = semaphore.acquire_owned().await else {
                 let err = Error::msg("review cancelled: semaphore closed");
                 review_context
@@ -665,7 +666,7 @@ impl ReviewFlow {
             state: Arc::clone(&self.shared.state),
             retry_backoff: Arc::clone(&self.retry_backoff),
             bot_user_id: self.shared.bot_user_id,
-            shutdown: Arc::clone(&self.shared.shutdown),
+            lifecycle: Arc::clone(&self.shared.lifecycle),
             acquired_rate_limit_rule_ids: acquired_rule_ids.clone(),
         };
         let _active_review = self.shared.active_tasks.track_review(ActiveReviewKey {
@@ -871,7 +872,7 @@ pub(crate) struct ReviewRunContext {
     pub(crate) state: Arc<ReviewStateStore>,
     pub(crate) retry_backoff: Arc<RetryBackoff>,
     pub(crate) bot_user_id: u64,
-    pub(crate) shutdown: Arc<AtomicBool>,
+    pub(crate) lifecycle: Arc<ServiceLifecycle>,
     pub(crate) acquired_rate_limit_rule_ids: Vec<String>,
 }
 
@@ -884,8 +885,12 @@ impl ReviewRunContext {
         format!("{} {repo} !{iid}", self.lane.review_label())
     }
 
-    fn shutdown_requested(&self) -> bool {
-        self.shutdown.load(Ordering::SeqCst)
+    fn should_reject_new_starts(&self) -> bool {
+        !self.lifecycle.accepts_new_work()
+    }
+
+    fn should_cancel_active_work(&self) -> bool {
+        self.lifecycle.should_cancel_active_work()
     }
 
     async fn resolve_review_project_path(&self, repo: &str, mr: &MergeRequest) -> String {
@@ -1061,7 +1066,7 @@ impl ReviewRunContext {
     ) -> Result<()> {
         let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
         let inline_review_comments_enabled = feature_flags.gitlab_inline_review_comments;
-        if self.shutdown_requested() {
+        if self.should_reject_new_starts() {
             self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                 .await?;
             return Ok(());
@@ -1109,20 +1114,21 @@ impl ReviewRunContext {
         };
         let review_project_path = review_ctx.project_path.clone();
 
-        if self.shutdown_requested() {
+        if self.should_reject_new_starts() {
             self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                 .await?;
             return Ok(());
         }
 
+        let _started_run = self.lifecycle.track_started_run();
         let result = self.codex.run_review(review_ctx).await;
-        if self.shutdown_requested() {
+        if self.should_cancel_active_work() {
             self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                 .await?;
             return Ok(());
         }
         self.remove_eyes_best_effort(repo, mr.iid).await;
-        if self.shutdown_requested() {
+        if self.should_cancel_active_work() {
             self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                 .await?;
             return Ok(());
@@ -1130,7 +1136,7 @@ impl ReviewRunContext {
 
         match result {
             Ok(CodexResult::Pass { summary }) => {
-                if self.shutdown_requested() {
+                if self.should_cancel_active_work() {
                     self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                         .await?;
                     return Ok(());
@@ -1170,7 +1176,7 @@ impl ReviewRunContext {
                 );
             }
             Ok(CodexResult::Comment(comment)) => {
-                if self.shutdown_requested() {
+                if self.should_cancel_active_work() {
                     self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                         .await?;
                     return Ok(());
@@ -1231,7 +1237,7 @@ impl ReviewRunContext {
                     next_retry_at = %next_retry_at,
                     "review failed"
                 );
-                if self.shutdown_requested() {
+                if self.should_cancel_active_work() {
                     self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
                         .await?;
                     return Ok(());

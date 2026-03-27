@@ -22,6 +22,7 @@ use codex_gitlab_code_review::docker_utils::wait_for_docker_ready;
 use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
 use codex_gitlab_code_review::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use codex_gitlab_code_review::http::{StatusService, run_http_server_with_dev_tools};
+use codex_gitlab_code_review::lifecycle::ServiceLifecycleSignal;
 use codex_gitlab_code_review::review::{ReviewService, ScanRunStatus};
 use codex_gitlab_code_review::state::{ReviewStateStore, ScanMode, ScanOutcome};
 
@@ -234,11 +235,44 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
     info!("starting scan loop");
-    if let Err(err) =
-        run_tracked_scan(status_service.as_ref(), ScanMode::Full, service.scan_once()).await
-    {
-        warn!(error = %format!("{err:#}"), "initial scan failed");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let initial_scan_service = Arc::clone(&service);
+    let initial_scan_status_service = Arc::clone(&status_service);
+    let mut initial_scan = tokio::spawn(async move {
+        run_tracked_scan(
+            initial_scan_status_service.as_ref(),
+            ScanMode::Full,
+            initial_scan_service.scan_once(),
+        )
+        .await
+    });
+    tokio::select! {
+        signal_result = &mut shutdown_signal => {
+            let signal = signal_result?;
+            handle_service_signal(
+                signal,
+                service.as_ref(),
+                status_service.as_ref(),
+                gitlab_discovery_mcp.as_ref(),
+                &shutdown_tx,
+            )
+            .await;
+            log_task_result("initial scan", initial_scan.await);
+            if matches!(signal, ServiceLifecycleSignal::GracefulDrain) {
+                finalize_graceful_drain(service.as_ref(), gitlab_discovery_mcp.as_ref()).await;
+            }
+            return Ok(());
+        }
+        initial_result = &mut initial_scan => {
+            if let Ok(Err(err)) = &initial_result {
+                warn!(error = %format!("{err:#}"), "initial scan failed");
+            } else if let Err(err) = &initial_result {
+                warn!(error = %err, "initial scan task failed");
+            }
+        }
     }
 
     let tz = parse_timezone(config.schedule.timezone.as_deref())?;
@@ -249,7 +283,6 @@ async fn main() -> Result<()> {
         )
     })?;
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let scheduled_service = Arc::clone(&service);
     let scheduled_status_service = Arc::clone(&status_service);
     let mut scheduled_loop = tokio::spawn(async move {
@@ -263,12 +296,22 @@ async fn main() -> Result<()> {
         .await
     });
 
-    let shutdown_signal = wait_for_shutdown_signal();
-    tokio::pin!(shutdown_signal);
     tokio::select! {
         signal_result = &mut shutdown_signal => {
-            signal_result?;
-            info!("shutdown signal received");
+            let signal = signal_result?;
+            handle_service_signal(
+                signal,
+                service.as_ref(),
+                status_service.as_ref(),
+                gitlab_discovery_mcp.as_ref(),
+                &shutdown_tx,
+            )
+            .await;
+            log_task_result("schedule loop", scheduled_loop.await);
+            if matches!(signal, ServiceLifecycleSignal::GracefulDrain) {
+                finalize_graceful_drain(service.as_ref(), gitlab_discovery_mcp.as_ref()).await;
+            }
+            return Ok(());
         }
         scheduled_result = &mut scheduled_loop => {
             return match scheduled_result {
@@ -279,23 +322,6 @@ async fn main() -> Result<()> {
                 Err(err) => Err(err.into()),
             };
         }
-    }
-
-    service.request_shutdown();
-    if let Some(service) = gitlab_discovery_mcp.as_ref() {
-        service.shutdown();
-    }
-    let _ = shutdown_tx.send(true);
-    if let Err(err) = service.recover_in_progress_reviews().await {
-        warn!(error = %err, "shutdown recovery of interrupted reviews failed");
-    }
-    if let Err(err) = status_service.reconcile_interrupted_run_history().await {
-        warn!(error = %err, "shutdown reconciliation of run history failed");
-    }
-
-    match scheduled_loop.await {
-        Ok(result) => result,
-        Err(err) => Err(err.into()),
     }
 }
 
@@ -744,21 +770,73 @@ where
     result.map(|_| ())
 }
 
-async fn wait_for_shutdown_signal() -> Result<()> {
+async fn handle_service_signal(
+    signal: ServiceLifecycleSignal,
+    service: &ReviewService,
+    status_service: &StatusService,
+    gitlab_discovery_mcp: Option<&Arc<GitLabDiscoveryMcpService>>,
+    shutdown_tx: &watch::Sender<bool>,
+) {
+    match signal {
+        ServiceLifecycleSignal::GracefulDrain => {
+            info!("graceful drain signal received");
+            service.request_graceful_drain();
+            let _ = shutdown_tx.send(true);
+        }
+        ServiceLifecycleSignal::FastStop => {
+            info!("shutdown signal received");
+            service.request_shutdown();
+            if let Some(service) = gitlab_discovery_mcp {
+                service.shutdown();
+            }
+            let _ = shutdown_tx.send(true);
+            if let Err(err) = service.recover_in_progress_reviews().await {
+                warn!(error = %err, "shutdown recovery of interrupted reviews failed");
+            }
+            if let Err(err) = status_service.reconcile_interrupted_run_history().await {
+                warn!(error = %err, "shutdown reconciliation of run history failed");
+            }
+        }
+    }
+}
+
+async fn finalize_graceful_drain(
+    service: &ReviewService,
+    gitlab_discovery_mcp: Option<&Arc<GitLabDiscoveryMcpService>>,
+) {
+    service.wait_for_started_runs().await;
+    service.wait_for_active_tasks().await;
+    if let Some(service) = gitlab_discovery_mcp {
+        service.shutdown();
+    }
+}
+
+fn log_task_result(label: &str, result: std::result::Result<Result<()>, tokio::task::JoinError>) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!(task = label, error = %format!("{err:#}"), "background task failed"),
+        Err(err) => warn!(task = label, error = %err, "background task join failed"),
+    }
+}
+
+async fn wait_for_shutdown_signal() -> Result<ServiceLifecycleSignal> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
 
         let mut terminate = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
+        let mut graceful_drain =
+            signal(SignalKind::user_defined1()).context("listen for SIGUSR1")?;
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+            _ = tokio::signal::ctrl_c() => Ok(ServiceLifecycleSignal::FastStop),
+            _ = terminate.recv() => Ok(ServiceLifecycleSignal::FastStop),
+            _ = graceful_drain.recv() => Ok(ServiceLifecycleSignal::GracefulDrain),
         }
-        Ok(())
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.context("listen for Ctrl+C")
+        tokio::signal::ctrl_c().await.context("listen for Ctrl+C")?;
+        Ok(ServiceLifecycleSignal::FastStop)
     }
 }
 

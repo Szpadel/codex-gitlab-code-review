@@ -47,6 +47,7 @@ spec:
         checksum/codex-config: {{ include (print $.Template.BasePath "/codex-auth-configmap.yaml") . | sha256sum }}
         checksum/gitlab-token: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
+      terminationGracePeriodSeconds: {{ add (int .Values.config.codex.timeoutSeconds) 120 }}
       serviceAccountName: {{ include "codex-gitlab-review.serviceAccountName" . }}
       initContainers:
         - name: seed-codex-auth
@@ -79,6 +80,17 @@ spec:
         - name: codex-review
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                      kill -USR1 1
+                      while kill -0 1 2>/dev/null; do
+                        sleep 1
+                      done
           env:
             - name: CONFIG_PATH
               value: "/etc/codex/config.yaml"

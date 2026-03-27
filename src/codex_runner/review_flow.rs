@@ -884,7 +884,11 @@ impl DockerCodexRunner {
             let thread_response = client
                 .request(
                     "thread/start",
-                    self.thread_start_params(request.repo_path, None, &[worktree_path.clone()]),
+                    self.thread_start_params(
+                        request.repo_path,
+                        None,
+                        std::slice::from_ref(&worktree_path),
+                    ),
                 )
                 .await?;
             let thread_id = thread_response

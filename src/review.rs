@@ -5,6 +5,7 @@ use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
 use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome, remove_bot_award};
 use crate::flow::{ActiveTaskRegistry, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
+use crate::lifecycle::ServiceLifecycle;
 use crate::review_lane::ReviewLane;
 use crate::state::{ReviewRateLimitPendingEntry, ReviewStateStore};
 use anyhow::Result;
@@ -12,7 +13,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use futures::future::join_all;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -79,7 +79,7 @@ pub struct ReviewService {
     general_review_flow: ReviewFlow,
     security_review_flow: ReviewFlow,
     mention_flow: MentionFlow,
-    shutdown: Arc<AtomicBool>,
+    lifecycle: Arc<ServiceLifecycle>,
     active_tasks: Arc<ActiveTaskRegistry>,
 }
 
@@ -95,7 +95,7 @@ impl ReviewService {
         let semaphore = Arc::new(Semaphore::new(config.review.max_concurrent));
         let mention_branch_locks = Arc::new(Mutex::new(HashMap::new()));
         let retry_backoff = Arc::new(RetryBackoff::new(Duration::hours(1)));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(ServiceLifecycle::default());
         let active_tasks = Arc::new(ActiveTaskRegistry::default());
         let flow_shared = FlowShared::new(
             config.clone(),
@@ -104,7 +104,7 @@ impl ReviewService {
             Arc::clone(&codex),
             bot_user_id,
             Arc::clone(&semaphore),
-            Arc::clone(&shutdown),
+            Arc::clone(&lifecycle),
             Arc::clone(&active_tasks),
         );
         let mention_flow = MentionFlow::new(flow_shared.clone(), mention_branch_locks);
@@ -126,7 +126,7 @@ impl ReviewService {
             general_review_flow,
             security_review_flow,
             mention_flow,
-            shutdown,
+            lifecycle,
             active_tasks,
         }
     }
@@ -205,7 +205,19 @@ impl ReviewService {
     }
 
     pub fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.lifecycle.request_fast_stop();
+    }
+
+    pub fn request_graceful_drain(&self) {
+        self.lifecycle.request_graceful_drain();
+    }
+
+    pub async fn wait_for_started_runs(&self) {
+        self.lifecycle.wait_for_started_runs().await;
+    }
+
+    pub async fn wait_for_active_tasks(&self) {
+        self.active_tasks.wait_for_idle().await;
     }
 
     /// # Errors
@@ -220,7 +232,7 @@ impl ReviewService {
     }
 
     fn shutdown_requested(&self) -> bool {
-        self.shutdown.load(Ordering::SeqCst)
+        !self.lifecycle.accepts_new_work()
     }
 
     async fn recover_flows(&self) -> Result<()> {

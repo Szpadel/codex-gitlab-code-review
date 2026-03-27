@@ -16,6 +16,7 @@ use crate::gitlab::{
     AwardEmoji, DiscussionNote, GitLabUser, GitLabUserDetail, MergeRequestDiff,
     MergeRequestDiffDiscussion, MergeRequestDiffVersion, MergeRequestDiscussion, Note,
 };
+use crate::lifecycle::ServiceLifecycle;
 use crate::state::{
     ReviewRateLimitBucketMode, ReviewRateLimitRuleUpsert, ReviewRateLimitScope,
     ReviewRateLimitTarget, ReviewRateLimitTargetKind,
@@ -27,7 +28,6 @@ use pretty_assertions::assert_eq;
 use sqlx::Row;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 struct FakeGitLab {
     bot_user: GitLabUser,
@@ -657,7 +657,7 @@ impl CodexRunner for RecoveryRunner {
 }
 
 struct ShutdownTriggerRunner {
-    shutdown: Arc<AtomicBool>,
+    lifecycle: Arc<ServiceLifecycle>,
     calls: Mutex<u32>,
 }
 
@@ -665,7 +665,23 @@ struct ShutdownTriggerRunner {
 impl CodexRunner for ShutdownTriggerRunner {
     async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
         *self.calls.lock().unwrap() += 1;
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.lifecycle.request_fast_stop();
+        Ok(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })
+    }
+}
+
+struct GracefulDrainTriggerRunner {
+    lifecycle: Arc<ServiceLifecycle>,
+    calls: Mutex<u32>,
+}
+
+#[async_trait]
+impl CodexRunner for GracefulDrainTriggerRunner {
+    async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+        *self.calls.lock().unwrap() += 1;
+        self.lifecycle.request_graceful_drain();
         Ok(CodexResult::Pass {
             summary: "ok".to_string(),
         })
@@ -674,7 +690,7 @@ impl CodexRunner for ShutdownTriggerRunner {
 
 struct ShutdownOnEyesAwardGitLab {
     inner: Arc<FakeGitLab>,
-    shutdown: Arc<AtomicBool>,
+    lifecycle: Arc<ServiceLifecycle>,
     eyes_emoji: String,
 }
 
@@ -717,7 +733,7 @@ impl GitLabApi for ShutdownOnEyesAwardGitLab {
 
     async fn add_award(&self, project: &str, iid: u64, name: &str) -> Result<()> {
         if name == self.eyes_emoji {
-            self.shutdown.store(true, Ordering::SeqCst);
+            self.lifecycle.request_fast_stop();
         }
         self.inner.add_award(project, iid, name).await
     }
@@ -737,7 +753,7 @@ impl GitLabApi for ShutdownOnEyesAwardGitLab {
 
 struct ShutdownOnListOpenGitLab {
     inner: Arc<FakeGitLab>,
-    shutdown: Arc<AtomicBool>,
+    signal_open: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
@@ -758,7 +774,7 @@ impl GitLabApi for ShutdownOnListOpenGitLab {
     }
 
     async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>> {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.signal_open.notify_waiters();
         self.inner.list_open_mrs(project).await
     }
 
@@ -797,7 +813,7 @@ impl GitLabApi for ShutdownOnListOpenGitLab {
 
 struct ShutdownOnListAwardsGitLab {
     inner: Arc<FakeGitLab>,
-    shutdown: Arc<AtomicBool>,
+    lifecycle: Arc<ServiceLifecycle>,
 }
 
 #[async_trait]
@@ -834,7 +850,7 @@ impl GitLabApi for ShutdownOnListAwardsGitLab {
     }
 
     async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>> {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.lifecycle.request_fast_stop();
         self.inner.list_awards(project, iid).await
     }
 
@@ -2792,10 +2808,10 @@ async fn incremental_does_not_advance_marker_when_repo_scan_is_interrupted() -> 
         list_group_projects_calls: Mutex::new(0),
         delete_award_fails: false,
     });
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let signal_open = Arc::new(tokio::sync::Notify::new());
     let gitlab = Arc::new(ShutdownOnListOpenGitLab {
         inner: Arc::clone(&base_gitlab),
-        shutdown: Arc::clone(&shutdown),
+        signal_open: Arc::clone(&signal_open),
     });
     let runner = Arc::new(FakeRunner {
         result: Mutex::new(None),
@@ -2810,15 +2826,19 @@ async fn incremental_does_not_advance_marker_when_repo_scan_is_interrupted() -> 
     state
         .set_project_last_mr_activity("group/repo", &previous_marker)
         .await?;
-    let mut service = ReviewService::new(
+    let service = Arc::new(ReviewService::new(
         config,
         gitlab,
         state.clone(),
         runner.clone(),
         1,
         default_created_after(),
-    );
-    service.shutdown = shutdown;
+    ));
+    let drain_service = Arc::clone(&service);
+    tokio::spawn(async move {
+        signal_open.notified().await;
+        drain_service.request_graceful_drain();
+    });
 
     service.scan_once_incremental().await?;
 
@@ -4056,9 +4076,9 @@ async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes()
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state.begin_review("group/repo", 22, "sha22").await?;
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let lifecycle = Arc::new(ServiceLifecycle::default());
     let runner = Arc::new(ShutdownTriggerRunner {
-        shutdown: Arc::clone(&shutdown),
+        lifecycle: Arc::clone(&lifecycle),
         calls: Mutex::new(0),
     });
     let review_context = ReviewRunContext {
@@ -4069,7 +4089,7 @@ async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes()
         state: state.clone(),
         retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
         bot_user_id: 1,
-        shutdown,
+        lifecycle,
         acquired_rate_limit_rule_ids: Vec::new(),
     };
 
@@ -4150,10 +4170,10 @@ async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_
         list_group_projects_calls: Mutex::new(0),
         delete_award_fails: false,
     });
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let lifecycle = Arc::new(ServiceLifecycle::default());
     let gitlab = Arc::new(ShutdownOnEyesAwardGitLab {
         inner: Arc::clone(&base_gitlab),
-        shutdown: Arc::clone(&shutdown),
+        lifecycle: Arc::clone(&lifecycle),
         eyes_emoji: config.review.eyes_emoji.clone(),
     });
     let runner = Arc::new(FakeRunner {
@@ -4170,7 +4190,7 @@ async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_
         state: state.clone(),
         retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
         bot_user_id: 1,
-        shutdown,
+        lifecycle,
         acquired_rate_limit_rule_ids: Vec::new(),
     };
 
@@ -4250,10 +4270,10 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
         list_group_projects_calls: Mutex::new(0),
         delete_award_fails: false,
     });
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let lifecycle = Arc::new(ServiceLifecycle::default());
     let gitlab = Arc::new(ShutdownOnListAwardsGitLab {
         inner: Arc::clone(&base_gitlab),
-        shutdown: Arc::clone(&shutdown),
+        lifecycle: Arc::clone(&lifecycle),
     });
     let runner = Arc::new(FakeRunner {
         result: Mutex::new(Some(CodexResult::Pass {
@@ -4271,7 +4291,7 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
         state: state.clone(),
         retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
         bot_user_id: 1,
-        shutdown,
+        lifecycle,
         acquired_rate_limit_rule_ids: Vec::new(),
     };
 
@@ -4317,6 +4337,186 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
     let result: Option<String> = row.try_get("result")?;
     assert_eq!(status, "done");
     assert_eq!(result, Some("cancelled".to_string()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_finishes_successfully_when_graceful_drain_starts_after_runner_begins() -> Result<()>
+{
+    let config = test_config();
+    let bot_user = GitLabUser {
+        id: 1,
+        username: None,
+        name: None,
+    };
+    let gitlab = Arc::new(FakeGitLab {
+        bot_user: bot_user.clone(),
+        mrs: Mutex::new(Vec::new()),
+        awards: Mutex::new(HashMap::from([(
+            ("group/repo".to_string(), 26),
+            vec![AwardEmoji {
+                id: 260,
+                name: "eyes".to_string(),
+                user: bot_user,
+            }],
+        )])),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::new()),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    state.begin_review("group/repo", 26, "sha26").await?;
+    let lifecycle = Arc::new(ServiceLifecycle::default());
+    let runner = Arc::new(GracefulDrainTriggerRunner {
+        lifecycle: Arc::clone(&lifecycle),
+        calls: Mutex::new(0),
+    });
+    let review_context = ReviewRunContext {
+        lane: crate::review_lane::ReviewLane::General,
+        config,
+        gitlab: gitlab.clone(),
+        codex: runner.clone(),
+        state: state.clone(),
+        retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
+        bot_user_id: 1,
+        lifecycle,
+        acquired_rate_limit_rule_ids: Vec::new(),
+    };
+
+    review_context
+        .run(
+            "group/repo",
+            mr(26, "sha26"),
+            "sha26",
+            crate::feature_flags::FeatureFlagSnapshot::default(),
+            0,
+        )
+        .await?;
+
+    assert_eq!(*runner.calls.lock().unwrap(), 1);
+    let calls = gitlab.calls.lock().unwrap().clone();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == "add_award:group/repo:26:eyes")
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == "delete_award:group/repo:26:260")
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == "add_award:group/repo:26:thumbsup")
+    );
+
+    let row = sqlx::query("SELECT status, result FROM review_state WHERE repo = ? AND iid = ?")
+        .bind("group/repo")
+        .bind(26i64)
+        .fetch_one(state.pool())
+        .await?;
+    let status: String = row.try_get("status")?;
+    let result: Option<String> = row.try_get("result")?;
+    assert_eq!(status, "done");
+    assert_eq!(result, Some("pass".to_string()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn graceful_drain_cancels_queued_review_without_starting_second_codex_run() -> Result<()> {
+    let mut config = test_config();
+    config.review.max_concurrent = 1;
+    let bot_user = GitLabUser {
+        id: 1,
+        username: Some("botuser".to_string()),
+        name: Some("Bot User".to_string()),
+    };
+    let mut first_mr = mr(90, "sha90");
+    first_mr.updated_at = Some(default_created_at() + Duration::minutes(1));
+    let mut second_mr = mr(91, "sha91");
+    second_mr.updated_at = Some(default_created_at() + Duration::minutes(2));
+    let gitlab = Arc::new(FakeGitLab {
+        bot_user,
+        mrs: Mutex::new(vec![first_mr.clone(), second_mr.clone()]),
+        awards: Mutex::new(HashMap::new()),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::new()),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let first_started = Arc::new(tokio::sync::Notify::new());
+    let release_first = Arc::new(tokio::sync::Notify::new());
+    let runner = Arc::new(BlockingReviewRunner {
+        first_started: Arc::clone(&first_started),
+        release_first: Arc::clone(&release_first),
+        review_calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let previous_marker = format!(
+        "{}|{}",
+        (default_created_at() - Duration::days(1)).to_rfc3339(),
+        90
+    );
+    state
+        .set_project_last_mr_activity("group/repo", &previous_marker)
+        .await?;
+    let service = Arc::new(ReviewService::new(
+        config,
+        gitlab,
+        Arc::clone(&state),
+        runner.clone(),
+        1,
+        default_created_after(),
+    ));
+
+    let first_started_wait = first_started.notified();
+    let first_scan_task = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move { service.scan_once_incremental().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), first_started_wait).await?;
+    let first_scan_status =
+        tokio::time::timeout(std::time::Duration::from_millis(200), first_scan_task).await???;
+    assert_eq!(first_scan_status, ScanRunStatus::Completed);
+    assert_eq!(*runner.review_calls.lock().unwrap(), 1);
+    assert_eq!(state.list_in_progress_reviews().await?.len(), 2);
+
+    service.request_graceful_drain();
+    release_first.notify_waiters();
+
+    for _ in 0..50 {
+        if state.list_in_progress_reviews().await?.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(*runner.review_calls.lock().unwrap(), 1);
+    assert!(state.list_in_progress_reviews().await?.is_empty());
+    let results: Vec<(i64, String)> =
+        sqlx::query_as("SELECT iid, result FROM review_state ORDER BY iid")
+            .fetch_all(state.pool())
+            .await?;
+    assert_eq!(
+        results,
+        vec![(90, "pass".to_string()), (91, "cancelled".to_string())]
+    );
     Ok(())
 }
 
@@ -4429,7 +4629,7 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
         state: state.clone(),
         retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
         bot_user_id: 1,
-        shutdown: Arc::new(AtomicBool::new(false)),
+        lifecycle: Arc::new(ServiceLifecycle::default()),
         acquired_rate_limit_rule_ids: Vec::new(),
     };
 
@@ -4530,7 +4730,7 @@ async fn security_review_pass_stays_silent() -> Result<()> {
         state: state.clone(),
         retry_backoff: Arc::new(RetryBackoff::new(Duration::hours(1))),
         bot_user_id: 1,
-        shutdown: Arc::new(AtomicBool::new(false)),
+        lifecycle: Arc::new(ServiceLifecycle::default()),
         acquired_rate_limit_rule_ids: Vec::new(),
     };
 

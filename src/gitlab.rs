@@ -63,7 +63,9 @@ impl From<RawMergeRequest> for MergeRequest {
             iid: raw.iid,
             title: raw.title,
             web_url: raw.web_url,
-            draft: raw.draft.unwrap_or_else(|| raw.work_in_progress.unwrap_or(false)),
+            draft: raw
+                .draft
+                .unwrap_or_else(|| raw.work_in_progress.unwrap_or(false)),
             created_at: raw.created_at,
             updated_at: raw.updated_at,
             sha: raw.sha,

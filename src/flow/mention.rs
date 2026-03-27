@@ -9,7 +9,6 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
@@ -571,7 +570,7 @@ impl MentionFlow {
             let gitlab = Arc::clone(&self.shared.gitlab);
             let codex = Arc::clone(&self.shared.codex);
             let state = Arc::clone(&self.shared.state);
-            let shutdown = Arc::clone(&self.shared.shutdown);
+            let lifecycle = Arc::clone(&self.shared.lifecycle);
             let repo_name = repo.to_string();
             let command_repo_name = command_repo.clone();
             let mr_copy = mr.clone();
@@ -586,14 +585,15 @@ impl MentionFlow {
             outcome.scheduled += 1;
             outcome.blocks_review = true;
             outcome.blocked_pending_work = true;
+            let active_mention = active_tasks.track_mention(ActiveMentionKey {
+                repo: repo_name.clone(),
+                iid: mr_copy.iid,
+                discussion_id: trigger.discussion_id.clone(),
+                trigger_note_id: trigger.trigger_note.id,
+                head_sha: head_sha_copy.clone(),
+            });
             tasks.push(tokio::spawn(async move {
-                let _active_mention = active_tasks.track_mention(ActiveMentionKey {
-                    repo: repo_name.clone(),
-                    iid: mr_copy.iid,
-                    discussion_id: trigger.discussion_id.clone(),
-                    trigger_note_id: trigger.trigger_note.id,
-                    head_sha: head_sha_copy.clone(),
-                });
+                let _active_mention = active_mention;
                 let _branch_guard = branch_lock.lock().await;
                 let Ok(_permit) = semaphore.acquire_owned().await else {
                     warn!(
@@ -605,7 +605,7 @@ impl MentionFlow {
                 };
                 let discussion_id = trigger.discussion_id.clone();
                 let trigger_note_id = trigger.trigger_note.id;
-                if shutdown.load(Ordering::SeqCst) {
+                if !lifecycle.accepts_new_work() {
                     let _ = state
                         .finish_mention_command(
                             &repo_name,
@@ -711,6 +711,7 @@ impl MentionFlow {
                     feature_flags,
                     run_history_id: Some(run_history_id),
                 };
+                let _started_run = lifecycle.track_started_run();
                 let outcome = codex.run_mention_command(command_context).await;
                 let (state_result, status_message, run_history_finish) = match outcome {
                     Ok(MentionCommandResult {
