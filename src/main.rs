@@ -238,7 +238,7 @@ async fn main() -> Result<()> {
     if let Err(err) =
         run_tracked_scan(status_service.as_ref(), ScanMode::Full, service.scan_once()).await
     {
-        warn!(error = %err, "initial scan failed");
+        warn!(error = %format!("{err:#}"), "initial scan failed");
     }
 
     let tz = parse_timezone(config.schedule.timezone.as_deref())?;
@@ -660,7 +660,7 @@ async fn run_schedule_loop(
             }
         };
         if let Err(err) = scan_result {
-            warn!(error = %err, "scheduled wake failed");
+            warn!(error = %format!("{err:#}"), "scheduled wake failed");
         }
         if matches!(scheduled_wake.reason, ScheduledWakeReason::Cron) {
             next_cron_at = schedule

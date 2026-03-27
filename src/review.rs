@@ -754,7 +754,7 @@ impl ReviewService {
             Err(err) => {
                 warn!(
                     repo = repo,
-                    error = %err,
+                    error = %format!("{err:#}"),
                     "failed to load latest MR activity; scanning"
                 );
                 None

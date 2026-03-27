@@ -14,11 +14,11 @@ pub struct GitLabUser {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(from = "RawMergeRequest")]
 pub struct MergeRequest {
     pub iid: u64,
     pub title: Option<String>,
     pub web_url: Option<String>,
-    #[serde(default, alias = "work_in_progress")]
     pub draft: bool,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
@@ -32,6 +32,49 @@ pub struct MergeRequest {
     #[serde(default)]
     pub target_project_id: Option<u64>,
     pub diff_refs: Option<DiffRefs>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawMergeRequest {
+    pub iid: u64,
+    pub title: Option<String>,
+    pub web_url: Option<String>,
+    #[serde(default)]
+    pub draft: Option<bool>,
+    #[serde(default)]
+    pub work_in_progress: Option<bool>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub sha: Option<String>,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
+    #[serde(default)]
+    pub author: Option<GitLabUser>,
+    #[serde(default)]
+    pub source_project_id: Option<u64>,
+    #[serde(default)]
+    pub target_project_id: Option<u64>,
+    pub diff_refs: Option<DiffRefs>,
+}
+
+impl From<RawMergeRequest> for MergeRequest {
+    fn from(raw: RawMergeRequest) -> Self {
+        Self {
+            iid: raw.iid,
+            title: raw.title,
+            web_url: raw.web_url,
+            draft: raw.draft.unwrap_or_else(|| raw.work_in_progress.unwrap_or(false)),
+            created_at: raw.created_at,
+            updated_at: raw.updated_at,
+            sha: raw.sha,
+            source_branch: raw.source_branch,
+            target_branch: raw.target_branch,
+            author: raw.author,
+            source_project_id: raw.source_project_id,
+            target_project_id: raw.target_project_id,
+            diff_refs: raw.diff_refs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -989,25 +1032,52 @@ async fn ensure_success<T: for<'de> Deserialize<'de>>(
     url: &str,
 ) -> Result<T> {
     let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let content_type = content_type.map(str::to_owned);
     if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
         return Err(anyhow!(format_gitlab_http_error(
-            method, url, status, &text
+            method,
+            url,
+            status,
+            content_type.as_deref(),
+            &text
         )));
     }
-    let value = response
-        .json::<T>()
+    let body = response
+        .bytes()
         .await
-        .with_context(|| format!("gitlab {method} {url} response"))?;
-    Ok(value)
+        .with_context(|| format!("gitlab {method} {url} response body"))?;
+    serde_json::from_slice::<T>(&body).map_err(|err| {
+        anyhow!(format_gitlab_decode_error(
+            method,
+            url,
+            status,
+            content_type.as_deref(),
+            &body,
+            &err
+        ))
+    })
 }
 
 async fn ensure_success_empty(response: Response, method: &str, url: &str) -> Result<()> {
     let status = response.status();
     if !status.is_success() {
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        let content_type = content_type.map(str::to_owned);
         let text = response.text().await.unwrap_or_default();
         return Err(anyhow!(format_gitlab_http_error(
-            method, url, status, &text
+            method,
+            url,
+            status,
+            content_type.as_deref(),
+            &text
         )));
     }
     Ok(())
@@ -1016,9 +1086,18 @@ async fn ensure_success_empty(response: Response, method: &str, url: &str) -> Re
 async fn ensure_success_bytes(response: Response, method: &str, url: &str) -> Result<Vec<u8>> {
     let status = response.status();
     if !status.is_success() {
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        let content_type = content_type.map(str::to_owned);
         let text = response.text().await.unwrap_or_default();
         return Err(anyhow!(format_gitlab_http_error(
-            method, url, status, &text
+            method,
+            url,
+            status,
+            content_type.as_deref(),
+            &text
         )));
     }
     let bytes = response
@@ -1032,11 +1111,28 @@ fn format_gitlab_http_error(
     method: &str,
     url: &str,
     status: reqwest::StatusCode,
+    content_type: Option<&str>,
     body: &str,
 ) -> String {
+    let content_type = content_type.unwrap_or("<unknown>");
     format!(
-        "gitlab {method} {url} response: status={status} body={}",
-        format_gitlab_error_body(body)
+        "gitlab {method} {url} response: status={status} content_type={content_type} body={}",
+        format_gitlab_error_body(body),
+    )
+}
+
+fn format_gitlab_decode_error(
+    method: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    content_type: Option<&str>,
+    body: &[u8],
+    err: &serde_json::Error,
+) -> String {
+    let content_type = content_type.unwrap_or("<unknown>");
+    format!(
+        "gitlab {method} {url} response: status={status} content_type={content_type} body={} decode_error={err}",
+        format_gitlab_error_body_bytes(body),
     )
 }
 
@@ -1061,6 +1157,10 @@ fn format_gitlab_error_body(body: &str) -> String {
     }
     let truncated: String = sanitized.chars().take(GITLAB_ERROR_BODY_LIMIT).collect();
     format!("{truncated}...")
+}
+
+fn format_gitlab_error_body_bytes(body: &[u8]) -> String {
+    format_gitlab_error_body(&String::from_utf8_lossy(body))
 }
 
 fn should_fallback_to_merge_request_note_awards(err: &anyhow::Error) -> bool {
@@ -1193,6 +1293,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_open_mrs_accepts_both_draft_fields() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "")
+            .set_body_json(vec![serde_json::json!({
+                "iid": 5,
+                "sha": "ghi",
+                "draft": true,
+                "work_in_progress": true
+            })]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+            .and(query_param("state", "opened"))
+            .and(query_param("scope", "all"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let mrs = client.list_open_mrs("group/repo").await?;
+        assert_eq!(mrs.len(), 1);
+        assert!(mrs[0].draft);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_open_mrs_prefers_draft_when_both_fields_exist() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "")
+            .set_body_json(vec![serde_json::json!({
+                "iid": 6,
+                "sha": "jkl",
+                "draft": false,
+                "work_in_progress": true
+            })]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+            .and(query_param("state", "opened"))
+            .and(query_param("scope", "all"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let mrs = client.list_open_mrs("group/repo").await?;
+        assert_eq!(mrs.len(), 1);
+        assert!(!mrs[0].draft);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn get_latest_open_mr_activity_fetches_latest_update() -> Result<()> {
         let server = MockServer::start().await;
         let response = ResponseTemplate::new(200).set_body_json(vec![serde_json::json!({
@@ -1222,6 +1380,38 @@ mod tests {
             mr.updated_at,
             Some(DateTime::parse_from_rfc3339("2025-01-05T12:34:56Z")?.with_timezone(&Utc))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_latest_open_mr_activity_accepts_both_draft_fields() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(vec![serde_json::json!({
+            "iid": 8,
+            "updated_at": "2025-01-05T12:34:56Z",
+            "draft": true,
+            "work_in_progress": true
+        })]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+            .and(query_param("state", "opened"))
+            .and(query_param("scope", "all"))
+            .and(query_param("order_by", "updated_at"))
+            .and(query_param("sort", "desc"))
+            .and(query_param("per_page", "1"))
+            .and(header_exists("PRIVATE-TOKEN"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let mr = client
+            .get_latest_open_mr_activity("group/repo")
+            .await?
+            .expect("latest MR");
+        assert_eq!(mr.iid, 8);
+        assert!(mr.draft);
         Ok(())
     }
 
@@ -1280,8 +1470,18 @@ mod tests {
             .await
             .expect_err("request should fail");
         let message = err.to_string();
-        assert!(message.contains("gitlab GET"));
-        assert!(message.contains("/projects/group%2Frepo/merge_requests?state=opened"));
+        assert!(message.contains("gitlab GET"), "{message}");
+        assert!(message.contains("status=200 OK"), "{message}");
+        assert!(message.contains("content_type=text/"), "{message}");
+        assert!(
+            message.contains("/projects/group%2Frepo/merge_requests?state=opened"),
+            "{message}"
+        );
+        assert!(
+            message.contains("body=<html>proxy splash</html>"),
+            "{message}"
+        );
+        assert!(message.contains("decode_error="), "{message}");
         Ok(())
     }
 
