@@ -401,6 +401,7 @@ impl DevMergeRequest {
                 project_web_url(repo_path),
                 self.iid
             )),
+            draft: false,
             created_at: Some(self.created_at),
             updated_at: Some(self.updated_at),
             sha: Some(self.head_sha.clone()),

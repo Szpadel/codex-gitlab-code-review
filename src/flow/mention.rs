@@ -1245,6 +1245,7 @@ mod tests {
             iid: 7,
             title: Some("Demo".to_string()),
             web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/7".to_string()),
+            draft: false,
             created_at: None,
             updated_at: None,
             sha: Some("deadbeef".to_string()),

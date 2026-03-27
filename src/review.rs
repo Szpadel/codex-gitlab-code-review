@@ -64,6 +64,7 @@ struct ScanCounters {
     skipped_backoff: usize,
     missing_sha: usize,
     skipped_inactive: usize,
+    skipped_draft: usize,
     skipped_created_before: usize,
 }
 
@@ -697,6 +698,7 @@ impl ReviewService {
                     mention_skipped_processed = counters.mention_skipped_processed,
                     skipped_backoff = counters.skipped_backoff,
                     missing_sha = counters.missing_sha,
+                    skipped_draft = counters.skipped_draft,
                     skipped_created_before = counters.skipped_created_before,
                     "scan complete"
                 );
@@ -721,6 +723,7 @@ impl ReviewService {
                     skipped_backoff = counters.skipped_backoff,
                     missing_sha = counters.missing_sha,
                     skipped_inactive = counters.skipped_inactive,
+                    skipped_draft = counters.skipped_draft,
                     skipped_created_before = counters.skipped_created_before,
                     "scan complete"
                 );
@@ -948,6 +951,11 @@ impl ReviewService {
                     iid = mr.iid,
                     "skip review scheduling in this scan: same-MR mention work is active or pending"
                 );
+                continue;
+            }
+            if mr.draft {
+                counters.skipped_draft += 1;
+                debug!(repo = repo, iid = mr.iid, "skip: draft MR");
                 continue;
             }
             let created_at = if let Some(value) = mr.created_at.as_ref() {
@@ -1315,6 +1323,7 @@ mod pending_rate_limit_tests {
             iid,
             title: None,
             web_url: None,
+            draft: false,
             created_at: Some(updated_at),
             updated_at: Some(updated_at),
             sha: Some(sha.to_string()),

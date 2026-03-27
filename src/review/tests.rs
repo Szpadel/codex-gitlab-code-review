@@ -1078,6 +1078,7 @@ fn mr_with_created_at(iid: u64, sha: &str, created_at: DateTime<Utc>) -> MergeRe
         iid,
         title: None,
         web_url: None,
+        draft: false,
         created_at: Some(created_at),
         updated_at: Some(created_at),
         sha: Some(sha.to_string()),
@@ -3552,6 +3553,179 @@ async fn review_finishes_when_eye_removal_fails() -> Result<()> {
         .await?;
     let status: String = row.try_get("status")?;
     assert_eq!(status, "done");
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_skips_review_for_draft_merge_request() -> Result<()> {
+    let config = test_config();
+    let bot_user = GitLabUser {
+        id: 1,
+        username: None,
+        name: None,
+    };
+    let mut draft_mr = mr(52, "sha52");
+    draft_mr.draft = true;
+    let gitlab = Arc::new(FakeGitLab {
+        bot_user,
+        mrs: Mutex::new(vec![draft_mr]),
+        awards: Mutex::new(HashMap::new()),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::new()),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let runner = Arc::new(MentionAndReviewCounterRunner {
+        mention_calls: Mutex::new(0),
+        review_calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab,
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once().await?;
+
+    assert_eq!(*runner.review_calls.lock().unwrap(), 0);
+    assert_eq!(*runner.mention_calls.lock().unwrap(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_runs_mention_command_for_draft_merge_request_without_reviewing_it() -> Result<()> {
+    let mut config = test_config();
+    config.review.mention_commands.enabled = true;
+    config.review.mention_commands.bot_username = Some("botuser".to_string());
+    config.review.mention_commands.eyes_emoji = Some("inspect".to_string());
+    let bot_user = GitLabUser {
+        id: 1,
+        username: Some("botuser".to_string()),
+        name: Some("Bot User".to_string()),
+    };
+    let requester = GitLabUser {
+        id: 7,
+        username: Some("alice".to_string()),
+        name: Some("Alice".to_string()),
+    };
+    let mut draft_mr = mr(53, "sha53");
+    draft_mr.draft = true;
+    let gitlab = Arc::new(FakeGitLab {
+        bot_user: bot_user.clone(),
+        mrs: Mutex::new(vec![draft_mr]),
+        awards: Mutex::new(HashMap::new()),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::from([(
+            ("group/repo".to_string(), 53),
+            vec![MergeRequestDiscussion {
+                id: "discussion-1".to_string(),
+                notes: vec![
+                    DiscussionNote {
+                        id: 920,
+                        body: "review note".to_string(),
+                        author: bot_user,
+                        system: false,
+                        in_reply_to_id: None,
+                        created_at: None,
+                    },
+                    DiscussionNote {
+                        id: 921,
+                        body: "@botuser question".to_string(),
+                        author: requester,
+                        system: false,
+                        in_reply_to_id: Some(920),
+                        created_at: None,
+                    },
+                ],
+            }],
+        )])),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let runner = Arc::new(MentionAndReviewCounterRunner {
+        mention_calls: Mutex::new(0),
+        review_calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab,
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once().await?;
+
+    assert_eq!(*runner.mention_calls.lock().unwrap(), 1);
+    assert_eq!(*runner.review_calls.lock().unwrap(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_review_still_runs_for_draft_merge_request() -> Result<()> {
+    let config = test_config();
+    let bot_user = GitLabUser {
+        id: 1,
+        username: None,
+        name: None,
+    };
+    let mut draft_mr = mr(54, "sha54");
+    draft_mr.draft = true;
+    let gitlab = Arc::new(FakeGitLab {
+        bot_user,
+        mrs: Mutex::new(vec![draft_mr]),
+        awards: Mutex::new(HashMap::new()),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::new()),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let runner = Arc::new(FakeRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab,
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.review_mr("group/repo", 54).await?;
+
+    assert_eq!(*runner.calls.lock().unwrap(), 1);
     Ok(())
 }
 

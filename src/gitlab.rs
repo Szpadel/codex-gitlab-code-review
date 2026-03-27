@@ -18,6 +18,8 @@ pub struct MergeRequest {
     pub iid: u64,
     pub title: Option<String>,
     pub web_url: Option<String>,
+    #[serde(default, alias = "work_in_progress")]
+    pub draft: bool,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub sha: Option<String>,
@@ -1138,6 +1140,55 @@ mod tests {
         assert_eq!(mrs.len(), 2);
         assert_eq!(mrs[0].iid, 1);
         assert_eq!(mrs[1].iid, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_open_mrs_deserializes_draft_status() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200)
+            .append_header("X-Next-Page", "")
+            .set_body_json(vec![serde_json::json!({
+                "iid": 3,
+                "sha": "abc",
+                "draft": true
+            })]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+            .and(query_param("state", "opened"))
+            .and(query_param("scope", "all"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "100"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let mrs = client.list_open_mrs("group/repo").await?;
+        assert_eq!(mrs.len(), 1);
+        assert!(mrs[0].draft);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_mr_deserializes_legacy_work_in_progress_as_draft() -> Result<()> {
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "iid": 4,
+            "sha": "def",
+            "work_in_progress": true
+        }));
+
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/group%2Frepo/merge_requests/4"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = GitLabClient::new(&server.uri(), "token")?;
+        let mr = client.get_mr("group/repo", 4).await?;
+        assert!(mr.draft);
         Ok(())
     }
 
