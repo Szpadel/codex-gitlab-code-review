@@ -797,4 +797,7 @@ fn decode_repo_key(repo_key: &str) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests;
