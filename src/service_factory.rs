@@ -265,7 +265,7 @@ async fn build_normal_runtime(
     let bot_user_id = resolve_bot_user_id(config, gitlab_client.as_ref()).await?;
 
     let git_base = gitlab_client.git_base_url()?;
-    let review_owner_id = state.get_or_create_review_owner_id().await?;
+    let review_owner_id = state.service_state.get_or_create_review_owner_id().await?;
     let mention_commands_active = mention_commands_active(config);
     let gitlab_discovery_mcp = if config.codex.gitlab_discovery_mcp.enabled {
         Some(Arc::new(GitLabDiscoveryMcpService::new(
@@ -435,11 +435,11 @@ pub async fn resolve_created_after(
 ) -> Result<DateTime<Utc>> {
     if let Some(value) = config.gitlab.created_after.as_ref() {
         let normalized = value.to_rfc3339();
-        state.set_created_after(&normalized).await?;
+        state.service_state.set_created_after(&normalized).await?;
         return Ok(value.to_owned());
     }
 
-    if let Some(raw) = state.get_created_after().await? {
+    if let Some(raw) = state.service_state.get_created_after().await? {
         match DateTime::parse_from_rfc3339(&raw) {
             Ok(parsed) => Ok(parsed.with_timezone(&Utc)),
             Err(err) => {
@@ -449,13 +449,19 @@ pub async fn resolve_created_after(
                     "invalid created_after in state; resetting to now"
                 );
                 let now = Utc::now();
-                state.set_created_after(&now.to_rfc3339()).await?;
+                state
+                    .service_state
+                    .set_created_after(&now.to_rfc3339())
+                    .await?;
                 Ok(now)
             }
         }
     } else {
         let now = Utc::now();
-        state.set_created_after(&now.to_rfc3339()).await?;
+        state
+            .service_state
+            .set_created_after(&now.to_rfc3339())
+            .await?;
         Ok(now)
     }
 }

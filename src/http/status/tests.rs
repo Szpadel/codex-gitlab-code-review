@@ -34,6 +34,7 @@ use std::sync::Arc;
 async fn review_rate_limit_snapshot_includes_rules_buckets_and_pending() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let rule_id = state
+        .review_rate_limit
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
             id: None,
             label: "Repository cap".to_string(),
@@ -53,9 +54,11 @@ async fn review_rate_limit_snapshot_includes_rules_buckets_and_pending() -> Resu
 
     let now = Utc::now().timestamp();
     state
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 99, now)
         .await?;
     state
+        .review_rate_limit
         .upsert_review_rate_limit_pending(
             ReviewLane::General,
             "group/repo",
@@ -495,6 +498,7 @@ async fn update_runtime_feature_flag_persists_override() -> anyhow::Result<()> {
     assert!(updated.effective_enabled);
     assert_eq!(
         store
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .gitlab_discovery_mcp,
@@ -516,6 +520,7 @@ async fn update_runtime_feature_flag_persists_security_review_override() -> anyh
     assert!(updated.effective_enabled);
     assert_eq!(
         store
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .security_review,
@@ -538,6 +543,7 @@ async fn update_runtime_feature_flag_persists_security_context_ignore_base_head_
     assert!(updated.effective_enabled);
     assert_eq!(
         store
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .security_context_ignore_base_head,
@@ -558,6 +564,7 @@ async fn update_runtime_feature_flag_rejects_unavailable_flags() -> anyhow::Resu
     assert!(result.is_err());
     assert_eq!(
         store
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .gitlab_discovery_mcp,
@@ -589,7 +596,10 @@ async fn update_runtime_feature_flag_persists_composer_overrides() -> anyhow::Re
     assert_eq!(safe_updated.runtime_override, Some(true));
     assert!(safe_updated.effective_enabled);
 
-    let stored = store.get_runtime_feature_flag_overrides().await?;
+    let stored = store
+        .feature_flags
+        .get_runtime_feature_flag_overrides()
+        .await?;
     assert_eq!(stored.composer_install, Some(true));
     assert_eq!(stored.composer_auto_repositories, Some(true));
     assert_eq!(stored.composer_safe_install, Some(true));
@@ -600,6 +610,7 @@ async fn update_runtime_feature_flag_persists_composer_overrides() -> anyhow::Re
 async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> anyhow::Result<()> {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
     store
+        .feature_flags
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
@@ -620,6 +631,7 @@ async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> a
     assert!(!updated.effective_enabled);
     assert_eq!(
         store
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .gitlab_discovery_mcp,
@@ -634,6 +646,7 @@ async fn run_detail_snapshot_includes_security_context_preview_for_legacy_cached
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
     let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Security,
             repo: "group/repo".to_string(),
@@ -647,6 +660,7 @@ async fn run_detail_snapshot_includes_security_context_preview_for_legacy_cached
         })
         .await?;
     store
+        .run_history
         .update_run_history_session(
             run_id,
             RunHistorySessionUpdate {
@@ -658,6 +672,7 @@ async fn run_detail_snapshot_includes_security_context_preview_for_legacy_cached
         )
         .await?;
     store
+        .security_context_cache
         .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
             repo: "group/repo".to_string(),
             base_branch: "main".to_string(),
@@ -692,6 +707,7 @@ async fn run_detail_snapshot_prefers_immutable_run_payload_over_mutated_cache() 
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
     let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Security,
             repo: "group/repo".to_string(),
@@ -705,6 +721,7 @@ async fn run_detail_snapshot_prefers_immutable_run_payload_over_mutated_cache() 
         })
         .await?;
     store
+        .run_history
         .update_run_history_session(
             run_id,
             RunHistorySessionUpdate {
@@ -720,6 +737,7 @@ async fn run_detail_snapshot_prefers_immutable_run_payload_over_mutated_cache() 
         )
         .await?;
     store
+        .security_context_cache
         .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
             repo: "group/repo".to_string(),
             base_branch: "main".to_string(),

@@ -3804,6 +3804,7 @@ async fn run_review_with_fake_runtime_security_lane_uses_split_sessions_on_cache
         test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
     let run_history_id = runner
         .state
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Security,
             repo: "group/repo".to_string(),
@@ -3871,6 +3872,7 @@ async fn run_review_with_fake_runtime_security_lane_uses_split_sessions_on_cache
 
     let run = runner
         .state
+        .run_history
         .get_run_history(run_history_id)
         .await?
         .expect("run history");
@@ -3891,7 +3893,11 @@ async fn run_review_with_fake_runtime_security_lane_uses_split_sessions_on_cache
     assert!(run.security_context_generated_at.is_some());
     assert!(run.security_context_expires_at.is_some());
 
-    let events = runner.state.list_run_history_events(run_history_id).await?;
+    let events = runner
+        .state
+        .run_history
+        .list_run_history_events(run_history_id)
+        .await?;
     let turn_ids = events
         .iter()
         .filter_map(|event| event.turn_id.as_deref())
@@ -3900,6 +3906,7 @@ async fn run_review_with_fake_runtime_security_lane_uses_split_sessions_on_cache
 
     let cache_entry = runner
         .state
+        .security_context_cache
         .get_security_review_context_cache(
             "group/repo",
             "main",
@@ -4071,6 +4078,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
         Arc::new(test_runner_with_fake_runtime(codex, false, Arc::clone(&harness), None).await);
     let run_history_id_1 = runner
         .state
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Security,
             repo: "group/repo".to_string(),
@@ -4085,6 +4093,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
         .await?;
     let run_history_id_2 = runner
         .state
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Security,
             repo: "group/repo".to_string(),
@@ -4138,6 +4147,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
 
     let cache_entry = runner
         .state
+        .security_context_cache
         .get_security_review_context_cache(
             "group/repo",
             "main",
@@ -4151,12 +4161,14 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
 
     let follower_run = runner
         .state
+        .run_history
         .get_run_history(run_history_id_2)
         .await?
         .expect("follower run history");
     assert_eq!(follower_run.thread_id.as_deref(), Some("thread-review-2"));
     let follower_events = runner
         .state
+        .run_history
         .list_run_history_events(run_history_id_2)
         .await?;
     let follower_turn_ids = follower_events
@@ -4345,6 +4357,7 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
     );
     let run_history_id_1 = runner
         .state
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Security,
             repo: "group/repo".to_string(),
@@ -4359,6 +4372,7 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
         .await?;
     let run_history_id_2 = runner
         .state
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Security,
             repo: "group/repo".to_string(),
@@ -4415,6 +4429,7 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
     assert!(
         runner
             .state
+            .security_context_cache
             .get_security_review_context_cache(
                 "group/repo",
                 "main",
@@ -4427,6 +4442,7 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
     );
     let follower_run = runner
         .state
+        .run_history
         .get_run_history(run_history_id_2)
         .await?
         .expect("follower run history");
@@ -4488,6 +4504,7 @@ async fn security_review_reuses_branch_cached_context_when_ignore_base_head_enab
         test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
     runner
         .state
+        .security_context_cache
         .upsert_security_review_context_cache(&crate::state::SecurityReviewContextCacheEntry {
             repo: "group/repo".to_string(),
             base_branch: "main".to_string(),
@@ -4502,6 +4519,7 @@ async fn security_review_reuses_branch_cached_context_when_ignore_base_head_enab
 
     let run_history_id = runner
         .state
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Security,
             repo: "group/repo".to_string(),
@@ -4559,6 +4577,7 @@ async fn security_review_reuses_branch_cached_context_when_ignore_base_head_enab
 
     let run = runner
         .state
+        .run_history
         .get_run_history(run_history_id)
         .await?
         .expect("run history");
@@ -4660,6 +4679,7 @@ async fn run_review_with_fake_runtime_persists_gitlab_discovery_startup_warning(
     .await;
     let run_history_id = runner
         .state
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -4696,7 +4716,11 @@ async fn run_review_with_fake_runtime_persists_gitlab_discovery_startup_warning(
         "mcp_servers.gitlab-discovery.url=\"http://gitlab-discovery.internal:8091/mcp\""
     ));
 
-    let events = runner.state.list_run_history_events(run_history_id).await?;
+    let events = runner
+        .state
+        .run_history
+        .list_run_history_events(run_history_id)
+        .await?;
     assert!(
         events
             .iter()

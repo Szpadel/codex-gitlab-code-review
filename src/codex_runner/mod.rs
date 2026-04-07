@@ -365,6 +365,7 @@ impl DockerCodexRunner {
         };
         if let Err(err) = self
             .state
+            .run_history
             .update_run_history_session(run_history_id, update)
             .await
         {
@@ -389,6 +390,7 @@ impl DockerCodexRunner {
         }
         if let Err(err) = self
             .state
+            .run_history
             .append_run_history_events(run_history_id, events)
             .await
         {
@@ -401,6 +403,7 @@ impl DockerCodexRunner {
             // permanent gaps because we do not replay already-consumed notifications.
             if let Err(mark_err) = self
                 .state
+                .run_history
                 .mark_run_history_events_incomplete(run_history_id)
                 .await
             {
@@ -424,6 +427,7 @@ impl DockerCodexRunner {
         };
         if let Err(err) = self
             .state
+            .run_history
             .replace_run_history_events_for_turn(run_history_id, turn_id, events)
             .await
         {
@@ -435,6 +439,7 @@ impl DockerCodexRunner {
             );
             if let Err(mark_err) = self
                 .state
+                .run_history
                 .mark_run_history_events_incomplete(run_history_id)
                 .await
             {

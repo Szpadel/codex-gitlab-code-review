@@ -1216,7 +1216,7 @@ async fn scan_once_with_fake_runtime_runner_posts_review_comment() -> Result<()>
         RunnerRuntimeOptions {
             gitlab_token: config.gitlab.token.clone(),
             log_all_json: false,
-            owner_id: state.get_or_create_review_owner_id().await?,
+            owner_id: state.service_state.get_or_create_review_owner_id().await?,
             mention_commands_active: false,
             review_additional_developer_instructions: None,
         },
@@ -1467,6 +1467,7 @@ async fn completed_review_state_skips_same_sha_without_note_marker() -> Result<(
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let run_id = state
+        .run_history
         .start_run_history(crate::state::NewRunHistory {
             kind: crate::state::RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -1480,6 +1481,7 @@ async fn completed_review_state_skips_same_sha_without_note_marker() -> Result<(
         })
         .await?;
     state
+        .run_history
         .set_run_history_feature_flags(
             run_id,
             &crate::feature_flags::FeatureFlagSnapshot {
@@ -1489,6 +1491,7 @@ async fn completed_review_state_skips_same_sha_without_note_marker() -> Result<(
         )
         .await?;
     state
+        .run_history
         .finish_run_history(
             run_id,
             crate::state::RunHistoryFinish {
@@ -1539,6 +1542,7 @@ async fn legacy_dry_run_comment_history_without_gitlab_markers_does_not_skip_sam
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let run_id = state
+        .run_history
         .start_run_history(crate::state::NewRunHistory {
             kind: crate::state::RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -1552,6 +1556,7 @@ async fn legacy_dry_run_comment_history_without_gitlab_markers_does_not_skip_sam
         })
         .await?;
     state
+        .run_history
         .set_run_history_feature_flags(
             run_id,
             &crate::feature_flags::FeatureFlagSnapshot {
@@ -1561,6 +1566,7 @@ async fn legacy_dry_run_comment_history_without_gitlab_markers_does_not_skip_sam
         )
         .await?;
     state
+        .run_history
         .finish_run_history(
             run_id,
             crate::state::RunHistoryFinish {
@@ -1602,6 +1608,7 @@ async fn completed_inline_review_state_skips_when_discussion_lookup_fails() -> R
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let run_id = state
+        .run_history
         .start_run_history(crate::state::NewRunHistory {
             kind: crate::state::RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -1615,6 +1622,7 @@ async fn completed_inline_review_state_skips_when_discussion_lookup_fails() -> R
         })
         .await?;
     state
+        .run_history
         .set_run_history_feature_flags(
             run_id,
             &crate::feature_flags::FeatureFlagSnapshot {
@@ -1624,6 +1632,7 @@ async fn completed_inline_review_state_skips_when_discussion_lookup_fails() -> R
         )
         .await?;
     state
+        .run_history
         .finish_run_history(
             run_id,
             crate::state::RunHistoryFinish {
@@ -1661,6 +1670,7 @@ async fn errored_review_state_does_not_skip_same_sha() -> Result<()> {
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let run_id = state
+        .run_history
         .start_run_history(crate::state::NewRunHistory {
             kind: crate::state::RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -1674,6 +1684,7 @@ async fn errored_review_state_does_not_skip_same_sha() -> Result<()> {
         })
         .await?;
     state
+        .run_history
         .set_run_history_feature_flags(
             run_id,
             &crate::feature_flags::FeatureFlagSnapshot {
@@ -1683,6 +1694,7 @@ async fn errored_review_state_does_not_skip_same_sha() -> Result<()> {
         )
         .await?;
     state
+        .run_history
         .finish_run_history(
             run_id,
             crate::state::RunHistoryFinish {
@@ -2450,7 +2462,13 @@ async fn review_history_insert_failure_releases_review_lock() -> Result<()> {
 
     assert!(service.scan_once().await.is_err());
     assert_eq!(*runner.calls.lock().unwrap(), 0);
-    assert!(state.list_in_progress_reviews().await?.is_empty());
+    assert!(
+        state
+            .review_state
+            .list_in_progress_reviews()
+            .await?
+            .is_empty()
+    );
     let row = sqlx::query("SELECT status, result FROM review_state WHERE repo = ? AND iid = ?")
         .bind("group/repo")
         .bind(40i64)
@@ -2635,6 +2653,7 @@ async fn security_reviews_use_canonical_project_path_for_runner_context() -> Res
     }
     let run_kinds = service
         .state
+        .run_history
         .list_run_history_for_mr("target/repo", 12)
         .await?
         .into_iter()
@@ -2705,6 +2724,7 @@ async fn incremental_skips_when_activity_unchanged() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let activity_marker = format!("{}|{}", default_created_at().to_rfc3339(), 10);
     state
+        .project_catalog
         .set_project_last_mr_activity("group/repo", &activity_marker)
         .await?;
     let service = ReviewService::new(
@@ -2763,6 +2783,7 @@ async fn incremental_scans_when_activity_changes() -> Result<()> {
         11
     );
     state
+        .project_catalog
         .set_project_last_mr_activity("group/repo", &previous_marker)
         .await?;
     let service = ReviewService::new(
@@ -2778,7 +2799,10 @@ async fn incremental_scans_when_activity_changes() -> Result<()> {
 
     assert_eq!(*gitlab.list_open_calls.lock().unwrap(), 1);
     assert_eq!(*runner.calls.lock().unwrap(), 1);
-    let stored = state.get_project_last_mr_activity("group/repo").await?;
+    let stored = state
+        .project_catalog
+        .get_project_last_mr_activity("group/repo")
+        .await?;
     let current_marker = format!("{}|{}", default_created_at().to_rfc3339(), 11);
     assert_eq!(stored, Some(current_marker));
     Ok(())
@@ -2824,6 +2848,7 @@ async fn incremental_does_not_advance_marker_when_repo_scan_is_interrupted() -> 
         12
     );
     state
+        .project_catalog
         .set_project_last_mr_activity("group/repo", &previous_marker)
         .await?;
     let service = Arc::new(ReviewService::new(
@@ -2844,7 +2869,10 @@ async fn incremental_does_not_advance_marker_when_repo_scan_is_interrupted() -> 
 
     assert_eq!(*base_gitlab.list_open_calls.lock().unwrap(), 1);
     assert_eq!(*runner.calls.lock().unwrap(), 0);
-    let stored = state.get_project_last_mr_activity("group/repo").await?;
+    let stored = state
+        .project_catalog
+        .get_project_last_mr_activity("group/repo")
+        .await?;
     assert_eq!(stored, Some(previous_marker));
     Ok(())
 }
@@ -2883,6 +2911,7 @@ async fn incremental_uses_cached_project_catalog() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let cache_key = config.gitlab.targets.cache_key_for_all();
     state
+        .project_catalog
         .save_project_catalog(&cache_key, &["group/repo".to_string()])
         .await?;
     let service = ReviewService::new(
@@ -2935,6 +2964,7 @@ async fn incremental_refreshes_project_catalog_when_expired() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let cache_key = config.gitlab.targets.cache_key_for_all();
     state
+        .project_catalog
         .save_project_catalog(&cache_key, &["group/stale".to_string()])
         .await?;
     let service = ReviewService::new(
@@ -2950,6 +2980,7 @@ async fn incremental_refreshes_project_catalog_when_expired() -> Result<()> {
 
     assert_eq!(*gitlab.list_projects_calls.lock().unwrap(), 1);
     let loaded = state
+        .project_catalog
         .load_project_catalog(&cache_key)
         .await?
         .expect("catalog");
@@ -2997,6 +3028,7 @@ async fn incremental_scan_returns_before_blocking_review_finishes() -> Result<()
         40
     );
     state
+        .project_catalog
         .set_project_last_mr_activity("group/repo", &previous_marker)
         .await?;
     let service = Arc::new(ReviewService::new(
@@ -3019,19 +3051,30 @@ async fn incremental_scan_returns_before_blocking_review_finishes() -> Result<()
         tokio::time::timeout(std::time::Duration::from_millis(200), scan_task).await???;
     assert_eq!(scan_status, ScanRunStatus::Completed);
 
-    let in_progress = state.list_in_progress_reviews().await?;
+    let in_progress = state.review_state.list_in_progress_reviews().await?;
     assert_eq!(in_progress.len(), 1);
     assert_eq!(in_progress[0].iid, 40);
     assert_eq!(*runner.review_calls.lock().unwrap(), 1);
 
     release_first.notify_waiters();
     for _ in 0..50 {
-        if state.list_in_progress_reviews().await?.is_empty() {
+        if state
+            .review_state
+            .list_in_progress_reviews()
+            .await?
+            .is_empty()
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(state.list_in_progress_reviews().await?.is_empty());
+    assert!(
+        state
+            .review_state
+            .list_in_progress_reviews()
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -3076,6 +3119,7 @@ async fn second_incremental_scan_returns_while_first_review_holds_only_permit() 
         70
     );
     state
+        .project_catalog
         .set_project_last_mr_activity("group/repo", &previous_marker)
         .await?;
     let service = Arc::new(ReviewService::new(
@@ -3114,20 +3158,30 @@ async fn second_incremental_scan_returns_while_first_review_holds_only_permit() 
             .fetch_all(state.pool())
             .await?;
     assert_eq!(review_iids, vec![70, 71]);
-    let in_progress = state.list_in_progress_reviews().await?;
+    let in_progress = state.review_state.list_in_progress_reviews().await?;
     assert_eq!(in_progress.len(), 2);
 
     release_first.notify_waiters();
     for _ in 0..50 {
         if *runner.review_calls.lock().unwrap() == 2
-            && state.list_in_progress_reviews().await?.is_empty()
+            && state
+                .review_state
+                .list_in_progress_reviews()
+                .await?
+                .is_empty()
         {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(*runner.review_calls.lock().unwrap(), 2);
-    assert!(state.list_in_progress_reviews().await?.is_empty());
+    assert!(
+        state
+            .review_state
+            .list_in_progress_reviews()
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -3175,6 +3229,7 @@ async fn queued_reviews_are_heartbeated_across_incremental_scans() -> Result<()>
         80
     );
     state
+        .project_catalog
         .set_project_last_mr_activity("group/repo", &previous_marker)
         .await?;
     let service = Arc::new(ReviewService::new(
@@ -3219,14 +3274,24 @@ async fn queued_reviews_are_heartbeated_across_incremental_scans() -> Result<()>
     release_first.notify_waiters();
     for _ in 0..50 {
         if *runner.review_calls.lock().unwrap() == 3
-            && state.list_in_progress_reviews().await?.is_empty()
+            && state
+                .review_state
+                .list_in_progress_reviews()
+                .await?
+                .is_empty()
         {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(*runner.review_calls.lock().unwrap(), 3);
-    assert!(state.list_in_progress_reviews().await?.is_empty());
+    assert!(
+        state
+            .review_state
+            .list_in_progress_reviews()
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -3315,9 +3380,11 @@ async fn incremental_defers_same_mr_mentions_while_active_mention_blocks_review(
         41
     );
     state
+        .project_catalog
         .set_project_last_mr_activity("group/repo", &previous_marker)
         .await?;
     state
+        .mention_commands
         .begin_mention_command("group/repo", 41, "discussion-41", 1041, "sha41")
         .await?;
     let service = ReviewService::new(
@@ -3349,10 +3416,14 @@ async fn incremental_defers_same_mr_mentions_while_active_mention_blocks_review(
             .fetch_one(state.pool())
             .await?;
     assert_eq!(mention_rows, 0);
-    let stored = state.get_project_last_mr_activity("group/repo").await?;
+    let stored = state
+        .project_catalog
+        .get_project_last_mr_activity("group/repo")
+        .await?;
     assert_eq!(stored, Some(previous_marker.clone()));
 
     state
+        .mention_commands
         .finish_mention_command(
             "group/repo",
             41,
@@ -3466,9 +3537,13 @@ async fn incremental_defers_new_mentions_while_same_mr_review_is_in_progress() -
         51
     );
     state
+        .project_catalog
         .set_project_last_mr_activity("group/repo", &previous_marker)
         .await?;
-    state.begin_review("group/repo", 51, "sha51").await?;
+    state
+        .review_state
+        .begin_review("group/repo", 51, "sha51")
+        .await?;
     let service = ReviewService::new(
         config,
         gitlab,
@@ -3487,10 +3562,14 @@ async fn incremental_defers_new_mentions_while_same_mr_review_is_in_progress() -
             .fetch_one(state.pool())
             .await?;
     assert_eq!(mention_rows, 0);
-    let stored = state.get_project_last_mr_activity("group/repo").await?;
+    let stored = state
+        .project_catalog
+        .get_project_last_mr_activity("group/repo")
+        .await?;
     assert_eq!(stored, Some(previous_marker.clone()));
 
     state
+        .review_state
         .finish_review("group/repo", 51, "sha51", "pass")
         .await?;
 
@@ -3784,7 +3863,10 @@ async fn recover_in_progress_reviews_cancels_and_removes_eyes() -> Result<()> {
         stop_calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    state.begin_review("group/repo", 20, "sha20").await?;
+    state
+        .review_state
+        .begin_review("group/repo", 20, "sha20")
+        .await?;
     let service = ReviewService::new(
         config,
         gitlab.clone(),
@@ -3845,6 +3927,7 @@ async fn recover_in_progress_reviews_marks_mentions_error_without_review_rows() 
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     assert!(
         state
+            .mention_commands
             .begin_mention_command("group/repo", 21, "discussion-1", 901, "sha21")
             .await?
     );
@@ -3916,6 +3999,7 @@ async fn recover_in_progress_reviews_dry_run_skips_mention_reaction_cleanup() ->
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     assert!(
         state
+            .mention_commands
             .begin_mention_command("group/repo", 22, "discussion-2", 902, "sha22")
             .await?
     );
@@ -4075,7 +4159,10 @@ async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes()
         delete_award_fails: false,
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    state.begin_review("group/repo", 22, "sha22").await?;
+    state
+        .review_state
+        .begin_review("group/repo", 22, "sha22")
+        .await?;
     let lifecycle = Arc::new(ServiceLifecycle::default());
     let runner = Arc::new(ShutdownTriggerRunner {
         lifecycle: Arc::clone(&lifecycle),
@@ -4181,7 +4268,10 @@ async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_
         calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    state.begin_review("group/repo", 23, "sha23").await?;
+    state
+        .review_state
+        .begin_review("group/repo", 23, "sha23")
+        .await?;
     let review_context = ReviewRunContext {
         lane: crate::review_lane::ReviewLane::General,
         config,
@@ -4282,7 +4372,10 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
         calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    state.begin_review("group/repo", 24, "sha24").await?;
+    state
+        .review_state
+        .begin_review("group/repo", 24, "sha24")
+        .await?;
     let review_context = ReviewRunContext {
         lane: crate::review_lane::ReviewLane::General,
         config,
@@ -4373,7 +4466,10 @@ async fn review_finishes_successfully_when_graceful_drain_starts_after_runner_be
         delete_award_fails: false,
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    state.begin_review("group/repo", 26, "sha26").await?;
+    state
+        .review_state
+        .begin_review("group/repo", 26, "sha26")
+        .await?;
     let lifecycle = Arc::new(ServiceLifecycle::default());
     let runner = Arc::new(GracefulDrainTriggerRunner {
         lifecycle: Arc::clone(&lifecycle),
@@ -4474,6 +4570,7 @@ async fn graceful_drain_cancels_queued_review_without_starting_second_codex_run(
         90
     );
     state
+        .project_catalog
         .set_project_last_mr_activity("group/repo", &previous_marker)
         .await?;
     let service = Arc::new(ReviewService::new(
@@ -4495,20 +4592,34 @@ async fn graceful_drain_cancels_queued_review_without_starting_second_codex_run(
         tokio::time::timeout(std::time::Duration::from_millis(200), first_scan_task).await???;
     assert_eq!(first_scan_status, ScanRunStatus::Completed);
     assert_eq!(*runner.review_calls.lock().unwrap(), 1);
-    assert_eq!(state.list_in_progress_reviews().await?.len(), 2);
+    assert_eq!(
+        state.review_state.list_in_progress_reviews().await?.len(),
+        2
+    );
 
     service.request_graceful_drain();
     release_first.notify_waiters();
 
     for _ in 0..50 {
-        if state.list_in_progress_reviews().await?.is_empty() {
+        if state
+            .review_state
+            .list_in_progress_reviews()
+            .await?
+            .is_empty()
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
     assert_eq!(*runner.review_calls.lock().unwrap(), 1);
-    assert!(state.list_in_progress_reviews().await?.is_empty());
+    assert!(
+        state
+            .review_state
+            .list_in_progress_reviews()
+            .await?
+            .is_empty()
+    );
     let results: Vec<(i64, String)> =
         sqlx::query_as("SELECT iid, result FROM review_state ORDER BY iid")
             .fetch_all(state.pool())
@@ -4614,6 +4725,7 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
+        .review_state
         .begin_review_for_lane(
             "group/repo",
             25,
@@ -4715,6 +4827,7 @@ async fn security_review_pass_stays_silent() -> Result<()> {
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
+        .review_state
         .begin_review_for_lane(
             "group/repo",
             25,
@@ -4780,6 +4893,7 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let rule_id = state
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "general-only",
             "General only",
@@ -4826,7 +4940,10 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
         crate::flow::review::ReviewScheduleOutcome::SkippedRateLimit
     );
 
-    let pending = state.list_review_rate_limit_pending().await?;
+    let pending = state
+        .review_rate_limit
+        .list_review_rate_limit_pending()
+        .await?;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].lane, crate::review_lane::ReviewLane::General);
     assert_eq!(pending[0].repo, "group/repo".to_string());
@@ -4836,6 +4953,7 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
     assert!(pending[0].next_retry_at > pending[0].last_blocked_at);
 
     state
+        .review_rate_limit
         .refund_review_rate_limit_buckets(
             &[format!("{rule_id}:repo:group/repo")],
             Utc::now().timestamp(),
@@ -4850,7 +4968,13 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
         fourth,
         crate::flow::review::ReviewScheduleOutcome::Scheduled
     );
-    assert!(state.list_review_rate_limit_pending().await?.is_empty());
+    assert!(
+        state
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?
+            .is_empty()
+    );
     assert_eq!(runner.review_contexts.lock().unwrap().len(), 2);
     Ok(())
 }
@@ -4869,6 +4993,7 @@ async fn runtime_rate_limit_block_adds_configured_mr_award() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let now = Utc::now().timestamp();
     state
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "general-only",
             "General only",
@@ -4884,6 +5009,7 @@ async fn runtime_rate_limit_block_adds_configured_mr_award() -> Result<()> {
         ))
         .await?;
     state
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 27, now)
         .await?;
     let service = ReviewService::new(
@@ -4959,6 +5085,7 @@ async fn runtime_rate_limit_block_skips_duplicate_mr_award_when_bot_already_has_
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let now = Utc::now().timestamp();
     state
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "general-only",
             "General only",
@@ -4974,6 +5101,7 @@ async fn runtime_rate_limit_block_skips_duplicate_mr_award_when_bot_already_has_
         ))
         .await?;
     state
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 28, now)
         .await?;
     let service = ReviewService::new(
@@ -5049,6 +5177,7 @@ async fn runtime_rate_limit_clear_removes_configured_mr_award_before_review_resu
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let rule_id = state
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "general-only",
             "General only",
@@ -5064,6 +5193,7 @@ async fn runtime_rate_limit_clear_removes_configured_mr_award_before_review_resu
         ))
         .await?;
     state
+        .review_rate_limit
         .upsert_review_rate_limit_pending(
             ReviewLane::General,
             "group/repo",
@@ -5074,6 +5204,7 @@ async fn runtime_rate_limit_clear_removes_configured_mr_award_before_review_resu
         )
         .await?;
     state
+        .review_rate_limit
         .refund_review_rate_limit_buckets(
             &[format!("{rule_id}:repo:group/repo")],
             Utc::now().timestamp(),
@@ -5105,7 +5236,13 @@ async fn runtime_rate_limit_clear_removes_configured_mr_award_before_review_resu
             .iter()
             .any(|call| call == "delete_award:group/repo:29:290")
     );
-    assert!(state.list_review_rate_limit_pending().await?.is_empty());
+    assert!(
+        state
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -5122,6 +5259,7 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let general_only = state
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "general-only",
             "General only",
@@ -5137,6 +5275,7 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
         ))
         .await?;
     let security_only = state
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "security-only",
             "Security only",
@@ -5152,6 +5291,7 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
         ))
         .await?;
     let shared = state
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "shared",
             "Shared",
@@ -5183,6 +5323,7 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
         crate::flow::review::ReviewScheduleOutcome::Scheduled
     );
     let mut active_rule_ids = state
+        .review_rate_limit
         .list_active_review_rate_limit_buckets(Utc::now().timestamp())
         .await?
         .into_iter()
@@ -5199,6 +5340,7 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
         crate::flow::review::ReviewScheduleOutcome::Scheduled
     );
     let mut active_rule_ids = state
+        .review_rate_limit
         .list_active_review_rate_limit_buckets(Utc::now().timestamp())
         .await?
         .into_iter()
@@ -5241,6 +5383,7 @@ async fn runtime_rate_limit_refunds_on_startup_failure() -> Result<()> {
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "startup-failure",
             "Startup failure",
@@ -5274,14 +5417,27 @@ async fn runtime_rate_limit_refunds_on_startup_failure() -> Result<()> {
             .await
             .is_err()
     );
-    assert!(state.list_review_rate_limit_pending().await?.is_empty());
     assert!(
         state
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?
+            .is_empty()
+    );
+    assert!(
+        state
+            .review_rate_limit
             .list_active_review_rate_limit_buckets(Utc::now().timestamp())
             .await?
             .is_empty()
     );
-    assert!(state.list_in_progress_reviews().await?.is_empty());
+    assert!(
+        state
+            .review_state
+            .list_in_progress_reviews()
+            .await?
+            .is_empty()
+    );
     assert!(runner.review_contexts.lock().unwrap().is_empty());
     Ok(())
 }
@@ -5327,6 +5483,7 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
+        .feature_flags
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
@@ -5366,6 +5523,7 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     state
+        .feature_flags
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(false),
             gitlab_inline_review_comments: None,
@@ -5691,7 +5849,13 @@ async fn mention_history_insert_failure_releases_mention_lock() -> Result<()> {
 
     assert!(service.scan_once().await.is_err());
     assert_eq!(*runner.mention_calls.lock().unwrap(), 0);
-    assert!(state.list_in_progress_mention_commands().await?.is_empty());
+    assert!(
+        state
+            .mention_commands
+            .list_in_progress_mention_commands()
+            .await?
+            .is_empty()
+    );
     let row = sqlx::query(
         "SELECT status, result FROM mention_command_state WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?",
     )
@@ -5934,6 +6098,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
+        .feature_flags
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
@@ -5973,6 +6138,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     state
+        .feature_flags
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(false),
             gitlab_inline_review_comments: None,
@@ -6518,13 +6684,17 @@ async fn dev_mode_scan_persists_mocked_run_history_for_synthetic_merge_request()
     service.scan_once().await?;
 
     let runs = state
+        .run_history
         .list_run_history_for_mr("demo/group/service-a", 1)
         .await?;
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].head_sha, first_head_sha);
     assert_eq!(runs[0].auth_account_name.as_deref(), Some("dev-mode"));
 
-    let events = state.list_run_history_events(runs[0].id).await?;
+    let events = state
+        .run_history
+        .list_run_history_events(runs[0].id)
+        .await?;
     assert!(!events.is_empty());
     assert!(
         events
@@ -6576,6 +6746,7 @@ async fn dev_mode_incremental_scan_detects_new_commit_on_existing_synthetic_merg
     service.scan_once_incremental().await?;
 
     let runs = state
+        .run_history
         .list_run_history_for_mr("demo/group/service-a", 1)
         .await?;
     assert_eq!(runs.len(), 2);

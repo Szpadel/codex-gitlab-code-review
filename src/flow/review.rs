@@ -164,12 +164,18 @@ impl ReviewFlow {
     pub(crate) async fn clear_stale_in_progress(&self) -> Result<()> {
         self.shared
             .state
+            .review_state
             .clear_stale_in_progress(self.shared.config.review.stale_in_progress_minutes)
             .await
     }
 
     pub(crate) async fn recover_in_progress(&self) -> Result<()> {
-        let in_progress = self.shared.state.list_in_progress_reviews().await?;
+        let in_progress = self
+            .shared
+            .state
+            .review_state
+            .list_in_progress_reviews()
+            .await?;
         if !in_progress.is_empty() {
             info!(
                 count = in_progress.len(),
@@ -211,6 +217,7 @@ impl ReviewFlow {
                 if let Err(err) = self
                     .shared
                     .state
+                    .review_state
                     .finish_review_for_lane(
                         review.repo.as_str(),
                         review.iid,
@@ -276,11 +283,13 @@ impl ReviewFlow {
         let completed_inline_review = self
             .shared
             .state
+            .run_history
             .has_completed_inline_review_for_lane(repo, mr.iid, head_sha, self.lane)
             .await?;
         let review_result = self
             .shared
             .state
+            .review_state
             .review_result_for_lane(repo, mr.iid, head_sha, self.lane)
             .await?;
         if self.lane.is_security() && matches!(review_result.as_deref(), Some("pass" | "comment")) {
@@ -325,6 +334,7 @@ impl ReviewFlow {
         if self
             .shared
             .state
+            .mention_commands
             .has_in_progress_mention_for_mr(repo, mr.iid)
             .await?
         {
@@ -335,6 +345,7 @@ impl ReviewFlow {
         if !self
             .shared
             .state
+            .review_state
             .begin_review_for_lane(repo, mr.iid, head_sha, self.lane)
             .await?
         {
@@ -345,6 +356,7 @@ impl ReviewFlow {
         let acquired_bucket_ids = match self
             .shared
             .state
+            .review_rate_limit
             .try_consume_review_rate_limits(self.lane, repo, mr.iid, now)
             .await
         {
@@ -358,10 +370,12 @@ impl ReviewFlow {
             Ok(ReviewRateLimitAcquireOutcome::Blocked { next_retry_at }) => {
                 self.shared
                     .state
+                    .review_state
                     .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, "cancelled")
                     .await?;
                 self.shared
                     .state
+                    .review_rate_limit
                     .upsert_review_rate_limit_pending(
                         self.lane,
                         repo,
@@ -383,6 +397,7 @@ impl ReviewFlow {
             } else {
                 self.shared
                     .state
+                    .review_rate_limit
                     .refund_review_rate_limit_buckets(&acquired_bucket_ids, now)
                     .await
                     .err()
@@ -390,6 +405,7 @@ impl ReviewFlow {
             if let Err(lock_err) = self
                 .shared
                 .state
+                .review_state
                 .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, "cancelled")
                 .await
             {
@@ -431,6 +447,7 @@ impl ReviewFlow {
         let run_history_id = match self
             .shared
             .state
+            .run_history
             .start_run_history_for_lane(
                 NewRunHistory {
                     kind: if self.lane.is_security() {
@@ -481,6 +498,7 @@ impl ReviewFlow {
         if let Err(err) = self
             .shared
             .state
+            .run_history
             .set_run_history_feature_flags(run_history_id, &feature_flags)
             .await
         {
@@ -563,6 +581,7 @@ impl ReviewFlow {
         let run_history_id = match self
             .shared
             .state
+            .run_history
             .start_run_history_for_lane(
                 NewRunHistory {
                     kind: if self.lane.is_security() {
@@ -613,6 +632,7 @@ impl ReviewFlow {
         if let Err(err) = self
             .shared
             .state
+            .run_history
             .set_run_history_feature_flags(run_history_id, &feature_flags)
             .await
         {
@@ -685,6 +705,7 @@ impl ReviewFlow {
         let overrides = self
             .shared
             .state
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?;
         Ok(self.shared.config.resolve_feature_flags(&overrides))
@@ -694,6 +715,7 @@ impl ReviewFlow {
         let cleared = self
             .shared
             .state
+            .review_rate_limit
             .clear_review_rate_limit_pending(self.lane, repo, iid)
             .await?;
         if cleared {
@@ -756,6 +778,7 @@ impl ReviewFlow {
         if let Err(recovery_err) = self
             .shared
             .state
+            .review_state
             .finish_review_for_lane(repo, iid, head_sha, self.lane, "error")
             .await
         {
@@ -782,6 +805,7 @@ impl ReviewFlow {
             && let Err(recovery_err) = self
                 .shared
                 .state
+                .review_rate_limit
                 .refund_review_rate_limit_buckets(acquired_rule_ids, Utc::now().timestamp())
                 .await
         {
@@ -796,6 +820,7 @@ impl ReviewFlow {
         if let Err(recovery_err) = self
             .shared
             .state
+            .review_state
             .finish_review_for_lane(repo, iid, head_sha, self.lane, "error")
             .await
         {
@@ -823,6 +848,7 @@ impl ReviewFlow {
         if let Err(recovery_err) = self
             .shared
             .state
+            .run_history
             .finish_run_history(
                 run_history_id,
                 RunHistoryFinish {
@@ -971,6 +997,7 @@ impl ReviewRunContext {
         self.remove_eyes_best_effort(repo, iid).await;
         if !self.acquired_rate_limit_rule_ids.is_empty() {
             self.state
+                .review_rate_limit
                 .refund_review_rate_limit_buckets(
                     &self.acquired_rate_limit_rule_ids,
                     Utc::now().timestamp(),
@@ -979,9 +1006,11 @@ impl ReviewRunContext {
         }
         self.retry_backoff.clear(retry_key);
         self.state
+            .review_state
             .finish_review_for_lane(repo, iid, head_sha, self.lane, "cancelled")
             .await?;
         self.state
+            .run_history
             .finish_run_history(
                 run_history_id,
                 RunHistoryFinish {
@@ -1006,6 +1035,7 @@ impl ReviewRunContext {
         if !self.acquired_rate_limit_rule_ids.is_empty()
             && let Err(recovery_err) = self
                 .state
+                .review_rate_limit
                 .refund_review_rate_limit_buckets(
                     &self.acquired_rate_limit_rule_ids,
                     Utc::now().timestamp(),
@@ -1022,6 +1052,7 @@ impl ReviewRunContext {
         }
         if let Err(recovery_err) = self
             .state
+            .review_state
             .finish_review_for_lane(repo, iid, head_sha, self.lane, "error")
             .await
         {
@@ -1035,6 +1066,7 @@ impl ReviewRunContext {
         }
         if let Err(recovery_err) = self
             .state
+            .run_history
             .finish_run_history(
                 run_history_id,
                 RunHistoryFinish {
@@ -1155,9 +1187,11 @@ impl ReviewRunContext {
                     "pass"
                 };
                 self.state
+                    .review_state
                     .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, review_result)
                     .await?;
                 self.state
+                    .run_history
                     .finish_run_history(
                         run_history_id,
                         RunHistoryFinish {
@@ -1205,9 +1239,11 @@ impl ReviewRunContext {
                     "comment"
                 };
                 self.state
+                    .review_state
                     .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, review_result)
                     .await?;
                 self.state
+                    .run_history
                     .finish_run_history(
                         run_history_id,
                         RunHistoryFinish {
@@ -1243,9 +1279,11 @@ impl ReviewRunContext {
                     return Ok(());
                 }
                 self.state
+                    .review_state
                     .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, "error")
                     .await?;
                 self.state
+                    .run_history
                     .finish_run_history(
                         run_history_id,
                         RunHistoryFinish {

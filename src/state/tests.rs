@@ -1,5 +1,7 @@
 use super::*;
+use crate::feature_flags::RuntimeFeatureFlagOverrides;
 use pretty_assertions::assert_eq;
+use sqlx::Row;
 use std::env;
 use std::fs;
 use uuid::Uuid;
@@ -8,13 +10,25 @@ use uuid::Uuid;
 async fn begin_review_locks_in_progress() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
 
-    let first = store.begin_review("group/repo", 1, "sha1").await?;
-    let second = store.begin_review("group/repo", 1, "sha1").await?;
+    let first = store
+        .review_state
+        .begin_review("group/repo", 1, "sha1")
+        .await?;
+    let second = store
+        .review_state
+        .begin_review("group/repo", 1, "sha1")
+        .await?;
     assert_eq!(first, true);
     assert_eq!(second, false);
 
-    store.finish_review("group/repo", 1, "sha1", "pass").await?;
-    let third = store.begin_review("group/repo", 1, "sha2").await?;
+    store
+        .review_state
+        .finish_review("group/repo", 1, "sha1", "pass")
+        .await?;
+    let third = store
+        .review_state
+        .begin_review("group/repo", 1, "sha2")
+        .await?;
     assert_eq!(third, true);
     Ok(())
 }
@@ -22,7 +36,10 @@ async fn begin_review_locks_in_progress() -> Result<()> {
 #[tokio::test]
 async fn clear_stale_releases_lock() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
-    store.begin_review("group/repo", 2, "sha1").await?;
+    store
+        .review_state
+        .begin_review("group/repo", 2, "sha1")
+        .await?;
 
     sqlx::query("UPDATE review_state SET updated_at = 0 WHERE repo = ? AND iid = ?")
         .bind("group/repo")
@@ -30,8 +47,11 @@ async fn clear_stale_releases_lock() -> Result<()> {
         .execute(store.pool())
         .await?;
 
-    store.clear_stale_in_progress(1).await?;
-    let again = store.begin_review("group/repo", 2, "sha2").await?;
+    store.review_state.clear_stale_in_progress(1).await?;
+    let again = store
+        .review_state
+        .begin_review("group/repo", 2, "sha2")
+        .await?;
     assert_eq!(again, true);
     Ok(())
 }
@@ -44,6 +64,7 @@ async fn clear_stale_mentions_mark_error_and_block_replay() -> Result<()> {
     let discussion_id = "discussion-1";
     let trigger_note_id = 22u64;
     store
+        .mention_commands
         .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1")
         .await?;
 
@@ -61,8 +82,12 @@ async fn clear_stale_mentions_mark_error_and_block_replay() -> Result<()> {
     .execute(store.pool())
     .await?;
 
-    store.clear_stale_in_progress_mentions(1).await?;
+    store
+        .mention_commands
+        .clear_stale_in_progress_mentions(1)
+        .await?;
     let again = store
+        .mention_commands
         .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha2")
         .await?;
 
@@ -90,13 +115,20 @@ async fn clear_stale_mentions_mark_error_and_block_replay() -> Result<()> {
 #[tokio::test]
 async fn list_in_progress_reviews_returns_only_active_rows() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
-    store.begin_review("group/repo-a", 1, "sha1").await?;
-    store.begin_review("group/repo-b", 2, "sha2").await?;
     store
+        .review_state
+        .begin_review("group/repo-a", 1, "sha1")
+        .await?;
+    store
+        .review_state
+        .begin_review("group/repo-b", 2, "sha2")
+        .await?;
+    store
+        .review_state
         .finish_review("group/repo-b", 2, "sha2", "pass")
         .await?;
 
-    let in_progress = store.list_in_progress_reviews().await?;
+    let in_progress = store.review_state.list_in_progress_reviews().await?;
     assert_eq!(
         in_progress,
         vec![InProgressReview {
@@ -113,6 +145,7 @@ async fn list_in_progress_reviews_returns_only_active_rows() -> Result<()> {
 async fn security_review_context_cache_evicts_expired_rows_on_upsert() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .security_context_cache
         .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
             repo: "group/repo".to_string(),
             base_branch: "main".to_string(),
@@ -126,6 +159,7 @@ async fn security_review_context_cache_evicts_expired_rows_on_upsert() -> Result
         .await?;
 
     store
+        .security_context_cache
         .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
             repo: "group/repo".to_string(),
             base_branch: "main".to_string(),
@@ -149,6 +183,7 @@ async fn security_review_context_cache_evicts_expired_rows_on_upsert() -> Result
 async fn security_review_context_cache_roundtrips_source_run_history_id() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .security_context_cache
         .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
             repo: "group/repo".to_string(),
             base_branch: "main".to_string(),
@@ -162,6 +197,7 @@ async fn security_review_context_cache_roundtrips_source_run_history_id() -> Res
         .await?;
 
     let entry = store
+        .security_context_cache
         .get_security_review_context_cache("group/repo", "main", "sha-1", "v1", 150)
         .await?
         .expect("cache entry");
@@ -174,6 +210,7 @@ async fn security_review_context_cache_roundtrips_source_run_history_id() -> Res
 async fn security_review_context_cache_fallback_returns_newest_live_branch_entry() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .security_context_cache
         .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
             repo: "group/repo".to_string(),
             base_branch: "main".to_string(),
@@ -186,6 +223,7 @@ async fn security_review_context_cache_fallback_returns_newest_live_branch_entry
         })
         .await?;
     store
+        .security_context_cache
         .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
             repo: "group/repo".to_string(),
             base_branch: "main".to_string(),
@@ -198,6 +236,7 @@ async fn security_review_context_cache_fallback_returns_newest_live_branch_entry
         })
         .await?;
     store
+        .security_context_cache
         .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
             repo: "group/repo".to_string(),
             base_branch: "main".to_string(),
@@ -211,6 +250,7 @@ async fn security_review_context_cache_fallback_returns_newest_live_branch_entry
         .await?;
 
     let entry = store
+        .security_context_cache
         .get_latest_security_review_context_cache_for_branch("group/repo", "main", "v1", 400)
         .await?
         .expect("branch cache entry");
@@ -225,10 +265,12 @@ async fn security_review_context_cache_fallback_returns_newest_live_branch_entry
 async fn security_review_debounce_state_roundtrips_and_marks_repo_due() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .security_review_debounce
         .upsert_security_review_debounce("group/repo", 7, 100, 3_700)
         .await?;
 
     let row = store
+        .security_review_debounce
         .get_security_review_debounce("group/repo", 7)
         .await?
         .expect("debounce state");
@@ -236,11 +278,13 @@ async fn security_review_debounce_state_roundtrips_and_marks_repo_due() -> Resul
     assert_eq!(row.next_eligible_at, 3_700);
     assert!(
         !store
+            .security_review_debounce
             .repo_has_due_security_review_debounce("group/repo", 3_699)
             .await?
     );
     assert!(
         store
+            .security_review_debounce
             .repo_has_due_security_review_debounce("group/repo", 3_700)
             .await?
     );
@@ -251,30 +295,36 @@ async fn security_review_debounce_state_roundtrips_and_marks_repo_due() -> Resul
 async fn sync_security_review_debounce_state_prunes_closed_merge_requests() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .security_review_debounce
         .upsert_security_review_debounce("group/repo", 7, 100, 200)
         .await?;
     store
+        .security_review_debounce
         .upsert_security_review_debounce("group/repo", 8, 100, 150)
         .await?;
 
     store
+        .security_review_debounce
         .sync_security_review_debounce_rows("group/repo", &[8])
         .await?;
 
     assert!(
         store
+            .security_review_debounce
             .get_security_review_debounce("group/repo", 7)
             .await?
             .is_none()
     );
     assert!(
         store
+            .security_review_debounce
             .get_security_review_debounce("group/repo", 8)
             .await?
             .is_some()
     );
     assert!(
         store
+            .security_review_debounce
             .repo_has_due_security_review_debounce("group/repo", 150)
             .await?
     );
@@ -336,6 +386,7 @@ fn assert_approx_eq(actual: f64, expected: f64) {
 async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-crud",
             "Initial label",
@@ -352,7 +403,10 @@ async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
         ))
         .await?;
 
-    let rules = store.list_review_rate_limit_rules().await?;
+    let rules = store
+        .review_rate_limit
+        .list_review_rate_limit_rules()
+        .await?;
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].id, rule_id);
     assert_eq!(rules[0].label, "Initial label".to_string());
@@ -363,6 +417,7 @@ async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
     assert_eq!(rules[0].capacity, 2);
 
     store
+        .review_rate_limit
         .update_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-crud",
             "Updated label",
@@ -379,7 +434,10 @@ async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
         ))
         .await?;
 
-    let rules = store.list_review_rate_limit_rules().await?;
+    let rules = store
+        .review_rate_limit
+        .list_review_rate_limit_rules()
+        .await?;
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].label, "Updated label".to_string());
     assert_eq!(
@@ -391,8 +449,14 @@ async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
     assert_eq!(rules[0].capacity, 3);
     assert_eq!(rules[0].window_seconds, 200);
 
-    store.delete_review_rate_limit_rule("rule-crud").await?;
-    let rules = store.list_review_rate_limit_rules().await?;
+    store
+        .review_rate_limit
+        .delete_review_rate_limit_rule("rule-crud")
+        .await?;
+    let rules = store
+        .review_rate_limit
+        .list_review_rate_limit_rules()
+        .await?;
     assert!(rules.is_empty());
     Ok(())
 }
@@ -401,6 +465,7 @@ async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
 async fn runtime_rate_limit_refill_math_exposes_fractional_slots() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-refill",
             "Refill math",
@@ -419,6 +484,7 @@ async fn runtime_rate_limit_refill_math_exposes_fractional_slots() -> Result<()>
 
     let started_at = 1_000;
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 7, started_at)
         .await?
     {
@@ -429,6 +495,7 @@ async fn runtime_rate_limit_refill_math_exposes_fractional_slots() -> Result<()>
     }
 
     let buckets = store
+        .review_rate_limit
         .list_active_review_rate_limit_buckets(started_at + 25)
         .await?;
     assert_eq!(buckets.len(), 1);
@@ -443,6 +510,7 @@ async fn runtime_rate_limit_refill_math_exposes_fractional_slots() -> Result<()>
 async fn runtime_rate_limit_stacked_rules_block_only_when_every_bucket_is_empty() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let first_rule = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-a",
             "First",
@@ -459,6 +527,7 @@ async fn runtime_rate_limit_stacked_rules_block_only_when_every_bucket_is_empty(
         ))
         .await?;
     let second_rule = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-b",
             "Second",
@@ -477,6 +546,7 @@ async fn runtime_rate_limit_stacked_rules_block_only_when_every_bucket_is_empty(
 
     let started_at = 2_000;
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 1, started_at)
         .await?
     {
@@ -495,6 +565,7 @@ async fn runtime_rate_limit_stacked_rules_block_only_when_every_bucket_is_empty(
     }
 
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 1, started_at)
         .await?
     {
@@ -510,6 +581,7 @@ async fn runtime_rate_limit_stacked_rules_block_only_when_every_bucket_is_empty(
 async fn runtime_rate_limit_project_and_mr_scopes_do_not_cross_apply() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let project_rule = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-project",
             "Project",
@@ -526,6 +598,7 @@ async fn runtime_rate_limit_project_and_mr_scopes_do_not_cross_apply() -> Result
         ))
         .await?;
     let mr_rule = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-mr",
             "MR",
@@ -544,6 +617,7 @@ async fn runtime_rate_limit_project_and_mr_scopes_do_not_cross_apply() -> Result
 
     let started_at = 3_000;
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 10, started_at)
         .await?
     {
@@ -562,6 +636,7 @@ async fn runtime_rate_limit_project_and_mr_scopes_do_not_cross_apply() -> Result
     }
 
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 11, started_at)
         .await?
     {
@@ -585,6 +660,7 @@ async fn runtime_rate_limit_project_and_mr_scopes_do_not_cross_apply() -> Result
 async fn runtime_rate_limit_shared_review_and_security_rules_use_one_bucket() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-shared",
             "Shared",
@@ -603,6 +679,7 @@ async fn runtime_rate_limit_shared_review_and_security_rules_use_one_bucket() ->
 
     let started_at = 4_000;
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 12, started_at)
         .await?
     {
@@ -612,6 +689,7 @@ async fn runtime_rate_limit_shared_review_and_security_rules_use_one_bucket() ->
         other => panic!("unexpected consume outcome: {other:?}"),
     }
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::Security, "group/repo", 12, started_at)
         .await?
     {
@@ -621,6 +699,7 @@ async fn runtime_rate_limit_shared_review_and_security_rules_use_one_bucket() ->
         other => panic!("unexpected consume outcome: {other:?}"),
     }
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 12, started_at)
         .await?
     {
@@ -636,6 +715,7 @@ async fn runtime_rate_limit_shared_review_and_security_rules_use_one_bucket() ->
 async fn runtime_rate_limit_regen_one_slot_is_reflected_in_active_buckets() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-regen",
             "Regen",
@@ -654,16 +734,20 @@ async fn runtime_rate_limit_regen_one_slot_is_reflected_in_active_buckets() -> R
 
     let started_at = 5_000;
     store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 13, started_at)
         .await?;
     store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 13, started_at)
         .await?;
     store
+        .review_rate_limit
         .refund_review_rate_limit_buckets(&[format!("{rule_id}:repo:group/repo")], started_at)
         .await?;
 
     let buckets = store
+        .review_rate_limit
         .list_active_review_rate_limit_buckets(started_at)
         .await?;
     assert_eq!(buckets.len(), 1);
@@ -676,6 +760,7 @@ async fn runtime_rate_limit_regen_one_slot_is_reflected_in_active_buckets() -> R
 async fn runtime_rate_limit_auto_deletes_full_bucket_rows() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let _rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-auto-delete",
             "Auto delete",
@@ -694,10 +779,12 @@ async fn runtime_rate_limit_auto_deletes_full_bucket_rows() -> Result<()> {
 
     let started_at = 6_000;
     store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 14, started_at)
         .await?;
 
     let buckets = store
+        .review_rate_limit
         .list_active_review_rate_limit_buckets(started_at + 100)
         .await?;
     assert!(buckets.is_empty());
@@ -712,13 +799,18 @@ async fn runtime_rate_limit_auto_deletes_full_bucket_rows() -> Result<()> {
 async fn runtime_rate_limit_pending_deduplicates_rows() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .review_rate_limit
         .upsert_review_rate_limit_pending(ReviewLane::General, "group/repo", 15, "sha-1", 100, 500)
         .await?;
     store
+        .review_rate_limit
         .upsert_review_rate_limit_pending(ReviewLane::General, "group/repo", 15, "sha-2", 150, 700)
         .await?;
 
-    let rows = store.list_review_rate_limit_pending().await?;
+    let rows = store
+        .review_rate_limit
+        .list_review_rate_limit_pending()
+        .await?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].lane, ReviewLane::General);
     assert_eq!(rows[0].repo, "group/repo".to_string());
@@ -734,17 +826,28 @@ async fn runtime_rate_limit_pending_deduplicates_rows() -> Result<()> {
 async fn runtime_rate_limit_pending_clear_removes_row() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .review_rate_limit
         .upsert_review_rate_limit_pending(ReviewLane::Security, "group/repo", 18, "sha-1", 100, 500)
         .await?;
 
     assert!(
         store
+            .review_rate_limit
             .clear_review_rate_limit_pending(ReviewLane::Security, "group/repo", 18)
             .await?
     );
-    assert!(store.list_review_rate_limit_pending().await?.is_empty());
+    assert!(
+        store
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?
+            .is_empty()
+    );
     assert_eq!(
-        store.earliest_review_rate_limit_pending_retry_at().await?,
+        store
+            .review_rate_limit
+            .earliest_review_rate_limit_pending_retry_at()
+            .await?,
         None
     );
     Ok(())
@@ -754,13 +857,18 @@ async fn runtime_rate_limit_pending_clear_removes_row() -> Result<()> {
 async fn runtime_rate_limit_earliest_pending_retry_tracks_minimum() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .review_rate_limit
         .upsert_review_rate_limit_pending(ReviewLane::General, "group/repo", 16, "sha-1", 100, 500)
         .await?;
     store
+        .review_rate_limit
         .upsert_review_rate_limit_pending(ReviewLane::Security, "group/repo", 17, "sha-2", 120, 300)
         .await?;
 
-    let earliest = store.earliest_review_rate_limit_pending_retry_at().await?;
+    let earliest = store
+        .review_rate_limit
+        .earliest_review_rate_limit_pending_retry_at()
+        .await?;
     assert_eq!(earliest, Some(300));
     Ok(())
 }
@@ -769,6 +877,7 @@ async fn runtime_rate_limit_earliest_pending_retry_tracks_minimum() -> Result<()
 async fn runtime_rate_limit_consume_and_refund_roundtrip() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-roundtrip",
             "Roundtrip",
@@ -787,6 +896,7 @@ async fn runtime_rate_limit_consume_and_refund_roundtrip() -> Result<()> {
 
     let started_at = 7_000;
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 18, started_at)
         .await?
     {
@@ -797,6 +907,7 @@ async fn runtime_rate_limit_consume_and_refund_roundtrip() -> Result<()> {
     }
 
     store
+        .review_rate_limit
         .refund_review_rate_limit_buckets(&[format!("{rule_id}:repo:group/repo")], started_at)
         .await?;
 
@@ -806,6 +917,7 @@ async fn runtime_rate_limit_consume_and_refund_roundtrip() -> Result<()> {
     assert_eq!(count, 0);
 
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 18, started_at)
         .await?
     {
@@ -821,6 +933,7 @@ async fn runtime_rate_limit_consume_and_refund_roundtrip() -> Result<()> {
 async fn runtime_rate_limit_group_targets_match_nested_repositories() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-group",
             "Group cap",
@@ -838,6 +951,7 @@ async fn runtime_rate_limit_group_targets_match_nested_repositories() -> Result<
         .await?;
 
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/platform/service-a", 21, 8_000)
         .await?
     {
@@ -856,6 +970,7 @@ async fn runtime_rate_limit_group_targets_match_nested_repositories() -> Result<
 async fn runtime_rate_limit_global_rules_apply_without_targets() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-global",
             "Global cap",
@@ -872,13 +987,17 @@ async fn runtime_rate_limit_global_rules_apply_without_targets() -> Result<()> {
         ))
         .await?;
 
-    let rules = store.list_review_rate_limit_rules().await?;
+    let rules = store
+        .review_rate_limit
+        .list_review_rate_limit_rules()
+        .await?;
     assert_eq!(rules.len(), 1);
     assert!(rules[0].targets.is_empty());
     assert_eq!(rules[0].scope_subject, "Global".to_string());
     assert_eq!(rules[0].bucket_mode, ReviewRateLimitBucketMode::Shared);
 
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/service-a", 41, 9_500)
         .await?
     {
@@ -889,6 +1008,7 @@ async fn runtime_rate_limit_global_rules_apply_without_targets() -> Result<()> {
     }
 
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/service-b", 42, 9_500)
         .await?
     {
@@ -898,7 +1018,10 @@ async fn runtime_rate_limit_global_rules_apply_without_targets() -> Result<()> {
         other => panic!("unexpected consume outcome: {other:?}"),
     }
 
-    let buckets = store.list_active_review_rate_limit_buckets(9_500).await?;
+    let buckets = store
+        .review_rate_limit
+        .list_active_review_rate_limit_buckets(9_500)
+        .await?;
     assert_eq!(buckets.len(), 2);
     let mut scopes = buckets
         .iter()
@@ -916,6 +1039,7 @@ async fn runtime_rate_limit_global_rules_apply_without_targets() -> Result<()> {
 async fn runtime_rate_limit_independent_bucket_mode_tracks_each_target_separately() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-independent",
             "Independent",
@@ -936,6 +1060,7 @@ async fn runtime_rate_limit_independent_bucket_mode_tracks_each_target_separatel
         .await?;
 
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/service-a", 31, 9_000)
         .await?
     {
@@ -946,6 +1071,7 @@ async fn runtime_rate_limit_independent_bucket_mode_tracks_each_target_separatel
     }
 
     match store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/service-b", 32, 9_000)
         .await?
     {
@@ -961,6 +1087,7 @@ async fn runtime_rate_limit_independent_bucket_mode_tracks_each_target_separatel
 async fn runtime_rate_limit_project_scope_group_targets_isolate_each_repository() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-project-group-per-repo",
             "Per repo group cap",
@@ -979,6 +1106,7 @@ async fn runtime_rate_limit_project_scope_group_targets_isolate_each_repository(
 
     let started_at = 12_000;
     let first = store
+        .review_rate_limit
         .try_consume_review_rate_limits(
             ReviewLane::General,
             "group/platform/service-a",
@@ -987,6 +1115,7 @@ async fn runtime_rate_limit_project_scope_group_targets_isolate_each_repository(
         )
         .await?;
     let second = store
+        .review_rate_limit
         .try_consume_review_rate_limits(
             ReviewLane::General,
             "group/platform/service-b",
@@ -1014,6 +1143,7 @@ async fn runtime_rate_limit_project_scope_group_targets_isolate_each_repository(
 async fn runtime_rate_limit_bucket_refund_only_restores_requested_bucket() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-bucket-refund",
             "Bucket refund",
@@ -1035,17 +1165,21 @@ async fn runtime_rate_limit_bucket_refund_only_restores_requested_bucket() -> Re
 
     let started_at = 10_000;
     store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/service-a", 51, started_at)
         .await?;
     store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/service-b", 52, started_at)
         .await?;
 
     store
+        .review_rate_limit
         .refund_review_rate_limit_bucket(&format!("{rule_id}:repo:group/service-a"), started_at)
         .await?;
 
     let mut buckets = store
+        .review_rate_limit
         .list_active_review_rate_limit_buckets(started_at)
         .await?;
     buckets.sort_by(|left, right| left.target_path.cmp(&right.target_path));
@@ -1059,6 +1193,7 @@ async fn runtime_rate_limit_bucket_refund_only_restores_requested_bucket() -> Re
 async fn runtime_rate_limit_label_update_preserves_existing_bucket_state() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
+        .review_rate_limit
         .create_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-preserve-update",
             "Original label",
@@ -1076,9 +1211,11 @@ async fn runtime_rate_limit_label_update_preserves_existing_bucket_state() -> Re
         .await?;
 
     store
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 61, 11_000)
         .await?;
     store
+        .review_rate_limit
         .update_review_rate_limit_rule(&review_rate_limit_rule(
             "rule-preserve-update",
             "Renamed",
@@ -1095,7 +1232,10 @@ async fn runtime_rate_limit_label_update_preserves_existing_bucket_state() -> Re
         ))
         .await?;
 
-    let buckets = store.list_active_review_rate_limit_buckets(11_000).await?;
+    let buckets = store
+        .review_rate_limit
+        .list_active_review_rate_limit_buckets(11_000)
+        .await?;
     assert_eq!(buckets.len(), 1);
     assert_eq!(buckets[0].rule_id, rule_id);
     assert_eq!(buckets[0].available_slots, 0.0);
@@ -1105,10 +1245,17 @@ async fn runtime_rate_limit_label_update_preserves_existing_bucket_state() -> Re
 #[tokio::test]
 async fn finish_review_is_noop_once_row_is_not_in_progress() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
-    store.begin_review("group/repo", 3, "sha1").await?;
-
-    store.finish_review("group/repo", 3, "sha1", "pass").await?;
     store
+        .review_state
+        .begin_review("group/repo", 3, "sha1")
+        .await?;
+
+    store
+        .review_state
+        .finish_review("group/repo", 3, "sha1", "pass")
+        .await?;
+    store
+        .review_state
         .finish_review("group/repo", 3, "sha2", "error")
         .await?;
 
@@ -1132,19 +1279,22 @@ async fn finish_review_ignores_outdated_sha_for_new_in_progress_review() -> Resu
     let store = ReviewStateStore::new(":memory:").await?;
     let repo = "group/repo";
     let iid = 4u64;
-    store.begin_review(repo, iid, "sha1").await?;
+    store.review_state.begin_review(repo, iid, "sha1").await?;
 
     sqlx::query("UPDATE review_state SET updated_at = 0 WHERE repo = ? AND iid = ?")
         .bind(repo)
         .bind(iid as i64)
         .execute(store.pool())
         .await?;
-    store.clear_stale_in_progress(1).await?;
+    store.review_state.clear_stale_in_progress(1).await?;
 
-    let restarted = store.begin_review(repo, iid, "sha2").await?;
+    let restarted = store.review_state.begin_review(repo, iid, "sha2").await?;
     assert_eq!(restarted, true);
 
-    store.finish_review(repo, iid, "sha1", "error").await?;
+    store
+        .review_state
+        .finish_review(repo, iid, "sha1", "error")
+        .await?;
     let row =
         sqlx::query("SELECT status, head_sha, result FROM review_state WHERE repo = ? AND iid = ?")
             .bind(repo)
@@ -1158,7 +1308,10 @@ async fn finish_review_ignores_outdated_sha_for_new_in_progress_review() -> Resu
     assert_eq!(head_sha, "sha2".to_string());
     assert_eq!(result, None);
 
-    store.finish_review(repo, iid, "sha2", "pass").await?;
+    store
+        .review_state
+        .finish_review(repo, iid, "sha2", "pass")
+        .await?;
     let row =
         sqlx::query("SELECT status, head_sha, result FROM review_state WHERE repo = ? AND iid = ?")
             .bind(repo)
@@ -1183,9 +1336,11 @@ async fn begin_mention_command_is_idempotent() -> Result<()> {
     let trigger_note_id = 22u64;
 
     let first = store
+        .mention_commands
         .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1")
         .await?;
     let second = store
+        .mention_commands
         .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha2")
         .await?;
     assert_eq!(first, true);
@@ -1223,10 +1378,12 @@ async fn begin_mention_command_retries_after_cancelled_but_not_error() -> Result
 
     assert!(
         store
+            .mention_commands
             .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1")
             .await?
     );
     store
+        .mention_commands
         .finish_mention_command(
             repo,
             iid,
@@ -1238,15 +1395,18 @@ async fn begin_mention_command_retries_after_cancelled_but_not_error() -> Result
         .await?;
     assert!(
         store
+            .mention_commands
             .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha2")
             .await?
     );
 
     store
+        .mention_commands
         .finish_mention_command(repo, iid, discussion_id, trigger_note_id, "sha2", "error")
         .await?;
     assert!(
         !store
+            .mention_commands
             .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha3")
             .await?
     );
@@ -1282,14 +1442,17 @@ async fn finish_mention_command_transitions_only_in_progress_rows() -> Result<()
     let trigger_note_id = 24u64;
 
     let started = store
+        .mention_commands
         .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1")
         .await?;
     assert_eq!(started, true);
 
     store
+        .mention_commands
         .finish_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1", "pass")
         .await?;
     store
+        .mention_commands
         .finish_mention_command(
             repo,
             iid,
@@ -1325,16 +1488,22 @@ async fn list_in_progress_mention_commands_returns_only_active_rows() -> Result<
     let store = ReviewStateStore::new(":memory:").await?;
 
     store
+        .mention_commands
         .begin_mention_command("group/repo-a", 1, "discussion-a", 101, "sha-a")
         .await?;
     store
+        .mention_commands
         .begin_mention_command("group/repo-b", 2, "discussion-b", 102, "sha-b")
         .await?;
     store
+        .mention_commands
         .finish_mention_command("group/repo-b", 2, "discussion-b", 102, "sha-b", "pass")
         .await?;
 
-    let in_progress = store.list_in_progress_mention_commands().await?;
+    let in_progress = store
+        .mention_commands
+        .list_in_progress_mention_commands()
+        .await?;
     assert_eq!(
         in_progress,
         vec![InProgressMentionCommand {
@@ -1385,13 +1554,20 @@ async fn project_last_activity_roundtrip() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let repo = "group/repo";
 
-    let missing = store.get_project_last_mr_activity(repo).await?;
+    let missing = store
+        .project_catalog
+        .get_project_last_mr_activity(repo)
+        .await?;
     assert_eq!(missing, None);
 
     store
+        .project_catalog
         .set_project_last_mr_activity(repo, "2025-01-01T00:00:00Z")
         .await?;
-    let loaded = store.get_project_last_mr_activity(repo).await?;
+    let loaded = store
+        .project_catalog
+        .get_project_last_mr_activity(repo)
+        .await?;
     assert_eq!(loaded, Some("2025-01-01T00:00:00Z".to_string()));
     Ok(())
 }
@@ -1402,11 +1578,18 @@ async fn project_catalog_roundtrip() -> Result<()> {
     let key = "mode=all;repos=;groups=";
     let projects = vec!["group/repo".to_string(), "group/other".to_string()];
 
-    let missing = store.load_project_catalog(key).await?;
+    let missing = store.project_catalog.load_project_catalog(key).await?;
     assert!(missing.is_none());
 
-    store.save_project_catalog(key, &projects).await?;
-    let loaded = store.load_project_catalog(key).await?.expect("catalog");
+    store
+        .project_catalog
+        .save_project_catalog(key, &projects)
+        .await?;
+    let loaded = store
+        .project_catalog
+        .load_project_catalog(key)
+        .await?
+        .expect("catalog");
     assert_eq!(loaded.projects, projects);
     assert!(loaded.fetched_at > 0);
     Ok(())
@@ -1416,11 +1599,14 @@ async fn project_catalog_roundtrip() -> Result<()> {
 async fn created_after_roundtrip() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
 
-    let missing = store.get_created_after().await?;
+    let missing = store.service_state.get_created_after().await?;
     assert_eq!(missing, None);
 
-    store.set_created_after("2025-01-02T03:04:05Z").await?;
-    let loaded = store.get_created_after().await?;
+    store
+        .service_state
+        .set_created_after("2025-01-02T03:04:05Z")
+        .await?;
+    let loaded = store.service_state.get_created_after().await?;
     assert_eq!(loaded, Some("2025-01-02T03:04:05Z".to_string()));
     Ok(())
 }
@@ -1429,10 +1615,10 @@ async fn created_after_roundtrip() -> Result<()> {
 async fn review_owner_id_is_created_once_and_stable_across_calls() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
 
-    let first = store.get_or_create_review_owner_id().await?;
+    let first = store.service_state.get_or_create_review_owner_id().await?;
     assert!(!first.is_empty());
 
-    let second = store.get_or_create_review_owner_id().await?;
+    let second = store.service_state.get_or_create_review_owner_id().await?;
     assert_eq!(second, first);
     Ok(())
 }
@@ -1442,17 +1628,21 @@ async fn auth_limit_reset_roundtrip_and_clear() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let account = "backup-1";
 
-    let missing = store.get_auth_limit_reset_at(account).await?;
+    let missing = store.service_state.get_auth_limit_reset_at(account).await?;
     assert_eq!(missing, None);
 
     store
+        .service_state
         .set_auth_limit_reset_at(account, "2026-03-02T10:15:00Z")
         .await?;
-    let loaded = store.get_auth_limit_reset_at(account).await?;
+    let loaded = store.service_state.get_auth_limit_reset_at(account).await?;
     assert_eq!(loaded, Some("2026-03-02T10:15:00Z".to_string()));
 
-    store.clear_auth_limit_reset_at(account).await?;
-    let cleared = store.get_auth_limit_reset_at(account).await?;
+    store
+        .service_state
+        .clear_auth_limit_reset_at(account)
+        .await?;
+    let cleared = store.service_state.get_auth_limit_reset_at(account).await?;
     assert_eq!(cleared, None);
     Ok(())
 }
@@ -1461,14 +1651,22 @@ async fn auth_limit_reset_roundtrip_and_clear() -> Result<()> {
 async fn auth_limit_reset_tracks_accounts_independently() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .service_state
         .set_auth_limit_reset_at("primary", "2026-03-02T10:15:00Z")
         .await?;
     store
+        .service_state
         .set_auth_limit_reset_at("backup-1", "2026-03-02T12:00:00Z")
         .await?;
 
-    let primary = store.get_auth_limit_reset_at("primary").await?;
-    let backup = store.get_auth_limit_reset_at("backup-1").await?;
+    let primary = store
+        .service_state
+        .get_auth_limit_reset_at("primary")
+        .await?;
+    let backup = store
+        .service_state
+        .get_auth_limit_reset_at("backup-1")
+        .await?;
     assert_eq!(primary, Some("2026-03-02T10:15:00Z".to_string()));
     assert_eq!(backup, Some("2026-03-02T12:00:00Z".to_string()));
     Ok(())
@@ -1480,18 +1678,21 @@ async fn auth_limit_reset_keeps_latest_timestamp_for_account() -> Result<()> {
     let account = "backup-1";
 
     store
+        .service_state
         .set_auth_limit_reset_at(account, "2026-03-02T12:00:00Z")
         .await?;
     store
+        .service_state
         .set_auth_limit_reset_at(account, "2026-03-02T10:00:00Z")
         .await?;
-    let after_older_write = store.get_auth_limit_reset_at(account).await?;
+    let after_older_write = store.service_state.get_auth_limit_reset_at(account).await?;
     assert_eq!(after_older_write, Some("2026-03-02T12:00:00Z".to_string()));
 
     store
+        .service_state
         .set_auth_limit_reset_at(account, "2026-03-02T13:30:00Z")
         .await?;
-    let after_newer_write = store.get_auth_limit_reset_at(account).await?;
+    let after_newer_write = store.service_state.get_auth_limit_reset_at(account).await?;
     assert_eq!(after_newer_write, Some("2026-03-02T13:30:00Z".to_string()));
     Ok(())
 }
@@ -1500,7 +1701,7 @@ async fn auth_limit_reset_keeps_latest_timestamp_for_account() -> Result<()> {
 async fn scan_status_roundtrip_and_clear_next_scan() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
 
-    let initial = store.get_scan_status().await?;
+    let initial = store.service_state.get_scan_status().await?;
     assert_eq!(initial.state, ScanState::Idle);
     assert_eq!(initial.mode, None);
     assert_eq!(initial.started_at, None);
@@ -1510,6 +1711,7 @@ async fn scan_status_roundtrip_and_clear_next_scan() -> Result<()> {
     assert_eq!(initial.next_scan_at, None);
 
     store
+        .service_state
         .set_scan_status(&PersistedScanStatus {
             state: ScanState::Scanning,
             mode: Some(ScanMode::Full),
@@ -1521,7 +1723,7 @@ async fn scan_status_roundtrip_and_clear_next_scan() -> Result<()> {
         })
         .await?;
 
-    let running = store.get_scan_status().await?;
+    let running = store.service_state.get_scan_status().await?;
     assert_eq!(running.state, ScanState::Scanning);
     assert_eq!(running.mode, Some(ScanMode::Full));
     assert_eq!(running.started_at, Some("2026-03-10T10:00:00Z".to_string()));
@@ -1533,8 +1735,8 @@ async fn scan_status_roundtrip_and_clear_next_scan() -> Result<()> {
         Some("2026-03-10T10:10:00Z".to_string())
     );
 
-    store.clear_next_scan_at().await?;
-    let cleared = store.get_scan_status().await?;
+    store.service_state.clear_next_scan_at().await?;
+    let cleared = store.service_state.get_scan_status().await?;
     assert_eq!(cleared.next_scan_at, None);
     Ok(())
 }
@@ -1543,13 +1745,15 @@ async fn scan_status_roundtrip_and_clear_next_scan() -> Result<()> {
 async fn auth_limit_reset_listing_returns_sorted_accounts() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .service_state
         .set_auth_limit_reset_at("backup-2", "2026-03-10T12:30:00Z")
         .await?;
     store
+        .service_state
         .set_auth_limit_reset_at("primary", "2026-03-10T11:00:00Z")
         .await?;
 
-    let entries = store.list_auth_limit_reset_entries().await?;
+    let entries = store.service_state.list_auth_limit_reset_entries().await?;
     assert_eq!(
         entries,
         vec![
@@ -1570,6 +1774,7 @@ async fn auth_limit_reset_listing_returns_sorted_accounts() -> Result<()> {
 async fn project_catalog_summary_lists_project_counts() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store
+        .project_catalog
         .save_project_catalog(
             "all",
             &[
@@ -1580,7 +1785,10 @@ async fn project_catalog_summary_lists_project_counts() -> Result<()> {
         )
         .await?;
 
-    let summaries = store.list_project_catalog_summaries().await?;
+    let summaries = store
+        .project_catalog
+        .list_project_catalog_summaries()
+        .await?;
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].cache_key, "all".to_string());
     assert_eq!(summaries[0].project_count, 3);
@@ -1603,7 +1811,10 @@ async fn project_catalog_summary_falls_back_for_legacy_rows_without_count() -> R
     .execute(store.pool())
     .await?;
 
-    let summaries = store.list_project_catalog_summaries().await?;
+    let summaries = store
+        .project_catalog
+        .list_project_catalog_summaries()
+        .await?;
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].cache_key, "legacy".to_string());
     assert_eq!(summaries[0].project_count, 2);
@@ -1615,6 +1826,7 @@ async fn run_history_is_append_only_for_same_mr() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
 
     let first_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -1628,6 +1840,7 @@ async fn run_history_is_append_only_for_same_mr() -> Result<()> {
         })
         .await?;
     store
+        .run_history
         .finish_run_history(
             first_id,
             RunHistoryFinish {
@@ -1645,6 +1858,7 @@ async fn run_history_is_append_only_for_same_mr() -> Result<()> {
         .await?;
 
     let second_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -1660,7 +1874,10 @@ async fn run_history_is_append_only_for_same_mr() -> Result<()> {
 
     assert_ne!(first_id, second_id);
 
-    let records = store.list_run_history_for_mr("group/repo", 42).await?;
+    let records = store
+        .run_history
+        .list_run_history_for_mr("group/repo", 42)
+        .await?;
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].id, second_id);
     assert_eq!(records[0].head_sha, "sha2".to_string());
@@ -1674,6 +1891,7 @@ async fn run_history_preserves_mention_trigger_metadata() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
 
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Mention,
             repo: "group/repo".to_string(),
@@ -1687,6 +1905,7 @@ async fn run_history_preserves_mention_trigger_metadata() -> Result<()> {
         })
         .await?;
     store
+        .run_history
         .finish_run_history(
             run_id,
             RunHistoryFinish {
@@ -1704,6 +1923,7 @@ async fn run_history_preserves_mention_trigger_metadata() -> Result<()> {
         .await?;
 
     let record = store
+        .run_history
         .get_run_history(run_id)
         .await?
         .expect("run history record should exist");
@@ -1726,7 +1946,10 @@ async fn runtime_feature_flag_overrides_roundtrip() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
 
     assert_eq!(
-        store.get_runtime_feature_flag_overrides().await?,
+        store
+            .feature_flags
+            .get_runtime_feature_flag_overrides()
+            .await?,
         RuntimeFeatureFlagOverrides::default()
     );
 
@@ -1739,9 +1962,18 @@ async fn runtime_feature_flag_overrides_roundtrip() -> Result<()> {
         composer_auto_repositories: Some(true),
         composer_safe_install: Some(true),
     };
-    store.set_runtime_feature_flag_overrides(&overrides).await?;
+    store
+        .feature_flags
+        .set_runtime_feature_flag_overrides(&overrides)
+        .await?;
 
-    assert_eq!(store.get_runtime_feature_flag_overrides().await?, overrides);
+    assert_eq!(
+        store
+            .feature_flags
+            .get_runtime_feature_flag_overrides()
+            .await?,
+        overrides
+    );
     Ok(())
 }
 
@@ -1749,6 +1981,7 @@ async fn runtime_feature_flag_overrides_roundtrip() -> Result<()> {
 async fn run_history_feature_flags_snapshot_roundtrip() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -1772,10 +2005,12 @@ async fn run_history_feature_flags_snapshot_roundtrip() -> Result<()> {
         composer_safe_install: true,
     };
     store
+        .run_history
         .set_run_history_feature_flags(run_id, &feature_flags)
         .await?;
 
     let record = store
+        .run_history
         .get_run_history(run_id)
         .await?
         .context("run history row should exist")?;
@@ -1787,6 +2022,7 @@ async fn run_history_feature_flags_snapshot_roundtrip() -> Result<()> {
 async fn security_run_history_roundtrip_uses_security_kind() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
+        .run_history
         .start_run_history_for_lane(
             NewRunHistory {
                 kind: RunHistoryKind::Security,
@@ -1804,6 +2040,7 @@ async fn security_run_history_roundtrip_uses_security_kind() -> Result<()> {
         .await?;
 
     let record = store
+        .run_history
         .get_run_history(run_id)
         .await?
         .context("run history row should exist")?;
@@ -1815,6 +2052,7 @@ async fn security_run_history_roundtrip_uses_security_kind() -> Result<()> {
 async fn run_history_session_roundtrips_security_context_metadata() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Security,
             repo: "group/repo".to_string(),
@@ -1829,6 +2067,7 @@ async fn run_history_session_roundtrips_security_context_metadata() -> Result<()
         .await?;
 
     store
+        .run_history
         .update_run_history_session(
             run_id,
             RunHistorySessionUpdate {
@@ -1845,6 +2084,7 @@ async fn run_history_session_roundtrips_security_context_metadata() -> Result<()
         .await?;
 
     let record = store
+        .run_history
         .get_run_history(run_id)
         .await?
         .context("run history row should exist")?;
@@ -1871,6 +2111,7 @@ async fn run_history_session_roundtrips_security_context_metadata() -> Result<()
 async fn run_history_filters_by_mr() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let first = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -1884,6 +2125,7 @@ async fn run_history_filters_by_mr() -> Result<()> {
         })
         .await?;
     let _other = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/other".to_string(),
@@ -1897,6 +2139,7 @@ async fn run_history_filters_by_mr() -> Result<()> {
         })
         .await?;
     store
+        .run_history
         .finish_run_history(
             first,
             RunHistoryFinish {
@@ -1913,7 +2156,10 @@ async fn run_history_filters_by_mr() -> Result<()> {
         )
         .await?;
 
-    let records = store.list_run_history_for_mr("group/repo", 11).await?;
+    let records = store
+        .run_history
+        .list_run_history_for_mr("group/repo", 11)
+        .await?;
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].repo, "group/repo".to_string());
     assert_eq!(records[0].iid, 11);
@@ -1924,6 +2170,7 @@ async fn run_history_filters_by_mr() -> Result<()> {
 async fn completed_inline_review_detection_respects_security_kind() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
+        .run_history
         .start_run_history_for_lane(
             NewRunHistory {
                 kind: RunHistoryKind::Security,
@@ -1940,6 +2187,7 @@ async fn completed_inline_review_detection_respects_security_kind() -> Result<()
         )
         .await?;
     store
+        .run_history
         .set_run_history_feature_flags(
             run_id,
             &FeatureFlagSnapshot {
@@ -1949,6 +2197,7 @@ async fn completed_inline_review_detection_respects_security_kind() -> Result<()
         )
         .await?;
     store
+        .run_history
         .finish_run_history(
             run_id,
             RunHistoryFinish {
@@ -1960,6 +2209,7 @@ async fn completed_inline_review_detection_respects_security_kind() -> Result<()
 
     assert!(
         store
+            .run_history
             .has_completed_inline_review_for_lane(
                 "group/repo",
                 21,
@@ -1977,6 +2227,7 @@ async fn list_run_history_pages_with_cursors_and_preserves_filtering() -> Result
     let mut run_ids = Vec::new();
     for (iid, started_at) in [(21u64, 1_000i64), (22, 2_000), (23, 3_000)] {
         let run_id = store
+            .run_history
             .start_run_history(NewRunHistory {
                 kind: RunHistoryKind::Review,
                 repo: "group/repo".to_string(),
@@ -1990,6 +2241,7 @@ async fn list_run_history_pages_with_cursors_and_preserves_filtering() -> Result
             })
             .await?;
         store
+            .run_history
             .finish_run_history(
                 run_id,
                 RunHistoryFinish {
@@ -2009,6 +2261,7 @@ async fn list_run_history_pages_with_cursors_and_preserves_filtering() -> Result
         run_ids.push(run_id);
     }
     let unrelated_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/other".to_string(),
@@ -2022,6 +2275,7 @@ async fn list_run_history_pages_with_cursors_and_preserves_filtering() -> Result
         })
         .await?;
     store
+        .run_history
         .finish_run_history(
             unrelated_id,
             RunHistoryFinish {
@@ -2040,13 +2294,14 @@ async fn list_run_history_pages_with_cursors_and_preserves_filtering() -> Result
         ..Default::default()
     };
 
-    let first_page = store.list_run_history(&filtered).await?;
+    let first_page = store.run_history.list_run_history(&filtered).await?;
     assert_eq!(first_page.runs.len(), 1);
     assert_eq!(first_page.runs[0].id, run_ids[2]);
     assert_eq!(first_page.has_previous, false);
     assert_eq!(first_page.has_next, true);
 
     let second_page = store
+        .run_history
         .list_run_history(&RunHistoryListQuery {
             after: first_page.next_cursor,
             ..filtered.clone()
@@ -2058,6 +2313,7 @@ async fn list_run_history_pages_with_cursors_and_preserves_filtering() -> Result
     assert_eq!(second_page.has_next, true);
 
     let previous_page = store
+        .run_history
         .list_run_history(&RunHistoryListQuery {
             before: second_page.previous_cursor,
             ..filtered.clone()
@@ -2076,6 +2332,7 @@ async fn list_run_history_cursor_uses_id_as_tie_breaker() -> Result<()> {
     let mut run_ids = Vec::new();
     for iid in [31u64, 32, 33] {
         let run_id = store
+            .run_history
             .start_run_history(NewRunHistory {
                 kind: RunHistoryKind::Review,
                 repo: "group/repo".to_string(),
@@ -2089,6 +2346,7 @@ async fn list_run_history_cursor_uses_id_as_tie_breaker() -> Result<()> {
             })
             .await?;
         store
+            .run_history
             .finish_run_history(
                 run_id,
                 RunHistoryFinish {
@@ -2107,6 +2365,7 @@ async fn list_run_history_cursor_uses_id_as_tie_breaker() -> Result<()> {
     }
 
     let first_page = store
+        .run_history
         .list_run_history(&RunHistoryListQuery {
             limit: 2,
             ..Default::default()
@@ -2118,6 +2377,7 @@ async fn list_run_history_cursor_uses_id_as_tie_breaker() -> Result<()> {
     );
 
     let second_page = store
+        .run_history
         .list_run_history(&RunHistoryListQuery {
             limit: 2,
             after: first_page.next_cursor,
@@ -2161,6 +2421,7 @@ async fn file_backed_sqlite_uses_wal_and_normal_synchronous() -> Result<()> {
 async fn reconcile_interrupted_run_history_marks_in_progress_rows_cancelled() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let interrupted_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Mention,
             repo: "group/repo".to_string(),
@@ -2174,6 +2435,7 @@ async fn reconcile_interrupted_run_history_marks_in_progress_rows_cancelled() ->
         })
         .await?;
     let finished_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -2187,6 +2449,7 @@ async fn reconcile_interrupted_run_history_marks_in_progress_rows_cancelled() ->
         })
         .await?;
     store
+        .run_history
         .finish_run_history(
             finished_id,
             RunHistoryFinish {
@@ -2199,11 +2462,13 @@ async fn reconcile_interrupted_run_history_marks_in_progress_rows_cancelled() ->
         .await?;
 
     let affected = store
+        .run_history
         .reconcile_interrupted_run_history("run interrupted by service restart")
         .await?;
     assert_eq!(affected, 1);
 
     let interrupted = store
+        .run_history
         .get_run_history(interrupted_id)
         .await?
         .expect("interrupted run should exist");
@@ -2216,6 +2481,7 @@ async fn reconcile_interrupted_run_history_marks_in_progress_rows_cancelled() ->
     assert!(interrupted.finished_at.is_some());
 
     let finished = store
+        .run_history
         .get_run_history(finished_id)
         .await?
         .expect("finished run should exist");
@@ -2227,6 +2493,7 @@ async fn reconcile_interrupted_run_history_marks_in_progress_rows_cancelled() ->
 async fn run_history_events_roundtrip_in_sequence_order() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -2240,6 +2507,7 @@ async fn run_history_events_roundtrip_in_sequence_order() -> Result<()> {
         })
         .await?;
     store
+        .run_history
         .append_run_history_events(
             run_id,
             &[
@@ -2259,7 +2527,7 @@ async fn run_history_events_roundtrip_in_sequence_order() -> Result<()> {
         )
         .await?;
 
-    let events = store.list_run_history_events(run_id).await?;
+    let events = store.run_history.list_run_history_events(run_id).await?;
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].sequence, 1);
     assert_eq!(events[0].event_type, "turn_started");
@@ -2273,6 +2541,7 @@ async fn run_history_events_roundtrip_in_sequence_order() -> Result<()> {
 async fn run_history_events_offset_sequence_across_append_batches() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -2286,6 +2555,7 @@ async fn run_history_events_offset_sequence_across_append_batches() -> Result<()
         })
         .await?;
     store
+        .run_history
         .append_run_history_events(
             run_id,
             &[NewRunHistoryEvent {
@@ -2297,6 +2567,7 @@ async fn run_history_events_offset_sequence_across_append_batches() -> Result<()
         )
         .await?;
     store
+        .run_history
         .append_run_history_events(
             run_id,
             &[
@@ -2316,7 +2587,7 @@ async fn run_history_events_offset_sequence_across_append_batches() -> Result<()
         )
         .await?;
 
-    let events = store.list_run_history_events(run_id).await?;
+    let events = store.run_history.list_run_history_events(run_id).await?;
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].sequence, 1);
     assert_eq!(events[0].turn_id.as_deref(), Some("turn-a"));
@@ -2331,6 +2602,7 @@ async fn run_history_events_offset_sequence_across_append_batches() -> Result<()
 async fn mark_run_history_events_incomplete_updates_flag() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -2344,6 +2616,7 @@ async fn mark_run_history_events_incomplete_updates_flag() -> Result<()> {
         })
         .await?;
     store
+        .run_history
         .finish_run_history(
             run_id,
             RunHistoryFinish {
@@ -2354,16 +2627,21 @@ async fn mark_run_history_events_incomplete_updates_flag() -> Result<()> {
         .await?;
     assert!(
         store
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row")?
             .events_persisted_cleanly
     );
 
-    store.mark_run_history_events_incomplete(run_id).await?;
+    store
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
 
     assert!(
         !store
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after mark")?
@@ -2376,6 +2654,7 @@ async fn mark_run_history_events_incomplete_updates_flag() -> Result<()> {
 async fn transcript_backfill_state_and_event_rewrite_roundtrip() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -2389,6 +2668,7 @@ async fn transcript_backfill_state_and_event_rewrite_roundtrip() -> Result<()> {
         })
         .await?;
     store
+        .run_history
         .finish_run_history(
             run_id,
             RunHistoryFinish {
@@ -2398,6 +2678,7 @@ async fn transcript_backfill_state_and_event_rewrite_roundtrip() -> Result<()> {
         )
         .await?;
     store
+        .run_history
         .append_run_history_events(
             run_id,
             &[
@@ -2428,9 +2709,11 @@ async fn transcript_backfill_state_and_event_rewrite_roundtrip() -> Result<()> {
         .await?;
 
     store
+        .run_history
         .update_run_history_transcript_backfill(run_id, TranscriptBackfillState::InProgress, None)
         .await?;
     let in_progress = store
+        .run_history
         .get_run_history(run_id)
         .await?
         .context("run history row after in-progress update")?;
@@ -2441,6 +2724,7 @@ async fn transcript_backfill_state_and_event_rewrite_roundtrip() -> Result<()> {
     assert_eq!(in_progress.transcript_backfill_error, None);
 
     store
+        .run_history
         .replace_run_history_events(
             run_id,
             &[
@@ -2470,10 +2754,12 @@ async fn transcript_backfill_state_and_event_rewrite_roundtrip() -> Result<()> {
         )
         .await?;
     store
+        .run_history
         .mark_run_history_transcript_backfill_complete(run_id)
         .await?;
 
     let run = store
+        .run_history
         .get_run_history(run_id)
         .await?
         .context("run history row after rewrite")?;
@@ -2484,7 +2770,7 @@ async fn transcript_backfill_state_and_event_rewrite_roundtrip() -> Result<()> {
     assert_eq!(run.transcript_backfill_error, None);
     assert!(run.events_persisted_cleanly);
 
-    let events = store.list_run_history_events(run_id).await?;
+    let events = store.run_history.list_run_history_events(run_id).await?;
     assert_eq!(events.len(), 3);
     assert_eq!(
         events[1].payload["summary"][0]["text"],
@@ -2501,6 +2787,7 @@ async fn transcript_backfill_state_and_event_rewrite_roundtrip() -> Result<()> {
 async fn replace_run_history_events_for_turn_preserves_other_turns() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -2514,6 +2801,7 @@ async fn replace_run_history_events_for_turn_preserves_other_turns() -> Result<(
         })
         .await?;
     store
+        .run_history
         .finish_run_history(
             run_id,
             RunHistoryFinish {
@@ -2523,6 +2811,7 @@ async fn replace_run_history_events_for_turn_preserves_other_turns() -> Result<(
         )
         .await?;
     store
+        .run_history
         .append_run_history_events(
             run_id,
             &[
@@ -2555,9 +2844,11 @@ async fn replace_run_history_events_for_turn_preserves_other_turns() -> Result<(
         .await?;
 
     store
+        .run_history
         .update_run_history_transcript_backfill(run_id, TranscriptBackfillState::InProgress, None)
         .await?;
     store
+        .run_history
         .replace_run_history_events_for_turn(
             run_id,
             "turn-b",
@@ -2584,7 +2875,7 @@ async fn replace_run_history_events_for_turn_preserves_other_turns() -> Result<(
         )
         .await?;
 
-    let events = store.list_run_history_events(run_id).await?;
+    let events = store.run_history.list_run_history_events(run_id).await?;
     assert_eq!(events.len(), 5);
     assert_eq!(events[0].sequence, 1);
     assert_eq!(events[0].turn_id.as_deref(), Some("turn-a"));
@@ -2608,6 +2899,7 @@ async fn replace_run_history_events_for_turn_preserves_other_turns() -> Result<(
 async fn replace_run_history_events_for_turn_removes_turn_when_rewritten_empty() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -2621,6 +2913,7 @@ async fn replace_run_history_events_for_turn_removes_turn_when_rewritten_empty()
         })
         .await?;
     store
+        .run_history
         .finish_run_history(
             run_id,
             RunHistoryFinish {
@@ -2630,6 +2923,7 @@ async fn replace_run_history_events_for_turn_removes_turn_when_rewritten_empty()
         )
         .await?;
     store
+        .run_history
         .append_run_history_events(
             run_id,
             &[
@@ -2662,10 +2956,11 @@ async fn replace_run_history_events_for_turn_removes_turn_when_rewritten_empty()
         .await?;
 
     store
+        .run_history
         .replace_run_history_events_for_turn(run_id, "turn-b", &[])
         .await?;
 
-    let events = store.list_run_history_events(run_id).await?;
+    let events = store.run_history.list_run_history_events(run_id).await?;
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].sequence, 1);
     assert_eq!(events[0].turn_id.as_deref(), Some("turn-a"));

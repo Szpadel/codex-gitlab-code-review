@@ -125,6 +125,7 @@ impl DockerCodexRunner {
         let effective = Self::effective_feature_flags(requested, gitlab_discovery_enabled);
         if let Err(err) = self
             .state
+            .run_history
             .set_run_history_feature_flags(run_history_id, &effective)
             .await
         {

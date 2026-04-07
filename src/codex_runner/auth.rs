@@ -50,6 +50,7 @@ impl DockerCodexRunner {
     ) -> Result<bool> {
         let Some(raw_reset_at) = self
             .state
+            .service_state
             .get_auth_limit_reset_at(&account.state_key)
             .await?
         else {
@@ -65,6 +66,7 @@ impl DockerCodexRunner {
                     "invalid account reset timestamp in state; clearing stale entry"
                 );
                 self.state
+                    .service_state
                     .clear_auth_limit_reset_at(&account.state_key)
                     .await?;
                 Ok(false)
@@ -93,6 +95,7 @@ impl DockerCodexRunner {
     ) -> Result<()> {
         let Some(raw_reset_at) = self
             .state
+            .service_state
             .get_auth_limit_reset_at(&account.state_key)
             .await?
         else {
@@ -103,12 +106,14 @@ impl DockerCodexRunner {
                 let reset_at = parsed.with_timezone(&Utc);
                 if should_clear_limit_reset(reset_at, attempt_started_at) {
                     self.state
+                        .service_state
                         .clear_auth_limit_reset_at(&account.state_key)
                         .await?;
                 }
             }
             Err(_) => {
                 self.state
+                    .service_state
                     .clear_auth_limit_reset_at(&account.state_key)
                     .await?;
             }
@@ -122,6 +127,7 @@ impl DockerCodexRunner {
         reset_at: DateTime<Utc>,
     ) -> Result<()> {
         self.state
+            .service_state
             .set_auth_limit_reset_at(&account.state_key, &reset_at.to_rfc3339())
             .await
     }

@@ -598,6 +598,7 @@ impl DockerCodexRunner {
         let now = Utc::now().timestamp();
         if let Some(entry) = self
             .state
+            .security_context_cache
             .get_security_review_context_cache(
                 cache_repo_key,
                 base_branch,
@@ -621,6 +622,7 @@ impl DockerCodexRunner {
         if ctx.feature_flags.security_context_ignore_base_head
             && let Some(entry) = self
                 .state
+                .security_context_cache
                 .get_latest_security_review_context_cache_for_branch(
                     cache_repo_key,
                     base_branch,
@@ -651,6 +653,7 @@ impl DockerCodexRunner {
                 let now = Utc::now().timestamp();
                 if let Some(entry) = self
                     .state
+                    .security_context_cache
                     .get_security_review_context_cache(
                         cache_repo_key,
                         base_branch,
@@ -675,6 +678,7 @@ impl DockerCodexRunner {
                 if ctx.feature_flags.security_context_ignore_base_head
                     && let Some(entry) = self
                         .state
+                        .security_context_cache
                         .get_latest_security_review_context_cache_for_branch(
                             cache_repo_key,
                             base_branch,
@@ -717,6 +721,7 @@ impl DockerCodexRunner {
                 let now = Utc::now().timestamp();
                 if let Some(entry) = self
                     .state
+                    .security_context_cache
                     .get_security_review_context_cache(
                         cache_repo_key,
                         base_branch,
@@ -740,6 +745,7 @@ impl DockerCodexRunner {
                 if ctx.feature_flags.security_context_ignore_base_head
                     && let Some(entry) = self
                         .state
+                        .security_context_cache
                         .get_latest_security_review_context_cache_for_branch(
                             cache_repo_key,
                             base_branch,
@@ -1163,7 +1169,7 @@ impl DockerCodexRunner {
                                     + ctx.security_context_ttl_seconds.unwrap_or(1_209_600) as i64;
                                 if let Err(err) = self
                                     .state
-                                    .upsert_security_review_context_cache(
+                                    .security_context_cache.upsert_security_review_context_cache(
                                         &crate::state::SecurityReviewContextCacheEntry {
                                             repo: self.security_context_cache_repo_key(ctx)
                                                 .to_string(),

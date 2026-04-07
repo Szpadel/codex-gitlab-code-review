@@ -65,6 +65,7 @@ impl MentionFlow {
     pub(crate) async fn clear_stale_in_progress(&self) -> Result<()> {
         self.shared
             .state
+            .mention_commands
             .clear_stale_in_progress_mentions(self.shared.config.review.stale_in_progress_minutes)
             .await
     }
@@ -73,6 +74,7 @@ impl MentionFlow {
         let mention_in_progress = self
             .shared
             .state
+            .mention_commands
             .list_in_progress_mention_commands()
             .await?;
         if !mention_in_progress.is_empty() {
@@ -116,6 +118,7 @@ impl MentionFlow {
             if let Err(err) = self
                 .shared
                 .state
+                .mention_commands
                 .finish_mention_command(
                     mention.key.repo.as_str(),
                     mention.key.iid,
@@ -445,6 +448,7 @@ impl MentionFlow {
             match self
                 .shared
                 .state
+                .mention_commands
                 .mention_command_scan_state(repo, mr.iid, &trigger.discussion_id, trigger_note_id)
                 .await?
             {
@@ -463,8 +467,15 @@ impl MentionFlow {
             if self
                 .shared
                 .state
-                .mr_has_in_progress_work(repo, mr.iid)
+                .review_state
+                .has_in_progress_review(repo, mr.iid)
                 .await?
+                || self
+                    .shared
+                    .state
+                    .mention_commands
+                    .has_in_progress_mention_for_mr(repo, mr.iid)
+                    .await?
             {
                 outcome.blocks_review = true;
                 outcome.blocked_pending_work = true;
@@ -473,6 +484,7 @@ impl MentionFlow {
             if !self
                 .shared
                 .state
+                .mention_commands
                 .begin_mention_command(
                     repo,
                     mr.iid,
@@ -494,6 +506,7 @@ impl MentionFlow {
             let run_history_id = match self
                 .shared
                 .state
+                .run_history
                 .start_run_history(NewRunHistory {
                     kind: RunHistoryKind::Mention,
                     repo: repo.to_string(),
@@ -547,6 +560,7 @@ impl MentionFlow {
             if let Err(err) = self
                 .shared
                 .state
+                .run_history
                 .set_run_history_feature_flags(run_history_id, &feature_flags)
                 .await
             {
@@ -607,7 +621,7 @@ impl MentionFlow {
                 let trigger_note_id = trigger.trigger_note.id;
                 if !lifecycle.accepts_new_work() {
                     let _ = state
-                        .finish_mention_command(
+                        .mention_commands.finish_mention_command(
                             &repo_name,
                             mr_copy.iid,
                             &discussion_id,
@@ -617,7 +631,7 @@ impl MentionFlow {
                         )
                         .await;
                     let _ = state
-                        .finish_run_history(
+                        .run_history.finish_run_history(
                             run_history_id,
                             RunHistoryFinish {
                                 result: "cancelled".to_string(),
@@ -650,7 +664,7 @@ impl MentionFlow {
                     .unwrap_or_else(|| head_sha_copy.clone());
                 if effective_head_sha != head_sha_copy
                     && let Err(err) = state
-                        .update_run_history_head_sha(run_history_id, &effective_head_sha)
+                        .run_history.update_run_history_head_sha(run_history_id, &effective_head_sha)
                         .await
                 {
                     warn!(
@@ -798,7 +812,7 @@ impl MentionFlow {
                     }
                 };
                 if let Err(err) = state
-                    .finish_run_history(run_history_id, run_history_finish)
+                    .run_history.finish_run_history(run_history_id, run_history_finish)
                     .await
                 {
                     warn!(
@@ -875,7 +889,7 @@ impl MentionFlow {
                 let mut mention_state_persisted = false;
                 for attempt in 1..=3 {
                     match state
-                        .finish_mention_command(
+                        .mention_commands.finish_mention_command(
                             &repo_name,
                             mr_copy.iid,
                             &discussion_id,
@@ -919,7 +933,7 @@ impl MentionFlow {
                 }
                 if !mention_state_persisted {
                     let _ = state
-                        .finish_mention_command(
+                        .mention_commands.finish_mention_command(
                             &repo_name,
                             mr_copy.iid,
                             &discussion_id,
@@ -967,6 +981,7 @@ impl MentionFlow {
         if let Err(recovery_err) = self
             .shared
             .state
+            .mention_commands
             .finish_mention_command(repo, iid, discussion_id, trigger_note_id, head_sha, "error")
             .await
         {
@@ -986,6 +1001,7 @@ impl MentionFlow {
         let overrides = self
             .shared
             .state
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?;
         Ok(self.shared.config.resolve_feature_flags(&overrides))
@@ -1007,6 +1023,7 @@ impl MentionFlow {
         if let Err(finish_err) = self
             .shared
             .state
+            .run_history
             .finish_run_history(
                 ctx.run_history_id,
                 RunHistoryFinish {

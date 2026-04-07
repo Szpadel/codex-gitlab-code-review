@@ -33,6 +33,7 @@ impl CodexRunner for MockCodexRunner {
         );
         if let Some(run_history_id) = ctx.run_history_id {
             self.state
+                .run_history
                 .update_run_history_session(
                     run_history_id,
                     RunHistorySessionUpdate {
@@ -45,6 +46,7 @@ impl CodexRunner for MockCodexRunner {
                 )
                 .await?;
             self.state
+                .run_history
                 .append_run_history_events(run_history_id, &transcript.events)
                 .await?;
         }

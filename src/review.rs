@@ -160,6 +160,7 @@ impl ReviewService {
     pub async fn next_pending_rate_limit_retry_at(&self) -> Result<Option<DateTime<Utc>>> {
         Ok(self
             .state
+            .review_rate_limit
             .earliest_review_rate_limit_pending_retry_at()
             .await?
             .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single()))
@@ -177,6 +178,7 @@ impl ReviewService {
         let now = Utc::now().timestamp();
         let due_pending_rows = self
             .state
+            .review_rate_limit
             .list_review_rate_limit_pending()
             .await?
             .into_iter()
@@ -264,6 +266,7 @@ impl ReviewService {
     async fn refresh_active_flow_state(&self) -> Result<()> {
         for review in self.active_tasks.active_reviews() {
             self.state
+                .review_state
                 .touch_in_progress_review_for_lane(
                     &review.repo,
                     review.iid,
@@ -274,6 +277,7 @@ impl ReviewService {
         }
         for mention in self.active_tasks.active_mentions() {
             self.state
+                .mention_commands
                 .touch_in_progress_mention_command(
                     &mention.repo,
                     mention.iid,
@@ -334,6 +338,7 @@ impl ReviewService {
                 );
                 if self
                     .state
+                    .review_rate_limit
                     .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
                     .await?
                 {
@@ -358,6 +363,7 @@ impl ReviewService {
                 let deferred_until =
                     retry_started_at.saturating_add(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
                 self.state
+                    .review_rate_limit
                     .upsert_review_rate_limit_pending(
                         pending.lane,
                         &pending.repo,
@@ -381,6 +387,7 @@ impl ReviewService {
             );
             if self
                 .state
+                .review_rate_limit
                 .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
                 .await?
             {
@@ -407,6 +414,7 @@ impl ReviewService {
             Ok(outcome) => outcome,
             Err((err, retry_started_at, deferred_until)) => {
                 self.state
+                    .review_rate_limit
                     .upsert_review_rate_limit_pending(
                         pending.lane,
                         &pending.repo,
@@ -424,6 +432,7 @@ impl ReviewService {
             ReviewScheduleOutcome::SkippedRateLimit | ReviewScheduleOutcome::Interrupted
         ) && self
             .state
+            .review_rate_limit
             .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
             .await?
         {
@@ -473,6 +482,7 @@ impl ReviewService {
         let open_iids_set = open_iids.iter().copied().collect::<HashSet<_>>();
         let pending_to_clear = self
             .state
+            .review_rate_limit
             .list_review_rate_limit_pending()
             .await?
             .into_iter()
@@ -482,6 +492,7 @@ impl ReviewService {
             return Ok(());
         }
         self.state
+            .review_rate_limit
             .sync_review_rate_limit_pending_rows(repo, open_iids)
             .await?;
         for pending in pending_to_clear {
@@ -633,15 +644,21 @@ impl ReviewService {
             let due_pending_review = matches!(mode, ScanMode::Incremental)
                 && self
                     .state
+                    .review_rate_limit
                     .repo_has_due_review_rate_limit_pending(repo, now_ts)
                     .await?;
             if matches!(mode, ScanMode::Incremental)
                 && let Some(marker) = activity_marker.as_ref()
             {
-                let previous = self.state.get_project_last_mr_activity(repo).await?;
+                let previous = self
+                    .state
+                    .project_catalog
+                    .get_project_last_mr_activity(repo)
+                    .await?;
                 if marker.as_str() == NO_OPEN_MRS_MARKER {
                     if previous.as_ref() != Some(marker) {
                         self.state
+                            .project_catalog
                             .set_project_last_mr_activity(repo, marker)
                             .await?;
                     }
@@ -668,6 +685,7 @@ impl ReviewService {
                 RepoScanStatus::Complete => {
                     if let Some(marker) = activity_marker {
                         self.state
+                            .project_catalog
                             .set_project_last_mr_activity(repo, &marker)
                             .await?;
                     }
@@ -882,7 +900,11 @@ impl ReviewService {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Vec<String>>>,
     {
-        let cached = self.state.load_project_catalog(&cache_key).await?;
+        let cached = self
+            .state
+            .project_catalog
+            .load_project_catalog(&cache_key)
+            .await?;
         let force_refresh = matches!(mode, ScanMode::Full);
         if let Some(cache) = cached.as_ref() {
             let refresh_seconds = self.config.gitlab.targets.refresh_seconds;
@@ -903,6 +925,7 @@ impl ReviewService {
                 projects.sort();
                 projects.dedup();
                 self.state
+                    .project_catalog
                     .save_project_catalog(&cache_key, &projects)
                     .await?;
                 Ok(projects)
@@ -1354,9 +1377,11 @@ mod pending_rate_limit_tests {
         let gitlab = Arc::new(TestGitLab::new(Vec::new()));
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         state
+            .project_catalog
             .set_project_last_mr_activity("group/repo", "2025-01-02T00:00:00Z|77")
             .await?;
         state
+            .review_rate_limit
             .upsert_review_rate_limit_pending(
                 ReviewLane::General,
                 "group/repo",
@@ -1378,7 +1403,13 @@ mod pending_rate_limit_tests {
         service.scan_once_incremental().await?;
 
         assert_eq!(*gitlab.list_open_calls.lock().unwrap(), 1);
-        assert!(state.list_review_rate_limit_pending().await?.is_empty());
+        assert!(
+            state
+                .review_rate_limit
+                .list_review_rate_limit_pending()
+                .await?
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -1393,6 +1424,7 @@ mod pending_rate_limit_tests {
         ));
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         state
+            .review_rate_limit
             .upsert_review_rate_limit_pending(
                 ReviewLane::General,
                 "group/repo",
@@ -1420,7 +1452,13 @@ mod pending_rate_limit_tests {
             assert_eq!(review_contexts[0].lane, ReviewLane::General);
             assert_eq!(review_contexts[0].head_sha, "sha82-new");
         }
-        assert!(state.list_review_rate_limit_pending().await?.is_empty());
+        assert!(
+            state
+                .review_rate_limit
+                .list_review_rate_limit_pending()
+                .await?
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -1437,6 +1475,7 @@ mod pending_rate_limit_tests {
         );
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         state
+            .review_rate_limit
             .upsert_review_rate_limit_pending(
                 ReviewLane::General,
                 "group/repo",
@@ -1459,7 +1498,13 @@ mod pending_rate_limit_tests {
         service.process_due_pending_rate_limit_reviews().await?;
 
         assert!(runner.review_contexts.lock().unwrap().is_empty());
-        assert!(state.list_review_rate_limit_pending().await?.is_empty());
+        assert!(
+            state
+                .review_rate_limit
+                .list_review_rate_limit_pending()
+                .await?
+                .is_empty()
+        );
         assert!(
             gitlab
                 .calls
@@ -1477,6 +1522,7 @@ mod pending_rate_limit_tests {
         gitlab.fail_mr_lookup("request failed: status=500 Internal Server Error");
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         state
+            .review_rate_limit
             .upsert_review_rate_limit_pending(
                 ReviewLane::General,
                 "group/repo",
@@ -1499,7 +1545,10 @@ mod pending_rate_limit_tests {
         service.process_due_pending_rate_limit_reviews().await?;
 
         assert!(runner.review_contexts.lock().unwrap().is_empty());
-        let pending = state.list_review_rate_limit_pending().await?;
+        let pending = state
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].iid, 92);
         assert!(pending[0].next_retry_at > 0);
@@ -1516,6 +1565,7 @@ mod pending_rate_limit_tests {
         ));
         let state = Arc::new(ReviewStateStore::new(":memory:").await?);
         state
+            .review_rate_limit
             .upsert_review_rate_limit_pending(
                 ReviewLane::General,
                 "group/repo",
@@ -1547,7 +1597,10 @@ mod pending_rate_limit_tests {
             err.to_string()
                 .contains("deserialize feature flag overrides")
         );
-        let pending = state.list_review_rate_limit_pending().await?;
+        let pending = state
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].iid, 93);
         assert_eq!(pending[0].last_seen_head_sha, "sha93-new");

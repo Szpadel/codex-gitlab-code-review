@@ -84,6 +84,7 @@ async fn seed_example_history_with_store(
     for spec in seed_specs {
         let transcript = spec.transcript.map(seed_transcript);
         let run_id = state
+            .run_history
             .start_run_history(NewRunHistory {
                 kind: spec.kind,
                 repo: spec.repo.to_string(),
@@ -99,6 +100,7 @@ async fn seed_example_history_with_store(
             .with_context(|| format!("insert demo run history for {} !{}", spec.repo, spec.iid))?;
         if let Some(transcript) = transcript.as_ref() {
             state
+                .run_history
                 .update_run_history_session(
                     run_id,
                     RunHistorySessionUpdate {
@@ -118,11 +120,13 @@ async fn seed_example_history_with_store(
                 .await
                 .with_context(|| format!("update demo run session metadata for run {run_id}"))?;
             state
+                .run_history
                 .append_run_history_events(run_id, &transcript.events)
                 .await
                 .with_context(|| format!("append demo run events for run {run_id}"))?;
         }
         state
+            .run_history
             .finish_run_history(
                 run_id,
                 RunHistoryFinish {
@@ -150,6 +154,7 @@ async fn seed_example_history_with_store(
             .await
             .with_context(|| format!("finish demo run history for run {run_id}"))?;
         let stored = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .with_context(|| format!("demo run {run_id} missing after insert"))?;
@@ -755,6 +760,7 @@ mod tests {
 
         assert_eq!(report.runs.len(), 5);
         let mr_runs = state
+            .run_history
             .list_run_history_for_mr("demo/group/service-a", 101)
             .await?;
         assert_eq!(mr_runs.len(), 2);
@@ -765,6 +771,7 @@ mod tests {
             .find(|run| run.repo == "demo/group/service-b")
             .context("seeded mention run")?;
         let stored_mention = state
+            .run_history
             .get_run_history(mention_run.run_id)
             .await?
             .context("stored mention row")?;
@@ -780,7 +787,10 @@ mod tests {
             .iter()
             .find(|run| run.review_thread_id.is_some())
             .context("rich review run")?;
-        let rich_events = state.list_run_history_events(rich_run.run_id).await?;
+        let rich_events = state
+            .run_history
+            .list_run_history_events(rich_run.run_id)
+            .await?;
         assert!(rich_events.iter().any(|event| {
             event.event_type == "item_completed" && event.payload["type"] == "enteredReviewMode"
         }));
@@ -803,6 +813,7 @@ mod tests {
             .find(|run| run.repo == "demo/group/service-c")
             .context("fallback run")?;
         let fallback = state
+            .run_history
             .get_run_history(fallback_run.run_id)
             .await?
             .context("stored fallback row")?;
@@ -822,11 +833,13 @@ mod tests {
         seed_example_history_with_store(&state, db_path.to_string_lossy().as_ref()).await?;
 
         let runs = state
+            .run_history
             .list_run_history_for_mr("demo/group/service-a", 101)
             .await?;
         assert_eq!(runs.len(), 4);
 
         let all_runs = state
+            .run_history
             .list_run_history_for_mr("demo/group/service-d", 404)
             .await?;
         assert_eq!(all_runs.len(), 2);

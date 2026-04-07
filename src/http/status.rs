@@ -242,9 +242,13 @@ impl StatusService {
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn snapshot(&self) -> Result<StatusSnapshot> {
-        let created_after = self.state.get_created_after().await?;
-        let scan = self.state.get_scan_status().await?;
-        let overrides = self.state.get_runtime_feature_flag_overrides().await?;
+        let created_after = self.state.service_state.get_created_after().await?;
+        let scan = self.state.service_state.get_scan_status().await?;
+        let overrides = self
+            .state
+            .feature_flags
+            .get_runtime_feature_flag_overrides()
+            .await?;
         let rate_limits = self.review_rate_limit_snapshot().await?;
         Ok(StatusSnapshot {
             generated_at: Utc::now().to_rfc3339(),
@@ -269,10 +273,22 @@ impl StatusService {
                 feature_flags: self.feature_flag_snapshots(&overrides),
             },
             scan: scan_into_snapshot(scan),
-            in_progress_reviews: self.state.list_in_progress_reviews().await?,
-            in_progress_mentions: self.state.list_in_progress_mention_commands().await?,
-            auth_limit_resets: self.state.list_auth_limit_reset_entries().await?,
-            project_catalogs: self.state.list_project_catalog_summaries().await?,
+            in_progress_reviews: self.state.review_state.list_in_progress_reviews().await?,
+            in_progress_mentions: self
+                .state
+                .mention_commands
+                .list_in_progress_mention_commands()
+                .await?,
+            auth_limit_resets: self
+                .state
+                .service_state
+                .list_auth_limit_reset_entries()
+                .await?,
+            project_catalogs: self
+                .state
+                .project_catalog
+                .list_project_catalog_summaries()
+                .await?,
             rate_limits,
         })
     }
@@ -283,12 +299,21 @@ impl StatusService {
     pub async fn review_rate_limit_snapshot(&self) -> Result<StatusRateLimitSnapshot> {
         let now = Utc::now().timestamp();
         Ok(StatusRateLimitSnapshot {
-            rules: self.state.list_review_rate_limit_rules().await?,
+            rules: self
+                .state
+                .review_rate_limit
+                .list_review_rate_limit_rules()
+                .await?,
             active_buckets: self
                 .state
+                .review_rate_limit
                 .list_active_review_rate_limit_buckets(now)
                 .await?,
-            pending: self.state.list_review_rate_limit_pending().await?,
+            pending: self
+                .state
+                .review_rate_limit
+                .list_review_rate_limit_pending()
+                .await?,
         })
     }
 
@@ -309,7 +334,12 @@ impl StatusService {
                 path: path.clone(),
             });
         }
-        for rule in self.state.list_review_rate_limit_rules().await? {
+        for rule in self
+            .state
+            .review_rate_limit
+            .list_review_rate_limit_rules()
+            .await?
+        {
             suggestions.extend(rule.targets);
         }
 
@@ -330,7 +360,10 @@ impl StatusService {
         &self,
         rule: &ReviewRateLimitRuleUpsert,
     ) -> Result<String> {
-        self.state.create_review_rate_limit_rule(rule).await
+        self.state
+            .review_rate_limit
+            .create_review_rate_limit_rule(rule)
+            .await
     }
 
     /// # Errors
@@ -340,14 +373,20 @@ impl StatusService {
         &self,
         rule: &ReviewRateLimitRuleUpsert,
     ) -> Result<()> {
-        self.state.update_review_rate_limit_rule(rule).await
+        self.state
+            .review_rate_limit
+            .update_review_rate_limit_rule(rule)
+            .await
     }
 
     /// # Errors
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn delete_review_rate_limit_rule(&self, rule_id: &str) -> Result<()> {
-        self.state.delete_review_rate_limit_rule(rule_id).await
+        self.state
+            .review_rate_limit
+            .delete_review_rate_limit_rule(rule_id)
+            .await
     }
 
     /// # Errors
@@ -355,6 +394,7 @@ impl StatusService {
     /// Returns an error if the underlying operation fails.
     pub async fn refund_one_review_rate_limit_bucket_slot(&self, bucket_id: &str) -> Result<()> {
         self.state
+            .review_rate_limit
             .refund_review_rate_limit_bucket(bucket_id, Utc::now().timestamp())
             .await
     }
@@ -383,7 +423,11 @@ impl StatusService {
             other => bail!("invalid feature flag: {other}"),
         }
 
-        let mut overrides = self.state.get_runtime_feature_flag_overrides().await?;
+        let mut overrides = self
+            .state
+            .feature_flags
+            .get_runtime_feature_flag_overrides()
+            .await?;
         match flag_name {
             "gitlab_discovery_mcp" => overrides.gitlab_discovery_mcp = enabled,
             "gitlab_inline_review_comments" => overrides.gitlab_inline_review_comments = enabled,
@@ -397,6 +441,7 @@ impl StatusService {
             _ => unreachable!("validated feature flag name"),
         }
         self.state
+            .feature_flags
             .set_runtime_feature_flag_overrides(&overrides)
             .await?;
         self.feature_flag_snapshots(&overrides)
@@ -520,7 +565,7 @@ impl StatusService {
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn mark_scan_started(&self, mode: ScanMode) -> Result<()> {
-        let mut scan = self.state.get_scan_status().await?;
+        let mut scan = self.state.service_state.get_scan_status().await?;
         scan.state = ScanState::Scanning;
         scan.mode = Some(mode);
         scan.started_at = Some(Utc::now().to_rfc3339());
@@ -528,7 +573,7 @@ impl StatusService {
         scan.outcome = None;
         scan.error = None;
         scan.next_scan_at = None;
-        self.state.set_scan_status(&scan).await
+        self.state.service_state.set_scan_status(&scan).await
     }
 
     /// # Errors
@@ -540,7 +585,7 @@ impl StatusService {
         outcome: ScanOutcome,
         error: Option<String>,
     ) -> Result<()> {
-        let mut scan = self.state.get_scan_status().await?;
+        let mut scan = self.state.service_state.get_scan_status().await?;
         scan.state = ScanState::Idle;
         scan.mode = Some(mode);
         if scan.started_at.is_none() {
@@ -549,23 +594,23 @@ impl StatusService {
         scan.finished_at = Some(Utc::now().to_rfc3339());
         scan.outcome = Some(outcome);
         scan.error = error;
-        self.state.set_scan_status(&scan).await
+        self.state.service_state.set_scan_status(&scan).await
     }
 
     /// # Errors
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn set_next_scan_at(&self, next_scan_at: Option<DateTime<Utc>>) -> Result<()> {
-        let mut scan = self.state.get_scan_status().await?;
+        let mut scan = self.state.service_state.get_scan_status().await?;
         scan.next_scan_at = next_scan_at.map(|value| value.to_rfc3339());
-        self.state.set_scan_status(&scan).await
+        self.state.service_state.set_scan_status(&scan).await
     }
 
     /// # Errors
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn clear_next_scan_at(&self) -> Result<()> {
-        self.state.clear_next_scan_at().await
+        self.state.service_state.clear_next_scan_at().await
     }
 
     /// # Errors
@@ -573,7 +618,7 @@ impl StatusService {
     /// Returns an error if the underlying operation fails.
     pub async fn recover_startup_status(&self) -> Result<()> {
         self.reconcile_interrupted_run_history().await?;
-        let mut scan = self.state.get_scan_status().await?;
+        let mut scan = self.state.service_state.get_scan_status().await?;
         scan.next_scan_at = None;
         if scan.state == ScanState::Scanning {
             scan.state = ScanState::Idle;
@@ -581,7 +626,7 @@ impl StatusService {
             scan.finished_at = Some(Utc::now().to_rfc3339());
             scan.error = Some("scan interrupted by service restart".to_string());
         }
-        self.state.set_scan_status(&scan).await
+        self.state.service_state.set_scan_status(&scan).await
     }
 
     /// # Errors
@@ -589,6 +634,7 @@ impl StatusService {
     /// Returns an error if the underlying operation fails.
     pub async fn reconcile_interrupted_run_history(&self) -> Result<()> {
         self.state
+            .run_history
             .reconcile_interrupted_run_history("run interrupted by service restart")
             .await?;
         Ok(())
@@ -621,7 +667,7 @@ impl StatusService {
                 .transpose()?,
         };
         let limit = list_query.normalized_limit();
-        let page = self.state.list_run_history(&list_query).await?;
+        let page = self.state.run_history.list_run_history(&list_query).await?;
         let mut filters = query;
         filters.limit = limit;
         Ok(HistorySnapshot {
@@ -640,7 +686,11 @@ impl StatusService {
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn mr_history_snapshot(&self, repo: &str, iid: u64) -> Result<MrHistorySnapshot> {
-        let runs = self.state.list_run_history_for_mr(repo, iid).await?;
+        let runs = self
+            .state
+            .run_history
+            .list_run_history_for_mr(repo, iid)
+            .await?;
         Ok(MrHistorySnapshot {
             generated_at: Utc::now().to_rfc3339(),
             repo: repo.to_string(),
@@ -653,15 +703,20 @@ impl StatusService {
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn run_detail_snapshot(&self, run_id: i64) -> Result<Option<RunDetailSnapshot>> {
-        let Some(run) = self.state.get_run_history(run_id).await? else {
+        let Some(run) = self.state.run_history.get_run_history(run_id).await? else {
             return Ok(None);
         };
         let related_runs = self
             .state
+            .run_history
             .list_run_history_for_mr(&run.repo, run.iid)
             .await?;
         let security_context_preview = self.resolve_security_context_preview(&run).await?;
-        let events = self.state.list_run_history_events(run.id).await?;
+        let events = self
+            .state
+            .run_history
+            .list_run_history_events(run.id)
+            .await?;
         let thread = thread_snapshot_from_events(&run, &events);
         let transcript_backfill = self
             .resolve_transcript_backfill(&run, thread.as_ref())
@@ -705,6 +760,7 @@ impl StatusService {
         }
         let cache_entry = self
             .state
+            .security_context_cache
             .find_security_review_context_cache(
                 &run.repo,
                 base_branch,
@@ -787,6 +843,7 @@ impl StatusService {
 
         if let Err(err) = self
             .state
+            .run_history
             .update_run_history_transcript_backfill(
                 run.id,
                 TranscriptBackfillState::InProgress,
@@ -840,6 +897,7 @@ impl StatusService {
                         backfill_retry_after.lock().await.remove(&run.id);
                     }
                     if let Err(update_err) = state
+                        .run_history
                         .update_run_history_transcript_backfill(
                             run.id,
                             TranscriptBackfillState::Failed,
@@ -898,6 +956,7 @@ pub(super) async fn run_transcript_backfill(
         run.kind == RunHistoryKind::Security && run.review_thread_id.is_none();
     let Some(thread_id) = run.thread_id.as_deref().or(run.review_thread_id.as_deref()) else {
         state
+            .run_history
             .update_run_history_transcript_backfill(
                 run.id,
                 TranscriptBackfillState::Failed,
@@ -930,7 +989,7 @@ pub(super) async fn run_transcript_backfill(
         .as_ref()
         .filter(|events| turn_events_include_review_wrapper_items(events))
         .cloned();
-    let original_persisted_events = state.list_run_history_events(run.id).await?;
+    let original_persisted_events = state.run_history.list_run_history_events(run.id).await?;
     let target_turn_missing_in_persisted = run.turn_id.as_deref().is_some_and(|turn_id| {
         !original_persisted_events
             .iter()
@@ -1103,7 +1162,10 @@ pub(super) async fn run_transcript_backfill(
         .as_ref()
         .is_some_and(thread_snapshot_is_complete)
     {
-        state.mark_run_history_events_incomplete(run.id).await?;
+        state
+            .run_history
+            .mark_run_history_events_incomplete(run.id)
+            .await?;
         if run.turn_id.as_deref().is_some_and(|turn_id| {
             rebuilt_thread.as_ref().is_some_and(|thread| {
                 thread_snapshot_only_target_turn_is_incomplete(thread, turn_id)
@@ -1112,6 +1174,7 @@ pub(super) async fn run_transcript_backfill(
             anyhow::bail!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR);
         }
         state
+            .run_history
             .update_run_history_transcript_backfill(
                 run.id,
                 TranscriptBackfillState::Failed,
@@ -1121,9 +1184,11 @@ pub(super) async fn run_transcript_backfill(
         return Ok(());
     }
     state
+        .run_history
         .replace_run_history_events(run.id, &candidate_events)
         .await?;
     state
+        .run_history
         .mark_run_history_transcript_backfill_complete(run.id)
         .await?;
     Ok(())

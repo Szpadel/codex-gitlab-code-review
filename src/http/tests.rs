@@ -48,11 +48,16 @@ async fn test_get(url: impl reqwest::IntoUrl) -> reqwest::Result<reqwest::Respon
 #[tokio::test]
 async fn api_status_returns_scan_and_in_progress_state() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    state.begin_review("group/repo", 7, "abcdef").await?;
     state
+        .review_state
+        .begin_review("group/repo", 7, "abcdef")
+        .await?;
+    state
+        .mention_commands
         .begin_mention_command("group/repo", 7, "discussion-1", 99, "abcdef")
         .await?;
     state
+        .service_state
         .set_scan_status(&PersistedScanStatus {
             state: ScanState::Idle,
             mode: Some(ScanMode::Incremental),
@@ -85,11 +90,16 @@ async fn api_status_returns_scan_and_in_progress_state() -> Result<()> {
 #[tokio::test]
 async fn status_page_renders_sections_and_escapes_dynamic_content() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    state.begin_review("group/<repo>", 42, "abcdef").await?;
     state
+        .review_state
+        .begin_review("group/<repo>", 42, "abcdef")
+        .await?;
+    state
+        .service_state
         .set_auth_limit_reset_at("primary<script>", "2026-03-10T12:00:00Z")
         .await?;
     state
+        .service_state
         .set_scan_status(&PersistedScanStatus {
             state: ScanState::Scanning,
             mode: Some(ScanMode::Full),
@@ -239,6 +249,7 @@ async fn development_repo_actions_require_csrf_and_update_snapshot() -> Result<(
 async fn rate_limits_page_renders_create_form_and_empty_state() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
+        .review_rate_limit
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
             id: None,
             label: "Merge request backlog limit".to_string(),
@@ -329,13 +340,28 @@ async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Re
         .send()
         .await?;
     assert_eq!(created.status(), StatusCode::SEE_OTHER);
-    assert_eq!(state.list_review_rate_limit_rules().await?.len(), 1);
     assert_eq!(
-        state.list_review_rate_limit_rules().await?[0].label,
+        state
+            .review_rate_limit
+            .list_review_rate_limit_rules()
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(
+        state
+            .review_rate_limit
+            .list_review_rate_limit_rules()
+            .await?[0]
+            .label,
         "Create allowed"
     );
     assert_eq!(
-        state.list_review_rate_limit_rules().await?[0].targets,
+        state
+            .review_rate_limit
+            .list_review_rate_limit_rules()
+            .await?[0]
+            .targets,
         vec![
             ReviewRateLimitTarget {
                 kind: ReviewRateLimitTargetKind::Repo,
@@ -348,7 +374,11 @@ async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Re
         ]
     );
     assert_eq!(
-        state.list_review_rate_limit_rules().await?[0].bucket_mode,
+        state
+            .review_rate_limit
+            .list_review_rate_limit_rules()
+            .await?[0]
+            .bucket_mode,
         ReviewRateLimitBucketMode::Shared
     );
     Ok(())
@@ -358,6 +388,7 @@ async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Re
 async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let rule_id = state
+        .review_rate_limit
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
             id: None,
             label: "Original".to_string(),
@@ -421,7 +452,10 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
         .await?;
     assert_eq!(updated.status(), StatusCode::SEE_OTHER);
 
-    let rule = state.list_review_rate_limit_rules().await?;
+    let rule = state
+        .review_rate_limit
+        .list_review_rate_limit_rules()
+        .await?;
     assert_eq!(rule.len(), 1);
     assert_eq!(rule[0].label, "Updated");
     assert_eq!(rule[0].capacity, 5);
@@ -440,6 +474,7 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
 async fn delete_rate_limit_rule_endpoint_requires_csrf_and_removes_rule() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let rule_id = state
+        .review_rate_limit
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
             id: None,
             label: "Delete me".to_string(),
@@ -475,7 +510,14 @@ async fn delete_rate_limit_rule_endpoint_requires_csrf_and_removes_rule() -> Res
         .send()
         .await?;
     assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(state.list_review_rate_limit_rules().await?.len(), 1);
+    assert_eq!(
+        state
+            .review_rate_limit
+            .list_review_rate_limit_rules()
+            .await?
+            .len(),
+        1
+    );
 
     let deleted = client
         .post(format!("http://{address}/rate-limits/{rule_id}/delete"))
@@ -483,7 +525,13 @@ async fn delete_rate_limit_rule_endpoint_requires_csrf_and_removes_rule() -> Res
         .send()
         .await?;
     assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
-    assert!(state.list_review_rate_limit_rules().await?.is_empty());
+    assert!(
+        state
+            .review_rate_limit
+            .list_review_rate_limit_rules()
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -491,6 +539,7 @@ async fn delete_rate_limit_rule_endpoint_requires_csrf_and_removes_rule() -> Res
 async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let rule_id = state
+        .review_rate_limit
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
             id: None,
             label: "Regenerate".to_string(),
@@ -510,12 +559,17 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
 
     let now = Utc::now().timestamp();
     state
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 11, now)
         .await?;
     state
+        .review_rate_limit
         .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 11, now)
         .await?;
-    let before = state.list_active_review_rate_limit_buckets(now).await?;
+    let before = state
+        .review_rate_limit
+        .list_active_review_rate_limit_buckets(now)
+        .await?;
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].available_slots, 0.0);
     let bucket_id = before[0].bucket_id.clone();
@@ -541,6 +595,7 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
     let after = state
+        .review_rate_limit
         .list_active_review_rate_limit_buckets(Utc::now().timestamp())
         .await?;
     assert_eq!(after.len(), 1);
@@ -583,7 +638,10 @@ async fn create_rate_limit_rule_endpoint_allows_global_rules_without_targets() -
         .await?;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
-    let rules = state.list_review_rate_limit_rules().await?;
+    let rules = state
+        .review_rate_limit
+        .list_review_rate_limit_rules()
+        .await?;
     assert_eq!(rules.len(), 1);
     assert!(rules[0].targets.is_empty());
     assert_eq!(rules[0].scope_subject, "Global".to_string());
@@ -692,6 +750,7 @@ async fn feature_flag_update_endpoint_persists_runtime_override() -> Result<()> 
 
     assert_eq!(
         state
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .gitlab_discovery_mcp,
@@ -718,6 +777,7 @@ async fn feature_flag_update_endpoint_requires_csrf_header() -> Result<()> {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         state
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .gitlab_discovery_mcp,
@@ -749,6 +809,7 @@ async fn feature_flag_update_endpoint_rejects_unavailable_flags() -> Result<()> 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         state
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .gitlab_discovery_mcp,
@@ -761,6 +822,7 @@ async fn feature_flag_update_endpoint_rejects_unavailable_flags() -> Result<()> 
 async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
+        .feature_flags
         .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
@@ -791,6 +853,7 @@ async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         state
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .gitlab_discovery_mcp,
@@ -822,6 +885,7 @@ async fn feature_flag_update_endpoint_persists_composer_install_override() -> Re
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         state
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .composer_install,
@@ -853,6 +917,7 @@ async fn feature_flag_update_endpoint_persists_composer_auto_repositories_overri
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         state
+            .feature_flags
             .get_runtime_feature_flag_overrides()
             .await?
             .composer_auto_repositories,
@@ -865,9 +930,11 @@ async fn feature_flag_update_endpoint_persists_composer_auto_repositories_overri
 async fn status_service_snapshot_exposes_project_catalog_summary() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
+        .project_catalog
         .save_project_catalog("all", &["group/a".to_string(), "group/b".to_string()])
         .await?;
     state
+        .service_state
         .set_scan_status(&PersistedScanStatus {
             state: ScanState::Idle,
             mode: Some(ScanMode::Full),
@@ -920,7 +987,7 @@ async fn status_service_scan_updates_roundtrip() -> Result<()> {
         .mark_scan_finished(ScanMode::Full, ScanOutcome::Success, None)
         .await?;
 
-    let persisted = state.get_scan_status().await?;
+    let persisted = state.service_state.get_scan_status().await?;
     assert_eq!(persisted.state, ScanState::Idle);
     assert_eq!(persisted.mode, Some(ScanMode::Full));
     assert!(persisted.started_at.is_some());
@@ -972,6 +1039,7 @@ async fn startup_recovery_clears_stale_scanning_state() -> Result<()> {
         .execute(state.pool())
         .await?;
     state
+        .service_state
         .set_scan_status(&PersistedScanStatus {
             state: ScanState::Scanning,
             mode: Some(ScanMode::Incremental),
@@ -986,7 +1054,7 @@ async fn startup_recovery_clears_stale_scanning_state() -> Result<()> {
 
     status_service.recover_startup_status().await?;
 
-    let persisted = state.get_scan_status().await?;
+    let persisted = state.service_state.get_scan_status().await?;
     assert_eq!(persisted.state, ScanState::Idle);
     assert_eq!(persisted.mode, Some(ScanMode::Incremental));
     assert_eq!(persisted.outcome, Some(ScanOutcome::Failure));
@@ -997,6 +1065,7 @@ async fn startup_recovery_clears_stale_scanning_state() -> Result<()> {
     assert!(persisted.finished_at.is_some());
     assert_eq!(persisted.next_scan_at, None);
     let recovered_run = state
+        .run_history
         .get_run_history(run_id)
         .await?
         .expect("recovered run should exist");
@@ -2663,7 +2732,10 @@ async fn run_detail_keeps_incomplete_persisted_history_without_thread_reader() -
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let runner = Arc::new(ThreadReaderRunner {
         response: json!({
             "thread": {
@@ -3122,6 +3194,7 @@ async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history
 
     for _ in 0..20 {
         if state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after async backfill")?
@@ -3204,8 +3277,12 @@ async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread(
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let run = state
+        .run_history
         .get_run_history(run_id)
         .await?
         .expect("run history should exist");
@@ -3282,7 +3359,7 @@ async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread(
 
     crate::http::status::run_transcript_backfill(&state, &source, &run, false).await?;
 
-    let persisted_events = state.list_run_history_events(run_id).await?;
+    let persisted_events = state.run_history.list_run_history_events(run_id).await?;
     let persisted_turn_ids = persisted_events
         .iter()
         .filter_map(|event| event.turn_id.as_deref())
@@ -3354,7 +3431,10 @@ async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Res
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -3403,6 +3483,7 @@ async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Res
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after child-only backfill")?;
@@ -3418,7 +3499,7 @@ async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Res
     assert!(body.contains("fresh review transcript"));
     assert!(!body.contains("stale child transcript"));
 
-    let persisted_events = state.list_run_history_events(run_id).await?;
+    let persisted_events = state.run_history.list_run_history_events(run_id).await?;
     assert!(
         persisted_events
             .iter()
@@ -3489,7 +3570,10 @@ async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -3541,6 +3625,7 @@ async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after sanitize-empty recovery")?;
@@ -3646,7 +3731,10 @@ async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewri
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -3700,6 +3788,7 @@ async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewri
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after duplicate child backfill")?;
@@ -3715,7 +3804,7 @@ async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewri
     assert!(body.contains("fresh review transcript"));
     assert!(!body.contains("stale child transcript"));
 
-    let persisted_events = state.list_run_history_events(run_id).await?;
+    let persisted_events = state.run_history.list_run_history_events(run_id).await?;
     assert!(
         persisted_events
             .iter()
@@ -3831,7 +3920,10 @@ async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_c
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -3880,6 +3972,7 @@ async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_c
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after later-turn preserving backfill")?;
@@ -3896,7 +3989,7 @@ async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_c
     assert!(body.contains("later legitimate turn"));
     assert!(!body.contains("stale child transcript"));
 
-    let persisted_events = state.list_run_history_events(run_id).await?;
+    let persisted_events = state.run_history.list_run_history_events(run_id).await?;
     assert!(persisted_events.iter().all(|event| {
         matches!(
             event.turn_id.as_deref(),
@@ -3996,7 +4089,10 @@ async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing(
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -4115,6 +4211,7 @@ async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing(
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after missing-parent backfill")?;
@@ -4228,7 +4325,10 @@ async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> R
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -4322,6 +4422,7 @@ async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> R
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after target-only fallback backfill")?;
@@ -4407,7 +4508,10 @@ async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_tu
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -4492,6 +4596,7 @@ async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_tu
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after plain missing-target recovery")?;
@@ -4501,7 +4606,7 @@ async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_tu
         sleep(Duration::from_millis(10)).await;
     }
 
-    let persisted_events = state.list_run_history_events(run_id).await?;
+    let persisted_events = state.run_history.list_run_history_events(run_id).await?;
     let target_first_sequence = persisted_events
         .iter()
         .find(|event| event.turn_id.as_deref() == Some("turn-target"))
@@ -4556,7 +4661,10 @@ async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<
         },
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -4627,6 +4735,7 @@ async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after empty-history recovery")?;
@@ -4641,7 +4750,7 @@ async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<
     let body = response.text().await?;
     assert!(body.contains("fresh review transcript"));
     assert!(!body.contains("later legitimate turn"));
-    let persisted_events = state.list_run_history_events(run_id).await?;
+    let persisted_events = state.run_history.list_run_history_events(run_id).await?;
     assert!(
         persisted_events
             .iter()
@@ -4692,7 +4801,10 @@ async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_mark
         },
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -4763,6 +4875,7 @@ async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_mark
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after empty-history unrelated marker recovery")?;
@@ -4777,7 +4890,7 @@ async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_mark
     let body = response.text().await?;
     assert!(body.contains("fresh review transcript"));
     assert!(!body.contains("Transcript backfill failed"));
-    let persisted_events = state.list_run_history_events(run_id).await?;
+    let persisted_events = state.run_history.list_run_history_events(run_id).await?;
     assert!(
         persisted_events
             .iter()
@@ -4855,7 +4968,10 @@ async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -4919,6 +5035,7 @@ async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after target-only unrelated-marker recovery")?;
@@ -5011,7 +5128,10 @@ async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_t
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -5084,6 +5204,7 @@ async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_t
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after stale full-thread recovery")?;
@@ -5143,7 +5264,10 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
         },
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
@@ -5193,6 +5317,7 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after empty target-only missing-child recovery")?;
@@ -5203,6 +5328,7 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
     }
 
     let run = state
+        .run_history
         .get_run_history(run_id)
         .await?
         .context("run history row after empty target-only missing-child recovery")?;
@@ -5214,7 +5340,13 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
         run.transcript_backfill_error.as_deref(),
         Some("local session history is still being written")
     );
-    assert!(state.list_run_history_events(run_id).await?.is_empty());
+    assert!(
+        state
+            .run_history
+            .list_run_history_events(run_id)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -5258,7 +5390,10 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
         .bind(run_id)
         .execute(state.pool())
         .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
@@ -5321,6 +5456,7 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after stale missing-sibling retry window")?;
@@ -5331,6 +5467,7 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
     }
 
     let run = state
+        .run_history
         .get_run_history(run_id)
         .await?
         .context("run history row after stale missing-sibling retry window")?;
@@ -5342,7 +5479,13 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
         run.transcript_backfill_error.as_deref(),
         Some("local session history remained incomplete after retry window")
     );
-    assert!(state.list_run_history_events(run_id).await?.is_empty());
+    assert!(
+        state
+            .run_history
+            .list_run_history_events(run_id)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -5385,7 +5528,10 @@ async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers(
         .bind(run_id)
         .execute(state.pool())
         .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
@@ -5468,6 +5614,7 @@ async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers(
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after stale wrapper fallback recovery")?;
@@ -5477,6 +5624,7 @@ async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers(
         sleep(Duration::from_millis(10)).await;
     }
     let run = state
+        .run_history
         .get_run_history(run_id)
         .await?
         .context("run history row after stale wrapper fallback recovery final state")?;
@@ -5599,7 +5747,10 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
         ],
     )
     .await?;
-    state.mark_run_history_events_incomplete(run_id).await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
         StatusService::new(test_config(), Arc::clone(&state), false, None)
@@ -5724,6 +5875,7 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after multi-child missing-parent backfill")?;
@@ -5753,6 +5905,7 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
 async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let run_id = state
+        .run_history
         .start_run_history(NewRunHistory {
             kind: RunHistoryKind::Review,
             repo: "group/repo".to_string(),
@@ -5766,6 +5919,7 @@ async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
         })
         .await?;
     state
+        .run_history
         .update_run_history_session(
             run_id,
             RunHistorySessionUpdate {
@@ -5882,6 +6036,7 @@ async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result
     )
     .await?;
     state
+        .run_history
         .update_run_history_transcript_backfill(run_id, TranscriptBackfillState::InProgress, None)
         .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
@@ -5924,6 +6079,7 @@ async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result
 
     for _ in 0..20 {
         if state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after retry")?
@@ -6056,6 +6212,7 @@ async fn run_detail_retries_after_transient_missing_session_history() -> Result<
     }
     for _ in 0..20 {
         if state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after transient miss")?
@@ -6067,6 +6224,7 @@ async fn run_detail_retries_after_transient_missing_session_history() -> Result<
         sleep(Duration::from_millis(10)).await;
     }
     let run = state
+        .run_history
         .get_run_history(run_id)
         .await?
         .context("run history row after transient miss")?;
@@ -6093,6 +6251,7 @@ async fn run_detail_retries_after_transient_missing_session_history() -> Result<
 
     for _ in 0..20 {
         if state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after retry success")?
@@ -6235,6 +6394,7 @@ async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
 
     for _ in 0..20 {
         if state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after partial file fallback")?
@@ -6378,6 +6538,7 @@ async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after partial multi-turn backfill")?;
@@ -6388,6 +6549,7 @@ async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -
     }
 
     let run = state
+        .run_history
         .get_run_history(run_id)
         .await?
         .context("run history row after failed partial backfill")?;
@@ -6592,6 +6754,7 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing()
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after full-thread fallback backfill")?;
@@ -6812,6 +6975,7 @@ async fn run_detail_full_thread_fallback_ignores_unrelated_pending_review_marker
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after unrelated marker fallback backfill")?;
@@ -7004,6 +7168,7 @@ async fn run_detail_uses_full_thread_fallback_when_turn_scoped_backfill_is_incom
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after incomplete-turn full-thread fallback")?;
@@ -7182,6 +7347,7 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missi
 
     for _ in 0..20 {
         let run = state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after missing turn fallback backfill")?;
@@ -7405,6 +7571,7 @@ async fn run_detail_retries_when_session_history_directory_appears_later() -> Re
 
     for _ in 0..20 {
         if state
+            .run_history
             .get_run_history(run_id)
             .await?
             .context("run history row after unavailable backfill source")?
@@ -7733,11 +7900,14 @@ async fn insert_run_history(
     session: RunHistorySessionUpdate,
     finish: RunHistoryFinish,
 ) -> Result<i64> {
-    let run_id = state.start_run_history(new_run).await?;
+    let run_id = state.run_history.start_run_history(new_run).await?;
     if session != RunHistorySessionUpdate::default() {
-        state.update_run_history_session(run_id, session).await?;
+        state
+            .run_history
+            .update_run_history_session(run_id, session)
+            .await?;
     }
-    state.finish_run_history(run_id, finish).await?;
+    state.run_history.finish_run_history(run_id, finish).await?;
     Ok(run_id)
 }
 
@@ -7746,5 +7916,8 @@ async fn insert_run_history_events(
     run_id: i64,
     events: Vec<NewRunHistoryEvent>,
 ) -> Result<()> {
-    state.append_run_history_events(run_id, &events).await
+    state
+        .run_history
+        .append_run_history_events(run_id, &events)
+        .await
 }
