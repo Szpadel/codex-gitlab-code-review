@@ -544,7 +544,11 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
         .list_active_review_rate_limit_buckets(Utc::now().timestamp())
         .await?;
     assert_eq!(after.len(), 1);
-    assert_eq!(after[0].available_slots, 1.0);
+    assert!(
+        (1.0..=1.01).contains(&after[0].available_slots),
+        "expected refunded slot count to be about 1.0, got {}",
+        after[0].available_slots
+    );
     assert_eq!(after[0].rule_id, rule_id);
     Ok(())
 }

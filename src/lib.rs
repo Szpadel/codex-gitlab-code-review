@@ -1,4 +1,6 @@
 pub mod auth_cli;
+mod bootstrap;
+pub mod cli;
 pub mod codex_runner;
 pub mod composer_install;
 pub mod config;
@@ -17,6 +19,7 @@ pub mod lifecycle;
 pub mod review;
 pub mod review_lane;
 pub mod review_prompt_templates;
+mod scheduler;
 pub mod skills;
 pub mod state;
 mod tls;
