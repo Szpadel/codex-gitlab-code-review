@@ -20,6 +20,7 @@ pub mod review;
 pub mod review_lane;
 pub mod review_prompt_templates;
 mod scheduler;
+pub mod service_factory;
 pub mod skills;
 pub mod state;
 mod tls;

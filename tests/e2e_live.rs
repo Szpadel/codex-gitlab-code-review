@@ -1,16 +1,15 @@
 use anyhow::{Result, anyhow};
 use chrono::{Duration, Utc};
-use codex_gitlab_code_review::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
 use codex_gitlab_code_review::config::{
     CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
     McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ReviewSecurityConfig,
     ScheduleConfig, ServerConfig, TargetSelector,
 };
-use codex_gitlab_code_review::gitlab::{GitLabApi, GitLabClient};
-use codex_gitlab_code_review::review::ReviewService;
-use codex_gitlab_code_review::state::ReviewStateStore;
+use codex_gitlab_code_review::gitlab::GitLabApi;
+use codex_gitlab_code_review::service_factory::{
+    RuntimeMode, ServiceFactoryOptions, build_service_bundle,
+};
 use std::env;
-use std::sync::Arc;
 
 #[tokio::test]
 async fn e2e_live_dry_run() -> Result<()> {
@@ -88,13 +87,20 @@ async fn e2e_live_dry_run() -> Result<()> {
         },
     };
 
-    let gitlab_client = GitLabClient::new(&config.gitlab.base_url, &config.gitlab.token)?;
-    let bot_user_id = if config.gitlab.token.is_empty() {
-        0
-    } else {
-        gitlab_client.current_user().await?.id
-    };
-    let git_base = gitlab_client.git_base_url()?;
+    let runtime = build_service_bundle(
+        config,
+        ServiceFactoryOptions {
+            run_once: true,
+            force_dry_run: false,
+            log_all_json: false,
+            runtime_mode: RuntimeMode::Normal,
+        },
+    )
+    .await?;
+    let gitlab_client = runtime
+        .gitlab_client
+        .as_ref()
+        .ok_or_else(|| anyhow!("service bundle missing GitLab client in normal mode"))?;
     let iid = match mr_iid {
         Some(value) => value,
         None => {
@@ -104,43 +110,7 @@ async fn e2e_live_dry_run() -> Result<()> {
         }
     };
 
-    let state = Arc::new(ReviewStateStore::new(&config.database.path).await?);
-    let review_owner_id = state.get_or_create_review_owner_id().await?;
-    let runner = DockerCodexRunner::new(
-        &config.docker,
-        config.codex.clone(),
-        git_base,
-        Arc::clone(&state),
-        None,
-        RunnerRuntimeOptions {
-            gitlab_token: config.gitlab.token.clone(),
-            log_all_json: false,
-            owner_id: review_owner_id,
-            mention_commands_active: config.review.mention_commands.enabled
-                && !config.review.dry_run
-                && config
-                    .review
-                    .mention_commands
-                    .bot_username
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|value| !value.is_empty()),
-            review_additional_developer_instructions: config
-                .review
-                .additional_developer_instructions
-                .clone(),
-        },
-    )?;
-    let service = ReviewService::new(
-        config.clone(),
-        Arc::new(gitlab_client),
-        state,
-        Arc::new(runner),
-        bot_user_id,
-        created_after,
-    );
-
-    service.review_mr(&repo, iid).await?;
+    runtime.service.review_mr(&repo, iid).await?;
     Ok(())
 }
 

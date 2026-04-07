@@ -90,6 +90,7 @@ pub(crate) async fn run_with_hooks(
         status_service,
         gitlab_discovery_mcp,
         dev_tools,
+        ..
     } = runtime;
 
     if let Err(err) = service.recover_in_progress_reviews().await {
@@ -463,7 +464,7 @@ async fn wait_for_shutdown_signal() -> Result<ServiceLifecycleSignal> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::{BootstrapOptions, apply_dev_mode_profile, bootstrap_runtime};
+    use crate::bootstrap::{BootstrapOptions, bootstrap_runtime};
     use crate::config::{
         BrowserMcpConfig, CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig,
         GitLabDiscoveryMcpConfig, GitLabTargets, McpServerOverridesConfig,
@@ -471,6 +472,7 @@ mod tests {
         ServerConfig, SessionOverridesConfig, TargetSelector,
     };
     use crate::feature_flags::FeatureFlagDefaults;
+    use crate::service_factory::apply_dev_mode_profile;
     use sqlx::Executor;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
