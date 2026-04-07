@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use crate::bootstrap::BootstrappedRuntime;
 use crate::dev_mode::DevToolsService;
 use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
-use crate::http::{StatusService, run_http_server_with_dev_tools};
+use crate::http::{AdminService, HttpServices, run_http_server_with_dev_tools};
 use crate::lifecycle::ServiceLifecycleSignal;
 use crate::review::{ReviewService, ScanRunStatus};
 use crate::state::{ScanMode, ScanOutcome};
@@ -50,7 +50,7 @@ pub(crate) trait HttpServerLauncher: Send + Sync {
     fn launch(
         &self,
         bind_addr: String,
-        status_service: Arc<StatusService>,
+        http_services: Arc<HttpServices>,
         dev_tools: Option<Arc<DevToolsService>>,
     ) -> JoinHandle<()>;
 }
@@ -61,12 +61,12 @@ impl HttpServerLauncher for DefaultHttpServerLauncher {
     fn launch(
         &self,
         bind_addr: String,
-        status_service: Arc<StatusService>,
+        http_services: Arc<HttpServices>,
         dev_tools: Option<Arc<DevToolsService>>,
     ) -> JoinHandle<()> {
         tokio::spawn(run_http_server_with_dev_tools(
             bind_addr,
-            status_service,
+            http_services,
             dev_tools,
         ))
     }
@@ -87,7 +87,7 @@ pub(crate) async fn run_with_hooks(
         config,
         run_once,
         service,
-        status_service,
+        http_services,
         gitlab_discovery_mcp,
         dev_tools,
         ..
@@ -96,22 +96,27 @@ pub(crate) async fn run_with_hooks(
     if let Err(err) = service.recover_in_progress_reviews().await {
         warn!(error = %err, "startup recovery of interrupted reviews failed");
     }
-    if let Err(err) = status_service.recover_startup_status().await {
+    if let Err(err) = http_services.admin.recover_startup_status().await {
         warn!(error = %err, "failed to reconcile startup scan status");
     }
 
     let _http_server = http_launcher.launch(
         config.server.bind_addr.clone(),
-        Arc::clone(&status_service),
+        Arc::clone(&http_services),
         dev_tools.clone(),
     );
 
     if run_once {
         info!("running single scan");
-        if let Err(err) = status_service.clear_next_scan_at().await {
+        if let Err(err) = http_services.admin.clear_next_scan_at().await {
             warn!(error = %err, "failed to clear next scheduled scan status");
         }
-        run_tracked_scan(status_service.as_ref(), ScanMode::Full, service.scan_once()).await?;
+        run_tracked_scan(
+            http_services.admin.as_ref(),
+            ScanMode::Full,
+            service.scan_once(),
+        )
+        .await?;
         info!("single scan complete");
         return Ok(());
     }
@@ -122,10 +127,10 @@ pub(crate) async fn run_with_hooks(
     info!("starting scan loop");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let initial_scan_service = Arc::clone(&service);
-    let initial_scan_status_service = Arc::clone(&status_service);
+    let initial_scan_admin_service = Arc::clone(&http_services.admin);
     let mut initial_scan = tokio::spawn(async move {
         run_tracked_scan(
-            initial_scan_status_service.as_ref(),
+            initial_scan_admin_service.as_ref(),
             ScanMode::Full,
             initial_scan_service.scan_once(),
         )
@@ -137,7 +142,7 @@ pub(crate) async fn run_with_hooks(
             handle_service_signal(
                 signal,
                 service.as_ref(),
-                status_service.as_ref(),
+                http_services.admin.as_ref(),
                 gitlab_discovery_mcp.as_ref(),
                 &shutdown_tx,
             )
@@ -166,11 +171,11 @@ pub(crate) async fn run_with_hooks(
     })?;
 
     let scheduled_service = Arc::clone(&service);
-    let scheduled_status_service = Arc::clone(&status_service);
+    let scheduled_admin_service = Arc::clone(&http_services.admin);
     let mut scheduled_loop = tokio::spawn(async move {
         run_schedule_loop(
             scheduled_service.as_ref(),
-            scheduled_status_service.as_ref(),
+            scheduled_admin_service.as_ref(),
             schedule,
             tz,
             shutdown_rx,
@@ -184,7 +189,7 @@ pub(crate) async fn run_with_hooks(
             handle_service_signal(
                 signal,
                 service.as_ref(),
-                status_service.as_ref(),
+                http_services.admin.as_ref(),
                 gitlab_discovery_mcp.as_ref(),
                 &shutdown_tx,
             )
@@ -216,7 +221,7 @@ fn parse_timezone(value: Option<&str>) -> Result<chrono_tz::Tz> {
 
 async fn run_schedule_loop(
     service: &ReviewService,
-    status_service: &StatusService,
+    admin_service: &AdminService,
     schedule: Schedule,
     tz: chrono_tz::Tz,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -229,7 +234,7 @@ async fn run_schedule_loop(
 
     loop {
         if *shutdown_rx.borrow() {
-            if let Err(err) = status_service.clear_next_scan_at().await {
+            if let Err(err) = admin_service.clear_next_scan_at().await {
                 warn!(error = %err, "failed to clear next scheduled scan status");
             }
             info!("stopping schedule loop: shutdown requested");
@@ -246,7 +251,7 @@ async fn run_schedule_loop(
         };
         let scheduled_wake =
             select_next_wake(now.with_timezone(&Utc), next_cron_at, next_pending_retry_at);
-        if let Err(err) = status_service
+        if let Err(err) = admin_service
             .set_next_scan_at(Some(scheduled_wake.at))
             .await
         {
@@ -263,7 +268,7 @@ async fn run_schedule_loop(
             () = &mut sleep => {}
             changed = shutdown_rx.changed() => match changed {
                 Ok(()) if *shutdown_rx.borrow() => {
-                    if let Err(err) = status_service.clear_next_scan_at().await {
+                    if let Err(err) = admin_service.clear_next_scan_at().await {
                         warn!(error = %err, "failed to clear next scheduled scan status");
                     }
                     info!("stopping schedule loop: shutdown requested");
@@ -275,7 +280,7 @@ async fn run_schedule_loop(
         }
 
         if *shutdown_rx.borrow() {
-            if let Err(err) = status_service.clear_next_scan_at().await {
+            if let Err(err) = admin_service.clear_next_scan_at().await {
                 warn!(error = %err, "failed to clear next scheduled scan status");
             }
             info!("stopping schedule loop: shutdown requested");
@@ -285,7 +290,7 @@ async fn run_schedule_loop(
         let scan_result = match scheduled_wake.reason {
             ScheduledWakeReason::Cron => {
                 run_tracked_scan(
-                    status_service,
+                    admin_service,
                     ScanMode::Incremental,
                     service.scan_once_incremental(),
                 )
@@ -293,7 +298,7 @@ async fn run_schedule_loop(
             }
             ScheduledWakeReason::PendingRateLimit => {
                 run_tracked_scan(
-                    status_service,
+                    admin_service,
                     ScanMode::Incremental,
                     service.process_due_pending_rate_limit_reviews(),
                 )
@@ -339,20 +344,20 @@ fn select_next_wake(
 }
 
 pub(crate) async fn run_tracked_scan<F>(
-    status_service: &StatusService,
+    admin_service: &AdminService,
     mode: ScanMode,
     scan: F,
 ) -> Result<()>
 where
     F: Future<Output = Result<ScanRunStatus>>,
 {
-    if let Err(err) = status_service.mark_scan_started(mode).await {
+    if let Err(err) = admin_service.mark_scan_started(mode).await {
         warn!(error = %err, ?mode, "failed to persist scan start status");
     }
     let result = scan.await;
     match &result {
         Ok(ScanRunStatus::Interrupted) => {
-            if let Err(status_err) = status_service
+            if let Err(status_err) = admin_service
                 .mark_scan_finished(
                     mode,
                     ScanOutcome::Failure,
@@ -368,7 +373,7 @@ where
             }
         }
         Ok(ScanRunStatus::Completed) => {
-            if let Err(err) = status_service
+            if let Err(err) = admin_service
                 .mark_scan_finished(mode, ScanOutcome::Success, None)
                 .await
             {
@@ -376,7 +381,7 @@ where
             }
         }
         Err(err) => {
-            if let Err(status_err) = status_service
+            if let Err(status_err) = admin_service
                 .mark_scan_finished(mode, ScanOutcome::Failure, Some(err.to_string()))
                 .await
             {
@@ -394,7 +399,7 @@ where
 async fn handle_service_signal(
     signal: ServiceLifecycleSignal,
     service: &ReviewService,
-    status_service: &StatusService,
+    admin_service: &AdminService,
     gitlab_discovery_mcp: Option<&Arc<GitLabDiscoveryMcpService>>,
     shutdown_tx: &watch::Sender<bool>,
 ) {
@@ -414,7 +419,7 @@ async fn handle_service_signal(
             if let Err(err) = service.recover_in_progress_reviews().await {
                 warn!(error = %err, "shutdown recovery of interrupted reviews failed");
             }
-            if let Err(err) = status_service.reconcile_interrupted_run_history().await {
+            if let Err(err) = admin_service.reconcile_interrupted_run_history().await {
                 warn!(error = %err, "shutdown reconciliation of run history failed");
             }
         }
@@ -494,7 +499,7 @@ mod tests {
         fn launch(
             &self,
             _bind_addr: String,
-            _status_service: Arc<StatusService>,
+            _http_services: Arc<HttpServices>,
             _dev_tools: Option<Arc<DevToolsService>>,
         ) -> JoinHandle<()> {
             self.launches.fetch_add(1, Ordering::SeqCst);
@@ -512,12 +517,12 @@ mod tests {
                 "INSERT INTO service_state (key, value) VALUES ('scan_status', 'not-json')",
             ))
             .await?;
-        let status_service = StatusService::new(config, state, false, None);
+        let http_services = HttpServices::new(config, state, false, None);
 
         let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let executed_flag = Arc::clone(&executed);
 
-        run_tracked_scan(&status_service, ScanMode::Full, async move {
+        run_tracked_scan(http_services.admin.as_ref(), ScanMode::Full, async move {
             executed_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(ScanRunStatus::Completed)
         })

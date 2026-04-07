@@ -1,5 +1,5 @@
 use super::{
-    StatusService, TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR,
+    HttpServices, TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR,
     TRANSCRIPT_BACKFILL_STALE_INCOMPLETE_ERROR, TRANSCRIPT_BACKFILL_STALE_MISSING_HISTORY_ERROR,
     events_have_missing_review_child_history, fallback_session_history_path,
     initial_backfill_candidate_events, is_final_retry_window_attempt_pending,
@@ -69,8 +69,8 @@ async fn review_rate_limit_snapshot_includes_rules_buckets_and_pending() -> Resu
         )
         .await?;
 
-    let status_service = StatusService::new(test_config(), state, false, None);
-    let snapshot = status_service.review_rate_limit_snapshot().await?;
+    let status_service = HttpServices::new(test_config(), state, false, None);
+    let snapshot = status_service.ratelimit.snapshot().await?;
     assert_eq!(snapshot.rules.len(), 1);
     assert_eq!(snapshot.rules[0].id, rule_id);
     assert_eq!(snapshot.rules[0].scope_subject, "group/repo");
@@ -445,9 +445,9 @@ fn primary_session_history_preserves_explicit_custom_root() {
 #[tokio::test]
 async fn status_snapshot_includes_feature_flag_state() -> anyhow::Result<()> {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let service = StatusService::new(test_config(), store, false, None);
+    let service = HttpServices::new(test_config(), store, false, None);
 
-    let snapshot = service.snapshot().await?;
+    let snapshot = service.status.snapshot().await?;
 
     assert_eq!(snapshot.config.feature_flags.len(), 7);
     assert_eq!(
@@ -488,9 +488,10 @@ async fn update_runtime_feature_flag_persists_override() -> anyhow::Result<()> {
         target_repos: vec!["group/target".to_string()],
         target_groups: Vec::new(),
     }];
-    let service = StatusService::new(config, Arc::clone(&store), false, None);
+    let service = HttpServices::new(config, Arc::clone(&store), false, None);
 
     let updated = service
+        .admin
         .update_runtime_feature_flag("gitlab_discovery_mcp", Some(true))
         .await?;
 
@@ -510,9 +511,10 @@ async fn update_runtime_feature_flag_persists_override() -> anyhow::Result<()> {
 #[tokio::test]
 async fn update_runtime_feature_flag_persists_security_review_override() -> anyhow::Result<()> {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+    let service = HttpServices::new(test_config(), Arc::clone(&store), false, None);
 
     let updated = service
+        .admin
         .update_runtime_feature_flag("security_review", Some(true))
         .await?;
 
@@ -533,9 +535,10 @@ async fn update_runtime_feature_flag_persists_security_review_override() -> anyh
 async fn update_runtime_feature_flag_persists_security_context_ignore_base_head_override()
 -> anyhow::Result<()> {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+    let service = HttpServices::new(test_config(), Arc::clone(&store), false, None);
 
     let updated = service
+        .admin
         .update_runtime_feature_flag("security_context_ignore_base_head", Some(true))
         .await?;
 
@@ -555,9 +558,10 @@ async fn update_runtime_feature_flag_persists_security_context_ignore_base_head_
 #[tokio::test]
 async fn update_runtime_feature_flag_rejects_unavailable_flags() -> anyhow::Result<()> {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+    let service = HttpServices::new(test_config(), Arc::clone(&store), false, None);
 
     let result = service
+        .admin
         .update_runtime_feature_flag("gitlab_discovery_mcp", Some(true))
         .await;
 
@@ -576,21 +580,24 @@ async fn update_runtime_feature_flag_rejects_unavailable_flags() -> anyhow::Resu
 #[tokio::test]
 async fn update_runtime_feature_flag_persists_composer_overrides() -> anyhow::Result<()> {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+    let service = HttpServices::new(test_config(), Arc::clone(&store), false, None);
 
     let updated = service
+        .admin
         .update_runtime_feature_flag("composer_install", Some(true))
         .await?;
     assert_eq!(updated.runtime_override, Some(true));
     assert!(updated.effective_enabled);
 
     let auto_repo_updated = service
+        .admin
         .update_runtime_feature_flag("composer_auto_repositories", Some(true))
         .await?;
     assert_eq!(auto_repo_updated.runtime_override, Some(true));
     assert!(auto_repo_updated.effective_enabled);
 
     let safe_updated = service
+        .admin
         .update_runtime_feature_flag("composer_safe_install", Some(true))
         .await?;
     assert_eq!(safe_updated.runtime_override, Some(true));
@@ -621,9 +628,10 @@ async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> a
             security_review: None,
         })
         .await?;
-    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+    let service = HttpServices::new(test_config(), Arc::clone(&store), false, None);
 
     let updated = service
+        .admin
         .update_runtime_feature_flag("gitlab_discovery_mcp", None)
         .await?;
 
@@ -644,7 +652,7 @@ async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> a
 async fn run_detail_snapshot_includes_security_context_preview_for_legacy_cached_entry()
 -> anyhow::Result<()> {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+    let service = HttpServices::new(test_config(), Arc::clone(&store), false, None);
     let run_id = store
         .run_history
         .start_run_history(NewRunHistory {
@@ -686,6 +694,7 @@ async fn run_detail_snapshot_includes_security_context_preview_for_legacy_cached
         .await?;
 
     let snapshot = service
+        .status
         .run_detail_snapshot(run_id)
         .await?
         .expect("run detail snapshot");
@@ -705,7 +714,7 @@ async fn run_detail_snapshot_includes_security_context_preview_for_legacy_cached
 async fn run_detail_snapshot_prefers_immutable_run_payload_over_mutated_cache() -> anyhow::Result<()>
 {
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let service = StatusService::new(test_config(), Arc::clone(&store), false, None);
+    let service = HttpServices::new(test_config(), Arc::clone(&store), false, None);
     let run_id = store
         .run_history
         .start_run_history(NewRunHistory {
@@ -751,6 +760,7 @@ async fn run_detail_snapshot_prefers_immutable_run_payload_over_mutated_cache() 
         .await?;
 
     let snapshot = service
+        .status
         .run_detail_snapshot(run_id)
         .await?
         .expect("run detail snapshot");

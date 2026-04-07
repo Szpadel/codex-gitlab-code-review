@@ -69,7 +69,7 @@ async fn api_status_returns_scan_and_in_progress_state() -> Result<()> {
         })
         .await?;
 
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -111,7 +111,7 @@ async fn status_page_renders_sections_and_escapes_dynamic_content() -> Result<()
         })
         .await?;
 
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -143,7 +143,7 @@ async fn development_page_renders_when_dev_tools_are_enabled() -> Result<()> {
     let mut config = test_config();
     config.database.path = "/tmp/codex-gitlab-code-review-dev-test.sqlite".to_string();
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(StatusService::new(config.clone(), state, false, None));
+    let status_service = Arc::new(HttpServices::new(config.clone(), state, false, None));
     let dev_tools = Arc::new(DevToolsService::new(&config.database.path));
     let address = spawn_test_server(app_router_with_dev_tools(
         Arc::clone(&status_service),
@@ -167,7 +167,7 @@ async fn development_page_renders_when_dev_tools_are_enabled() -> Result<()> {
 #[tokio::test]
 async fn development_page_is_not_mounted_without_dev_tools() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(StatusService::new(test_config(), state, false, None));
+    let status_service = Arc::new(HttpServices::new(test_config(), state, false, None));
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let status_response = reqwest::get(format!("http://{address}/status")).await?;
@@ -185,8 +185,8 @@ async fn development_repo_actions_require_csrf_and_update_snapshot() -> Result<(
     let mut config = test_config();
     config.database.path = "/tmp/codex-gitlab-code-review-dev-test.sqlite".to_string();
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(StatusService::new(config.clone(), state, false, None));
-    let csrf_token = status_service.admin_csrf_token().to_string();
+    let status_service = Arc::new(HttpServices::new(config.clone(), state, false, None));
+    let csrf_token = status_service.admin.admin_csrf_token().to_string();
     let dev_tools = Arc::new(DevToolsService::new(&config.database.path));
     let address = spawn_test_server(app_router_with_dev_tools(
         Arc::clone(&status_service),
@@ -267,7 +267,7 @@ async fn rate_limits_page_renders_create_form_and_empty_state() -> Result<()> {
         })
         .await?;
 
-    let status_service = Arc::new(StatusService::new(test_config(), state, false, None));
+    let status_service = Arc::new(HttpServices::new(test_config(), state, false, None));
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let response = test_get(format!("http://{address}/rate-limits")).await?;
@@ -294,13 +294,13 @@ async fn rate_limits_page_renders_create_form_and_empty_state() -> Result<()> {
 #[tokio::test]
 async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
         None,
     ));
-    let csrf_token = status_service.admin_csrf_token().to_string();
+    let csrf_token = status_service.admin.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
     let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -406,13 +406,13 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
         })
         .await?;
 
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
         None,
     ));
-    let csrf_token = status_service.admin_csrf_token().to_string();
+    let csrf_token = status_service.admin.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
     let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -492,13 +492,13 @@ async fn delete_rate_limit_rule_endpoint_requires_csrf_and_removes_rule() -> Res
         })
         .await?;
 
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
         None,
     ));
-    let csrf_token = status_service.admin_csrf_token().to_string();
+    let csrf_token = status_service.admin.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
     let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -574,13 +574,13 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
     assert_eq!(before[0].available_slots, 0.0);
     let bucket_id = before[0].bucket_id.clone();
 
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
         None,
     ));
-    let csrf_token = status_service.admin_csrf_token().to_string();
+    let csrf_token = status_service.admin.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
     let response = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -611,13 +611,13 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
 #[tokio::test]
 async fn create_rate_limit_rule_endpoint_allows_global_rules_without_targets() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
         None,
     ));
-    let csrf_token = status_service.admin_csrf_token().to_string();
+    let csrf_token = status_service.admin.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let response = test_client_builder()
@@ -730,8 +730,8 @@ async fn feature_flag_update_endpoint_persists_runtime_override() -> Result<()> 
         target_repos: vec!["group/target".to_string()],
         target_groups: Vec::new(),
     }];
-    let status_service = Arc::new(StatusService::new(config, Arc::clone(&state), false, None));
-    let csrf_token = status_service.feature_flag_csrf_token().to_string();
+    let status_service = Arc::new(HttpServices::new(config, Arc::clone(&state), false, None));
+    let csrf_token = status_service.admin.feature_flag_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
     let client = test_client();
 
@@ -764,7 +764,7 @@ async fn feature_flag_update_endpoint_requires_csrf_header() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.gitlab_discovery_mcp.enabled = true;
-    let status_service = Arc::new(StatusService::new(config, Arc::clone(&state), false, None));
+    let status_service = Arc::new(HttpServices::new(config, Arc::clone(&state), false, None));
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let response = test_client()
@@ -789,13 +789,13 @@ async fn feature_flag_update_endpoint_requires_csrf_header() -> Result<()> {
 #[tokio::test]
 async fn feature_flag_update_endpoint_rejects_unavailable_flags() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
         None,
     ));
-    let csrf_token = status_service.feature_flag_csrf_token().to_string();
+    let csrf_token = status_service.admin.feature_flag_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let response = test_client()
@@ -833,13 +833,13 @@ async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()
             security_review: None,
         })
         .await?;
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
         None,
     ));
-    let csrf_token = status_service.feature_flag_csrf_token().to_string();
+    let csrf_token = status_service.admin.feature_flag_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let response = test_client()
@@ -865,13 +865,13 @@ async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()
 #[tokio::test]
 async fn feature_flag_update_endpoint_persists_composer_install_override() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
         None,
     ));
-    let csrf_token = status_service.feature_flag_csrf_token().to_string();
+    let csrf_token = status_service.admin.feature_flag_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let response = test_client()
@@ -897,13 +897,13 @@ async fn feature_flag_update_endpoint_persists_composer_install_override() -> Re
 #[tokio::test]
 async fn feature_flag_update_endpoint_persists_composer_auto_repositories_override() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
         None,
     ));
-    let csrf_token = status_service.feature_flag_csrf_token().to_string();
+    let csrf_token = status_service.admin.feature_flag_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let response = test_client()
@@ -946,8 +946,8 @@ async fn status_service_snapshot_exposes_project_catalog_summary() -> Result<()>
         })
         .await?;
 
-    let status_service = StatusService::new(test_config(), state, false, None);
-    let snapshot = status_service.snapshot().await?;
+    let status_service = HttpServices::new(test_config(), state, false, None);
+    let snapshot = status_service.status.snapshot().await?;
     assert_eq!(snapshot.project_catalogs.len(), 1);
     assert_eq!(snapshot.project_catalogs[0].cache_key, "all".to_string());
     assert_eq!(snapshot.project_catalogs[0].project_count, 2);
@@ -964,8 +964,8 @@ async fn status_service_snapshot_tolerates_malformed_scan_status() -> Result<()>
         .execute(state.pool())
         .await?;
 
-    let status_service = StatusService::new(test_config(), state, false, None);
-    let snapshot = status_service.snapshot().await?;
+    let status_service = HttpServices::new(test_config(), state, false, None);
+    let snapshot = status_service.status.snapshot().await?;
 
     assert_eq!(snapshot.scan.scan_state, "idle".to_string());
     assert_eq!(snapshot.scan.mode, None);
@@ -975,15 +975,20 @@ async fn status_service_snapshot_tolerates_malformed_scan_status() -> Result<()>
 #[tokio::test]
 async fn status_service_scan_updates_roundtrip() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = StatusService::new(test_config(), Arc::clone(&state), false, None);
+    let status_service = HttpServices::new(test_config(), Arc::clone(&state), false, None);
 
     status_service
+        .admin
         .set_next_scan_at(Some(
             DateTime::parse_from_rfc3339("2026-03-10T12:10:00Z")?.with_timezone(&Utc),
         ))
         .await?;
-    status_service.mark_scan_started(ScanMode::Full).await?;
     status_service
+        .admin
+        .mark_scan_started(ScanMode::Full)
+        .await?;
+    status_service
+        .admin
         .mark_scan_finished(ScanMode::Full, ScanOutcome::Success, None)
         .await?;
 
@@ -1003,7 +1008,7 @@ async fn status_routes_are_not_registered_when_ui_disabled() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.server.status_ui_enabled = false;
-    let status_service = Arc::new(StatusService::new(config, state, false, None));
+    let status_service = Arc::new(HttpServices::new(config, state, false, None));
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let status_response = reqwest::get(format!("http://{address}/status")).await?;
@@ -1050,9 +1055,9 @@ async fn startup_recovery_clears_stale_scanning_state() -> Result<()> {
             next_scan_at: Some("2026-03-10T10:10:00Z".to_string()),
         })
         .await?;
-    let status_service = StatusService::new(test_config(), Arc::clone(&state), false, None);
+    let status_service = HttpServices::new(test_config(), Arc::clone(&state), false, None);
 
-    status_service.recover_startup_status().await?;
+    status_service.admin.recover_startup_status().await?;
 
     let persisted = state.service_state.get_scan_status().await?;
     assert_eq!(persisted.state, ScanState::Idle);
@@ -1126,13 +1131,14 @@ async fn history_snapshot_filters_runs_and_returns_summary_rows() -> Result<()> 
     )
     .await?;
 
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
         None,
     ));
     let snapshot = status_service
+        .status
         .history_snapshot(
             HistoryQueryParams {
                 repo: Some("group/repo".to_string()),
@@ -1201,7 +1207,7 @@ async fn history_page_renders_field_based_filters_layout() -> Result<()> {
         .bind(run_id)
         .execute(state.pool())
         .await?;
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -1253,9 +1259,10 @@ async fn history_snapshot_searches_review_comment_body() -> Result<()> {
         },
     )
     .await?;
-    let status_service = StatusService::new(test_config(), Arc::clone(&state), false, None);
+    let status_service = HttpServices::new(test_config(), Arc::clone(&state), false, None);
 
     let snapshot = status_service
+        .status
         .history_snapshot(
             HistoryQueryParams {
                 repo: None,
@@ -1388,7 +1395,7 @@ async fn history_api_returns_cursor_metadata() -> Result<()> {
             .await?;
         run_ids.push(run_id);
     }
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -1490,7 +1497,7 @@ async fn history_page_renders_pagination_links_with_active_filters() -> Result<(
             .execute(state.pool())
             .await?;
     }
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -1582,7 +1589,7 @@ async fn mr_history_page_lists_all_sessions_for_single_mr() -> Result<()> {
     )
     .await?;
 
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -1791,7 +1798,7 @@ async fn run_detail_page_renders_trigger_note_and_thread_preview() -> Result<()>
         ],
     )
     .await?;
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -1925,7 +1932,7 @@ async fn run_detail_uses_review_thread_id_in_metadata_when_events_exist() -> Res
         ],
     )
     .await?;
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2018,7 +2025,7 @@ async fn run_detail_renders_dynamic_tool_results_and_failed_command_status() -> 
         ],
     )
     .await?;
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2099,7 +2106,7 @@ async fn run_detail_formats_numeric_millisecond_timestamps_as_utc() -> Result<()
         ],
     )
     .await?;
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2148,7 +2155,7 @@ async fn run_detail_page_falls_back_when_event_history_is_missing() -> Result<()
         },
     )
     .await?;
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2230,7 +2237,7 @@ async fn run_detail_renders_non_diff_file_change_payload_as_plain_body() -> Resu
         ],
     )
     .await?;
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2318,7 +2325,7 @@ async fn run_detail_renders_mixed_file_change_payloads_with_diff_sections() -> R
         ],
     )
     .await?;
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2405,7 +2412,7 @@ async fn run_detail_page_shows_unavailable_transcript_for_legacy_runs() -> Resul
             }
         }),
     });
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2491,7 +2498,7 @@ async fn run_detail_keeps_partial_persisted_history_without_thread_reader() -> R
             }
         }),
     });
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2585,7 +2592,7 @@ async fn run_detail_prefers_complete_persisted_event_history() -> Result<()> {
             }
         }),
     });
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2665,7 +2672,7 @@ async fn run_detail_skips_live_thread_when_complete_persisted_history_exists() -
     let runner = Arc::new(CountingThreadReaderRunner {
         read_calls: Arc::clone(&read_calls),
     });
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2753,7 +2760,7 @@ async fn run_detail_keeps_incomplete_persisted_history_without_thread_reader() -
             }
         }),
     });
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2837,7 +2844,7 @@ async fn run_detail_keeps_completed_turn_without_items_without_thread_reader() -
             }
         }),
     });
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -2932,7 +2939,7 @@ async fn run_detail_keeps_command_without_body_without_thread_reader() -> Result
             }
         }),
     });
-    let status_service = Arc::new(StatusService::new(
+    let status_service = Arc::new(HttpServices::new(
         test_config(),
         Arc::clone(&state),
         false,
@@ -3181,7 +3188,7 @@ async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history
         calls: Arc::clone(&backfill_calls),
     });
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, Some(runner))
+        HttpServices::new(test_config(), Arc::clone(&state), false, Some(runner))
             .with_transcript_backfill_source(backfill_source),
     );
     let address = spawn_test_server(app_router(status_service)).await?;
@@ -3437,7 +3444,7 @@ async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Res
         .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: vec![
                     NewRunHistoryEvent {
@@ -3576,7 +3583,7 @@ async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after
         .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
@@ -3737,7 +3744,7 @@ async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewri
         .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: vec![
                     NewRunHistoryEvent {
@@ -3926,7 +3933,7 @@ async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_c
         .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: vec![
                     NewRunHistoryEvent {
@@ -4095,7 +4102,7 @@ async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing(
         .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
@@ -4331,7 +4338,7 @@ async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> R
         .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
@@ -4514,7 +4521,7 @@ async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_tu
         .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
@@ -4667,7 +4674,7 @@ async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<
         .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
@@ -4807,7 +4814,7 @@ async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_mark
         .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
@@ -4974,7 +4981,7 @@ async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history
         .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
@@ -5134,7 +5141,7 @@ async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_t
         .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
@@ -5269,7 +5276,7 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
         .mark_run_history_events_incomplete(run_id)
         .await?;
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
@@ -5395,7 +5402,7 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
         .mark_run_history_events_incomplete(run_id)
         .await?;
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
@@ -5533,7 +5540,7 @@ async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers(
         .mark_run_history_events_incomplete(run_id)
         .await?;
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
@@ -5753,7 +5760,7 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
         .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
@@ -5957,7 +5964,7 @@ async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
     .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: Vec::new(),
                 calls: Arc::clone(&backfill_calls),
@@ -6041,7 +6048,7 @@ async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result
         .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: vec![
                     NewRunHistoryEvent {
@@ -6194,7 +6201,7 @@ async fn run_detail_retries_after_transient_missing_session_history() -> Result<
         calls: Arc::clone(&backfill_calls),
     });
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(backfill_source),
     );
     let address = spawn_test_server(app_router(status_service)).await?;
@@ -6382,7 +6389,7 @@ async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
         calls: Arc::clone(&backfill_calls),
     });
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(backfill_source),
     );
     let address = spawn_test_server(app_router(status_service)).await?;
@@ -6500,7 +6507,7 @@ async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -
     .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: vec![
                     NewRunHistoryEvent {
@@ -6653,7 +6660,7 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing()
     .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
@@ -6867,7 +6874,7 @@ async fn run_detail_full_thread_fallback_ignores_unrelated_pending_review_marker
     .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
@@ -7088,7 +7095,7 @@ async fn run_detail_uses_full_thread_fallback_when_turn_scoped_backfill_is_incom
     .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
@@ -7280,7 +7287,7 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missi
     .await?;
     let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
@@ -7437,7 +7444,7 @@ async fn run_detail_backfill_uses_base_thread_id_when_review_thread_differs() ->
     let seen_thread_id = Arc::new(Mutex::new(None));
     let seen_turn_id = Arc::new(Mutex::new(None));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(CapturingTranscriptBackfillSource {
                 events: vec![
                     NewRunHistoryEvent {
@@ -7556,7 +7563,7 @@ async fn run_detail_retries_when_session_history_directory_appears_later() -> Re
     .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let status_service = Arc::new(
-        StatusService::new(test_config(), Arc::clone(&state), false, None)
+        HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(ErroringTranscriptBackfillSource {
                 error: TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR,
                 calls: Arc::clone(&backfill_calls),
@@ -7610,7 +7617,7 @@ async fn skills_page_renders_upload_form_and_installed_skill_list() -> Result<()
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.auth_host_path = auth_home.path().display().to_string();
-    let status_service = Arc::new(StatusService::new(config, state, false, None));
+    let status_service = Arc::new(HttpServices::new(config, state, false, None));
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let response = reqwest::get(format!("http://{address}/skills")).await?;
@@ -7646,7 +7653,7 @@ async fn skill_preview_page_renders_account_status_and_delete_form() -> Result<(
         name: "backup".to_string(),
         auth_host_path: backup.path().display().to_string(),
     }];
-    let status_service = Arc::new(StatusService::new(config, state, false, None));
+    let status_service = Arc::new(HttpServices::new(config, state, false, None));
     let address = spawn_test_server(app_router(status_service)).await?;
 
     let response = reqwest::get(format!("http://{address}/skills/preview-skill")).await?;
@@ -7671,8 +7678,8 @@ async fn upload_skill_endpoint_installs_into_primary_and_fallback_auth_homes() -
         name: "backup".to_string(),
         auth_host_path: backup.path().display().to_string(),
     }];
-    let status_service = Arc::new(StatusService::new(config, state, false, None));
-    let csrf_token = status_service.admin_csrf_token().to_string();
+    let status_service = Arc::new(HttpServices::new(config, state, false, None));
+    let csrf_token = status_service.admin.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(Arc::clone(&status_service))).await?;
     let archive = build_skill_zip(&[
         (
@@ -7709,8 +7716,8 @@ async fn upload_skill_endpoint_rejects_unsupported_archive_type() -> Result<()> 
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.auth_host_path = auth_home.path().display().to_string();
-    let status_service = Arc::new(StatusService::new(config, state, false, None));
-    let csrf_token = status_service.admin_csrf_token().to_string();
+    let status_service = Arc::new(HttpServices::new(config, state, false, None));
+    let csrf_token = status_service.admin.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(status_service)).await?;
     let client = test_client();
 
@@ -7739,8 +7746,8 @@ async fn delete_skill_endpoint_requires_csrf_and_removes_skill() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.auth_host_path = auth_home.path().display().to_string();
-    let status_service = Arc::new(StatusService::new(config, state, false, None));
-    let csrf_token = status_service.admin_csrf_token().to_string();
+    let status_service = Arc::new(HttpServices::new(config, state, false, None));
+    let csrf_token = status_service.admin.admin_csrf_token().to_string();
     let address = spawn_test_server(app_router(Arc::clone(&status_service))).await?;
     let client = test_client();
 

@@ -23,7 +23,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::error;
 
-pub use status::StatusService;
+pub use status::{
+    AdminService, BackfillService, HistoryQuery, HistorySnapshot, HttpServices, MrHistorySnapshot,
+    RateLimitService, RunDetailSnapshot, SecurityContextPreview, SkillsService, StatusService,
+};
 use view::{
     render_development_page, render_history_page, render_mr_history_page, render_rate_limits_page,
     render_run_detail_page, render_skill_detail_page, render_skills_page, render_status_page,
@@ -31,13 +34,13 @@ use view::{
 
 const MAX_SKILL_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
 
-pub fn app_router(status_service: Arc<StatusService>) -> Router {
-    app_router_with_dev_tools(status_service, None)
+pub fn app_router(http_services: Arc<HttpServices>) -> Router {
+    app_router_with_dev_tools(http_services, None)
 }
 
 #[derive(Clone)]
 pub struct HttpAppState {
-    status_service: Arc<StatusService>,
+    http_services: Arc<HttpServices>,
     dev_tools_service: Option<Arc<DevToolsService>>,
 }
 
@@ -48,15 +51,15 @@ impl HttpAppState {
 }
 
 pub fn app_router_with_dev_tools(
-    status_service: Arc<StatusService>,
+    http_services: Arc<HttpServices>,
     dev_tools_service: Option<Arc<DevToolsService>>,
 ) -> Router {
     let app_state = HttpAppState {
-        status_service,
+        http_services,
         dev_tools_service,
     };
     let mut router = Router::new().route("/healthz", get(healthcheck));
-    if app_state.status_service.status_ui_enabled() {
+    if app_state.http_services.admin.status_ui_enabled() {
         let skill_upload_router = Router::new()
             .route("/skills/upload", post(upload_skill))
             .layer(DefaultBodyLimit::max(MAX_SKILL_ARCHIVE_BYTES));
@@ -120,20 +123,20 @@ pub fn app_router_with_dev_tools(
     router.with_state(app_state)
 }
 
-pub async fn run_http_server(bind_addr: String, status_service: Arc<StatusService>) {
-    run_http_server_with_dev_tools(bind_addr, status_service, None).await;
+pub async fn run_http_server(bind_addr: String, http_services: Arc<HttpServices>) {
+    run_http_server_with_dev_tools(bind_addr, http_services, None).await;
 }
 
 pub async fn run_http_server_with_dev_tools(
     bind_addr: String,
-    status_service: Arc<StatusService>,
+    http_services: Arc<HttpServices>,
     dev_tools_service: Option<Arc<DevToolsService>>,
 ) {
     match TcpListener::bind(&bind_addr).await {
         Ok(listener) => {
             if let Err(err) = axum::serve(
                 listener,
-                app_router_with_dev_tools(status_service, dev_tools_service),
+                app_router_with_dev_tools(http_services, dev_tools_service),
             )
             .await
             {
@@ -153,16 +156,16 @@ async fn healthcheck() -> &'static str {
 async fn status_json(
     State(app_state): State<HttpAppState>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
-    Ok(Json(app_state.status_service.snapshot().await?))
+    Ok(Json(app_state.http_services.status.snapshot().await?))
 }
 
 async fn status_page(
     State(app_state): State<HttpAppState>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
-    let snapshot = app_state.status_service.snapshot().await?;
+    let snapshot = app_state.http_services.status.snapshot().await?;
     Ok(Html(render_status_page(
         &snapshot,
-        Some(app_state.status_service.feature_flag_csrf_token()),
+        Some(app_state.http_services.admin.feature_flag_csrf_token()),
         app_state.development_enabled(),
     )))
 }
@@ -172,7 +175,8 @@ async fn history_json(
     Query(params): Query<HistoryQueryParams>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     let snapshot = app_state
-        .status_service
+        .http_services
+        .status
         .history_snapshot(params.into_query()?)
         .await?;
     Ok(Json(snapshot))
@@ -183,12 +187,13 @@ async fn history_page(
     Query(params): Query<HistoryQueryParams>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     let snapshot = app_state
-        .status_service
+        .http_services
+        .status
         .history_snapshot(params.into_query()?)
         .await?;
     Ok(Html(render_history_page(
         &snapshot,
-        Some(app_state.status_service.feature_flag_csrf_token()),
+        Some(app_state.http_services.admin.feature_flag_csrf_token()),
         app_state.development_enabled(),
     )))
 }
@@ -200,7 +205,8 @@ async fn mr_history_json(
     let repo = decode_repo_key(&repo_key)?;
     Ok(Json(
         app_state
-            .status_service
+            .http_services
+            .status
             .mr_history_snapshot(&repo, iid)
             .await?,
     ))
@@ -212,12 +218,13 @@ async fn mr_history_page(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     let repo = decode_repo_key(&repo_key)?;
     let snapshot = app_state
-        .status_service
+        .http_services
+        .status
         .mr_history_snapshot(&repo, iid)
         .await?;
     Ok(Html(render_mr_history_page(
         &snapshot,
-        Some(app_state.status_service.feature_flag_csrf_token()),
+        Some(app_state.http_services.admin.feature_flag_csrf_token()),
         app_state.development_enabled(),
     )))
 }
@@ -226,7 +233,12 @@ async fn run_detail_json(
     State(app_state): State<HttpAppState>,
     Path(run_id): Path<i64>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
-    let Some(snapshot) = app_state.status_service.run_detail_snapshot(run_id).await? else {
+    let Some(snapshot) = app_state
+        .http_services
+        .status
+        .run_detail_snapshot(run_id)
+        .await?
+    else {
         return Err(StatusHandlerError(anyhow::anyhow!("run not found")));
     };
     Ok(Json(snapshot))
@@ -236,13 +248,18 @@ async fn run_detail_page(
     State(app_state): State<HttpAppState>,
     Path(run_id): Path<i64>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
-    let Some(snapshot) = app_state.status_service.run_detail_snapshot(run_id).await? else {
+    let Some(snapshot) = app_state
+        .http_services
+        .status
+        .run_detail_snapshot(run_id)
+        .await?
+    else {
         return Err(StatusHandlerError(anyhow::anyhow!("run not found")));
     };
     Ok(Html(render_run_detail_page(
         &snapshot,
-        app_state.status_service.gitlab_base_url(),
-        Some(app_state.status_service.feature_flag_csrf_token()),
+        app_state.http_services.status.gitlab_base_url(),
+        Some(app_state.http_services.admin.feature_flag_csrf_token()),
         app_state.development_enabled(),
     )))
 }
@@ -253,10 +270,14 @@ async fn update_feature_flag_json(
     headers: HeaderMap,
     Json(request): Json<FeatureFlagUpdateJson>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
-    require_feature_flag_csrf_header(&headers, app_state.status_service.feature_flag_csrf_token())?;
+    require_feature_flag_csrf_header(
+        &headers,
+        app_state.http_services.admin.feature_flag_csrf_token(),
+    )?;
     Ok(Json(
         app_state
-            .status_service
+            .http_services
+            .admin
             .update_runtime_feature_flag(&flag_name, request.enabled)
             .await?,
     ))
@@ -265,10 +286,10 @@ async fn update_feature_flag_json(
 async fn skills_page(
     State(app_state): State<HttpAppState>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
-    let snapshot = app_state.status_service.skills_snapshot().await?;
+    let snapshot = app_state.http_services.skills.snapshot().await?;
     Ok(Html(render_skills_page(
         &snapshot,
-        Some(app_state.status_service.admin_csrf_token()),
+        Some(app_state.http_services.admin.admin_csrf_token()),
         app_state.development_enabled(),
     )))
 }
@@ -278,15 +299,16 @@ async fn skill_detail_page(
     Path(skill_name): Path<String>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     let Some(snapshot) = app_state
-        .status_service
-        .skill_preview_snapshot(&skill_name)
+        .http_services
+        .skills
+        .preview_snapshot(&skill_name)
         .await?
     else {
         return Err(StatusHandlerError(anyhow::anyhow!("skill not found")));
     };
     Ok(Html(render_skill_detail_page(
         &snapshot,
-        Some(app_state.status_service.admin_csrf_token()),
+        Some(app_state.http_services.admin.admin_csrf_token()),
         app_state.development_enabled(),
     )))
 }
@@ -294,13 +316,11 @@ async fn skill_detail_page(
 async fn rate_limits_page(
     State(app_state): State<HttpAppState>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
-    let snapshot = app_state
-        .status_service
-        .review_rate_limit_snapshot()
-        .await?;
+    let snapshot = app_state.http_services.ratelimit.snapshot().await?;
     let mut target_suggestions = app_state
-        .status_service
-        .review_rate_limit_target_suggestions()
+        .http_services
+        .ratelimit
+        .target_suggestions()
         .await?;
     if let Some(dev_tools) = &app_state.dev_tools_service {
         let dev_snapshot = dev_tools.snapshot().await;
@@ -328,7 +348,7 @@ async fn rate_limits_page(
     Ok(Html(render_rate_limits_page(
         &snapshot,
         &target_suggestions,
-        Some(app_state.status_service.admin_csrf_token()),
+        Some(app_state.http_services.admin.admin_csrf_token()),
         app_state.development_enabled(),
     )))
 }
@@ -339,13 +359,14 @@ async fn create_rate_limit_rule(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     require_admin_csrf_form_token(
         Some(&form.csrf_token),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
     let upsert = parse_rate_limit_rule_upsert(form)
         .with_context(|| "invalid create rate limit rule form")?;
     app_state
-        .status_service
-        .create_review_rate_limit_rule(&upsert)
+        .http_services
+        .ratelimit
+        .create_rule(&upsert)
         .await?;
     Ok(Redirect::to("/rate-limits"))
 }
@@ -357,14 +378,15 @@ async fn update_rate_limit_rule(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     require_admin_csrf_form_token(
         Some(&form.csrf_token),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
     let mut upsert = parse_rate_limit_rule_upsert(form)
         .with_context(|| "invalid update rate limit rule form")?;
     upsert.id = Some(rule_id);
     app_state
-        .status_service
-        .update_review_rate_limit_rule(&upsert)
+        .http_services
+        .ratelimit
+        .update_rule(&upsert)
         .await?;
     Ok(Redirect::to("/rate-limits"))
 }
@@ -376,11 +398,12 @@ async fn delete_rate_limit_rule(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     require_admin_csrf_form_token(
         Some(&form.csrf_token),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
     app_state
-        .status_service
-        .delete_review_rate_limit_rule(&rule_id)
+        .http_services
+        .ratelimit
+        .delete_rule(&rule_id)
         .await?;
     Ok(Redirect::to("/rate-limits"))
 }
@@ -391,11 +414,12 @@ async fn regen_rate_limit_bucket_slot(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     require_admin_csrf_form_token(
         Some(&form.csrf_token),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
     app_state
-        .status_service
-        .refund_one_review_rate_limit_bucket_slot(&form.bucket_id)
+        .http_services
+        .ratelimit
+        .refund_one_bucket_slot(&form.bucket_id)
         .await?;
     Ok(Redirect::to("/rate-limits"))
 }
@@ -421,7 +445,7 @@ async fn upload_skill(
     }
     require_admin_csrf_form_token(
         csrf_token.as_deref(),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
     let archive_name = archive_name
         .as_deref()
@@ -430,8 +454,9 @@ async fn upload_skill(
     let archive_bytes = archive_bytes
         .ok_or_else(|| anyhow::anyhow!("invalid skill archive: missing upload file"))?;
     let skill_name = app_state
-        .status_service
-        .install_skill_archive(archive_name, archive_bytes)
+        .http_services
+        .skills
+        .install_archive(archive_name, archive_bytes)
         .await?;
     Ok(Redirect::to(&format!(
         "/skills/{}",
@@ -446,9 +471,13 @@ async fn delete_skill(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     require_admin_csrf_form_token(
         Some(&form.csrf_token),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
-    app_state.status_service.delete_skill(&skill_name).await?;
+    app_state
+        .http_services
+        .skills
+        .delete_skill(&skill_name)
+        .await?;
     Ok(Redirect::to("/skills"))
 }
 
@@ -459,7 +488,7 @@ async fn development_page(
     let snapshot = dev_tools.snapshot().await;
     Ok(Html(render_development_page(
         &snapshot,
-        Some(app_state.status_service.admin_csrf_token()),
+        Some(app_state.http_services.admin.admin_csrf_token()),
     )))
 }
 
@@ -469,7 +498,7 @@ async fn create_development_repo(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     require_admin_csrf_form_token(
         Some(&form.csrf_token),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
     dev_tools_service(&app_state)?
         .create_repo(&form.repo_path)
@@ -484,7 +513,7 @@ async fn update_development_repo(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     require_admin_csrf_form_token(
         Some(&form.csrf_token),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
     let repo_path = decode_repo_key(&repo_key)?;
     dev_tools_service(&app_state)?
@@ -500,7 +529,7 @@ async fn delete_development_repo(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     require_admin_csrf_form_token(
         Some(&form.csrf_token),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
     let repo_path = decode_repo_key(&repo_key)?;
     dev_tools_service(&app_state)?
@@ -516,7 +545,7 @@ async fn simulate_development_mr(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     require_admin_csrf_form_token(
         Some(&form.csrf_token),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
     let repo_path = decode_repo_key(&repo_key)?;
     dev_tools_service(&app_state)?
@@ -532,7 +561,7 @@ async fn simulate_development_commit(
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     require_admin_csrf_form_token(
         Some(&form.csrf_token),
-        app_state.status_service.admin_csrf_token(),
+        app_state.http_services.admin.admin_csrf_token(),
     )?;
     let repo_path = decode_repo_key(&repo_key)?;
     dev_tools_service(&app_state)?

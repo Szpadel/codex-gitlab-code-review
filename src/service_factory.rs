@@ -15,7 +15,7 @@ use crate::dev_mode::{DEV_MODE_BASE_URL, DevToolsService, MockCodexRunner};
 use crate::docker_utils::wait_for_docker_ready;
 use crate::gitlab::{GitLabApi, GitLabClient, GitLabUser, GitLabUserDetail};
 use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
-use crate::http::StatusService;
+use crate::http::HttpServices;
 use crate::review::ReviewService;
 use crate::state::ReviewStateStore;
 
@@ -41,7 +41,7 @@ struct RuntimeServices {
     runner: Arc<dyn CodexRunner>,
     gitlab_client: Option<Arc<GitLabClient>>,
     service: Arc<ReviewService>,
-    status_service: Arc<StatusService>,
+    http_services: Arc<HttpServices>,
     gitlab_discovery_mcp: Option<Arc<GitLabDiscoveryMcpService>>,
     dev_tools: Option<Arc<DevToolsService>>,
 }
@@ -53,7 +53,7 @@ pub struct ServiceBundle {
     pub runner: Arc<dyn CodexRunner>,
     pub gitlab_client: Option<Arc<GitLabClient>>,
     pub service: Arc<ReviewService>,
-    pub status_service: Arc<StatusService>,
+    pub http_services: Arc<HttpServices>,
     pub gitlab_discovery_mcp: Option<Arc<GitLabDiscoveryMcpService>>,
     pub dev_tools: Option<Arc<DevToolsService>>,
 }
@@ -177,7 +177,7 @@ async fn build_service_bundle_with_probe(
         runner: runtime.runner,
         gitlab_client: runtime.gitlab_client,
         service: runtime.service,
-        status_service: runtime.status_service,
+        http_services: runtime.http_services,
         gitlab_discovery_mcp: runtime.gitlab_discovery_mcp,
         dev_tools: runtime.dev_tools,
     })
@@ -227,8 +227,8 @@ fn build_dev_runtime(
         )
         .with_dynamic_repo_source(dev_tools.clone()),
     );
-    let status_service = Arc::new(
-        StatusService::new(
+    let http_services = Arc::new(
+        HttpServices::new(
             config.clone(),
             Arc::clone(&state),
             run_once,
@@ -241,7 +241,7 @@ fn build_dev_runtime(
         runner,
         gitlab_client: None,
         service,
-        status_service,
+        http_services,
         gitlab_discovery_mcp: None,
         dev_tools: Some(dev_tools),
     })
@@ -308,8 +308,8 @@ async fn build_normal_runtime(
         bot_user_id,
         created_after,
     ));
-    let status_service = Arc::new(
-        StatusService::new(
+    let http_services = Arc::new(
+        HttpServices::new(
             config.clone(),
             Arc::clone(&state),
             run_once,
@@ -323,7 +323,7 @@ async fn build_normal_runtime(
         runner,
         gitlab_client: Some(gitlab_client),
         service,
-        status_service,
+        http_services,
         gitlab_discovery_mcp,
         dev_tools: None,
     })
