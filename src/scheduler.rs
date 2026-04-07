@@ -472,7 +472,7 @@ mod tests {
         ServerConfig, SessionOverridesConfig, TargetSelector,
     };
     use crate::feature_flags::FeatureFlagDefaults;
-    use crate::service_factory::apply_dev_mode_profile;
+    use crate::service_factory::{apply_dev_mode_profile, build_review_state_store};
     use sqlx::Executor;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -504,14 +504,15 @@ mod tests {
 
     #[tokio::test]
     async fn tracked_scan_runs_even_when_status_state_is_malformed() -> Result<()> {
-        let state = Arc::new(crate::state::ReviewStateStore::new(":memory:").await?);
+        let config = test_config();
+        let state = build_review_state_store(&config).await?;
         state
             .pool()
             .execute(sqlx::query(
                 "INSERT INTO service_state (key, value) VALUES ('scan_status', 'not-json')",
             ))
             .await?;
-        let status_service = StatusService::new(test_config(), state, false, None);
+        let status_service = StatusService::new(config, state, false, None);
 
         let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let executed_flag = Arc::clone(&executed);

@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::service_factory::build_review_state_store;
 use crate::state::{
     NewRunHistory, NewRunHistoryEvent, ReviewStateStore, RunHistoryFinish, RunHistoryKind,
     RunHistoryRecord, RunHistorySessionUpdate,
@@ -70,8 +71,8 @@ struct SeededTranscript {
 ///
 /// Returns an error if demo state initialization or history persistence fails.
 pub async fn seed_example_history(config: &Config) -> Result<SeedExampleHistoryReport> {
-    let state = ReviewStateStore::new(&config.database.path).await?;
-    seed_example_history_with_store(&state, &config.database.path).await
+    let state = build_review_state_store(config).await?;
+    seed_example_history_with_store(state.as_ref(), &config.database.path).await
 }
 
 async fn seed_example_history_with_store(

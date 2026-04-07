@@ -149,7 +149,7 @@ async fn build_service_bundle_with_probe(
         "starting codex gitlab review"
     );
 
-    let state = Arc::new(ReviewStateStore::new(&config.database.path).await?);
+    let state = build_review_state_store(&config).await?;
     let created_after = resolve_created_after(&config, state.as_ref()).await?;
     info!(
         created_after = %created_after,
@@ -181,6 +181,12 @@ async fn build_service_bundle_with_probe(
         gitlab_discovery_mcp: runtime.gitlab_discovery_mcp,
         dev_tools: runtime.dev_tools,
     })
+}
+
+pub(crate) async fn build_review_state_store(config: &Config) -> Result<Arc<ReviewStateStore>> {
+    Ok(Arc::new(
+        ReviewStateStore::new(&config.database.path).await?,
+    ))
 }
 
 pub fn apply_dev_mode_profile(config: &mut Config) {
@@ -736,8 +742,8 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(async {
-            let state = ReviewStateStore::new(":memory:").await?;
-            let created_after = resolve_created_after(&config, &state).await?;
+            let state = build_review_state_store(&config).await?;
+            let created_after = resolve_created_after(&config, state.as_ref()).await?;
             assert_eq!(
                 created_after,
                 Utc.with_ymd_and_hms(2026, 3, 25, 12, 0, 0).unwrap()
