@@ -1,11 +1,16 @@
+mod scan_coordinator;
+mod target_resolver;
+
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
+use crate::flow::ActiveTaskRegistry;
 use crate::flow::FlowShared;
 use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
 use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome, remove_bot_award};
-use crate::flow::{ActiveTaskRegistry, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
+use crate::review::scan_coordinator::{DefaultScanCoordinator, ScanCoordinator};
+use crate::review::target_resolver::{DefaultTargetResolver, TargetResolver};
 use crate::review_lane::ReviewLane;
 use crate::state::{ReviewRateLimitPendingEntry, ReviewStateStore};
 use anyhow::Result;
@@ -72,15 +77,15 @@ pub struct ReviewService {
     config: Config,
     gitlab: Arc<dyn GitLabApi>,
     state: Arc<ReviewStateStore>,
-    codex: Arc<dyn CodexRunner>,
-    dynamic_repo_source: Option<Arc<dyn DynamicRepoSource>>,
     created_after: DateTime<Utc>,
     bot_user_id: u64,
-    general_review_flow: ReviewFlow,
-    security_review_flow: ReviewFlow,
-    mention_flow: MentionFlow,
+    general_review_flow: Arc<ReviewFlow>,
+    security_review_flow: Arc<ReviewFlow>,
+    mention_flow: Arc<MentionFlow>,
     lifecycle: Arc<ServiceLifecycle>,
     active_tasks: Arc<ActiveTaskRegistry>,
+    scan_coordinator: Box<dyn ScanCoordinator>,
+    target_resolver: Box<dyn TargetResolver>,
 }
 
 impl ReviewService {
@@ -107,20 +112,34 @@ impl ReviewService {
             Arc::clone(&lifecycle),
             Arc::clone(&active_tasks),
         );
-        let mention_flow = MentionFlow::new(flow_shared.clone(), mention_branch_locks);
-        let general_review_flow = ReviewFlow::new(
+        let mention_flow = Arc::new(MentionFlow::new(flow_shared.clone(), mention_branch_locks));
+        let general_review_flow = Arc::new(ReviewFlow::new(
             flow_shared.clone(),
             Arc::clone(&retry_backoff),
             ReviewLane::General,
-        );
-        let security_review_flow =
-            ReviewFlow::new(flow_shared, retry_backoff, ReviewLane::Security);
+        ));
+        let security_review_flow = Arc::new(ReviewFlow::new(
+            flow_shared,
+            retry_backoff,
+            ReviewLane::Security,
+        ));
+        let scan_coordinator = Box::new(DefaultScanCoordinator::new(
+            Arc::clone(&state),
+            Arc::clone(&active_tasks),
+            Arc::clone(&codex),
+            Arc::clone(&general_review_flow),
+            Arc::clone(&security_review_flow),
+            Arc::clone(&mention_flow),
+        ));
+        let target_resolver = Box::new(DefaultTargetResolver::new(
+            config.clone(),
+            Arc::clone(&gitlab),
+            Arc::clone(&state),
+        ));
         Self {
             config,
             gitlab,
             state,
-            codex,
-            dynamic_repo_source: None,
             created_after,
             bot_user_id,
             general_review_flow,
@@ -128,6 +147,8 @@ impl ReviewService {
             mention_flow,
             lifecycle,
             active_tasks,
+            scan_coordinator,
+            target_resolver,
         }
     }
 
@@ -136,7 +157,8 @@ impl ReviewService {
         mut self,
         dynamic_repo_source: Arc<dyn DynamicRepoSource>,
     ) -> Self {
-        self.dynamic_repo_source = Some(dynamic_repo_source);
+        self.target_resolver
+            .set_dynamic_repo_source(dynamic_repo_source);
         self
     }
 
@@ -226,68 +248,15 @@ impl ReviewService {
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn recover_in_progress_reviews(&self) -> Result<()> {
-        if let Err(err) = self.codex.stop_active_reviews().await {
-            warn!(error = %err, "failed to stop active codex review containers");
-        }
-        self.recover_flows().await?;
-        Ok(())
+        self.scan_coordinator.recover_in_progress().await
     }
 
     fn shutdown_requested(&self) -> bool {
         !self.lifecycle.accepts_new_work()
     }
 
-    async fn recover_flows(&self) -> Result<()> {
-        let flows: [&dyn MergeRequestFlow; 3] = [
-            &self.general_review_flow,
-            &self.security_review_flow,
-            &self.mention_flow,
-        ];
-        for flow in flows {
-            debug!(flow = flow.flow_name(), "recover in-progress flow state");
-            flow.recover_in_progress().await?;
-        }
-        Ok(())
-    }
-
     async fn clear_stale_flow_state(&self) -> Result<()> {
-        self.refresh_active_flow_state().await?;
-        let flows: [&dyn MergeRequestFlow; 3] = [
-            &self.general_review_flow,
-            &self.security_review_flow,
-            &self.mention_flow,
-        ];
-        for flow in flows {
-            flow.clear_stale_in_progress().await?;
-        }
-        Ok(())
-    }
-
-    async fn refresh_active_flow_state(&self) -> Result<()> {
-        for review in self.active_tasks.active_reviews() {
-            self.state
-                .review_state
-                .touch_in_progress_review_for_lane(
-                    &review.repo,
-                    review.iid,
-                    &review.head_sha,
-                    review.lane,
-                )
-                .await?;
-        }
-        for mention in self.active_tasks.active_mentions() {
-            self.state
-                .mention_commands
-                .touch_in_progress_mention_command(
-                    &mention.repo,
-                    mention.iid,
-                    &mention.discussion_id,
-                    mention.trigger_note_id,
-                    &mention.head_sha,
-                )
-                .await?;
-        }
-        Ok(())
+        self.scan_coordinator.clear_stale_flow_state().await
     }
 
     async fn schedule_mention_commands_for_mr(
@@ -309,9 +278,9 @@ impl ReviewService {
 
     fn review_flow_for_lane(&self, lane: ReviewLane) -> &ReviewFlow {
         if lane.is_security() {
-            &self.security_review_flow
+            self.security_review_flow.as_ref()
         } else {
-            &self.general_review_flow
+            self.general_review_flow.as_ref()
         }
     }
 
@@ -793,156 +762,7 @@ impl ReviewService {
     }
 
     async fn resolve_repos(&self, mode: ScanMode) -> Result<Vec<String>> {
-        if let Some(dynamic_repo_source) = self.dynamic_repo_source.as_ref() {
-            let mut repos = dynamic_repo_source.list_repos().await?;
-            repos.sort();
-            repos.dedup();
-            return Ok(repos);
-        }
-
-        let targets = &self.config.gitlab.targets;
-        let include_all = targets.repos.is_all() || targets.groups.is_all();
-        let mut included = HashSet::new();
-        if include_all {
-            for repo in self.resolve_all_targets(mode).await? {
-                included.insert(repo);
-            }
-        } else {
-            for repo in targets.repos.list() {
-                included.insert(repo.clone());
-            }
-            if !targets.groups.list().is_empty() {
-                for repo in self.resolve_group_targets(mode).await? {
-                    included.insert(repo);
-                }
-            }
-        }
-
-        if included.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let exclude_repos: HashSet<&str> =
-            targets.exclude_repos.iter().map(String::as_str).collect();
-        let exclude_group_prefixes: Vec<String> = targets
-            .exclude_groups
-            .iter()
-            .map(|group| group.trim_end_matches('/'))
-            .filter(|group| !group.is_empty())
-            .map(|group| format!("{group}/"))
-            .collect();
-
-        let mut repos: Vec<String> = included
-            .into_iter()
-            .filter(|repo| {
-                if exclude_repos.contains(repo.as_str()) {
-                    return false;
-                }
-                if exclude_group_prefixes
-                    .iter()
-                    .any(|prefix| repo.starts_with(prefix))
-                {
-                    return false;
-                }
-                true
-            })
-            .collect();
-        repos.sort();
-        Ok(repos)
-    }
-
-    async fn resolve_all_targets(&self, mode: ScanMode) -> Result<Vec<String>> {
-        let cache_key = self.config.gitlab.targets.cache_key_for_all();
-        self.resolve_discovered_targets(
-            mode,
-            || async {
-                let projects = self.gitlab.list_projects().await?;
-                Ok(projects
-                    .into_iter()
-                    .map(|project| project.path_with_namespace)
-                    .collect())
-            },
-            cache_key,
-        )
-        .await
-    }
-
-    async fn resolve_group_targets(&self, mode: ScanMode) -> Result<Vec<String>> {
-        let groups = &self.config.gitlab.targets.groups;
-        if groups.list().is_empty() {
-            return Ok(Vec::new());
-        }
-        let cache_key = self.config.gitlab.targets.cache_key_for_groups();
-        self.resolve_discovered_targets(
-            mode,
-            || async {
-                let mut deduped = HashSet::new();
-                for group in groups.list() {
-                    let projects = self.gitlab.list_group_projects(group).await?;
-                    for project in projects {
-                        deduped.insert(project.path_with_namespace);
-                    }
-                }
-                Ok(deduped.into_iter().collect())
-            },
-            cache_key,
-        )
-        .await
-    }
-
-    async fn resolve_discovered_targets<F, Fut>(
-        &self,
-        mode: ScanMode,
-        fetch: F,
-        cache_key: String,
-    ) -> Result<Vec<String>>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<Vec<String>>>,
-    {
-        let cached = self
-            .state
-            .project_catalog
-            .load_project_catalog(&cache_key)
-            .await?;
-        let force_refresh = matches!(mode, ScanMode::Full);
-        if let Some(cache) = cached.as_ref() {
-            let refresh_seconds = self.config.gitlab.targets.refresh_seconds;
-            if !force_refresh
-                && refresh_seconds > 0
-                && Utc::now().timestamp() - cache.fetched_at < refresh_seconds as i64
-            {
-                debug!(
-                    cache_key = cache_key.as_str(),
-                    count = cache.projects.len(),
-                    "using cached project catalog"
-                );
-                return Ok(cache.projects.clone());
-            }
-        }
-        match fetch().await {
-            Ok(mut projects) => {
-                projects.sort();
-                projects.dedup();
-                self.state
-                    .project_catalog
-                    .save_project_catalog(&cache_key, &projects)
-                    .await?;
-                Ok(projects)
-            }
-            Err(err) => {
-                if let Some(cache) = cached {
-                    warn!(
-                        cache_key = cache_key.as_str(),
-                        error = %err,
-                        "failed to refresh project catalog; using cached list"
-                    );
-                    Ok(cache.projects)
-                } else {
-                    Err(err)
-                }
-            }
-        }
+        self.target_resolver.resolve_repos(mode).await
     }
 
     async fn scan_repo_mrs(
@@ -1056,7 +876,7 @@ impl ReviewService {
             info!(repo = repo, iid = iid, "skip: shutdown requested");
             return Ok(());
         }
-        self.mention_flow.clear_stale_in_progress().await?;
+        self.clear_stale_flow_state().await?;
         let mut mr = self.gitlab.get_mr(repo, iid).await?;
         let mut head_sha = if let Some(value) = mr.head_sha() {
             value
