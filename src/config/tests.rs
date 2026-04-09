@@ -1,4 +1,6 @@
 use super::*;
+use anyhow::Result;
+use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -20,7 +22,7 @@ fn try_load_from_yaml(contents: &str) -> Result<Config> {
     unsafe {
         env::set_var("CONFIG_PATH", &path);
     }
-    let loaded = Config::load();
+    let loaded = load_raw_config().and_then(validate_config);
     match previous {
         Some(value) => unsafe {
             env::set_var("CONFIG_PATH", value);
@@ -30,7 +32,7 @@ fn try_load_from_yaml(contents: &str) -> Result<Config> {
         },
     }
     let _ = fs::remove_file(&path);
-    loaded
+    loaded.map(ValidatedConfig::into_inner)
 }
 
 fn load_from_yaml(contents: &str) -> Config {

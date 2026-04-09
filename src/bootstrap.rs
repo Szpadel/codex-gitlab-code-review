@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::config::Config;
+use crate::config::ValidatedConfig;
 use crate::service_factory::{
     RuntimeMode, ServiceBundle, ServiceFactoryOptions, build_service_bundle,
     load_config as load_config_inner,
@@ -17,7 +17,7 @@ pub(crate) struct BootstrapOptions {
 pub(crate) type BootstrappedRuntime = ServiceBundle;
 
 pub(crate) async fn bootstrap_runtime(
-    config: Config,
+    config: ValidatedConfig,
     options: BootstrapOptions,
 ) -> Result<BootstrappedRuntime> {
     build_service_bundle(
@@ -36,6 +36,6 @@ pub(crate) async fn bootstrap_runtime(
     .await
 }
 
-pub(crate) fn load_config(dev_mode: bool) -> Result<Config> {
+pub(crate) fn load_config(dev_mode: bool) -> Result<ValidatedConfig> {
     load_config_inner(dev_mode)
 }

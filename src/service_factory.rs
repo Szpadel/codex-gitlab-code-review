@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use crate::codex_runner::{CodexRunner, DockerCodexRunner, RunnerRuntimeOptions};
 use crate::config::{
-    Config, DockerConfig, TargetSelector, gitlab_discovery_mcp_uses_cluster_service_advertise_url,
+    Config, DockerConfig, TargetSelector, ValidatedConfig,
+    gitlab_discovery_mcp_uses_cluster_service_advertise_url, load_raw_config, validate_config,
 };
 use crate::dev_mode::{DEV_MODE_BASE_URL, DevToolsService, MockCodexRunner};
 use crate::docker_utils::wait_for_docker_ready;
@@ -47,7 +48,7 @@ struct RuntimeServices {
 }
 
 pub struct ServiceBundle {
-    pub config: Config,
+    pub config: ValidatedConfig,
     pub run_once: bool,
     pub state: Arc<ReviewStateStore>,
     pub runner: Arc<dyn CodexRunner>,
@@ -104,8 +105,8 @@ impl BotUserResolver for GitLabClient {
     }
 }
 
-pub fn load_config(dev_mode: bool) -> Result<Config> {
-    let mut config = Config::load()?;
+pub fn load_config(dev_mode: bool) -> Result<ValidatedConfig> {
+    let mut config = load_raw_config()?;
     if dev_mode {
         apply_dev_mode_profile(&mut config);
     }
@@ -115,11 +116,11 @@ pub fn load_config(dev_mode: bool) -> Result<Config> {
             "gitlab discovery MCP advertise_url uses cluster service DNS; Docker review containers may fail to reach it, so prefer host.docker.internal with host-gateway mapping or another explicit routable address"
         );
     }
-    Ok(config)
+    validate_config(config)
 }
 
 pub async fn build_service_bundle(
-    config: Config,
+    config: ValidatedConfig,
     options: ServiceFactoryOptions,
 ) -> Result<ServiceBundle> {
     let readiness_probe = RealDockerReadinessProbe;
@@ -127,40 +128,46 @@ pub async fn build_service_bundle(
 }
 
 async fn build_service_bundle_with_probe(
-    mut config: Config,
+    config: ValidatedConfig,
     options: ServiceFactoryOptions,
     readiness_probe: &dyn DockerReadinessProbe,
 ) -> Result<ServiceBundle> {
+    let mut runtime_config = config.into_inner();
     if options.force_dry_run {
-        config.review.dry_run = true;
+        runtime_config.review.dry_run = true;
         info!("dry run enabled");
     }
     info!(
-        gitlab_base = config.gitlab.base_url.as_str(),
+        gitlab_base = runtime_config.gitlab.base_url.as_str(),
         dev_mode = matches!(options.runtime_mode, RuntimeMode::Development),
-        repos_all = config.gitlab.targets.repos.is_all(),
-        repos = config.gitlab.targets.repos.list().len(),
-        groups_all = config.gitlab.targets.groups.is_all(),
-        groups = config.gitlab.targets.groups.list().len(),
-        exclude_repos = config.gitlab.targets.exclude_repos.len(),
-        exclude_groups = config.gitlab.targets.exclude_groups.len(),
+        repos_all = runtime_config.gitlab.targets.repos.is_all(),
+        repos = runtime_config.gitlab.targets.repos.list().len(),
+        groups_all = runtime_config.gitlab.targets.groups.is_all(),
+        groups = runtime_config.gitlab.targets.groups.list().len(),
+        exclude_repos = runtime_config.gitlab.targets.exclude_repos.len(),
+        exclude_groups = runtime_config.gitlab.targets.exclude_groups.len(),
         run_once = options.run_once,
-        dry_run = config.review.dry_run,
+        dry_run = runtime_config.review.dry_run,
         "starting codex gitlab review"
     );
 
-    let state = build_review_state_store(&config).await?;
-    let created_after = resolve_created_after(&config, state.as_ref()).await?;
+    let state = build_review_state_store(&runtime_config).await?;
+    let created_after = resolve_created_after(&runtime_config, state.as_ref()).await?;
     info!(
         created_after = %created_after,
         "using merge request created_after cutoff"
     );
 
     let runtime = if matches!(options.runtime_mode, RuntimeMode::Development) {
-        build_dev_runtime(&config, Arc::clone(&state), options.run_once, created_after)?
+        build_dev_runtime(
+            &runtime_config,
+            Arc::clone(&state),
+            options.run_once,
+            created_after,
+        )?
     } else {
         build_normal_runtime(
-            &mut config,
+            &mut runtime_config,
             Arc::clone(&state),
             options.run_once,
             created_after,
@@ -169,6 +176,7 @@ async fn build_service_bundle_with_probe(
         )
         .await?
     };
+    let config = validate_config(runtime_config)?;
 
     Ok(ServiceBundle {
         config,

@@ -1,17 +1,41 @@
 use crate::feature_flags::{
     FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
 };
-use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
-use std::collections::{BTreeMap, HashSet};
-use std::env;
-use url::Url;
+use std::collections::BTreeMap;
 
 pub const BROWSER_MCP_REMOTE_DEBUGGING_PORT: u16 = 9222;
-const SUPPORTED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
-const SUPPORTED_REASONING_SUMMARIES: &[&str] = &["none", "auto", "detailed"];
+
+pub(crate) mod defaults;
+mod load;
+mod validate;
+
+use self::defaults::{
+    default_browser_mcp_args, default_browser_mcp_command, default_browser_mcp_image,
+    default_browser_mcp_remote_debugging_port, default_browser_mcp_server_name,
+    default_docker_host, default_gitlab_discovery_mcp_bind_addr,
+    default_gitlab_discovery_mcp_clone_root, default_gitlab_discovery_mcp_server_name,
+    default_reasoning_summary_override, default_refresh_seconds, default_review_rate_limit_emoji,
+    default_security_context_session_override, default_security_review_comment_marker_prefix,
+    default_security_review_context_ttl_seconds, default_security_review_finding_marker_prefix,
+    default_security_review_min_confidence_score, default_security_review_session_override,
+    default_usage_limit_fallback_cooldown_seconds,
+};
+use self::load::{
+    deserialize_security_context_session_override, deserialize_security_review_session_override,
+    empty_string_as_none,
+};
+
+#[cfg(test)]
+pub(crate) use self::load::legacy_proxy_config_present;
+pub use self::load::load_raw_config;
+#[cfg(test)]
+pub(crate) use self::validate::apply_gitlab_discovery_mcp_runtime_defaults;
+pub use self::validate::{
+    ValidatedConfig, gitlab_discovery_mcp_uses_cluster_service_advertise_url, validate_config,
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -56,24 +80,6 @@ pub struct GitLabTargets {
 pub enum TargetSelector {
     All,
     List(Vec<String>),
-}
-
-impl Default for GitLabTargets {
-    fn default() -> Self {
-        Self {
-            repos: TargetSelector::default(),
-            groups: TargetSelector::default(),
-            exclude_repos: Vec::new(),
-            exclude_groups: Vec::new(),
-            refresh_seconds: default_refresh_seconds(),
-        }
-    }
-}
-
-impl Default for TargetSelector {
-    fn default() -> Self {
-        TargetSelector::List(Vec::new())
-    }
 }
 
 impl TargetSelector {
@@ -171,18 +177,6 @@ pub struct ReviewSecurityConfig {
     pub finding_marker_prefix: String,
     #[serde(default)]
     pub additional_developer_instructions: Option<String>,
-}
-
-impl Default for ReviewSecurityConfig {
-    fn default() -> Self {
-        Self {
-            context_ttl_seconds: default_security_review_context_ttl_seconds(),
-            min_confidence_score: default_security_review_min_confidence_score(),
-            comment_marker_prefix: default_security_review_comment_marker_prefix(),
-            finding_marker_prefix: default_security_review_finding_marker_prefix(),
-            additional_developer_instructions: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -307,17 +301,6 @@ pub struct SessionOverridesConfig {
     pub security_review: SessionModeOverrideConfig,
 }
 
-impl Default for SessionOverridesConfig {
-    fn default() -> Self {
-        Self {
-            review: SessionModeOverrideConfig::default(),
-            mention: SessionModeOverrideConfig::default(),
-            security_context: default_security_context_session_override(),
-            security_review: default_security_review_session_override(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ReasoningSummaryOverridesConfig {
     #[serde(default = "default_reasoning_summary_override")]
@@ -336,145 +319,6 @@ pub struct FallbackAuthAccountConfig {
 pub struct DockerConfig {
     #[serde(default = "default_docker_host")]
     pub host: String,
-}
-
-fn default_refresh_seconds() -> u64 {
-    3600
-}
-
-fn default_docker_host() -> String {
-    "unix:///var/run/docker.sock".to_string()
-}
-
-fn default_usage_limit_fallback_cooldown_seconds() -> u64 {
-    3600
-}
-
-fn default_review_rate_limit_emoji() -> String {
-    "hourglass_flowing_sand".to_string()
-}
-
-fn default_browser_mcp_server_name() -> String {
-    "chrome-devtools".to_string()
-}
-
-fn default_browser_mcp_image() -> String {
-    "chromedp/headless-shell:latest".to_string()
-}
-
-fn default_browser_mcp_remote_debugging_port() -> u16 {
-    BROWSER_MCP_REMOTE_DEBUGGING_PORT
-}
-
-fn default_browser_mcp_command() -> String {
-    "npx".to_string()
-}
-
-fn default_browser_mcp_args() -> Vec<String> {
-    vec!["-y".to_string(), "chrome-devtools-mcp@latest".to_string()]
-}
-
-fn default_reasoning_summary_override() -> Option<String> {
-    default_optional_text("detailed")
-}
-
-fn default_security_context_session_override() -> SessionModeOverrideConfig {
-    SessionModeOverrideConfig {
-        model: None,
-        reasoning_effort: default_security_context_reasoning_effort_override(),
-    }
-}
-
-fn default_security_review_session_override() -> SessionModeOverrideConfig {
-    SessionModeOverrideConfig {
-        model: None,
-        reasoning_effort: default_security_review_reasoning_effort_override(),
-    }
-}
-
-fn default_security_context_reasoning_effort_override() -> Option<String> {
-    default_optional_text("xhigh")
-}
-
-fn default_security_review_reasoning_effort_override() -> Option<String> {
-    default_optional_text("high")
-}
-
-fn default_optional_text(value: &'static str) -> Option<String> {
-    (!value.is_empty()).then(|| value.to_string())
-}
-
-fn default_gitlab_discovery_mcp_server_name() -> String {
-    "gitlab-discovery".to_string()
-}
-
-fn default_security_review_context_ttl_seconds() -> u64 {
-    1_209_600
-}
-
-fn default_security_review_min_confidence_score() -> f32 {
-    0.85
-}
-
-fn default_security_review_comment_marker_prefix() -> String {
-    "<!-- codex-security-review:sha=".to_string()
-}
-
-fn default_security_review_finding_marker_prefix() -> String {
-    "<!-- codex-security-review-finding:sha=".to_string()
-}
-
-fn default_gitlab_discovery_mcp_bind_addr() -> String {
-    "0.0.0.0:8091".to_string()
-}
-
-fn default_gitlab_discovery_mcp_clone_root() -> String {
-    "/work/mcp".to_string()
-}
-
-impl Default for DockerConfig {
-    fn default() -> Self {
-        Self {
-            host: default_docker_host(),
-        }
-    }
-}
-
-impl Default for BrowserMcpConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            server_name: default_browser_mcp_server_name(),
-            browser_image: default_browser_mcp_image(),
-            browser_entrypoint: Vec::new(),
-            remote_debugging_port: default_browser_mcp_remote_debugging_port(),
-            browser_args: Vec::new(),
-            mcp_command: default_browser_mcp_command(),
-            mcp_args: default_browser_mcp_args(),
-        }
-    }
-}
-
-impl Default for GitLabDiscoveryMcpConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            server_name: default_gitlab_discovery_mcp_server_name(),
-            bind_addr: default_gitlab_discovery_mcp_bind_addr(),
-            advertise_url: String::new(),
-            clone_root: default_gitlab_discovery_mcp_clone_root(),
-            allow: Vec::new(),
-        }
-    }
-}
-
-impl Default for ReasoningSummaryOverridesConfig {
-    fn default() -> Self {
-        Self {
-            review: default_reasoning_summary_override(),
-            mention: default_reasoning_summary_override(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -496,43 +340,6 @@ pub struct DepsConfig {
 }
 
 impl Config {
-    /// # Errors
-    ///
-    /// Returns an error if configuration files or environment overrides cannot
-    /// be loaded or parsed.
-    pub fn load() -> Result<Self> {
-        let path = env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
-        let builder = config::Config::builder()
-            .add_source(config::File::with_name(&path))
-            .add_source(config::Environment::with_prefix("CODEX_REVIEW").separator("__"));
-        let cfg = builder
-            .build()
-            .with_context(|| format!("load config from {path}"))?;
-        if legacy_proxy_config_present(&cfg) {
-            tracing::warn!(
-                "legacy proxy config detected but ignored; built-in proxy support has been removed"
-            );
-        }
-        validate_no_legacy_reasoning_effort_config(&cfg)?;
-        let mut config: Config = cfg.try_deserialize().context("deserialize config")?;
-        if config.codex.auth_host_path.is_empty() {
-            config.codex.auth_host_path = config.codex.auth_mount_path.clone();
-        }
-        if config.docker.host.trim().is_empty() {
-            config.docker.host = default_docker_host();
-        }
-        apply_gitlab_discovery_mcp_runtime_defaults(&mut config)?;
-        validate_codex_auth_accounts(&config.codex)?;
-        validate_browser_mcp(&config.codex)?;
-        validate_gitlab_discovery_mcp(&config.codex)?;
-        validate_unique_injected_mcp_server_names(&config.codex)?;
-        validate_distinct_http_and_gitlab_discovery_bind_addrs(&config)?;
-        validate_mcp_server_overrides(&config.codex)?;
-        validate_session_overrides(&config.codex)?;
-        validate_reasoning_summary_overrides(&config.codex)?;
-        Ok(config)
-    }
-
     #[must_use]
     pub fn feature_flag_availability(&self) -> FeatureFlagAvailability {
         FeatureFlagAvailability {
@@ -558,479 +365,6 @@ impl Config {
             overrides,
         )
     }
-}
-
-fn apply_gitlab_discovery_mcp_runtime_defaults(config: &mut Config) -> Result<()> {
-    if !config.codex.gitlab_discovery_mcp.enabled
-        || !config
-            .codex
-            .gitlab_discovery_mcp
-            .advertise_url
-            .trim()
-            .is_empty()
-    {
-        return Ok(());
-    }
-
-    let (bind_host, port) = parse_bind_addr(
-        "codex.gitlab_discovery_mcp.bind_addr",
-        &config.codex.gitlab_discovery_mcp.bind_addr,
-    )?;
-    let pod_ip = env::var("POD_IP")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if let Some(pod_ip) = pod_ip {
-        anyhow::ensure!(
-            is_wildcard_host(&bind_host),
-            "codex.gitlab_discovery_mcp.advertise_url cannot default from POD_IP when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
-        );
-        let pod_ip = pod_ip
-            .parse::<std::net::IpAddr>()
-            .context("parse POD_IP for gitlab discovery MCP advertise_url default")?;
-        if bind_host_supports_ip(&bind_host, pod_ip) {
-            let host = match pod_ip {
-                std::net::IpAddr::V4(ip) => ip.to_string(),
-                std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-            };
-            config.codex.gitlab_discovery_mcp.advertise_url = format!("http://{host}:{port}/mcp");
-        } else {
-            config.codex.gitlab_discovery_mcp.advertise_url =
-                format!("http://host.docker.internal:{port}/mcp");
-        }
-    } else {
-        anyhow::ensure!(
-            is_wildcard_host(&bind_host),
-            "codex.gitlab_discovery_mcp.advertise_url cannot default to host.docker.internal when codex.gitlab_discovery_mcp.bind_addr listens on {bind_host}; use a wildcard bind_addr or set advertise_url explicitly"
-        );
-        config.codex.gitlab_discovery_mcp.advertise_url =
-            format!("http://host.docker.internal:{port}/mcp");
-    }
-    Ok(())
-}
-
-#[must_use]
-pub fn gitlab_discovery_mcp_uses_cluster_service_advertise_url(codex: &CodexConfig) -> bool {
-    if !codex.gitlab_discovery_mcp.enabled {
-        return false;
-    }
-
-    let Ok(advertise_url) = Url::parse(&codex.gitlab_discovery_mcp.advertise_url) else {
-        return false;
-    };
-    let Some(host) = advertise_url.host_str() else {
-        return false;
-    };
-
-    host.ends_with(".svc.cluster.local") || host.ends_with(".cluster.local")
-}
-
-fn empty_string_as_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    Ok(value.and_then(|value| {
-        let trimmed = value.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_string())
-    }))
-}
-
-fn legacy_proxy_config_present(cfg: &config::Config) -> bool {
-    cfg.get_table("proxy").is_ok_and(|table| !table.is_empty())
-}
-
-fn validate_no_legacy_reasoning_effort_config(cfg: &config::Config) -> Result<()> {
-    anyhow::ensure!(
-        !cfg.get_table("codex.reasoning_effort")
-            .is_ok_and(|table| !table.is_empty()),
-        "codex.reasoning_effort has been replaced by codex.session_overrides.<mode>.reasoning_effort"
-    );
-    Ok(())
-}
-
-fn validate_codex_auth_accounts(codex: &CodexConfig) -> Result<()> {
-    anyhow::ensure!(
-        !codex.auth_host_path.trim().is_empty(),
-        "codex.auth_host_path must not be empty"
-    );
-
-    let mut names = HashSet::new();
-    let mut host_paths = HashSet::new();
-    host_paths.insert(codex.auth_host_path.as_str());
-
-    for account in &codex.fallback_auth_accounts {
-        anyhow::ensure!(
-            !account.name.trim().is_empty(),
-            "codex.fallback_auth_accounts[].name must not be empty"
-        );
-        anyhow::ensure!(
-            account.name != "primary",
-            "codex.fallback_auth_accounts[].name 'primary' is reserved"
-        );
-        anyhow::ensure!(
-            !account.auth_host_path.trim().is_empty(),
-            "codex.fallback_auth_accounts[].auth_host_path must not be empty"
-        );
-        anyhow::ensure!(
-            names.insert(account.name.as_str()),
-            "duplicate codex fallback account name: {}",
-            account.name
-        );
-        anyhow::ensure!(
-            host_paths.insert(account.auth_host_path.as_str()),
-            "duplicate codex auth_host_path across primary/fallback accounts: {}",
-            account.auth_host_path
-        );
-    }
-
-    Ok(())
-}
-
-fn validate_mcp_server_overrides(codex: &CodexConfig) -> Result<()> {
-    for server in codex
-        .mcp_server_overrides
-        .review
-        .keys()
-        .chain(codex.mcp_server_overrides.mention.keys())
-    {
-        anyhow::ensure!(
-            !server.trim().is_empty(),
-            "codex.mcp_server_overrides keys must not be empty"
-        );
-        anyhow::ensure!(
-            is_valid_mcp_server_name(server),
-            "codex.mcp_server_overrides keys must match ^[a-zA-Z0-9_-]+$"
-        );
-    }
-    Ok(())
-}
-
-fn validate_browser_mcp(codex: &CodexConfig) -> Result<()> {
-    if !codex.browser_mcp.enabled {
-        return Ok(());
-    }
-
-    anyhow::ensure!(
-        !codex.browser_mcp.server_name.trim().is_empty(),
-        "codex.browser_mcp.server_name must not be empty"
-    );
-    anyhow::ensure!(
-        codex
-            .browser_mcp
-            .server_name
-            .chars()
-            .all(|ch| !ch.is_control()),
-        "codex.browser_mcp.server_name must not contain control characters"
-    );
-    anyhow::ensure!(
-        is_valid_mcp_server_name(&codex.browser_mcp.server_name),
-        "codex.browser_mcp.server_name must match ^[a-zA-Z0-9_-]+$"
-    );
-    anyhow::ensure!(
-        !codex.browser_mcp.browser_image.trim().is_empty(),
-        "codex.browser_mcp.browser_image must not be empty"
-    );
-    anyhow::ensure!(
-        !codex.browser_mcp.mcp_command.trim().is_empty(),
-        "codex.browser_mcp.mcp_command must not be empty"
-    );
-    anyhow::ensure!(
-        codex.browser_mcp.remote_debugging_port == BROWSER_MCP_REMOTE_DEBUGGING_PORT,
-        "codex.browser_mcp.remote_debugging_port must be {BROWSER_MCP_REMOTE_DEBUGGING_PORT}"
-    );
-    for arg in &codex.browser_mcp.browser_args {
-        let trimmed = arg.trim();
-        anyhow::ensure!(
-            trimmed != "--remote-debugging-port"
-                && !trimmed.starts_with("--remote-debugging-port="),
-            "codex.browser_mcp.browser_args must not override --remote-debugging-port"
-        );
-        anyhow::ensure!(
-            trimmed != "--remote-debugging-address"
-                && !trimmed.starts_with("--remote-debugging-address="),
-            "codex.browser_mcp.browser_args must not override --remote-debugging-address"
-        );
-    }
-
-    Ok(())
-}
-
-fn validate_gitlab_discovery_mcp(codex: &CodexConfig) -> Result<()> {
-    if !codex.gitlab_discovery_mcp.enabled {
-        return Ok(());
-    }
-
-    let mcp = &codex.gitlab_discovery_mcp;
-    anyhow::ensure!(
-        !mcp.server_name.trim().is_empty(),
-        "codex.gitlab_discovery_mcp.server_name must not be empty"
-    );
-    anyhow::ensure!(
-        mcp.server_name.chars().all(|ch| !ch.is_control()),
-        "codex.gitlab_discovery_mcp.server_name must not contain control characters"
-    );
-    anyhow::ensure!(
-        is_valid_mcp_server_name(&mcp.server_name),
-        "codex.gitlab_discovery_mcp.server_name must match ^[a-zA-Z0-9_-]+$"
-    );
-    anyhow::ensure!(
-        !mcp.bind_addr.trim().is_empty(),
-        "codex.gitlab_discovery_mcp.bind_addr must not be empty"
-    );
-    let bind_addr = Url::parse(&format!("tcp://{}", mcp.bind_addr))
-        .context("parse codex.gitlab_discovery_mcp.bind_addr")?;
-    anyhow::ensure!(
-        bind_addr.port().is_some_and(|port| port != 0),
-        "codex.gitlab_discovery_mcp.bind_addr must include a non-zero port"
-    );
-    anyhow::ensure!(
-        !mcp.advertise_url.trim().is_empty(),
-        "codex.gitlab_discovery_mcp.advertise_url must not be empty"
-    );
-    let advertise_url =
-        Url::parse(&mcp.advertise_url).context("parse codex.gitlab_discovery_mcp.advertise_url")?;
-    anyhow::ensure!(
-        matches!(advertise_url.scheme(), "http" | "https"),
-        "codex.gitlab_discovery_mcp.advertise_url must use http or https"
-    );
-    advertise_url
-        .host_str()
-        .context("parse codex.gitlab_discovery_mcp.advertise_url host")?;
-    anyhow::ensure!(
-        !mcp.clone_root.trim().is_empty(),
-        "codex.gitlab_discovery_mcp.clone_root must not be empty"
-    );
-    anyhow::ensure!(
-        mcp.clone_root.starts_with('/'),
-        "codex.gitlab_discovery_mcp.clone_root must be an absolute path"
-    );
-    for (index, rule) in mcp.allow.iter().enumerate() {
-        let rule_name = format!("codex.gitlab_discovery_mcp.allow[{index}]");
-        anyhow::ensure!(
-            !(rule.source_repos.is_empty() && rule.source_group_prefixes.is_empty()),
-            "{rule_name} must include at least one source_repos or source_group_prefixes entry"
-        );
-        anyhow::ensure!(
-            !(rule.target_repos.is_empty() && rule.target_groups.is_empty()),
-            "{rule_name} must include at least one target_repos or target_groups entry"
-        );
-
-        for (field, values) in [
-            ("source_repos", &rule.source_repos),
-            ("source_group_prefixes", &rule.source_group_prefixes),
-            ("target_repos", &rule.target_repos),
-            ("target_groups", &rule.target_groups),
-        ] {
-            for value in values {
-                anyhow::ensure!(
-                    !value.trim().is_empty(),
-                    "{rule_name}.{field} values must not be empty"
-                );
-                anyhow::ensure!(
-                    value.chars().all(|ch| !ch.is_control()),
-                    "{rule_name}.{field} values must not contain control characters"
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_unique_injected_mcp_server_names(codex: &CodexConfig) -> Result<()> {
-    if codex.browser_mcp.enabled
-        && codex.gitlab_discovery_mcp.enabled
-        && codex.browser_mcp.server_name == codex.gitlab_discovery_mcp.server_name
-    {
-        anyhow::bail!(
-            "codex.browser_mcp.server_name and codex.gitlab_discovery_mcp.server_name must be distinct when both MCP injectors are enabled"
-        );
-    }
-
-    Ok(())
-}
-
-fn validate_distinct_http_and_gitlab_discovery_bind_addrs(config: &Config) -> Result<()> {
-    if !config.codex.gitlab_discovery_mcp.enabled {
-        return Ok(());
-    }
-
-    let (http_host, http_port) = parse_bind_addr("server.bind_addr", &config.server.bind_addr)?;
-    let (mcp_host, mcp_port) = parse_bind_addr(
-        "codex.gitlab_discovery_mcp.bind_addr",
-        &config.codex.gitlab_discovery_mcp.bind_addr,
-    )?;
-    if http_port == mcp_port
-        && (http_host == mcp_host || is_wildcard_host(&http_host) || is_wildcard_host(&mcp_host))
-    {
-        anyhow::bail!(
-            "server.bind_addr and codex.gitlab_discovery_mcp.bind_addr must not target the same listener socket"
-        );
-    }
-
-    Ok(())
-}
-
-fn parse_bind_addr(field: &str, value: &str) -> Result<(String, u16)> {
-    let url = Url::parse(&format!("tcp://{value}")).with_context(|| format!("parse {field}"))?;
-    let host = url
-        .host_str()
-        .map(ToOwned::to_owned)
-        .with_context(|| format!("{field} must include a host"))?;
-    let port = url
-        .port()
-        .with_context(|| format!("{field} must include a port"))?;
-    Ok((host, port))
-}
-
-fn is_wildcard_host(host: &str) -> bool {
-    matches!(host, "0.0.0.0" | "::" | "[::]" | "0:0:0:0:0:0:0:0")
-}
-
-fn bind_host_supports_ip(bind_host: &str, ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(_) => bind_host == "0.0.0.0",
-        std::net::IpAddr::V6(_) => matches!(bind_host, "::" | "[::]" | "0:0:0:0:0:0:0:0"),
-    }
-}
-
-fn validate_session_mode_override(
-    field: &str,
-    override_config: &SessionModeOverrideConfig,
-) -> Result<()> {
-    if let Some(model) = override_config.model.as_deref() {
-        anyhow::ensure!(
-            !model.trim().is_empty(),
-            "codex.session_overrides.{field}.model must not be empty"
-        );
-        anyhow::ensure!(
-            model.chars().all(|ch| !ch.is_control()),
-            "codex.session_overrides.{field}.model must not contain control characters"
-        );
-    }
-
-    let Some(reasoning_effort) = override_config.reasoning_effort.as_deref() else {
-        return Ok(());
-    };
-    anyhow::ensure!(
-        !reasoning_effort.trim().is_empty(),
-        "codex.session_overrides.{field}.reasoning_effort must not be empty"
-    );
-    anyhow::ensure!(
-        reasoning_effort.chars().all(|ch| !ch.is_control()),
-        "codex.session_overrides.{field}.reasoning_effort must not contain control characters"
-    );
-    anyhow::ensure!(
-        SUPPORTED_REASONING_EFFORTS.contains(&reasoning_effort),
-        "codex.session_overrides.{field}.reasoning_effort must be one of: {}",
-        SUPPORTED_REASONING_EFFORTS.join(", ")
-    );
-    Ok(())
-}
-
-fn validate_session_overrides(codex: &CodexConfig) -> Result<()> {
-    for (field, override_config) in [
-        ("review", &codex.session_overrides.review),
-        ("mention", &codex.session_overrides.mention),
-        (
-            "security_context",
-            &codex.session_overrides.security_context,
-        ),
-        ("security_review", &codex.session_overrides.security_review),
-    ] {
-        validate_session_mode_override(field, override_config)?;
-    }
-    Ok(())
-}
-
-#[derive(Deserialize)]
-struct RawSessionModeOverrideConfig {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    reasoning_effort: Option<Option<String>>,
-}
-
-fn deserialize_session_override_with_default<'de, D>(
-    deserializer: D,
-    default: SessionModeOverrideConfig,
-) -> std::result::Result<SessionModeOverrideConfig, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let raw = Option::<RawSessionModeOverrideConfig>::deserialize(deserializer)?;
-    let Some(raw) = raw else {
-        return Ok(default);
-    };
-
-    Ok(SessionModeOverrideConfig {
-        model: raw.model.or(default.model),
-        reasoning_effort: match raw.reasoning_effort {
-            Some(reasoning_effort) => reasoning_effort,
-            None => default.reasoning_effort,
-        },
-    })
-}
-
-fn deserialize_security_context_session_override<'de, D>(
-    deserializer: D,
-) -> std::result::Result<SessionModeOverrideConfig, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_session_override_with_default(
-        deserializer,
-        default_security_context_session_override(),
-    )
-}
-
-fn deserialize_security_review_session_override<'de, D>(
-    deserializer: D,
-) -> std::result::Result<SessionModeOverrideConfig, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_session_override_with_default(
-        deserializer,
-        default_security_review_session_override(),
-    )
-}
-
-fn validate_reasoning_summary_overrides(codex: &CodexConfig) -> Result<()> {
-    for (field, value) in [
-        ("review", codex.reasoning_summary.review.as_deref()),
-        ("mention", codex.reasoning_summary.mention.as_deref()),
-    ] {
-        let Some(value) = value else {
-            continue;
-        };
-        anyhow::ensure!(
-            !value.trim().is_empty(),
-            "codex.reasoning_summary.{field} must not be empty"
-        );
-        anyhow::ensure!(
-            value.chars().all(|ch| !ch.is_control()),
-            "codex.reasoning_summary.{field} must not contain control characters"
-        );
-        anyhow::ensure!(
-            SUPPORTED_REASONING_SUMMARIES.contains(&value),
-            "codex.reasoning_summary.{field} must be one of: {}",
-            SUPPORTED_REASONING_SUMMARIES.join(", ")
-        );
-    }
-    Ok(())
-}
-
-fn is_valid_mcp_server_name(name: &str) -> bool {
-    // Codex CLI `-c key=value` overrides split nested config paths on `.`, so
-    // names that require quoted TOML dotted-key segments cannot be targeted by
-    // our runtime override path. Codex itself also rejects MCP server names
-    // outside this upstream pattern during MCP startup.
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }
 
 #[cfg(test)]

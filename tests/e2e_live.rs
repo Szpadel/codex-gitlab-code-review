@@ -3,7 +3,7 @@ use chrono::{Duration, Utc};
 use codex_gitlab_code_review::config::{
     CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
     McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ReviewSecurityConfig,
-    ScheduleConfig, ServerConfig, TargetSelector,
+    ScheduleConfig, ServerConfig, TargetSelector, validate_config,
 };
 use codex_gitlab_code_review::gitlab::GitLabApi;
 use codex_gitlab_code_review::service_factory::{
@@ -88,7 +88,7 @@ async fn e2e_live_dry_run() -> Result<()> {
     };
 
     let runtime = build_service_bundle(
-        config,
+        validate_config(config)?,
         ServiceFactoryOptions {
             run_once: true,
             force_dry_run: false,

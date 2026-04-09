@@ -69,7 +69,7 @@ pub async fn run() -> Result<()> {
 
     let config = load_config(cli.dev_mode)?;
     if let Some(command) = cli.command {
-        return run_command(command, &config, cli.debug).await;
+        return run_command(command, config.as_ref(), cli.debug).await;
     }
 
     let run_once = cli.once || env_flag("RUN_ONCE");

@@ -474,7 +474,7 @@ mod tests {
         BrowserMcpConfig, CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig,
         GitLabDiscoveryMcpConfig, GitLabTargets, McpServerOverridesConfig,
         ReasoningSummaryOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
-        ServerConfig, SessionOverridesConfig, TargetSelector,
+        ServerConfig, SessionOverridesConfig, TargetSelector, validate_config,
     };
     use crate::feature_flags::FeatureFlagDefaults;
     use crate::service_factory::{apply_dev_mode_profile, build_review_state_store};
@@ -537,7 +537,7 @@ mod tests {
         let mut config = test_config();
         apply_dev_mode_profile(&mut config);
         let runtime = bootstrap_runtime(
-            config,
+            validate_config(config)?,
             BootstrapOptions {
                 run_once: true,
                 force_dry_run: false,
