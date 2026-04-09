@@ -1,0 +1,10 @@
+---
+source: src/http/transcript/renderer.rs
+expression: html
+---
+<div class="transcript-stream"><article class="transcript-entry activity-entry activity-entry-review-mode-transition"><header class="entry-header-shell"><span class="entry-summary-content"><span class="entry-heading entry-summary-main"><span class="entry-kicker">Review mode</span><span class="entry-title">Entered review mode</span></span></span><span class="entry-meta-cluster entry-summary-meta"></span></header><div class="activity-body review-markdown-body markdown-body"><h1>Review</h1>
+<ul>
+<li><input disabled="" type="checkbox"/>
+Check this</li>
+</ul>
+</div></article></div>

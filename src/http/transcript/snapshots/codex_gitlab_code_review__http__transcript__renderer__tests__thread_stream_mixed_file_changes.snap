@@ -1,0 +1,8 @@
+---
+source: src/http/transcript/renderer.rs
+expression: html
+---
+<div class="transcript-stream"><details class="transcript-entry file-change-entry"><summary class="entry-summary file-change-summary"><span class="entry-summary-content"><span class="entry-heading entry-summary-main"><span class="entry-kicker">File change</span><span class="entry-title">2 files changed</span></span></span><span class="entry-meta-cluster entry-summary-meta"><span class="meta-pill diff-stats-pill"><span class="diff-stats-add">+1</span><span class="diff-stats-remove">-1</span></span><span class="meta-pill preview-pill">diff</span><span class="meta-pills"><span class="meta-pill"><span class="meta-pill-label">status</span>completed</span></span></span></summary><section class="file-change-section"><div class="file-change-section-path"><code>README.md</code></div><pre class="activity-body">{
+  &quot;previous_path&quot;: &quot;README-old.md&quot;,
+  &quot;type&quot;: &quot;rename&quot;
+}</pre></section><section class="file-change-section"><div class="file-change-section-path"><code>src/lib.rs</code></div><div class="diff-view"><div class="diff-line diff-line-meta">diff --git a/src/lib.rs b/src/lib.rs</div><div class="diff-line diff-line-hunk">@@ -1 +1 @@</div><div class="diff-line diff-line-remove">-old</div><div class="diff-line diff-line-add">+new</div></div></section></details></div>

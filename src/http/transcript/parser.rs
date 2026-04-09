@@ -1,5 +1,8 @@
-use super::timestamp::UiTimestamp;
+use super::models::{
+    FileChangeBodyFormat, ThreadItemKind, ThreadItemSnapshot, ThreadSnapshot, TurnSnapshot,
+};
 use crate::composer_install::COMPOSER_INSTALL_TURN_ID;
+use crate::http::timestamp::UiTimestamp;
 use crate::state::{RunHistoryEventRecord, RunHistoryRecord};
 use serde::Serialize;
 use serde_json::Value;
@@ -13,33 +16,6 @@ pub(crate) fn is_auxiliary_transcript_turn_id(turn_id: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ThreadSnapshot {
-    pub id: String,
-    pub preview: String,
-    pub status: String,
-    pub turns: Vec<TurnSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct TurnSnapshot {
-    pub id: String,
-    pub status: String,
-    pub items: Vec<ThreadItemSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ThreadItemSnapshot {
-    pub item_type: String,
-    pub title: String,
-    pub preview: Option<String>,
-    pub body: Option<String>,
-    pub meta: Vec<(String, String)>,
-    pub timestamp: Option<String>,
-    #[serde(skip)]
-    pub(crate) ui_timestamp: Option<UiTimestamp>,
-}
-
 pub fn thread_snapshot_from_events(
     run: &RunHistoryRecord,
     events: &[RunHistoryEventRecord],
@@ -47,6 +23,7 @@ pub fn thread_snapshot_from_events(
     if events.is_empty() {
         return None;
     }
+
     let mut turns = Vec::<TurnSnapshot>::new();
     for event in events {
         let turn_id = event.turn_id.as_deref().unwrap_or("<unknown>");
@@ -60,6 +37,7 @@ pub fn thread_snapshot_from_events(
             });
             turns.last_mut().expect("turn inserted")
         };
+
         match event.event_type.as_str() {
             "turn_started" => {}
             "item_completed" => turn.items.push(parse_thread_item_snapshot(
@@ -73,6 +51,7 @@ pub fn thread_snapshot_from_events(
             _ => {}
         }
     }
+
     let status = turns
         .last()
         .map_or_else(|| "unknown".to_string(), |turn| turn.status.clone());
@@ -118,14 +97,14 @@ pub fn thread_snapshot_only_target_turn_is_incomplete(
 }
 
 fn thread_item_is_self_contained(item: &ThreadItemSnapshot) -> bool {
-    match item.item_type.as_str() {
-        "agentMessage" | "AgentMessage" => {
+    match &item.kind {
+        ThreadItemKind::AgentMessage { .. } => {
             item.body.as_deref().is_some_and(|body| !body.is_empty())
         }
-        "commandExecution" => {
+        ThreadItemKind::CommandExecution { .. } => {
             item.body.as_deref().is_some_and(|body| !body.is_empty()) || item.title != "Command"
         }
-        "reasoning" => item.body.as_deref().is_some_and(|body| !body.is_empty()),
+        ThreadItemKind::Reasoning => item.body.as_deref().is_some_and(|body| !body.is_empty()),
         _ => true,
     }
 }
@@ -134,13 +113,16 @@ fn turn_snapshot_is_complete(turn: &TurnSnapshot) -> bool {
     if matches!(turn.status.as_str(), "in_progress" | "unknown") || turn.items.is_empty() {
         return false;
     }
+
     let has_renderable_non_reasoning_item = turn
         .items
         .iter()
         .any(reasoning_fallback_supports_completeness);
+
     turn.items.iter().all(|item| {
         thread_item_is_self_contained(item)
-            || (item.item_type == "reasoning" && has_renderable_non_reasoning_item)
+            || (matches!(&item.kind, ThreadItemKind::Reasoning)
+                && has_renderable_non_reasoning_item)
     })
 }
 
@@ -151,110 +133,104 @@ fn turn_is_auxiliary_warning(turn: &TurnSnapshot) -> bool {
 fn reasoning_fallback_supports_completeness(item: &ThreadItemSnapshot) -> bool {
     thread_item_is_self_contained(item)
         && matches!(
-            item.item_type.as_str(),
-            "agentMessage" | "AgentMessage" | "exitedReviewMode"
+            &item.kind,
+            ThreadItemKind::AgentMessage { .. }
+                | ThreadItemKind::ReviewModeTransition { entered: false }
         )
 }
 
 fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> ThreadItemSnapshot {
     let item_type = json_string(item.get("type")).unwrap_or_else(|| "unknown".to_string());
     let timestamp_text = timestamp.as_ref().map(|value| value.fallback_text.clone());
+
     match item_type.as_str() {
         "userMessage" => ThreadItemSnapshot {
-            item_type,
             title: "User message".to_string(),
             preview: None,
             body: Some(join_user_content(item.get("content"))),
-            meta: Vec::new(),
             timestamp: timestamp_text,
             ui_timestamp: timestamp,
+            kind: ThreadItemKind::UserMessage,
         },
         "agentMessage" | "AgentMessage" => ThreadItemSnapshot {
-            item_type,
             title: "Agent message".to_string(),
             preview: None,
             body: json_string(item.get("text")).or_else(|| {
                 let content = join_agent_message_content(item.get("content"));
                 (!content.is_empty()).then_some(content)
             }),
-            meta: phase_meta(item),
             timestamp: timestamp_text,
             ui_timestamp: timestamp,
+            kind: ThreadItemKind::AgentMessage {
+                phase: json_string(item.get("phase")),
+            },
         },
         "reasoning" => ThreadItemSnapshot {
-            item_type,
             title: "Reasoning".to_string(),
             preview: None,
             body: Some(join_reasoning_content(item)),
-            meta: Vec::new(),
             timestamp: timestamp_text,
             ui_timestamp: timestamp,
+            kind: ThreadItemKind::Reasoning,
         },
         "commandExecution" => ThreadItemSnapshot {
-            item_type,
             title: json_string(item.get("command")).unwrap_or_else(|| "Command".to_string()),
             preview: None,
             body: json_string(item.get("aggregatedOutput")),
-            meta: vec![
-                optional_meta("cwd", item.get("cwd")),
-                optional_meta("status", item.get("status")),
-                optional_meta("exit", item.get("exitCode")),
-                optional_meta("durationMs", item.get("durationMs")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
             timestamp: timestamp_text,
             ui_timestamp: timestamp,
+            kind: ThreadItemKind::CommandExecution {
+                cwd: json_string(item.get("cwd")),
+                status: json_string(item.get("status")),
+                exit: json_string(item.get("exitCode")),
+                duration_ms: json_string(item.get("durationMs")),
+            },
         },
-        "mcpToolCall" => ThreadItemSnapshot {
-            item_type,
-            title: format!(
-                "{}:{}",
-                json_string(item.get("server")).unwrap_or_else(|| "mcp".to_string()),
-                json_string(item.get("tool")).unwrap_or_else(|| "tool".to_string())
-            ),
-            preview: tool_call_preview(item),
-            body: combine_detail_sections(&[
-                ("Arguments", tool_call_arguments(item)),
-                ("Result", item.get("result")),
-                ("Error", item.get("error")),
-            ]),
-            meta: vec![
-                optional_meta("status", item.get("status")),
-                optional_meta("durationMs", item.get("durationMs")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
-            timestamp: timestamp_text,
-            ui_timestamp: timestamp,
-        },
-        "dynamicToolCall" => ThreadItemSnapshot {
-            item_type,
-            title: json_string(item.get("tool")).unwrap_or_else(|| "Dynamic tool".to_string()),
-            preview: item
-                .get("contentItems")
-                .map(single_line_preview)
-                .or_else(|| item.get("result").map(single_line_preview))
-                .or_else(|| item.get("error").map(single_line_preview)),
-            body: combine_detail_sections(&[
-                ("Input", item.get("contentItems")),
-                ("Result", item.get("result")),
-                ("Error", item.get("error")),
-            ]),
-            meta: vec![
-                optional_meta("status", item.get("status")),
-                optional_meta("durationMs", item.get("durationMs")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
-            timestamp: timestamp_text,
-            ui_timestamp: timestamp,
-        },
+        "mcpToolCall" => {
+            let server = json_string(item.get("server")).unwrap_or_else(|| "mcp".to_string());
+            let tool = json_string(item.get("tool")).unwrap_or_else(|| "tool".to_string());
+            ThreadItemSnapshot {
+                title: format!("{server}:{tool}"),
+                preview: tool_call_preview(item),
+                body: combine_detail_sections(&[
+                    ("Arguments", tool_call_arguments(item)),
+                    ("Result", item.get("result")),
+                    ("Error", item.get("error")),
+                ]),
+                timestamp: timestamp_text,
+                ui_timestamp: timestamp,
+                kind: ThreadItemKind::McpToolCall {
+                    server,
+                    tool,
+                    status: json_string(item.get("status")),
+                    duration_ms: json_string(item.get("durationMs")),
+                },
+            }
+        }
+        "dynamicToolCall" => {
+            let tool = json_string(item.get("tool")).unwrap_or_else(|| "Dynamic tool".to_string());
+            ThreadItemSnapshot {
+                title: tool.clone(),
+                preview: item
+                    .get("contentItems")
+                    .map(single_line_preview)
+                    .or_else(|| item.get("result").map(single_line_preview))
+                    .or_else(|| item.get("error").map(single_line_preview)),
+                body: combine_detail_sections(&[
+                    ("Input", item.get("contentItems")),
+                    ("Result", item.get("result")),
+                    ("Error", item.get("error")),
+                ]),
+                timestamp: timestamp_text,
+                ui_timestamp: timestamp,
+                kind: ThreadItemKind::DynamicToolCall {
+                    tool,
+                    status: json_string(item.get("status")),
+                    duration_ms: json_string(item.get("durationMs")),
+                },
+            }
+        }
         "webSearch" => ThreadItemSnapshot {
-            item_type,
             title: "Web search".to_string(),
             preview: json_string(item.get("query"))
                 .or_else(|| item.get("action").map(single_line_preview)),
@@ -262,35 +238,27 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
                 .get("action")
                 .map(compact_json)
                 .filter(|body| Some(body.as_str()) != json_string(item.get("query")).as_deref()),
-            meta: Vec::new(),
             timestamp: timestamp_text,
             ui_timestamp: timestamp,
+            kind: ThreadItemKind::WebSearch,
         },
         "fileChange" => {
             let summary = file_change_preview_and_body(item.get("changes"));
             ThreadItemSnapshot {
-                item_type,
                 title: "File change".to_string(),
                 preview: summary.preview,
                 body: summary.body,
-                meta: vec![
-                    optional_meta("status", item.get("status")),
-                    Some(("bodyFormat".to_string(), summary.body_format.to_string())),
-                    Some(("addedLines".to_string(), summary.added_lines.to_string())),
-                    Some((
-                        "removedLines".to_string(),
-                        summary.removed_lines.to_string(),
-                    )),
-                ]
-                .into_iter()
-                .flatten()
-                .collect(),
                 timestamp: timestamp_text,
                 ui_timestamp: timestamp,
+                kind: ThreadItemKind::FileChange {
+                    status: json_string(item.get("status")),
+                    body_format: summary.body_format,
+                    added_lines: summary.added_lines,
+                    removed_lines: summary.removed_lines,
+                },
             }
         }
         "enteredReviewMode" | "exitedReviewMode" => ThreadItemSnapshot {
-            item_type: item_type.clone(),
             title: if item_type == "enteredReviewMode" {
                 "Entered review mode".to_string()
             } else {
@@ -298,27 +266,29 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
             },
             preview: None,
             body: json_string(item.get("review")),
-            meta: Vec::new(),
             timestamp: timestamp_text,
             ui_timestamp: timestamp,
+            kind: ThreadItemKind::ReviewModeTransition {
+                entered: item_type == "enteredReviewMode",
+            },
         },
         "contextCompaction" => ThreadItemSnapshot {
-            item_type,
             title: "Context compaction".to_string(),
             preview: None,
             body: None,
-            meta: Vec::new(),
             timestamp: timestamp_text,
             ui_timestamp: timestamp,
+            kind: ThreadItemKind::ContextCompaction,
         },
         _ => ThreadItemSnapshot {
-            item_type,
             title: "Event".to_string(),
             preview: None,
             body: Some(compact_json(item)),
-            meta: Vec::new(),
             timestamp: timestamp_text,
             ui_timestamp: timestamp,
+            kind: ThreadItemKind::Unknown {
+                event_type: item_type,
+            },
         },
     }
 }
@@ -369,8 +339,10 @@ fn join_agent_message_content(value: Option<&Value>) -> String {
 fn join_reasoning_content(item: &Value) -> String {
     const ENCRYPTED_REASONING_PLACEHOLDER: &str =
         "Reasoning is unavailable because Codex returned only encrypted history for this step.";
+
     let summary = join_reasoning_entries(item.get("summary"));
     let content = join_reasoning_entries(item.get("content"));
+
     match (summary.is_empty(), content.is_empty()) {
         (false, false) => format!("{summary}\n\n{content}"),
         (false, true) => summary,
@@ -455,7 +427,7 @@ fn truncate_preview(value: &str, max_chars: usize) -> String {
 struct FileChangeSummary {
     preview: Option<String>,
     body: Option<String>,
-    body_format: &'static str,
+    body_format: FileChangeBodyFormat,
     added_lines: usize,
     removed_lines: usize,
 }
@@ -472,16 +444,18 @@ fn file_change_preview_and_body(changes: Option<&Value>) -> FileChangeSummary {
         return FileChangeSummary {
             preview: None,
             body: None,
-            body_format: "payload",
+            body_format: FileChangeBodyFormat::Payload,
             added_lines: 0,
             removed_lines: 0,
         };
     };
+
     let preview = match changes.len() {
         0 => None,
         1 => changes.keys().next().cloned(),
         count => Some(format!("{count} files changed")),
     };
+
     let sections = changes
         .iter()
         .map(|(path, value)| {
@@ -500,6 +474,7 @@ fn file_change_preview_and_body(changes: Option<&Value>) -> FileChangeSummary {
             }
         })
         .collect::<Vec<_>>();
+
     let (added_lines, removed_lines) = sections
         .iter()
         .filter(|section| section.kind == "diff")
@@ -508,10 +483,15 @@ fn file_change_preview_and_body(changes: Option<&Value>) -> FileChangeSummary {
             (0usize, 0usize),
             |(added_acc, removed_acc), (added, removed)| (added_acc + added, removed_acc + removed),
         );
+
     let has_diff = sections.iter().any(|section| section.kind == "diff");
     let has_payload = sections.iter().any(|section| section.kind == "payload");
+
     let (body, body_format) = if has_diff && has_payload {
-        (serde_json::to_string(&sections).ok(), "mixed")
+        (
+            serde_json::to_string(&sections).ok(),
+            FileChangeBodyFormat::Mixed,
+        )
     } else if has_diff {
         (
             Some(
@@ -521,7 +501,7 @@ fn file_change_preview_and_body(changes: Option<&Value>) -> FileChangeSummary {
                     .collect::<Vec<_>>()
                     .join("\n\n"),
             ),
-            "diff",
+            FileChangeBodyFormat::Diff,
         )
     } else {
         (
@@ -532,9 +512,10 @@ fn file_change_preview_and_body(changes: Option<&Value>) -> FileChangeSummary {
                     .collect::<Vec<_>>()
                     .join("\n\n"),
             ),
-            "payload",
+            FileChangeBodyFormat::Payload,
         )
     };
+
     FileChangeSummary {
         preview,
         body: body.filter(|body| !body.is_empty()),
@@ -571,16 +552,6 @@ fn is_unified_diff_header(line: &str) -> bool {
     path == "/dev/null" || path.starts_with("a/") || path.starts_with("b/")
 }
 
-fn phase_meta(item: &Value) -> Vec<(String, String)> {
-    optional_meta("phase", item.get("phase"))
-        .into_iter()
-        .collect()
-}
-
-fn optional_meta(label: &str, value: Option<&Value>) -> Option<(String, String)> {
-    json_string(value).map(|value| (label.to_string(), value))
-}
-
 fn json_string(value: Option<&Value>) -> Option<String> {
     match value {
         Some(Value::String(text)) => Some(text.clone()),
@@ -599,8 +570,47 @@ fn compact_json(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::feature_flags::FeatureFlagSnapshot;
-    use crate::state::{RunHistoryKind, RunHistoryRecord};
+    use crate::state::{RunHistoryKind, TranscriptBackfillState};
     use serde_json::json;
+
+    fn base_run() -> RunHistoryRecord {
+        RunHistoryRecord {
+            id: 1,
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 1,
+            head_sha: "sha".to_string(),
+            status: "done".to_string(),
+            result: Some("commented".to_string()),
+            started_at: 0,
+            finished_at: Some(0),
+            updated_at: 0,
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            review_thread_id: None,
+            security_context_source_run_id: None,
+            security_context_base_branch: None,
+            security_context_base_head_sha: None,
+            security_context_prompt_version: None,
+            security_context_payload_json: None,
+            security_context_generated_at: None,
+            security_context_expires_at: None,
+            preview: Some("Preview".to_string()),
+            summary: None,
+            error: None,
+            auth_account_name: None,
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+            commit_sha: None,
+            feature_flags: FeatureFlagSnapshot::default(),
+            events_persisted_cleanly: false,
+            transcript_backfill_state: TranscriptBackfillState::NotRequested,
+            transcript_backfill_error: None,
+        }
+    }
 
     #[test]
     fn join_reasoning_content_extracts_typed_summary_and_content_entries() {
@@ -637,46 +647,10 @@ mod tests {
 
     #[test]
     fn thread_snapshot_treats_zero_output_command_as_complete() {
-        let run = RunHistoryRecord {
-            id: 1,
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 1,
-            head_sha: "sha".to_string(),
-            status: "done".to_string(),
-            result: Some("commented".to_string()),
-            started_at: 0,
-            finished_at: Some(0),
-            updated_at: 0,
-            thread_id: Some("thread-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            security_context_base_branch: None,
-            security_context_base_head_sha: None,
-            security_context_prompt_version: None,
-            security_context_payload_json: None,
-            security_context_generated_at: None,
-            security_context_expires_at: None,
-            preview: Some("Preview".to_string()),
-            summary: None,
-            error: None,
-            auth_account_name: None,
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-            commit_sha: None,
-            feature_flags: FeatureFlagSnapshot::default(),
-            events_persisted_cleanly: false,
-            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
-            transcript_backfill_error: None,
-        };
         let thread = thread_snapshot_from_events(
-            &run,
+            &base_run(),
             &[
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 1,
                     run_history_id: 1,
                     sequence: 1,
@@ -685,7 +659,7 @@ mod tests {
                     payload: json!({}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 2,
                     run_history_id: 1,
                     sequence: 2,
@@ -698,7 +672,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 3,
                     run_history_id: 1,
                     sequence: 3,
@@ -710,51 +684,16 @@ mod tests {
             ],
         )
         .expect("thread snapshot");
+
         assert!(thread_snapshot_is_complete(&thread));
     }
 
     #[test]
     fn thread_snapshot_treats_empty_reasoning_as_complete_when_turn_is_otherwise_renderable() {
-        let run = RunHistoryRecord {
-            id: 1,
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 1,
-            head_sha: "sha".to_string(),
-            status: "done".to_string(),
-            result: Some("commented".to_string()),
-            started_at: 0,
-            finished_at: Some(0),
-            updated_at: 0,
-            thread_id: Some("thread-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            security_context_base_branch: None,
-            security_context_base_head_sha: None,
-            security_context_prompt_version: None,
-            security_context_payload_json: None,
-            security_context_generated_at: None,
-            security_context_expires_at: None,
-            preview: Some("Preview".to_string()),
-            summary: None,
-            error: None,
-            auth_account_name: None,
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-            commit_sha: None,
-            feature_flags: FeatureFlagSnapshot::default(),
-            events_persisted_cleanly: false,
-            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
-            transcript_backfill_error: None,
-        };
         let thread = thread_snapshot_from_events(
-            &run,
+            &base_run(),
             &[
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 1,
                     run_history_id: 1,
                     sequence: 1,
@@ -763,7 +702,7 @@ mod tests {
                     payload: json!({}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 2,
                     run_history_id: 1,
                     sequence: 2,
@@ -776,7 +715,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 3,
                     run_history_id: 1,
                     sequence: 3,
@@ -790,7 +729,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 4,
                     run_history_id: 1,
                     sequence: 4,
@@ -802,7 +741,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 5,
                     run_history_id: 1,
                     sequence: 5,
@@ -814,51 +753,16 @@ mod tests {
             ],
         )
         .expect("thread snapshot");
+
         assert!(thread_snapshot_is_complete(&thread));
     }
 
     #[test]
     fn thread_snapshot_renders_gitlab_discovery_startup_failure_turn() {
-        let run = RunHistoryRecord {
-            id: 1,
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 1,
-            head_sha: "sha".to_string(),
-            status: "done".to_string(),
-            result: Some("commented".to_string()),
-            started_at: 0,
-            finished_at: Some(0),
-            updated_at: 0,
-            thread_id: Some("thread-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            security_context_base_branch: None,
-            security_context_base_head_sha: None,
-            security_context_prompt_version: None,
-            security_context_payload_json: None,
-            security_context_generated_at: None,
-            security_context_expires_at: None,
-            preview: Some("Preview".to_string()),
-            summary: None,
-            error: None,
-            auth_account_name: None,
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-            commit_sha: None,
-            feature_flags: FeatureFlagSnapshot::default(),
-            events_persisted_cleanly: false,
-            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
-            transcript_backfill_error: None,
-        };
         let thread = thread_snapshot_from_events(
-            &run,
+            &base_run(),
             &[
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 1,
                     run_history_id: 1,
                     sequence: 1,
@@ -867,7 +771,7 @@ mod tests {
                     payload: json!({}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 2,
                     run_history_id: 1,
                     sequence: 2,
@@ -876,11 +780,11 @@ mod tests {
                     payload: json!({
                         "type": "agentMessage",
                         "phase": "system",
-                        "text": "GitLab discovery MCP startup warning: endpoint http://10.0.0.5:8081/mcp was unreachable. MCP tools may be unavailable in this run."
+                        "text": "GitLab discovery MCP startup warning"
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 3,
                     run_history_id: 1,
                     sequence: 3,
@@ -897,63 +801,25 @@ mod tests {
         assert_eq!(thread.turns[0].id, "gitlab-discovery-mcp-startup");
         assert_eq!(thread.turns[0].status, "completed");
         assert_eq!(thread.turns[0].items.len(), 1);
-        assert_eq!(thread.turns[0].items[0].item_type, "agentMessage");
         assert_eq!(thread.turns[0].items[0].title, "Agent message");
+        assert!(matches!(
+            thread.turns[0].items[0].kind,
+            ThreadItemKind::AgentMessage { .. }
+        ));
         assert_eq!(
             thread.turns[0].items[0].body.as_deref(),
-            Some(
-                "GitLab discovery MCP startup warning: endpoint http://10.0.0.5:8081/mcp was unreachable. MCP tools may be unavailable in this run."
-            )
+            Some("GitLab discovery MCP startup warning")
         );
-        assert_eq!(
-            thread.turns[0].items[0].meta,
-            vec![("phase".to_string(), "system".to_string())]
-        );
+        assert_eq!(thread.turns[0].items[0].phase(), Some("system"));
         assert!(!thread_snapshot_is_complete(&thread));
     }
 
     #[test]
     fn thread_snapshot_ignores_gitlab_discovery_startup_warning_for_completeness() {
-        let run = RunHistoryRecord {
-            id: 1,
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 1,
-            head_sha: "sha".to_string(),
-            status: "done".to_string(),
-            result: Some("commented".to_string()),
-            started_at: 0,
-            finished_at: Some(0),
-            updated_at: 0,
-            thread_id: Some("thread-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            security_context_base_branch: None,
-            security_context_base_head_sha: None,
-            security_context_prompt_version: None,
-            security_context_payload_json: None,
-            security_context_generated_at: None,
-            security_context_expires_at: None,
-            preview: Some("Preview".to_string()),
-            summary: None,
-            error: None,
-            auth_account_name: None,
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-            commit_sha: None,
-            feature_flags: FeatureFlagSnapshot::default(),
-            events_persisted_cleanly: false,
-            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
-            transcript_backfill_error: None,
-        };
         let thread = thread_snapshot_from_events(
-            &run,
+            &base_run(),
             &[
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 1,
                     run_history_id: 1,
                     sequence: 1,
@@ -962,7 +828,7 @@ mod tests {
                     payload: json!({}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 2,
                     run_history_id: 1,
                     sequence: 2,
@@ -975,7 +841,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 3,
                     run_history_id: 1,
                     sequence: 3,
@@ -984,7 +850,7 @@ mod tests {
                     payload: json!({"status": "completed"}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 4,
                     run_history_id: 1,
                     sequence: 4,
@@ -993,7 +859,7 @@ mod tests {
                     payload: json!({}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 5,
                     run_history_id: 1,
                     sequence: 5,
@@ -1005,7 +871,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 6,
                     run_history_id: 1,
                     sequence: 6,
@@ -1023,46 +889,10 @@ mod tests {
 
     #[test]
     fn thread_snapshot_ignores_composer_install_turn_for_completeness() {
-        let run = RunHistoryRecord {
-            id: 1,
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 1,
-            head_sha: "sha".to_string(),
-            status: "done".to_string(),
-            result: Some("commented".to_string()),
-            started_at: 0,
-            finished_at: Some(0),
-            updated_at: 0,
-            thread_id: Some("thread-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            security_context_base_branch: None,
-            security_context_base_head_sha: None,
-            security_context_prompt_version: None,
-            security_context_payload_json: None,
-            security_context_generated_at: None,
-            security_context_expires_at: None,
-            preview: Some("Preview".to_string()),
-            summary: None,
-            error: None,
-            auth_account_name: None,
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-            commit_sha: None,
-            feature_flags: FeatureFlagSnapshot::default(),
-            events_persisted_cleanly: false,
-            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
-            transcript_backfill_error: None,
-        };
         let thread = thread_snapshot_from_events(
-            &run,
+            &base_run(),
             &[
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 1,
                     run_history_id: 1,
                     sequence: 1,
@@ -1071,7 +901,7 @@ mod tests {
                     payload: json!({}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 2,
                     run_history_id: 1,
                     sequence: 2,
@@ -1085,7 +915,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 3,
                     run_history_id: 1,
                     sequence: 3,
@@ -1094,7 +924,7 @@ mod tests {
                     payload: json!({"status": "completed"}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 4,
                     run_history_id: 1,
                     sequence: 4,
@@ -1103,7 +933,7 @@ mod tests {
                     payload: json!({}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 5,
                     run_history_id: 1,
                     sequence: 5,
@@ -1115,7 +945,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 6,
                     run_history_id: 1,
                     sequence: 6,
@@ -1138,46 +968,10 @@ mod tests {
 
     #[test]
     fn thread_snapshot_does_not_treat_user_message_as_reasoning_fallback() {
-        let run = RunHistoryRecord {
-            id: 1,
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 1,
-            head_sha: "sha".to_string(),
-            status: "done".to_string(),
-            result: Some("commented".to_string()),
-            started_at: 0,
-            finished_at: Some(0),
-            updated_at: 0,
-            thread_id: Some("thread-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            security_context_base_branch: None,
-            security_context_base_head_sha: None,
-            security_context_prompt_version: None,
-            security_context_payload_json: None,
-            security_context_generated_at: None,
-            security_context_expires_at: None,
-            preview: Some("Preview".to_string()),
-            summary: None,
-            error: None,
-            auth_account_name: None,
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-            commit_sha: None,
-            feature_flags: FeatureFlagSnapshot::default(),
-            events_persisted_cleanly: false,
-            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
-            transcript_backfill_error: None,
-        };
         let thread = thread_snapshot_from_events(
-            &run,
+            &base_run(),
             &[
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 1,
                     run_history_id: 1,
                     sequence: 1,
@@ -1186,7 +980,7 @@ mod tests {
                     payload: json!({}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 2,
                     run_history_id: 1,
                     sequence: 2,
@@ -1199,7 +993,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 3,
                     run_history_id: 1,
                     sequence: 3,
@@ -1211,7 +1005,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 4,
                     run_history_id: 1,
                     sequence: 4,
@@ -1223,51 +1017,16 @@ mod tests {
             ],
         )
         .expect("thread snapshot");
+
         assert!(!thread_snapshot_is_complete(&thread));
     }
 
     #[test]
     fn thread_snapshot_does_not_treat_tool_output_as_reasoning_fallback() {
-        let run = RunHistoryRecord {
-            id: 1,
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 1,
-            head_sha: "sha".to_string(),
-            status: "done".to_string(),
-            result: Some("commented".to_string()),
-            started_at: 0,
-            finished_at: Some(0),
-            updated_at: 0,
-            thread_id: Some("thread-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            security_context_base_branch: None,
-            security_context_base_head_sha: None,
-            security_context_prompt_version: None,
-            security_context_payload_json: None,
-            security_context_generated_at: None,
-            security_context_expires_at: None,
-            preview: Some("Preview".to_string()),
-            summary: None,
-            error: None,
-            auth_account_name: None,
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-            commit_sha: None,
-            feature_flags: FeatureFlagSnapshot::default(),
-            events_persisted_cleanly: false,
-            transcript_backfill_state: crate::state::TranscriptBackfillState::NotRequested,
-            transcript_backfill_error: None,
-        };
         let thread = thread_snapshot_from_events(
-            &run,
+            &base_run(),
             &[
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 1,
                     run_history_id: 1,
                     sequence: 1,
@@ -1276,7 +1035,7 @@ mod tests {
                     payload: json!({}),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 2,
                     run_history_id: 1,
                     sequence: 2,
@@ -1289,7 +1048,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 3,
                     run_history_id: 1,
                     sequence: 3,
@@ -1303,7 +1062,7 @@ mod tests {
                     }),
                     created_at: 0,
                 },
-                crate::state::RunHistoryEventRecord {
+                RunHistoryEventRecord {
                     id: 4,
                     run_history_id: 1,
                     sequence: 4,
@@ -1315,6 +1074,7 @@ mod tests {
             ],
         )
         .expect("thread snapshot");
+
         assert!(!thread_snapshot_is_complete(&thread));
     }
 }

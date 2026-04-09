@@ -6,7 +6,7 @@ mod rate_limit_service;
 mod skills_service;
 mod status_service;
 
-pub use super::transcript::{ThreadItemSnapshot, ThreadSnapshot};
+pub use super::transcript::ThreadSnapshot;
 pub use admin_service::AdminService;
 pub use backfill::BackfillService;
 pub use http_services::HttpServices;
