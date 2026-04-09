@@ -48,6 +48,59 @@ fn security_review_disables_gitlab_discovery_mcp() {
     assert!(runner.prepare_review_gitlab_discovery_mcp(&ctx).is_none());
 }
 
+#[tokio::test]
+async fn prepare_runner_session_components_respects_discovery_toggle() {
+    let mut codex = test_codex_config();
+    codex.gitlab_discovery_mcp = crate::config::GitLabDiscoveryMcpConfig {
+        enabled: true,
+        bind_addr: "127.0.0.1:8091".to_string(),
+        advertise_url: "http://mcp.internal:8091/mcp".to_string(),
+        allow: vec![crate::config::GitLabDiscoveryAllowRule {
+            source_repos: vec!["fork/source".to_string()],
+            source_group_prefixes: Vec::new(),
+            target_repos: vec!["group/shared".to_string()],
+            target_groups: Vec::new(),
+        }],
+        ..crate::config::GitLabDiscoveryMcpConfig::default()
+    };
+    let service = Arc::new(
+        crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService::new(
+            DockerConfig {
+                host: "tcp://127.0.0.1:2375".to_string(),
+            },
+            &crate::config::GitLabConfig {
+                base_url: "https://gitlab.example.com".to_string(),
+                token: "token".to_string(),
+                bot_user_id: Some(1),
+                created_after: None,
+                targets: GitLabTargets::default(),
+            },
+            codex.gitlab_discovery_mcp.clone(),
+        )
+        .expect("gitlab discovery service"),
+    );
+    let mut runner =
+        test_runner_with_fake_runtime(codex, false, Arc::new(FakeRunnerHarness::default()), None)
+            .await;
+    runner.gitlab_discovery_mcp = Some(service as Arc<dyn GitLabDiscoveryHandle>);
+    let mut ctx = review_context_with_target_branch(Some("main"));
+    ctx.lane = crate::review_lane::ReviewLane::Security;
+    ctx.project_path = "fork/source".to_string();
+    ctx.feature_flags.gitlab_discovery_mcp = true;
+
+    let prepared = runner
+        .prepare_runner_session_components(
+            None,
+            &ctx.feature_flags,
+            &ctx.project_path,
+            &runner.codex.mcp_server_overrides.review,
+            false,
+        )
+        .await;
+
+    assert!(prepared.gitlab_discovery_mcp.is_none());
+}
+
 #[test]
 fn review_target_request_uses_native_base_branch_without_extra_instructions() {
     let ctx = review_context_with_target_branch(Some("main"));

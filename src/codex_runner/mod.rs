@@ -51,24 +51,27 @@ mod mention_flow;
 mod mention_inputs;
 mod review_flow;
 mod scripts;
+mod session_runner;
 #[cfg(test)]
 pub(crate) mod test_support;
 
 use self::app_server::{
     AppServerClient, GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID, annotate_event_payload,
 };
-use self::auth::{
-    AuthAccount, AuthFailureKind, classify_auth_failure, classify_auth_failure_for_account,
-};
+use self::auth::{AuthAccount, AuthFallbackAction};
+#[cfg(test)]
+use self::auth::{AuthFailureKind, classify_auth_failure, classify_auth_failure_for_account};
 use self::container::{InFlightImagePull, format_command_for_log};
 use self::gitlab_discovery::{
     GitLabDiscoveryHandle, GitLabDiscoveryMcpRuntimeConfig, PreparedGitLabDiscoveryMcp,
+    RegisteredGitLabDiscoverySession,
 };
 use self::review_flow::parse_review_output_for_lane;
 use self::scripts::{
     AppServerCommandOptions, effective_browser_mcp, restore_push_remote_url_exec_command,
     shell_quote,
 };
+use self::session_runner::RunnerSessionConfig;
 
 #[derive(Debug, Clone)]
 pub struct ReviewContext {

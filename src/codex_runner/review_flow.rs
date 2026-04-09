@@ -1,13 +1,12 @@
 use super::{
-    AppServerClient, AppServerCommandOptions, Arc, AuthAccount, AuthFailureKind, BrowserMcpConfig,
-    CodexResult, Context, Deserialize, DockerCodexRunner, Duration, Instant, Mutex,
-    PreparedGitLabDiscoveryMcp, Result, ReviewCodeLocation, ReviewComment, ReviewContext,
-    ReviewFinding, ReviewLineRange, RunHistorySessionUpdate, SecurityContextBuildCompletionGuard,
-    SecurityContextBuildKey, SecurityContextBuildRegistration, StartedAppServer, Utc, Value,
-    anyhow, append_additional_review_instructions, bail, build_base_branch_review_prompt,
-    build_commit_review_prompt, classify_auth_failure, classify_auth_failure_for_account, debug,
-    info, json, repo_checkout_root, timeout, upstream_review_prompt_source_commit,
-    upstream_review_prompt_source_path, warn,
+    AppServerClient, AppServerCommandOptions, Arc, AuthAccount, AuthFallbackAction,
+    BrowserMcpConfig, CodexResult, Context, Deserialize, DockerCodexRunner, Duration, Instant,
+    Mutex, PreparedGitLabDiscoveryMcp, Result, ReviewCodeLocation, ReviewComment, ReviewContext,
+    ReviewFinding, ReviewLineRange, RunHistorySessionUpdate, RunnerSessionConfig,
+    SecurityContextBuildCompletionGuard, SecurityContextBuildKey, SecurityContextBuildRegistration,
+    Utc, Value, anyhow, append_additional_review_instructions, bail,
+    build_base_branch_review_prompt, build_commit_review_prompt, debug, json, repo_checkout_root,
+    upstream_review_prompt_source_commit, upstream_review_prompt_source_path, warn,
 };
 use crate::composer_install::composer_install_timeout_seconds;
 use crate::review_lane::ReviewLane;
@@ -102,6 +101,7 @@ impl DockerCodexRunner {
         ctx.repo.as_str()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn prepare_review_gitlab_discovery_mcp(
         &self,
         ctx: &ReviewContext,
@@ -855,59 +855,53 @@ impl DockerCodexRunner {
                 session_override: self.security_context_session_override(),
             },
         )?;
-        let StartedAppServer {
-            container_id,
-            browser_container_id,
-            mut client,
-        } = self
-            .start_app_server_container(
+        let mut session = self
+            .start_runner_session(RunnerSessionConfig {
                 script,
-                &request.account.auth_host_path,
-                Vec::new(),
-                Vec::new(),
-                request.browser_mcp,
-                Vec::new(),
-            )
+                auth_account: request.account.clone(),
+                run_history_id: ctx.run_history_id,
+                browser_mcp: request.browser_mcp.cloned(),
+                gitlab_discovery_mcp: None,
+                gitlab_discovery_extra_hosts: Vec::new(),
+            })
             .await?;
         {
             let mut slot = request
                 .extra_session_container
                 .lock()
                 .expect("security context extra session lock poisoned");
-            *slot = Some((container_id.clone(), browser_container_id.clone()));
+            *slot = Some((
+                session.container_id.clone(),
+                session.browser_container_id.clone(),
+            ));
         }
 
         let build_result = async {
-            client.initialize().await?;
-            client.initialized().await?;
+            session.client.initialize().await?;
+            session.client.initialized().await?;
             let worktree_path = self
                 .create_security_context_worktree(
-                    &container_id,
+                    &session.container_id,
                     request.repo_path,
                     request.base_head_sha,
                 )
                 .await?;
-            let thread_response = client
-                .request(
-                    "thread/start",
+            let thread_id = self
+                .session_start_thread(
+                    &mut session,
                     self.thread_start_params(
                         request.repo_path,
                         None,
                         std::slice::from_ref(&worktree_path),
                     ),
+                    "thread/start missing thread id for security context",
                 )
                 .await?;
-            let thread_id = thread_response
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(|id| id.as_str())
-                .ok_or_else(|| anyhow!("thread/start missing thread id for security context"))?
-                .to_string();
             let build_result = self
                 .build_security_context_payload(
                     ctx,
                     SecurityContextPayloadRequest {
-                        client: &mut client,
+                        client: &mut session.client,
                         gitlab_discovery_server_name: None,
                         thread_id: &thread_id,
                         turn_cwd: &worktree_path,
@@ -916,14 +910,17 @@ impl DockerCodexRunner {
                     },
                 )
                 .await;
-            self.remove_security_context_worktree(&container_id, request.repo_path, &worktree_path)
-                .await;
+            self.remove_security_context_worktree(
+                &session.container_id,
+                request.repo_path,
+                &worktree_path,
+            )
+            .await;
             build_result
         }
         .await;
 
-        self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
-            .await;
+        self.close_runner_session(session).await;
         {
             let mut slot = request
                 .extra_session_container
@@ -940,22 +937,24 @@ impl DockerCodexRunner {
         ctx: &ReviewContext,
         account: &AuthAccount,
     ) -> Result<String> {
-        let browser_mcp = self.effective_browser_mcp(&self.codex.mcp_server_overrides.review);
-        let gitlab_discovery_mcp = self.prepare_review_gitlab_discovery_mcp(ctx);
-        self.sync_effective_feature_flags(
-            ctx.run_history_id,
-            &ctx.feature_flags,
-            gitlab_discovery_mcp.is_some(),
-        )
-        .await;
+        let prepared = self
+            .prepare_runner_session_components(
+                ctx.run_history_id,
+                &ctx.feature_flags,
+                &ctx.project_path,
+                &self.codex.mcp_server_overrides.review,
+                !ctx.lane.is_security(),
+            )
+            .await;
         let script = self.command(
             ctx,
             AppServerCommandOptions {
-                browser_mcp,
-                gitlab_discovery_mcp: gitlab_discovery_mcp
+                browser_mcp: prepared.browser_mcp.as_ref(),
+                gitlab_discovery_mcp: prepared
+                    .gitlab_discovery_mcp
                     .as_ref()
                     .map(|prepared| &prepared.runtime_config),
-                mcp_server_overrides: &self.codex.mcp_server_overrides.review,
+                mcp_server_overrides: &prepared.effective_mcp_server_overrides,
                 session_override: if ctx.lane.is_security() {
                     self.security_review_session_override()
                 } else {
@@ -963,77 +962,41 @@ impl DockerCodexRunner {
                 },
             },
         )?;
-        let gitlab_discovery_extra_hosts = gitlab_discovery_mcp
-            .as_ref()
-            .map(|prepared| self.gitlab_discovery_extra_hosts(&prepared.runtime_config))
-            .unwrap_or_default();
-        let StartedAppServer {
-            container_id,
-            browser_container_id,
-            mut client,
-        } = self
-            .start_app_server_container(
+        let mut session = self
+            .start_runner_session(RunnerSessionConfig {
                 script,
-                &account.auth_host_path,
-                Vec::new(),
-                Vec::new(),
-                browser_mcp,
-                gitlab_discovery_extra_hosts,
-            )
+                auth_account: account.clone(),
+                run_history_id: ctx.run_history_id,
+                browser_mcp: prepared.browser_mcp.clone(),
+                gitlab_discovery_mcp: prepared.gitlab_discovery_mcp.clone(),
+                gitlab_discovery_extra_hosts: prepared.gitlab_discovery_extra_hosts.clone(),
+            })
             .await?;
-        let gitlab_discovery_session = match self
-            .register_gitlab_discovery_session(
-                gitlab_discovery_mcp.as_ref(),
-                &container_id,
-                browser_container_id.as_deref().unwrap_or(&container_id),
-                ctx.run_history_id,
-            )
-            .await
-        {
-            Ok(session) => session,
-            Err(err) => {
-                warn!(
-                    container_id,
-                    error = %err,
-                    "failed to register gitlab discovery MCP session"
-                );
-                self.append_gitlab_discovery_mcp_startup_failure(
-                    ctx.run_history_id,
-                    gitlab_discovery_mcp
-                        .as_ref()
-                        .map_or("<unknown>", |prepared| {
-                            prepared.runtime_config.advertise_url.as_str()
-                        }),
-                    "failed to register MCP session binding",
-                )
-                .await;
-                None
-            }
-        };
-        self.probe_gitlab_discovery_mcp_endpoint(
-            gitlab_discovery_mcp.as_ref(),
-            &container_id,
-            gitlab_discovery_session.as_ref(),
-            ctx.run_history_id,
-        )
-        .await;
+
         let repo_path = repo_checkout_root(&ctx.project_path);
         self.update_run_history_session(
             ctx.run_history_id,
             RunHistorySessionUpdate {
-                auth_account_name: Some(account.name.clone()),
+                auth_account_name: Some(session.auth_account_name.clone()),
                 ..RunHistorySessionUpdate::default()
             },
         )
         .await;
+
         let run_timeout = Duration::from_secs(self.codex.timeout_seconds);
         let run_started_at = Instant::now();
         let extra_security_context_session = Arc::new(Mutex::new(None::<(String, Option<String>)>));
-        let review_result = timeout(
-            run_timeout.saturating_sub(run_started_at.elapsed()),
-            async {
-                client.initialize().await?;
-                client.initialized().await?;
+        let browser_container_id = session.browser_container_id.clone();
+        let browser_mcp = prepared.browser_mcp.clone();
+        let review_result = self
+            .run_session_with_timeout(
+                browser_container_id.as_deref(),
+                browser_mcp.as_ref(),
+                run_timeout.saturating_sub(run_started_at.elapsed()),
+                "codex review timed out",
+                async {
+                    session.client.initialize().await?;
+                    session.client.initialized().await?;
                 let Some(composer_timeout_seconds) = composer_install_timeout_seconds(
                     run_timeout.saturating_sub(run_started_at.elapsed()),
                 ) else {
@@ -1041,7 +1004,7 @@ impl DockerCodexRunner {
                 };
                 let _composer_install = self
                     .run_composer_install_step(
-                        &container_id,
+                        &session.container_id,
                         repo_path.as_str(),
                         &ctx.project_path,
                         &ctx.feature_flags,
@@ -1049,10 +1012,7 @@ impl DockerCodexRunner {
                         ctx.run_history_id,
                     )
                     .await;
-                let extra_writable_roots = gitlab_discovery_mcp
-                    .as_ref()
-                    .map(|prepared| vec![prepared.runtime_config.clone_root.clone()])
-                    .unwrap_or_default();
+                let extra_writable_roots = prepared.extra_writable_roots();
                 let mut security_base_prompt = None;
                 let mut security_min_confidence_score = None;
                 let mut security_review_instructions = None;
@@ -1071,8 +1031,12 @@ impl DockerCodexRunner {
                         .filter(|value| !value.is_empty())
                         .map(ToOwned::to_owned);
                     let merge_base_sha = if let Some(branch) = base_branch.as_deref() {
-                        self.try_resolve_review_merge_base(&container_id, repo_path.as_str(), branch)
-                            .await
+                        self.try_resolve_review_merge_base(
+                            &session.container_id,
+                            repo_path.as_str(),
+                            branch,
+                        )
+                        .await
                     } else {
                         None
                     };
@@ -1086,7 +1050,7 @@ impl DockerCodexRunner {
                         match self
                             .resolve_security_context_payload(
                                 ctx,
-                                &container_id,
+                                &session.container_id,
                                 repo_path.as_str(),
                                 branch,
                             )
@@ -1115,26 +1079,19 @@ impl DockerCodexRunner {
                         ctx.additional_developer_instructions.as_deref(),
                     ));
                 }
-                let thread_response = client
-                    .request(
-                        "thread/start",
+                let thread_id = self
+                    .session_start_thread(
+                        &mut session,
                         self.thread_start_params(repo_path.as_str(), None, &extra_writable_roots),
+                        "thread/start missing thread id",
                     )
                     .await?;
-                let thread_id = match thread_response
-                    .get("thread")
-                    .and_then(|thread| thread.get("id"))
-                    .and_then(|id| id.as_str())
-                {
-                    Some(thread_id) => thread_id.to_string(),
-                    None => bail!("thread/start missing thread id"),
-                };
                 let mut session_update = Self::security_context_session_update(
                     security_context_base_branch.as_deref(),
                     &security_context_resolution,
                 );
                 session_update.thread_id = Some(thread_id.clone());
-                session_update.auth_account_name = Some(account.name.clone());
+                session_update.auth_account_name = Some(session.auth_account_name.clone());
                 self.update_run_history_session(ctx.run_history_id, session_update)
                     .await;
                 if ctx.lane.is_security() {
@@ -1151,7 +1108,7 @@ impl DockerCodexRunner {
                                 ctx,
                                 SeparateSecurityContextSessionRequest {
                                     account,
-                                    browser_mcp,
+                                    browser_mcp: prepared.browser_mcp.as_ref(),
                                     repo_path: repo_path.as_str(),
                                     base_branch,
                                     base_head_sha,
@@ -1239,9 +1196,9 @@ impl DockerCodexRunner {
                             }
                         }
                     }
-                    let turn_response = client
-                        .request(
-                            "turn/start",
+                    let turn_id = self
+                        .session_start_turn(
+                            &mut session,
                             json!({
                                 "threadId": thread_id,
                                 "cwd": repo_path.as_str(),
@@ -1255,116 +1212,53 @@ impl DockerCodexRunner {
                                 ],
                                 "outputSchema": Self::security_review_output_schema(),
                             }),
+                            "turn/start missing turn id for security review",
                         )
                         .await?;
-                    let turn_id = turn_response
-                        .get("turn")
-                        .and_then(|turn| turn.get("id"))
-                        .and_then(|id| id.as_str())
-                        .ok_or_else(|| anyhow!("turn/start missing turn id for security review"))?
-                        .to_string();
                     let mut session_update = Self::security_context_session_update(
                         security_context_base_branch.as_deref(),
                         &security_context_resolution,
                     );
                     session_update.thread_id = Some(thread_id.clone());
                     session_update.turn_id = Some(turn_id.clone());
-                    session_update.auth_account_name = Some(account.name.clone());
+                    session_update.auth_account_name = Some(session.auth_account_name.clone());
                     self.update_run_history_session(ctx.run_history_id, session_update)
                         .await;
-                    client
-                        .stream_turn_message(
-                            &thread_id,
-                            &turn_id,
-                            gitlab_discovery_mcp
-                                .as_ref()
-                                .map(|prepared| prepared.runtime_config.server_name.as_str()),
-                            |events| async move {
-                                self.append_run_history_events(ctx.run_history_id, &events)
-                                    .await;
-                            },
-                            || async move {
-                                self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
-                                    .await;
-                            },
-                        )
+                    self.session_stream_turn_message(&mut session, &thread_id, &turn_id)
                         .await
                 } else {
                     let review_target = Self::review_target_value(
-                        self.resolve_review_target_request(ctx, &container_id, repo_path.as_str())
+                        self.resolve_review_target_request(
+                            ctx,
+                            &session.container_id,
+                            repo_path.as_str(),
+                        )
                             .await,
                     );
-                    let review_response = client
-                        .request(
-                            "review/start",
-                            json!({
-                                "threadId": thread_id,
-                                "delivery": "inline",
-                                "target": review_target,
-                            }),
-                        )
+                    let review_turn = self
+                        .session_start_review(&mut session, &thread_id, review_target)
                         .await?;
-                    let turn_id = review_response
-                        .get("turn")
-                        .and_then(|turn| turn.get("id"))
-                        .and_then(|id| id.as_str())
-                        .ok_or_else(|| anyhow!("review/start missing turn id"))?
-                        .to_string();
-                    let review_thread_id = review_response
-                        .get("reviewThreadId")
-                        .and_then(|id| id.as_str())
-                        .unwrap_or(thread_id.as_str())
-                        .to_string();
                     self.update_run_history_session(
                         ctx.run_history_id,
                         RunHistorySessionUpdate {
                             thread_id: Some(thread_id.clone()),
-                            turn_id: Some(turn_id.clone()),
-                            review_thread_id: Some(review_thread_id.clone()),
-                            auth_account_name: Some(account.name.clone()),
+                            turn_id: Some(review_turn.turn_id.clone()),
+                            review_thread_id: Some(review_turn.review_thread_id.clone()),
+                            auth_account_name: Some(session.auth_account_name.clone()),
                             ..RunHistorySessionUpdate::default()
                         },
                     )
                     .await;
-                    client
-                        .stream_review(
-                            &review_thread_id,
-                            &turn_id,
-                            gitlab_discovery_mcp
-                                .as_ref()
-                                .map(|prepared| prepared.runtime_config.server_name.as_str()),
-                            |events| async move {
-                                self.append_run_history_events(ctx.run_history_id, &events)
-                                    .await;
-                            },
-                            || async move {
-                                self.clear_gitlab_discovery_mcp_startup_failure(ctx.run_history_id)
-                                    .await;
-                            },
-                        )
+                    self.session_stream_review(
+                        &mut session,
+                        &review_turn.review_thread_id,
+                        &review_turn.turn_id,
+                    )
                         .await
                 }
             },
         )
-        .await;
-
-        let review_result = match review_result {
-            Ok(Ok(review)) => Ok(review),
-            Ok(Err(err)) => Err(self
-                .enrich_error_with_browser_diagnostics(
-                    err,
-                    browser_container_id.as_deref(),
-                    browser_mcp,
-                )
-                .await),
-            Err(_) => Err(self
-                .enrich_error_with_browser_diagnostics(
-                    anyhow!("codex review timed out"),
-                    browser_container_id.as_deref(),
-                    browser_mcp,
-                )
-                .await),
-        };
+            .await;
 
         let extra_security_context_session = {
             let mut slot = extra_security_context_session
@@ -1382,88 +1276,16 @@ impl DockerCodexRunner {
             .await;
         }
 
-        self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
-            .await;
-        self.unregister_gitlab_discovery_session(gitlab_discovery_session.as_ref())
-            .await;
+        self.close_runner_session(session).await;
 
         review_result
     }
 
     pub(crate) async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
-        let now = Utc::now();
-        let available_accounts = self.available_auth_accounts(now).await?;
-        if available_accounts.is_empty() {
-            bail!(
-                "no available codex auth accounts (all accounts are waiting for usage-limit reset)"
-            );
-        }
-
-        let mut auth_fallback_errors = Vec::new();
-        for account in &available_accounts {
-            let attempt_started_at = Utc::now();
-            info!(
-                account = account.name.as_str(),
-                is_primary = account.is_primary,
-                repo = ctx.repo.as_str(),
-                iid = ctx.mr.iid,
-                "running codex review with auth account"
-            );
-            match self.run_app_server_review_with_account(ctx, account).await {
-                Ok(output) => {
-                    self.clear_limit_reset_if_stale(account, attempt_started_at)
-                        .await?;
-                    return Ok(output);
-                }
-                Err(err) => {
-                    let kind = classify_auth_failure(
-                        &err,
-                        Utc::now(),
-                        self.codex.usage_limit_fallback_cooldown_seconds,
-                    );
-                    let kind = classify_auth_failure_for_account(kind, &err, account);
-                    match kind {
-                        AuthFailureKind::UsageLimited { reset_at } => {
-                            self.mark_limit_reset_at(account, reset_at).await?;
-                            warn!(
-                                account = account.name.as_str(),
-                                is_primary = account.is_primary,
-                                reset_at = %reset_at,
-                                error = %err,
-                                "codex auth account usage-limited; trying next account"
-                            );
-                            auth_fallback_errors.push(format!(
-                                "account '{}' usage-limited until {}: {}",
-                                account.name, reset_at, err
-                            ));
-                        }
-                        AuthFailureKind::AuthUnavailable => {
-                            warn!(
-                                account = account.name.as_str(),
-                                is_primary = account.is_primary,
-                                error = %err,
-                                "codex auth account unavailable; trying next account"
-                            );
-                            auth_fallback_errors
-                                .push(format!("account '{}' unavailable: {}", account.name, err));
-                        }
-                        AuthFailureKind::Other => {
-                            return Err(err).with_context(|| {
-                                format!(
-                                    "codex review failed for account '{}' without fallback classification",
-                                    account.name
-                                )
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        bail!(
-            "all codex auth accounts failed with usage-limit/auth errors: {}",
-            auth_fallback_errors.join(" | ")
-        );
+        self.run_with_auth_fallback(AuthFallbackAction::Review, |account| async move {
+            self.run_app_server_review_with_account(ctx, &account).await
+        })
+        .await
     }
 }
 
