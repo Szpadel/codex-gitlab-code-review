@@ -7,6 +7,7 @@ pub(crate) struct StartAppServerContainerRequest {
     pub(crate) cmd: Vec<String>,
     pub(crate) env: Vec<String>,
     pub(crate) binds: Vec<String>,
+    pub(crate) tmpfs: Option<HashMap<String, String>>,
     pub(crate) labels: HashMap<String, String>,
     pub(crate) extra_hosts: Vec<String>,
     pub(crate) browser_mcp: Option<BrowserMcpConfig>,

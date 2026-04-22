@@ -733,6 +733,7 @@ mod tests {
                 usage_limit_fallback_cooldown_seconds: 3600,
                 deps: Default::default(),
                 browser_mcp: BrowserMcpConfig::default(),
+                work_tmpfs: crate::config::WorkTmpfsConfig::default(),
                 gitlab_discovery_mcp: GitLabDiscoveryMcpConfig::default(),
                 mcp_server_overrides: McpServerOverridesConfig::default(),
                 session_overrides: SessionOverridesConfig::default(),

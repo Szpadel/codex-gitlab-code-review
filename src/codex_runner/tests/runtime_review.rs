@@ -200,6 +200,71 @@ async fn run_review_with_fake_runtime_initializes_before_composer_install() -> R
 }
 
 #[tokio::test]
+async fn run_review_with_fake_runtime_mounts_work_tmpfs_when_enabled() -> Result<()> {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "thread-1" } })),
+        ScriptedAppRequest::result(
+            "review/start",
+            json!({
+                "turn": { "id": "turn-1" },
+                "reviewThreadId": "thread-1",
+            }),
+        )
+        .with_after_response(vec![
+            ScriptedAppChunk::Json(json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-1", "turnId": "turn-1" }
+            })),
+            ScriptedAppChunk::Json(json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "review-item-1",
+                        "type": "exitedReviewMode",
+                        "review": "{\"verdict\":\"pass\",\"summary\":\"ok\",\"comment_markdown\":\"\"}"
+                    }
+                }
+            })),
+            ScriptedAppChunk::Json(json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "turn": { "status": "completed" }
+                }
+            })),
+        ]),
+    ]));
+
+    let mut codex = test_codex_config();
+    codex.work_tmpfs.enabled = true;
+    codex.work_tmpfs.size_mib = Some(256);
+    let runner = test_runner_with_fake_runtime(codex, false, Arc::clone(&harness), None).await;
+    let result = runner
+        .run_review(review_context_with_target_branch(Some("main")))
+        .await?;
+    assert!(matches!(result, CodexResult::Pass { .. }));
+
+    let app_starts = harness.app_server_starts();
+    assert_eq!(app_starts.len(), 1);
+    let tmpfs = app_starts[0]
+        .request
+        .tmpfs
+        .as_ref()
+        .expect("tmpfs mount should be set");
+    assert_eq!(
+        tmpfs.get("/work").map(String::as_str),
+        Some("rw,exec,size=268435456")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn wait_for_browser_container_ready_with_fake_runtime_reports_exit() {
     let harness = Arc::new(FakeRunnerHarness::default());
     harness.set_browser_diagnostics(

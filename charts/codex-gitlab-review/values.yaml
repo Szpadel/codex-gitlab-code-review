@@ -114,6 +114,11 @@ config:
       mcpArgs:
         - "-y"
         - "chrome-devtools-mcp@latest"
+    workTmpfs:
+      # Mount /work on tmpfs in spawned Codex review containers for faster clone/checkout IO.
+      enabled: true
+      # Optional tmpfs size cap in MiB. null leaves the mount uncapped.
+      sizeMiB: null
     gitlabDiscoveryMcp:
       # Enable the internal MCP listener and inject its config into new runs when
       # the runtime feature flag is switched on.

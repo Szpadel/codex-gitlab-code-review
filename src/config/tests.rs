@@ -171,6 +171,8 @@ fn defaults_mention_commands_when_missing() {
         Some("detailed")
     );
     assert_eq!(config.codex.browser_mcp, BrowserMcpConfig::default());
+    assert!(!config.codex.work_tmpfs.enabled);
+    assert_eq!(config.codex.work_tmpfs.size_mib, None);
 }
 
 #[test]
@@ -629,6 +631,85 @@ server:
         config.codex.browser_mcp.mcp_args,
         vec!["-y".to_string(), "chrome-devtools-mcp@latest".to_string()]
     );
+}
+
+#[test]
+fn loads_work_tmpfs_config() {
+    let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  work_tmpfs:
+    enabled: true
+    size_mib: 512
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+    let config = load_from_yaml(yaml);
+    assert!(config.codex.work_tmpfs.enabled);
+    assert_eq!(config.codex.work_tmpfs.size_mib, Some(512));
+}
+
+#[test]
+fn errors_on_work_tmpfs_size_zero() {
+    let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  work_tmpfs:
+    enabled: true
+    size_mib: 0
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+    let result = try_load_from_yaml(yaml);
+    assert!(result.is_err());
+    let msg = format!("{:#}", result.expect_err("error"));
+    assert!(msg.contains("codex.work_tmpfs.size_mib must be greater than 0 when set"));
 }
 
 #[test]

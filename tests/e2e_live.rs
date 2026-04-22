@@ -70,6 +70,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             usage_limit_fallback_cooldown_seconds: 3600,
             deps: codex_gitlab_code_review::config::DepsConfig { enabled: false },
             browser_mcp: codex_gitlab_code_review::config::BrowserMcpConfig::default(),
+            work_tmpfs: codex_gitlab_code_review::config::WorkTmpfsConfig::default(),
             gitlab_discovery_mcp:
                 codex_gitlab_code_review::config::GitLabDiscoveryMcpConfig::default(),
             mcp_server_overrides: McpServerOverridesConfig::default(),

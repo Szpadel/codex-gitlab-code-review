@@ -119,6 +119,11 @@ codex:
   usage_limit_fallback_cooldown_seconds: 3600
   # Required. Sandbox mode passed to Codex: "read-only", "workspace-write", or "danger-full-access".
   exec_sandbox: "danger-full-access"
+  work_tmpfs:
+    # Optional. Mount /work as tmpfs inside spawned Codex review containers.
+    enabled: false
+    # Optional. Tmpfs size cap in MiB. null leaves the tmpfs size uncapped.
+    size_mib: null
   browser_mcp:
     # Optional. Start a sibling browser container inside Docker and make it reachable
     # from the Codex app-server at http://127.0.0.1:9222.

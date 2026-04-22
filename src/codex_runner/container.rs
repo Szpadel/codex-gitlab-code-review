@@ -26,6 +26,20 @@ pub(crate) struct ContainerExecOutput {
 }
 
 impl DockerCodexRunner {
+    fn work_tmpfs_mounts(&self) -> Option<HashMap<String, String>> {
+        if !self.codex.work_tmpfs.enabled {
+            return None;
+        }
+
+        let mut options = vec!["rw".to_string(), "exec".to_string()];
+        if let Some(size_mib) = self.codex.work_tmpfs.size_mib {
+            let size_bytes = size_mib.saturating_mul(1024 * 1024);
+            options.push(format!("size={size_bytes}"));
+        }
+
+        Some(HashMap::from([("/work".to_string(), options.join(","))]))
+    }
+
     pub(crate) fn warm_up_image_refs(&self) -> Vec<String> {
         let mut images = vec![Self::normalize_image_reference(&self.codex.image)];
         if self.browser_mcp_enabled_for_any_mode() {
@@ -436,12 +450,14 @@ impl DockerCodexRunner {
                 auth_host_path, self.codex.auth_mount_path
             )];
             binds.extend(extra_binds);
+            let tmpfs = self.work_tmpfs_mounts();
             let started = harness
                 .start_app_server_container(test_support::StartAppServerContainerRequest {
                     image: image_ref,
                     cmd: Self::app_server_cmd(script),
                     env: self.env_vars(&extra_env),
                     binds,
+                    tmpfs,
                     labels: Self::review_container_labels(&self.owner_id),
                     extra_hosts,
                     browser_mcp: browser_mcp.cloned(),
@@ -488,6 +504,7 @@ impl DockerCodexRunner {
             auth_host_path, self.codex.auth_mount_path
         )];
         binds.extend(extra_binds);
+        let tmpfs = self.work_tmpfs_mounts();
         let config = ContainerCreateBody {
             image: Some(image_ref.clone()),
             cmd: Some(Self::app_server_cmd(script)),
@@ -505,6 +522,7 @@ impl DockerCodexRunner {
                 network_mode: browser_container_id
                     .as_ref()
                     .map(|id| format!("container:{id}")),
+                tmpfs,
                 auto_remove: Some(false),
                 ..Default::default()
             }),

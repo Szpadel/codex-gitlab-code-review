@@ -25,6 +25,15 @@ tests:
           pattern: "(?m)^    allow: \\[\\]$"
       - matchRegex:
           path: data["config.yaml"]
+          pattern: '(?m)^  work_tmpfs:$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    enabled: true$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    size_mib: null$'
+      - matchRegex:
+          path: data["config.yaml"]
           pattern: '(?m)^  session_overrides:$'
       - matchRegex:
           path: data["config.yaml"]
@@ -68,6 +77,21 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: '(?m)^      reasoning_effort: "medium"$'
+  - it: renders codex work tmpfs overrides from Helm values
+    template: templates/configmap.yaml
+    set:
+      config.codex.workTmpfs.enabled: false
+      config.codex.workTmpfs.sizeMiB: 512
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^  work_tmpfs:$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    enabled: false$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    size_mib: 512$'
   - it: rejects legacy codex reasoningEffort Helm values
     template: templates/deployment.yaml
     set:

@@ -29,7 +29,7 @@ use crate::composer_install::{
 };
 use crate::config::{
     DepsConfig, FallbackAuthAccountConfig, GitLabTargets, McpServerOverridesConfig,
-    SessionOverridesConfig,
+    SessionOverridesConfig, WorkTmpfsConfig,
 };
 use crate::state::{NewRunHistory, RunHistoryKind};
 use anyhow::Context;
@@ -284,6 +284,7 @@ fn test_codex_config() -> CodexConfig {
         usage_limit_fallback_cooldown_seconds: 3600,
         deps: DepsConfig { enabled: false },
         browser_mcp: BrowserMcpConfig::default(),
+        work_tmpfs: WorkTmpfsConfig::default(),
         gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
         mcp_server_overrides: McpServerOverridesConfig::default(),
         session_overrides: SessionOverridesConfig::default(),

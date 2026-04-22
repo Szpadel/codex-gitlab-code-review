@@ -155,6 +155,13 @@ data:
 {{- else }}
         mcp_args: []
 {{- end }}
+      work_tmpfs:
+        enabled: {{ .Values.config.codex.workTmpfs.enabled }}
+{{- if eq .Values.config.codex.workTmpfs.sizeMiB nil }}
+        size_mib: null
+{{- else }}
+        size_mib: {{ .Values.config.codex.workTmpfs.sizeMiB }}
+{{- end }}
       gitlab_discovery_mcp:
         enabled: {{ .Values.config.codex.gitlabDiscoveryMcp.enabled }}
         server_name: {{ .Values.config.codex.gitlabDiscoveryMcp.serverName | quote }}

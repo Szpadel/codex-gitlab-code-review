@@ -45,6 +45,7 @@ pub fn validate_config(mut config: Config) -> Result<ValidatedConfig> {
 
     apply_gitlab_discovery_mcp_runtime_defaults(&mut config)?;
     validate_codex_auth_accounts(&config.codex)?;
+    validate_work_tmpfs(&config.codex)?;
     validate_browser_mcp(&config.codex)?;
     validate_gitlab_discovery_mcp(&config.codex)?;
     validate_unique_injected_mcp_server_names(&config.codex)?;
@@ -121,6 +122,16 @@ pub fn gitlab_discovery_mcp_uses_cluster_service_advertise_url(codex: &CodexConf
     };
 
     host.ends_with(".svc.cluster.local") || host.ends_with(".cluster.local")
+}
+
+fn validate_work_tmpfs(codex: &CodexConfig) -> Result<()> {
+    if let Some(size_mib) = codex.work_tmpfs.size_mib {
+        anyhow::ensure!(
+            size_mib > 0,
+            "codex.work_tmpfs.size_mib must be greater than 0 when set"
+        );
+    }
+    Ok(())
 }
 
 fn validate_codex_auth_accounts(codex: &CodexConfig) -> Result<()> {

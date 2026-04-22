@@ -210,6 +210,8 @@ pub struct CodexConfig {
     #[serde(default)]
     pub browser_mcp: BrowserMcpConfig,
     #[serde(default)]
+    pub work_tmpfs: WorkTmpfsConfig,
+    #[serde(default)]
     pub gitlab_discovery_mcp: GitLabDiscoveryMcpConfig,
     #[serde(default)]
     pub mcp_server_overrides: McpServerOverridesConfig,
@@ -237,6 +239,14 @@ pub struct BrowserMcpConfig {
     pub mcp_command: String,
     #[serde(default = "default_browser_mcp_args")]
     pub mcp_args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct WorkTmpfsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub size_mib: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
