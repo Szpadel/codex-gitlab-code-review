@@ -18,7 +18,10 @@ use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::{StartExecOptions, StartExecResults};
-use bollard::models::{ContainerCreateBody, ContainerInspectResponse, ExecConfig, HostConfig};
+use bollard::models::{
+    ContainerCreateBody, ContainerInspectResponse, ExecConfig, HostConfig, Mount,
+    MountTmpfsOptions, MountTypeEnum,
+};
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, ListContainersOptionsBuilder,
     LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,

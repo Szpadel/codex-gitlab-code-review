@@ -2,10 +2,11 @@ use super::{
     AppServerClient, Arc, AttachContainerOptionsBuilder, BROWSER_CONTAINER_NAME_PREFIX, BoxFuture,
     BrowserMcpConfig, ContainerCreateBody, Context, CreateContainerOptionsBuilder,
     DockerCodexRunner, ExecConfig, FutureExt, HashMap, HostConfig, ListContainersOptionsBuilder,
-    LogOutput, Ordering, REVIEW_CONTAINER_NAME_PREFIX, REVIEW_OWNER_LABEL_KEY,
-    RemoveContainerOptionsBuilder, Result, RunnerRuntime, Shared, StartContainerOptionsBuilder,
-    StartExecOptions, StartExecResults, StartedAppServer, StreamExt, Uuid, anyhow, bail,
-    effective_browser_mcp, ensure_image, info, normalize_image_reference, shell_quote, warn,
+    LogOutput, Mount, MountTmpfsOptions, MountTypeEnum, Ordering, REVIEW_CONTAINER_NAME_PREFIX,
+    REVIEW_OWNER_LABEL_KEY, RemoveContainerOptionsBuilder, Result, RunnerRuntime, Shared,
+    StartContainerOptionsBuilder, StartExecOptions, StartExecResults, StartedAppServer, StreamExt,
+    Uuid, anyhow, bail, effective_browser_mcp, ensure_image, info, normalize_image_reference,
+    shell_quote, warn,
 };
 #[cfg(test)]
 use crate::codex_runner::browser_mcp::BrowserLaunchConfig;
@@ -26,18 +27,36 @@ pub(crate) struct ContainerExecOutput {
 }
 
 impl DockerCodexRunner {
-    fn work_tmpfs_mounts(&self) -> Option<HashMap<String, String>> {
+    const WORK_TMPFS_TARGET: &'static str = "/work";
+
+    pub(crate) fn work_tmpfs_mounts(&self) -> Option<Vec<Mount>> {
         if !self.codex.work_tmpfs.enabled {
             return None;
         }
 
-        let mut options = vec!["rw".to_string(), "exec".to_string()];
-        if let Some(size_mib) = self.codex.work_tmpfs.size_mib {
-            let size_bytes = size_mib.saturating_mul(1024 * 1024);
-            options.push(format!("size={size_bytes}"));
-        }
+        Some(vec![Mount {
+            target: Some(Self::WORK_TMPFS_TARGET.to_string()),
+            typ: Some(MountTypeEnum::TMPFS),
+            tmpfs_options: Some(MountTmpfsOptions {
+                size_bytes: self.work_tmpfs_size_bytes(),
+                options: Some(Self::work_tmpfs_mount_options()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }])
+    }
 
-        Some(HashMap::from([("/work".to_string(), options.join(","))]))
+    fn work_tmpfs_mount_options() -> Vec<Vec<String>> {
+        vec![vec!["exec".to_string()]]
+    }
+
+    fn work_tmpfs_size_bytes(&self) -> Option<i64> {
+        self.codex.work_tmpfs.size_mib.map(|size_mib| {
+            size_mib
+                .checked_mul(1024 * 1024)
+                .and_then(|value| i64::try_from(value).ok())
+                .expect("validated work_tmpfs.size_mib fits Docker tmpfs size bytes")
+        })
     }
 
     pub(crate) fn warm_up_image_refs(&self) -> Vec<String> {
@@ -450,14 +469,14 @@ impl DockerCodexRunner {
                 auth_host_path, self.codex.auth_mount_path
             )];
             binds.extend(extra_binds);
-            let tmpfs = self.work_tmpfs_mounts();
+            let mounts = self.work_tmpfs_mounts();
             let started = harness
                 .start_app_server_container(test_support::StartAppServerContainerRequest {
                     image: image_ref,
                     cmd: Self::app_server_cmd(script),
                     env: self.env_vars(&extra_env),
                     binds,
-                    tmpfs,
+                    mounts,
                     labels: Self::review_container_labels(&self.owner_id),
                     extra_hosts,
                     browser_mcp: browser_mcp.cloned(),
@@ -504,7 +523,15 @@ impl DockerCodexRunner {
             auth_host_path, self.codex.auth_mount_path
         )];
         binds.extend(extra_binds);
-        let tmpfs = self.work_tmpfs_mounts();
+        let mounts = self.work_tmpfs_mounts();
+        if self.codex.work_tmpfs.enabled {
+            info!(
+                container_name = name.as_str(),
+                work_tmpfs_target = Self::WORK_TMPFS_TARGET,
+                work_tmpfs_size_mib = ?self.codex.work_tmpfs.size_mib,
+                "configuring review container work tmpfs mount"
+            );
+        }
         let config = ContainerCreateBody {
             image: Some(image_ref.clone()),
             cmd: Some(Self::app_server_cmd(script)),
@@ -522,7 +549,7 @@ impl DockerCodexRunner {
                 network_mode: browser_container_id
                     .as_ref()
                     .map(|id| format!("container:{id}")),
-                tmpfs,
+                mounts,
                 auto_remove: Some(false),
                 ..Default::default()
             }),

@@ -1,13 +1,14 @@
 use super::*;
 use crate::codex_runner::browser_mcp::BrowserLaunchConfig;
+use bollard::models::Mount;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StartAppServerContainerRequest {
     pub(crate) image: String,
     pub(crate) cmd: Vec<String>,
     pub(crate) env: Vec<String>,
     pub(crate) binds: Vec<String>,
-    pub(crate) tmpfs: Option<HashMap<String, String>>,
+    pub(crate) mounts: Option<Vec<Mount>>,
     pub(crate) labels: HashMap<String, String>,
     pub(crate) extra_hosts: Vec<String>,
     pub(crate) browser_mcp: Option<BrowserMcpConfig>,
@@ -21,7 +22,7 @@ pub(crate) struct BrowserStartRecord {
     pub(crate) extra_hosts: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AppServerStartRecord {
     pub(crate) container_id: String,
     pub(crate) browser_container_id: Option<String>,

@@ -8,6 +8,8 @@ use url::Url;
 
 const SUPPORTED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 const SUPPORTED_REASONING_SUMMARIES: &[&str] = &["none", "auto", "detailed"];
+const MIB_BYTES: u64 = 1024 * 1024;
+const MAX_WORK_TMPFS_SIZE_MIB: u64 = i64::MAX as u64 / MIB_BYTES;
 
 #[derive(Clone, Debug)]
 pub struct ValidatedConfig(Config);
@@ -129,6 +131,10 @@ fn validate_work_tmpfs(codex: &CodexConfig) -> Result<()> {
         anyhow::ensure!(
             size_mib > 0,
             "codex.work_tmpfs.size_mib must be greater than 0 when set"
+        );
+        anyhow::ensure!(
+            size_mib <= MAX_WORK_TMPFS_SIZE_MIB,
+            "codex.work_tmpfs.size_mib must be at most {MAX_WORK_TMPFS_SIZE_MIB}"
         );
     }
     Ok(())

@@ -713,6 +713,46 @@ server:
 }
 
 #[test]
+fn errors_on_work_tmpfs_size_above_docker_limit() {
+    let yaml = r#"
+gitlab:
+  base_url: "https://gitlab.example.com"
+  token: "token"
+  bot_user_id: 1
+  targets:
+    repos:
+      - "group/repo"
+schedule:
+  cron: "* * * * *"
+  timezone: null
+review:
+  max_concurrent: 1
+  eyes_emoji: "eyes"
+  thumbs_emoji: "thumbsup"
+  comment_marker_prefix: "<!-- codex-review:sha="
+  stale_in_progress_minutes: 60
+  dry_run: false
+codex:
+  image: "ghcr.io/openai/codex-universal:latest"
+  timeout_seconds: 300
+  auth_host_path: "/root/.codex"
+  auth_mount_path: "/root/.codex"
+  exec_sandbox: "danger-full-access"
+  work_tmpfs:
+    enabled: true
+    size_mib: 8796093022208
+database:
+  path: "/tmp/state.sqlite"
+server:
+  bind_addr: "127.0.0.1:0"
+"#;
+    let result = try_load_from_yaml(yaml);
+    assert!(result.is_err());
+    let msg = format!("{:#}", result.expect_err("error"));
+    assert!(msg.contains("codex.work_tmpfs.size_mib must be at most"));
+}
+
+#[test]
 fn errors_on_browser_mcp_non_default_port() {
     let yaml = r#"
 gitlab:

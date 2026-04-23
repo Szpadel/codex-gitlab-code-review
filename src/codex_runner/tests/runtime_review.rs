@@ -251,14 +251,152 @@ async fn run_review_with_fake_runtime_mounts_work_tmpfs_when_enabled() -> Result
 
     let app_starts = harness.app_server_starts();
     assert_eq!(app_starts.len(), 1);
-    let tmpfs = app_starts[0]
+    let mounts = app_starts[0]
         .request
-        .tmpfs
+        .mounts
         .as_ref()
         .expect("tmpfs mount should be set");
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].target.as_deref(), Some("/work"));
+    assert_eq!(mounts[0].typ, Some(MountTypeEnum::TMPFS));
+    let tmpfs_options = mounts[0]
+        .tmpfs_options
+        .as_ref()
+        .expect("tmpfs options should be set");
+    assert_eq!(tmpfs_options.size_bytes, Some(268_435_456));
     assert_eq!(
-        tmpfs.get("/work").map(String::as_str),
-        Some("rw,exec,size=268435456")
+        tmpfs_options
+            .options
+            .as_ref()
+            .expect("tmpfs mount options should be set")
+            .as_slice(),
+        [vec!["exec".to_string()]]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn docker_work_tmpfs_mount_is_visible_in_inspect_mounts_when_enabled() -> Result<()> {
+    if std::env::var("CODEX_REVIEW_DOCKER_TMPFS_TEST")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return Ok(());
+    }
+
+    let image = std::env::var("CODEX_REVIEW_DOCKER_TMPFS_TEST_IMAGE")
+        .unwrap_or_else(|_| "fedora:43".to_string());
+    let docker = crate::docker_utils::connect_docker(&DockerConfig::default())?;
+    let mut codex = test_codex_config();
+    codex.work_tmpfs.enabled = true;
+    codex.work_tmpfs.size_mib = Some(16);
+    let runner =
+        test_runner_with_fake_runtime(codex, false, Arc::new(FakeRunnerHarness::default()), None)
+            .await;
+    let name = format!("codex-work-tmpfs-test-{}", Uuid::new_v4());
+    let create = docker
+        .create_container(
+            Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+            ContainerCreateBody {
+                image: Some(image),
+                cmd: Some(vec![
+                    "sh".to_string(),
+                    "-lc".to_string(),
+                    "sleep 30".to_string(),
+                ]),
+                host_config: Some(HostConfig {
+                    mounts: runner.work_tmpfs_mounts(),
+                    auto_remove: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    let inspect_result: Result<(ContainerInspectResponse, String, String)> = async {
+        docker
+            .start_container(
+                &create.id,
+                Some(StartContainerOptionsBuilder::new().build()),
+            )
+            .await?;
+        let inspect = docker
+            .inspect_container(
+                &create.id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await?;
+        let exec = docker
+            .create_exec(
+                &create.id,
+                ExecConfig {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(vec![
+                        "sh".to_string(),
+                        "-lc".to_string(),
+                        "printf '#!/bin/sh\\nexit 0\\n' > /work/probe && chmod +x /work/probe && /work/probe && mount | grep ' /work '".to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let start_result = docker
+            .start_exec(&exec.id, None::<StartExecOptions>)
+            .await?;
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        match start_result {
+            StartExecResults::Attached { mut output, .. } => {
+                while let Some(message) = output.next().await {
+                    match message? {
+                        LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                            stdout.push_str(String::from_utf8_lossy(&message).as_ref());
+                        }
+                        LogOutput::StdErr { message } => {
+                            stderr.push_str(String::from_utf8_lossy(&message).as_ref());
+                        }
+                        LogOutput::StdIn { .. } => {}
+                    }
+                }
+            }
+            StartExecResults::Detached => bail!("docker exec unexpectedly detached"),
+        }
+        let exec_inspect = docker.inspect_exec(&exec.id).await?;
+        let exit_code = exec_inspect.exit_code.unwrap_or(-1);
+        if exit_code != 0 {
+            bail!(
+                "docker exec mount probe exited with {exit_code}, stdout: {stdout:?}, stderr: {stderr:?}"
+            );
+        }
+        Ok((inspect, stdout, stderr))
+    }
+    .await;
+
+    let remove_result = docker
+        .remove_container(
+            &create.id,
+            Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+        )
+        .await;
+
+    let (inspect, mount_output, mount_stderr) = inspect_result?;
+    remove_result?;
+    let mounts = inspect.mounts.unwrap_or_default();
+
+    assert!(
+        mounts.iter().any(|mount| {
+            mount.typ == Some(bollard::models::MountPointTypeEnum::TMPFS)
+                && mount.destination.as_deref() == Some("/work")
+        }),
+        "expected /work tmpfs in inspect mounts, got {mounts:?}"
+    );
+    assert!(
+        !mount_output.contains("noexec"),
+        "expected /work tmpfs to be executable, stdout: {mount_output:?}, stderr: {mount_stderr:?}"
     );
 
     Ok(())
