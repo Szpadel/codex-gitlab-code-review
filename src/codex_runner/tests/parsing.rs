@@ -298,15 +298,59 @@ fn parse_security_review_output_accepts_nullable_optional_fields() -> Result<()>
 }
 
 #[test]
-fn parse_security_review_output_preserves_sectioned_body() -> Result<()> {
-    let finding_body = "Summary:\nUntrusted callers can reach src/auth.rs:14.\n\nSeverity:\nP1 because the missing guard exposes tenant data.\n\nReproduction:\nSend the authenticated request sequence described near src/http.rs:22.\n\nEvidence:\nsrc/auth.rs:14 skips the role check and src/http.rs:22 still reaches the handler.\n\nAttack-path analysis:\nAn attacker-controlled request crosses the HTTP boundary, bypasses the auth check, and reaches the privileged handler.\n\nLikelihood:\nHigh because the endpoint is externally reachable.\n\nImpact:\nCross-tenant data exposure.\n\nAssumptions:\nThe route remains available to normal API clients.\n\nBlindspots:\nDid not validate WAF-specific mitigations.";
+fn parse_security_review_output_preserves_advisory_body() -> Result<()> {
+    let finding_body = r#"### Description
+
+# Missing authorization guard exposes tenant data
+
+**Severity:** HIGH
+**CWE:** CWE-862 (Missing Authorization)
+**Component:** `api/auth`
+**Affected versions:** current MR branch
+**File:** `/work/repo/src/auth.rs`
+
+## Summary
+
+Untrusted callers can reach /work/repo/src/auth.rs:14 without the tenant authorization guard.
+
+## Vulnerable code
+
+```rust
+return Ok(user);
+```
+
+The early return bypasses the role check that previously guarded the privileged handler.
+
+## Exploitation
+
+Preconditions:
+
+1. The endpoint remains reachable to ordinary API clients.
+2. The attacker has any valid session.
+
+Steps:
+
+1. Send the authenticated request sequence described near /work/repo/src/http.rs:22.
+2. The request reaches the privileged handler without the tenant check at /work/repo/src/auth.rs:14-16.
+
+## Impact
+
+HIGH because the bug allows cross-tenant data exposure through an authenticated API path.
+
+## Reproduction
+
+Run `cargo test auth_allows_cross_tenant_request` after applying the MR branch.
+
+## Suggested fix
+
+Move the tenant authorization check before the early return and add a regression test for cross-tenant requests."#;
     let text = json!({
         "findings": [
             {
-                "title": "[P1] Missing auth guard",
+                "title": "Missing authorization guard exposes tenant data",
                 "body": finding_body,
                 "confidence_score": 0.91,
-                "priority": 1,
+                "priority": null,
                 "code_location": {
                     "absolute_file_path": "/work/repo/src/auth.rs",
                     "line_range": { "start": 14, "end": 16 }
@@ -329,8 +373,9 @@ fn parse_security_review_output_preserves_sectioned_body() -> Result<()> {
             );
             assert_eq!(comment.findings.len(), 1);
             assert_eq!(comment.findings[0].body, finding_body);
+            assert_eq!(comment.findings[0].priority, None);
             let expected_body = format!(
-                "The patch introduces a confirmed auth bypass.\n\nReview comment:\n\n- [P1] Missing auth guard — /work/repo/src/auth.rs:14-16\n  {}",
+                "The patch introduces a confirmed auth bypass.\n\nReview comment:\n\n- Missing authorization guard exposes tenant data — /work/repo/src/auth.rs:14-16\n  {}",
                 finding_body.replace('\n', "\n  ")
             );
             assert_eq!(comment.body, expected_body);
