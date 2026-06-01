@@ -1,8 +1,16 @@
 use anyhow::{Context, Result, anyhow};
-use reqwest::{Response, header};
+use reqwest::{Response, StatusCode, header};
 use serde::Deserialize;
 
 const GITLAB_ERROR_BODY_LIMIT: usize = 512;
+const RETRYABLE_GITLAB_STATUSES: &[StatusCode] = &[
+    StatusCode::REQUEST_TIMEOUT,
+    StatusCode::TOO_MANY_REQUESTS,
+    StatusCode::INTERNAL_SERVER_ERROR,
+    StatusCode::BAD_GATEWAY,
+    StatusCode::SERVICE_UNAVAILABLE,
+    StatusCode::GATEWAY_TIMEOUT,
+];
 
 pub(crate) async fn ensure_success<T: for<'de> Deserialize<'de>>(
     response: Response,
@@ -147,4 +155,8 @@ pub(crate) fn gitlab_error_has_status(err: &anyhow::Error, statuses: &[u16]) -> 
     statuses
         .iter()
         .any(|status| text.contains(&format!("status={status}")))
+}
+
+pub(crate) fn is_retryable_gitlab_status(status: StatusCode) -> bool {
+    RETRYABLE_GITLAB_STATUSES.contains(&status)
 }

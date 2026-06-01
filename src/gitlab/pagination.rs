@@ -1,11 +1,10 @@
-use super::transport::ensure_success;
-use anyhow::{Context, Result};
-use reqwest::Client;
+use super::client::GitLabClient;
+use anyhow::Result;
 use serde::Deserialize;
 use url::Url;
 
-pub(crate) async fn get_paginated<T: for<'de> Deserialize<'de>>(
-    client: &Client,
+pub(crate) async fn get_paginated<T: for<'de> Deserialize<'de> + Send>(
+    client: &GitLabClient,
     base_url: &str,
 ) -> Result<Vec<T>> {
     let base = Url::parse(base_url)?;
@@ -20,25 +19,8 @@ pub(crate) async fn get_paginated<T: for<'de> Deserialize<'de>>(
             pairs.append_pair("page", &page.to_string());
         }
 
-        let response = client
-            .get(url.clone())
-            .send()
-            .await
-            .with_context(|| format!("gitlab GET {}", url.as_str()))?;
-
-        let next_page = response
-            .headers()
-            .get("X-Next-Page")
-            .and_then(|val| val.to_str().ok())
-            .and_then(|val| {
-                if val.is_empty() {
-                    None
-                } else {
-                    Some(val.to_string())
-                }
-            });
-
-        let mut page_items: Vec<T> = ensure_success(response, "GET", url.as_str()).await?;
+        let (mut page_items, next_page): (Vec<T>, Option<String>) =
+            client.get_paginated_page(url.as_str()).await?;
         items.append(&mut page_items);
 
         match next_page {

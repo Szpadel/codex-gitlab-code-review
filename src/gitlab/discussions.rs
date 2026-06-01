@@ -1,4 +1,4 @@
-use super::client::GitLabClient;
+use super::client::{GitLabClient, GitLabWriteConfirmation};
 use super::transport::gitlab_error_has_status;
 use super::types::{
     AwardEmoji, DiffDiscussionLineEndpoint, MergeRequestDiffDiscussion, MergeRequestDiscussion,
@@ -70,7 +70,15 @@ impl GitLabClient {
             self.project_path(project),
             iid
         );
-        self.post_note(&url, body).await
+        self.post_note(
+            &url,
+            body,
+            GitLabWriteConfirmation::MergeRequest {
+                notes_url: url.clone(),
+                body: body.to_string(),
+            },
+        )
+        .await
     }
 
     pub(crate) async fn create_diff_discussion_endpoint(
@@ -118,7 +126,15 @@ impl GitLabClient {
             append_line_range_form_fields(&mut form, "start", &line_range.start);
             append_line_range_form_fields(&mut form, "end", &line_range.end);
         }
-        self.post_form(&url, &form).await
+        self.post_form(
+            &url,
+            &form,
+            GitLabWriteConfirmation::AnyDiscussion {
+                discussions_url: url.clone(),
+                body: request.body.clone(),
+            },
+        )
+        .await
     }
 
     pub(crate) async fn list_discussions_endpoint(
@@ -148,7 +164,21 @@ impl GitLabClient {
             iid,
             encoded_discussion_id
         );
-        self.post_note(&url, body).await
+        let discussions_url = format!(
+            "{}/merge_requests/{}/discussions",
+            self.project_path(project),
+            iid
+        );
+        self.post_note(
+            &url,
+            body,
+            GitLabWriteConfirmation::Discussion {
+                discussions_url,
+                discussion_id: discussion_id.to_string(),
+                body: body.to_string(),
+            },
+        )
+        .await
     }
 
     pub(crate) async fn list_discussion_note_awards_endpoint(

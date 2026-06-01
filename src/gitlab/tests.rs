@@ -2,10 +2,45 @@ use super::*;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use pretty_assertions::assert_eq;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use wiremock::{
-    Mock, MockServer, ResponseTemplate,
+    Mock, MockServer, Request, ResponseTemplate,
     matchers::{body_string_contains, header_exists, method, path, query_param},
 };
+
+fn retry_test_client(server: &MockServer, max_attempts: u32) -> Result<GitLabClient> {
+    Ok(
+        GitLabClient::new(&server.uri(), "token")?.with_retry_policy(
+            super::client::GitLabRetryPolicy::without_delay(max_attempts),
+        ),
+    )
+}
+
+fn note_json(id: u64, body: &str, author_id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "body": body,
+        "author": { "id": author_id, "username": "botuser", "name": "Bot User" }
+    })
+}
+
+fn discussion_json(id: &str, notes: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "notes": notes
+    })
+}
+
+#[test]
+fn default_retry_policy_uses_ten_attempts() {
+    assert_eq!(
+        super::client::GitLabRetryPolicy::default().max_attempts(),
+        10
+    );
+}
 
 #[tokio::test]
 async fn list_open_mrs_paginates() -> Result<()> {
@@ -242,7 +277,7 @@ async fn get_latest_open_mr_activity_error_is_self_contained() -> Result<()> {
         .mount(&server)
         .await;
 
-    let client = GitLabClient::new(&server.uri(), "token")?;
+    let client = retry_test_client(&server, 1)?;
     let err = client
         .get_latest_open_mr_activity("group/repo")
         .await
@@ -291,6 +326,165 @@ async fn get_latest_open_mr_activity_json_decode_error_keeps_request_context() -
         "{message}"
     );
     assert!(message.contains("decode_error="), "{message}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_json_retries_retryable_gitlab_status() -> Result<()> {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responses = Arc::clone(&calls);
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+        .and(query_param("state", "opened"))
+        .and(query_param("scope", "all"))
+        .and(query_param("order_by", "updated_at"))
+        .and(query_param("sort", "desc"))
+        .and(query_param("per_page", "1"))
+        .respond_with(move |_request: &Request| {
+            if responses.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(502).set_body_string("temporary gitlab error")
+            } else {
+                ResponseTemplate::new(200).set_body_json(vec![serde_json::json!({
+                    "iid": 8,
+                    "sha": "abc"
+                })])
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let client = retry_test_client(&server, 3)?;
+    let mr = client
+        .get_latest_open_mr_activity("group/repo")
+        .await?
+        .expect("latest MR");
+
+    assert_eq!(mr.iid, 8);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_paginated_retries_failed_page() -> Result<()> {
+    let server = MockServer::start().await;
+    let page1_calls = Arc::new(AtomicUsize::new(0));
+    let page1_responses = Arc::clone(&page1_calls);
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects"))
+        .and(query_param("simple", "true"))
+        .and(query_param("page", "1"))
+        .and(query_param("per_page", "100"))
+        .respond_with(move |_request: &Request| {
+            if page1_responses.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503).set_body_string("gitlab maintenance")
+            } else {
+                ResponseTemplate::new(200)
+                    .append_header("X-Next-Page", "2")
+                    .set_body_json(vec![serde_json::json!({
+                        "path_with_namespace": "group/repo"
+                    })])
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects"))
+        .and(query_param("simple", "true"))
+        .and(query_param("page", "2"))
+        .and(query_param("per_page", "100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("X-Next-Page", "")
+                .set_body_json(vec![serde_json::json!({
+                    "path_with_namespace": "group/other"
+                })]),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = retry_test_client(&server, 3)?;
+    let projects = client.list_projects().await?;
+
+    assert_eq!(
+        projects
+            .iter()
+            .map(|project| project.path_with_namespace.as_str())
+            .collect::<Vec<_>>(),
+        vec!["group/repo", "group/other"]
+    );
+    assert_eq!(page1_calls.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_retryable_gitlab_status_fails_without_retry() -> Result<()> {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responses = Arc::clone(&calls);
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+        .and(query_param("state", "opened"))
+        .and(query_param("scope", "all"))
+        .and(query_param("order_by", "updated_at"))
+        .and(query_param("sort", "desc"))
+        .and(query_param("per_page", "1"))
+        .respond_with(move |_request: &Request| {
+            responses.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(403)
+                .insert_header("content-type", "application/json")
+                .set_body_string(r#"{"message":"forbidden"}"#)
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = retry_test_client(&server, 10)?;
+    let err = client
+        .get_latest_open_mr_activity("group/repo")
+        .await
+        .expect_err("request should fail");
+    let message = err.to_string();
+
+    assert!(message.contains("status=403 Forbidden"), "{message}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn retryable_gitlab_status_fails_after_ten_attempts() -> Result<()> {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responses = Arc::clone(&calls);
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/group%2Frepo/merge_requests"))
+        .and(query_param("state", "opened"))
+        .and(query_param("scope", "all"))
+        .and(query_param("order_by", "updated_at"))
+        .and(query_param("sort", "desc"))
+        .and(query_param("per_page", "1"))
+        .respond_with(move |_request: &Request| {
+            responses.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(502)
+                .insert_header("content-type", "text/plain")
+                .set_body_string("upstream unavailable")
+        })
+        .expect(10)
+        .mount(&server)
+        .await;
+
+    let client = retry_test_client(&server, 10)?;
+    let err = client
+        .get_latest_open_mr_activity("group/repo")
+        .await
+        .expect_err("request should fail");
+    let message = err.to_string();
+
+    assert!(message.contains("status=502 Bad Gateway"), "{message}");
+    assert_eq!(calls.load(Ordering::SeqCst), 10);
     Ok(())
 }
 
@@ -396,6 +590,117 @@ async fn create_note_error_is_self_contained() -> Result<()> {
     assert!(message.contains("/projects/group%2Frepo/merge_requests/7/notes"));
     assert!(message.contains("status=403 Forbidden"));
     assert!(message.contains(r#"body={"message":"forbidden"}"#));
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_note_json_decode_error_keeps_request_context() -> Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/group%2Frepo/merge_requests/7/notes"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html>proxy splash</html>"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = GitLabClient::new(&server.uri(), "token")?;
+    let err = client
+        .create_note("group/repo", 7, "hello")
+        .await
+        .expect_err("request should fail");
+    let message = err.to_string();
+    assert!(message.contains("gitlab POST"), "{message}");
+    assert!(
+        message.contains("/projects/group%2Frepo/merge_requests/7/notes"),
+        "{message}"
+    );
+    assert!(message.contains("status=200 OK"), "{message}");
+    assert!(
+        message.contains("body=<html>proxy splash</html>"),
+        "{message}"
+    );
+    assert!(message.contains("decode_error="), "{message}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_note_treats_retryable_failure_as_success_when_note_already_exists() -> Result<()> {
+    let server = MockServer::start().await;
+    let post_calls = Arc::new(AtomicUsize::new(0));
+    let post_responses = Arc::clone(&post_calls);
+    let body = "review result\n\n<!-- codex-review:sha=abc -->";
+
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/group%2Frepo/merge_requests/7/notes"))
+        .and(body_string_contains("review result"))
+        .respond_with(move |_request: &Request| {
+            post_responses.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(502).set_body_string("proxy lost upstream response")
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/group%2Frepo/merge_requests/7/notes"))
+        .and(query_param("page", "1"))
+        .and(query_param("per_page", "100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("X-Next-Page", "")
+                .set_body_json(vec![note_json(100, body, 1)]),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = retry_test_client(&server, 3)?;
+    client.create_note("group/repo", 7, body).await?;
+
+    assert_eq!(post_calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_note_retries_when_confirmation_does_not_find_existing_note() -> Result<()> {
+    let server = MockServer::start().await;
+    let post_calls = Arc::new(AtomicUsize::new(0));
+    let post_responses = Arc::clone(&post_calls);
+    let body = "review result\n\n<!-- codex-review:sha=def -->";
+
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/group%2Frepo/merge_requests/7/notes"))
+        .and(body_string_contains("review result"))
+        .respond_with(move |_request: &Request| {
+            if post_responses.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(502).set_body_string("proxy lost upstream response")
+            } else {
+                ResponseTemplate::new(201).set_body_json(note_json(101, body, 1))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/group%2Frepo/merge_requests/7/notes"))
+        .and(query_param("page", "1"))
+        .and(query_param("per_page", "100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("X-Next-Page", "")
+                .set_body_json(Vec::<serde_json::Value>::new()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = retry_test_client(&server, 3)?;
+    client.create_note("group/repo", 7, body).await?;
+
+    assert_eq!(post_calls.load(Ordering::SeqCst), 2);
     Ok(())
 }
 
@@ -1002,6 +1307,121 @@ async fn create_diff_discussion_posts_position_form_fields() -> Result<()> {
 }
 
 #[tokio::test]
+async fn create_diff_discussion_json_decode_error_keeps_request_context() -> Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v4/projects/group%2Frepo/merge_requests/4/discussions",
+        ))
+        .and(body_string_contains("body=inline+review"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html>proxy splash</html>"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = GitLabClient::new(&server.uri(), "token")?;
+    let err = client
+        .create_diff_discussion(
+            "group/repo",
+            4,
+            &MergeRequestDiffDiscussion {
+                body: "inline review".to_string(),
+                position: DiffDiscussionPosition {
+                    base_sha: "base".to_string(),
+                    head_sha: "head".to_string(),
+                    start_sha: "start".to_string(),
+                    old_path: "src/lib.rs".to_string(),
+                    new_path: "src/lib.rs".to_string(),
+                    old_line: None,
+                    new_line: Some(14),
+                    line_range: None,
+                },
+            },
+        )
+        .await
+        .expect_err("request should fail");
+    let message = err.to_string();
+    assert!(message.contains("gitlab POST"), "{message}");
+    assert!(
+        message.contains("/projects/group%2Frepo/merge_requests/4/discussions"),
+        "{message}"
+    );
+    assert!(message.contains("status=200 OK"), "{message}");
+    assert!(
+        message.contains("body=<html>proxy splash</html>"),
+        "{message}"
+    );
+    assert!(message.contains("decode_error="), "{message}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_diff_discussion_does_not_replay_when_confirmation_finds_note_body() -> Result<()> {
+    let server = MockServer::start().await;
+    let post_calls = Arc::new(AtomicUsize::new(0));
+    let post_responses = Arc::clone(&post_calls);
+    let body = "inline review";
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v4/projects/group%2Frepo/merge_requests/4/discussions",
+        ))
+        .and(body_string_contains("body=inline+review"))
+        .respond_with(move |_request: &Request| {
+            post_responses.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(502).set_body_string("proxy lost upstream response")
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/v4/projects/group%2Frepo/merge_requests/4/discussions",
+        ))
+        .and(query_param("page", "1"))
+        .and(query_param("per_page", "100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("X-Next-Page", "")
+                .set_body_json(vec![discussion_json(
+                    "discussion-77",
+                    vec![note_json(700, body, 1)],
+                )]),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = retry_test_client(&server, 3)?;
+    client
+        .create_diff_discussion(
+            "group/repo",
+            4,
+            &MergeRequestDiffDiscussion {
+                body: body.to_string(),
+                position: DiffDiscussionPosition {
+                    base_sha: "base".to_string(),
+                    head_sha: "head".to_string(),
+                    start_sha: "start".to_string(),
+                    old_path: "src/lib.rs".to_string(),
+                    new_path: "src/lib.rs".to_string(),
+                    old_line: None,
+                    new_line: Some(14),
+                    line_range: None,
+                },
+            },
+        )
+        .await?;
+
+    assert_eq!(post_calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_discussion_note_posts_to_discussion_endpoint() -> Result<()> {
     let server = MockServer::start().await;
     let response = ResponseTemplate::new(201).set_body_json(serde_json::json!({
@@ -1020,6 +1440,51 @@ async fn create_discussion_note_posts_to_discussion_endpoint() -> Result<()> {
     client
         .create_discussion_note("group/repo", 3, "discussion-123", "working on it")
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_discussion_note_skips_replay_when_body_exists() -> Result<()> {
+    let server = MockServer::start().await;
+    let post_calls = Arc::new(AtomicUsize::new(0));
+    let post_responses = Arc::clone(&post_calls);
+    let body = "working on it";
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v4/projects/group%2Frepo/merge_requests/3/discussions/discussion-123/notes",
+        ))
+        .respond_with(move |_request: &Request| {
+            post_responses.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(502).set_body_string("proxy lost upstream response")
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/v4/projects/group%2Frepo/merge_requests/3/discussions",
+        ))
+        .and(query_param("page", "1"))
+        .and(query_param("per_page", "100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("X-Next-Page", "")
+                .set_body_json(vec![discussion_json(
+                    "discussion-123",
+                    vec![note_json(777, body, 1)],
+                )]),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = retry_test_client(&server, 3)?;
+    client
+        .create_discussion_note("group/repo", 3, "discussion-123", body)
+        .await?;
+
+    assert_eq!(post_calls.load(Ordering::SeqCst), 1);
     Ok(())
 }
 

@@ -824,49 +824,28 @@ impl MentionFlow {
                         "failed to persist mention run history"
                     );
                 }
-                let mut completion_note_posted = false;
-                for attempt in 1..=3 {
-                    match gitlab
-                        .create_discussion_note(
-                            &repo_name,
-                            mr_copy.iid,
-                            &discussion_id,
-                            &status_message,
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            completion_note_posted = true;
-                            break;
-                        }
-                        Err(err) => {
-                            if attempt == 3 {
-                                warn!(
-                                    repo = repo_name.as_str(),
-                                    iid = mr_copy.iid,
-                                    discussion_id = discussion_id.as_str(),
-                                    trigger_note_id,
-                                    error = %err,
-                                    "failed to post mention-command completion status"
-                                );
-                            } else {
-                                warn!(
-                                    repo = repo_name.as_str(),
-                                    iid = mr_copy.iid,
-                                    discussion_id = discussion_id.as_str(),
-                                    trigger_note_id,
-                                    attempt,
-                                    error = %err,
-                                    "failed to post mention-command completion status; retrying"
-                                );
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    100 * u64::try_from(attempt).ok().unwrap_or(u64::MAX),
-                                ))
-                                .await;
-                            }
-                        }
+                let completion_note_posted = match gitlab
+                    .create_discussion_note(
+                        &repo_name,
+                        mr_copy.iid,
+                        &discussion_id,
+                        &status_message,
+                    )
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(
+                            repo = repo_name.as_str(),
+                            iid = mr_copy.iid,
+                            discussion_id = discussion_id.as_str(),
+                            trigger_note_id,
+                            error = %err,
+                            "failed to post mention-command completion status"
+                        );
+                        false
                     }
-                }
+                };
                 if !completion_note_posted {
                     let fallback_message = format!(
                         "Mention command result for discussion `{discussion_id}`:\n\n{status_message}"
