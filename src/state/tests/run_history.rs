@@ -120,6 +120,74 @@ async fn run_history_preserves_mention_trigger_metadata() -> Result<()> {
 }
 
 #[tokio::test]
+async fn error_run_history_finish_records_fallback_error_details() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let missing_error_run_id = store
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 9,
+            head_sha: "sha-error".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    store
+        .run_history
+        .finish_run_history(
+            missing_error_run_id,
+            RunHistoryFinish {
+                result: "error".to_string(),
+                ..RunHistoryFinish::default()
+            },
+        )
+        .await?;
+
+    let blank_error_run_id = store
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Mention,
+            repo: "group/repo".to_string(),
+            iid: 10,
+            head_sha: "sha-blank-error".to_string(),
+            discussion_id: Some("discussion-1".to_string()),
+            trigger_note_id: Some(7),
+            trigger_note_author_name: Some("Reviewer".to_string()),
+            trigger_note_body: Some("@codex please retry".to_string()),
+            command_repo: Some("group/repo".to_string()),
+        })
+        .await?;
+    store
+        .run_history
+        .finish_run_history(
+            blank_error_run_id,
+            RunHistoryFinish {
+                result: "error".to_string(),
+                error: Some("   ".to_string()),
+                ..RunHistoryFinish::default()
+            },
+        )
+        .await?;
+
+    for run_id in [missing_error_run_id, blank_error_run_id] {
+        let record = store
+            .run_history
+            .get_run_history(run_id)
+            .await?
+            .expect("run history record should exist");
+        assert_eq!(
+            record.error.as_deref(),
+            Some("Run finished with result error, but no failure details were recorded.")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_feature_flag_overrides_roundtrip() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
 

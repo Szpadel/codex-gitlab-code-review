@@ -805,7 +805,7 @@ impl MentionFlow {
                                     "Mention {} !{} note {}",
                                     repo_name, mr_copy.iid, trigger_note_id
                                 )),
-                                error: Some(err.to_string()),
+                                error: Some(format!("{err:#}")),
                                 ..RunHistoryFinish::default()
                             },
                         )

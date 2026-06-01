@@ -104,6 +104,80 @@ async fn run_review_with_fake_runtime_starts_browser_and_returns_comment() -> Re
 }
 
 #[tokio::test]
+async fn run_review_with_fake_runtime_persists_failed_turn_error() -> Result<()> {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "thread-1" } })),
+        ScriptedAppRequest::result(
+            "review/start",
+            json!({
+                "turn": { "id": "turn-1" },
+                "reviewThreadId": "thread-1",
+            }),
+        )
+        .with_after_response(vec![
+            ScriptedAppChunk::Json(json!({
+                "method": "turn/started",
+                "params": { "threadId": "thread-1", "turnId": "turn-1" }
+            })),
+            ScriptedAppChunk::Json(json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "turn": {
+                        "status": "failed",
+                        "error": { "message": "model stream closed before final response" }
+                    }
+                }
+            })),
+        ]),
+    ]));
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
+    let run_history_id = runner
+        .state
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 11,
+            head_sha: "abc123".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    let mut ctx = review_context_with_target_branch(Some("main"));
+    ctx.run_history_id = Some(run_history_id);
+
+    let err = runner
+        .run_review(ctx)
+        .await
+        .expect_err("review should fail when the Codex turn fails");
+    assert!(format!("{err:#}").contains("model stream closed before final response"));
+
+    let events = runner
+        .state
+        .run_history
+        .list_run_history_events(run_history_id)
+        .await?;
+    let turn_completed = events
+        .iter()
+        .find(|event| event.event_type == "turn_completed")
+        .expect("turn completion event should be persisted");
+    assert_eq!(turn_completed.payload["status"], "failed");
+    assert_eq!(
+        turn_completed.payload["error"],
+        "model stream closed before final response"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_review_with_fake_runtime_initializes_before_composer_install() -> Result<()> {
     let harness = Arc::new(FakeRunnerHarness::default());
     harness.push_app_server(ScriptedAppServer::from_requests(vec![

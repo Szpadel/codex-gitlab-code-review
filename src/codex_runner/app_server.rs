@@ -549,19 +549,19 @@ impl AppServerClient {
                     .and_then(|value| value.get("status"))
                     .and_then(|value| value.as_str())
                     .unwrap_or("unknown");
+                let error_message = turn_completed_error_message(params);
+                let payload = match error_message.as_deref() {
+                    Some(error) => json!({ "status": status, "error": error }),
+                    None => json!({ "status": status }),
+                };
                 history_capture.push(
                     Some(turn_id_from_params(params).unwrap_or(turn_id)),
                     "turn_completed",
-                    json!({ "status": status }),
+                    payload,
                 );
                 info!(status, "codex turn completed");
                 if status == "failed" {
-                    let error_message = params
-                        .and_then(|value| value.get("turn"))
-                        .and_then(|value| value.get("error"))
-                        .and_then(|value| value.get("message"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown error");
+                    let error_message = error_message.as_deref().unwrap_or("unknown error");
                     return Err(anyhow!("codex turn failed: {error_message}"));
                 }
                 return Ok(TurnStreamNotificationOutcome::TurnCompleted);
@@ -770,6 +770,27 @@ pub(crate) fn turn_id_from_params(params: Option<&Value>) -> Option<&str> {
     params
         .and_then(|value| value.get("turnId"))
         .and_then(|value| value.as_str())
+}
+
+fn turn_completed_error_message(params: Option<&Value>) -> Option<String> {
+    params
+        .and_then(|value| value.get("turn"))
+        .and_then(|value| value.get("error"))
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(|message| message.as_str())
+                .map(ToOwned::to_owned)
+                .or_else(|| value.as_str().map(ToOwned::to_owned))
+                .or_else(|| {
+                    if value.is_null() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }
+                })
+        })
+        .filter(|value| !value.trim().is_empty())
 }
 
 pub(crate) fn item_is_successful_gitlab_discovery_call(

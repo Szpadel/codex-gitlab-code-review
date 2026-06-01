@@ -202,7 +202,7 @@ pub(super) fn render_run_detail_page(
          <article class=\"card\"><h2>Run metadata</h2>{}</article>\
          <article class=\"card\"><h2>Related sessions</h2>{}</article>\
          </section>\
-         {}{}{}",
+         {}{}{}{}",
         run.id,
         escape_html(run_kind_label(run.kind)),
         escape_html(&run.repo),
@@ -211,6 +211,7 @@ pub(super) fn render_run_detail_page(
         render_related_runs(&snapshot.related_runs, run.id),
         render_trigger_card(run, gitlab_base_url),
         render_security_context_card(run, snapshot.security_context_preview.as_ref()),
+        render_failure_details_card(run),
         render_thread_card(
             run,
             snapshot.thread.as_ref(),
@@ -658,12 +659,12 @@ fn render_history_run_row(run: &RunHistoryListItem) -> String {
         escape_html(run.result.as_deref().unwrap_or(&run.status)),
         render_unix_timestamp(run.started_at),
         run.id,
-        escape_html(
-            run.preview
-                .as_deref()
-                .or(run.summary.as_deref())
-                .unwrap_or("(no preview)")
-        )
+        escape_html(&run_row_preview(
+            run.result.as_deref(),
+            run.preview.as_deref(),
+            run.summary.as_deref(),
+            run.error.as_deref()
+        ))
     )
 }
 
@@ -699,13 +700,47 @@ fn render_record_run_row(run: &RunHistoryRecord) -> String {
         escape_html(run.result.as_deref().unwrap_or(&run.status)),
         render_unix_timestamp(run.started_at),
         run.id,
-        escape_html(
-            run.preview
-                .as_deref()
-                .or(run.summary.as_deref())
-                .unwrap_or("(no preview)")
-        )
+        escape_html(&run_row_preview(
+            run.result.as_deref(),
+            run.preview.as_deref(),
+            run.summary.as_deref(),
+            run.error.as_deref()
+        ))
     )
+}
+
+fn run_row_preview(
+    result: Option<&str>,
+    preview: Option<&str>,
+    summary: Option<&str>,
+    error: Option<&str>,
+) -> String {
+    let value = if result == Some("error") {
+        non_empty_text(error)
+            .or_else(|| non_empty_text(summary))
+            .or_else(|| non_empty_text(preview))
+    } else {
+        non_empty_text(preview).or_else(|| non_empty_text(summary))
+    }
+    .unwrap_or("(no preview)");
+    compact_text_excerpt(value, 220)
+}
+
+fn non_empty_text(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn compact_text_excerpt(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut output = String::new();
+    for (index, ch) in compact.chars().enumerate() {
+        if index >= max_chars {
+            output.push_str("...");
+            break;
+        }
+        output.push(ch);
+    }
+    output
 }
 
 fn render_run_metadata(run: &RunHistoryRecord) -> String {
@@ -932,6 +967,22 @@ fn render_feature_flag_controls(flag: &StatusFeatureFlagSnapshot) -> String {
         )
     })
     .collect_html()
+}
+
+fn render_failure_details_card(run: &RunHistoryRecord) -> String {
+    if run.result.as_deref() != Some("error") {
+        return String::new();
+    }
+    let details = run
+        .error
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Run finished with result error, but no failure details were recorded.");
+    format!(
+        "<section class=\"card failure-card\"><h2>Failure details</h2><pre class=\"codeblock failure-details\">{}</pre></section>",
+        escape_html(details)
+    )
 }
 
 fn render_related_runs(runs: &[RunHistoryRecord], current_id: i64) -> String {

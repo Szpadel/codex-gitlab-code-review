@@ -85,6 +85,7 @@ async fn history_snapshot_filters_runs_and_returns_summary_rows() -> Result<()> 
         runs[0].get("summary").and_then(Value::as_str),
         Some("Committed a fix")
     );
+    assert_eq!(runs[0].get("error"), Some(&Value::Null));
     assert_eq!(runs[0].get("trigger_note_body"), None);
     Ok(())
 }
@@ -150,6 +151,69 @@ async fn history_page_renders_field_based_filters_layout() -> Result<()> {
 }
 
 #[tokio::test]
+async fn history_pages_and_api_surface_error_run_details() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let run_id = insert_run_history(
+        &state,
+        NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 7,
+            head_sha: "abc777".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        },
+        RunHistorySessionUpdate::default(),
+        RunHistoryFinish {
+            result: "error".to_string(),
+            preview: Some("Review group/repo !7".to_string()),
+            error: Some("codex app-server closed stdout after model request".to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let status_service = Arc::new(HttpServices::new(
+        test_config(),
+        Arc::clone(&state),
+        false,
+        None,
+    ));
+    let address = spawn_test_server(app_router(status_service)).await?;
+
+    let history = reqwest::get(format!("http://{address}/history?result=error")).await?;
+    assert_eq!(history.status(), StatusCode::OK);
+    let history_body = history.text().await?;
+    assert!(history_body.contains("codex app-server closed stdout after model request"));
+    assert!(history_body.contains(&format!("/history/{run_id}")));
+
+    let repo_key = super::view::encode_repo_key("group/repo");
+    let mr_history = reqwest::get(format!("http://{address}/mr/{repo_key}/7/history")).await?;
+    assert_eq!(mr_history.status(), StatusCode::OK);
+    assert!(
+        mr_history
+            .text()
+            .await?
+            .contains("codex app-server closed stdout after model request")
+    );
+
+    let response = reqwest::get(format!("http://{address}/api/history?result=error")).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    let runs = body
+        .get("runs")
+        .and_then(Value::as_array)
+        .expect("runs array");
+    assert_eq!(
+        runs[0].get("error").and_then(Value::as_str),
+        Some("codex app-server closed stdout after model request")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn history_snapshot_searches_review_comment_body() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let run_id = insert_run_history(
@@ -197,6 +261,7 @@ async fn history_snapshot_searches_review_comment_body() -> Result<()> {
 
     assert_eq!(snapshot.runs.len(), 1);
     assert_eq!(snapshot.runs[0].id, run_id);
+    assert_eq!(snapshot.runs[0].error, None);
     Ok(())
 }
 

@@ -122,6 +122,8 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
 .simple-list { margin: 0; padding-left: 18px; }
 .monospace-list li { margin-bottom: 6px; }
 .codeblock { white-space: pre-wrap; word-break: break-word; background: var(--surface-subtle); border: 1px solid var(--divider); border-radius: 8px; padding: 12px; overflow-x: auto; font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12px; line-height: 18px; }
+.failure-card { border-color: #FCA5A5; }
+.failure-details, .turn-error-body { background: #FEF2F2; border-color: #FECACA; color: #7F1D1D; }
 
 .transcript-panel { padding: 0; overflow: hidden; }
 .transcript-header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; padding: 20px; border-bottom: 1px solid var(--divider); }

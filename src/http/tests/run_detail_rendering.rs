@@ -563,6 +563,115 @@ async fn run_detail_page_falls_back_when_event_history_is_missing() -> Result<()
 }
 
 #[tokio::test]
+async fn run_detail_page_renders_failure_details_without_event_history() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let run_id = insert_run_history(
+        &state,
+        NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 7,
+            head_sha: "abc999".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        },
+        RunHistorySessionUpdate::default(),
+        RunHistoryFinish {
+            result: "error".to_string(),
+            preview: Some("Review group/repo !7".to_string()),
+            error: Some("codex turn failed: <network timeout>".to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let status_service = Arc::new(HttpServices::new(
+        test_config(),
+        Arc::clone(&state),
+        false,
+        None,
+    ));
+    let address = spawn_test_server(app_router(status_service)).await?;
+
+    let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await?;
+    assert!(body.contains("Failure details"));
+    assert!(body.contains("codex turn failed: &lt;network timeout&gt;"));
+    assert!(body.contains("Codex thread detail is unavailable for this run."));
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_detail_page_renders_failed_turn_error_from_transcript_events() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let run_id = insert_run_history(
+        &state,
+        NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 7,
+            head_sha: "abc999".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        },
+        RunHistorySessionUpdate {
+            thread_id: Some("thread-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            ..RunHistorySessionUpdate::default()
+        },
+        RunHistoryFinish {
+            result: "error".to_string(),
+            preview: Some("Review group/repo !7".to_string()),
+            error: Some("review failed".to_string()),
+            ..Default::default()
+        },
+    )
+    .await?;
+    insert_run_history_events(
+        &state,
+        run_id,
+        vec![
+            NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: json!({}),
+            },
+            NewRunHistoryEvent {
+                sequence: 2,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: json!({
+                    "status": "failed",
+                    "error": "model stream closed before final response"
+                }),
+            },
+        ],
+    )
+    .await?;
+    let status_service = Arc::new(HttpServices::new(
+        test_config(),
+        Arc::clone(&state),
+        false,
+        None,
+    ));
+    let address = spawn_test_server(app_router(status_service)).await?;
+
+    let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await?;
+    assert!(body.contains("status-pill status-danger\">failed</span>"));
+    assert!(body.contains("model stream closed before final response"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_detail_renders_non_diff_file_change_payload_as_plain_body() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let run_id = insert_run_history(

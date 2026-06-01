@@ -10,6 +10,9 @@ use super::{
     RunHistorySessionUpdate, TranscriptBackfillState, sqlite_i64_from_u64,
 };
 
+const MISSING_ERROR_DETAILS: &str =
+    "Run finished with result error, but no failure details were recorded.";
+
 #[derive(Clone)]
 pub struct RunHistoryRepository {
     pool: SqlitePool,
@@ -270,6 +273,7 @@ impl RunHistoryRepository {
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn finish_run_history(&self, run_id: i64, finish: RunHistoryFinish) -> Result<()> {
         let now = Utc::now().timestamp();
+        let error = normalized_run_history_finish_error(&finish.result, finish.error);
         sqlx::query(
             r"
             UPDATE run_history
@@ -296,7 +300,7 @@ impl RunHistoryRepository {
         .bind(finish.review_thread_id)
         .bind(finish.preview)
         .bind(finish.summary)
-        .bind(finish.error)
+        .bind(error)
         .bind(finish.auth_account_name)
         .bind(finish.commit_sha)
         .bind(run_id)
@@ -621,7 +625,7 @@ impl RunHistoryRepository {
 
         let mut builder = QueryBuilder::<Sqlite>::new(
             r"
-            SELECT id, kind, review_lane, repo, iid, status, result, started_at, preview, summary
+            SELECT id, kind, review_lane, repo, iid, status, result, started_at, preview, summary, error
             FROM run_history
             ",
         );
@@ -1012,6 +1016,13 @@ fn map_run_history_event_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunHistory
 
 fn map_run_history_list_item_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunHistoryListItem> {
     let iid_raw: i64 = row.try_get("iid").context("read run history list iid")?;
+    let result: Option<String> = row
+        .try_get("result")
+        .context("read run history list result")?;
+    let error: Option<String> = row
+        .try_get("error")
+        .context("read run history list error")?;
+    let expose_error = result.as_deref() == Some("error");
     Ok(RunHistoryListItem {
         id: row.try_get("id").context("read run history list id")?,
         kind: parse_run_history_kind(
@@ -1024,9 +1035,7 @@ fn map_run_history_list_item_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunHis
         status: row
             .try_get("status")
             .context("read run history list status")?,
-        result: row
-            .try_get("result")
-            .context("read run history list result")?,
+        result,
         started_at: row
             .try_get("started_at")
             .context("read run history list started_at")?,
@@ -1036,7 +1045,16 @@ fn map_run_history_list_item_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunHis
         summary: row
             .try_get("summary")
             .context("read run history list summary")?,
+        error: if expose_error { error } else { None },
     })
+}
+
+fn normalized_run_history_finish_error(result: &str, error: Option<String>) -> Option<String> {
+    if result == "error" && error.as_deref().is_none_or(|value| value.trim().is_empty()) {
+        Some(MISSING_ERROR_DETAILS.to_string())
+    } else {
+        error
+    }
 }
 
 #[cfg(test)]

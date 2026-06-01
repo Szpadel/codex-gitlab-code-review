@@ -503,3 +503,42 @@ fn handle_turn_notification_enriches_command_output_from_deltas() -> Result<()> 
     assert_eq!(events[0].payload["aggregatedOutput"], "line one\nline two");
     Ok(())
 }
+
+#[test]
+fn handle_turn_notification_persists_failed_turn_error() -> Result<()> {
+    let mut client = empty_app_server_client();
+    let mut capture = TurnHistoryCapture::default();
+
+    let err = match client.handle_turn_notification(
+        "turn/completed",
+        Some(&json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "turn": {
+                "status": "failed",
+                "error": { "message": "model stream closed before final response" }
+            }
+        })),
+        TurnNotificationContext {
+            thread_id: "thread-1",
+            turn_id: "turn-1",
+            history_capture: &mut capture,
+        },
+        |_, _| {},
+        |_| {},
+    ) {
+        Ok(_) => bail!("expected failed turn notification to return an error"),
+        Err(err) => err,
+    };
+
+    assert!(format!("{err:#}").contains("model stream closed before final response"));
+    let events = capture.take_pending();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event_type, "turn_completed");
+    assert_eq!(events[0].payload["status"], "failed");
+    assert_eq!(
+        events[0].payload["error"],
+        "model stream closed before final response"
+    );
+    Ok(())
+}

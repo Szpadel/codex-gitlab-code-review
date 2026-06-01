@@ -1289,7 +1289,7 @@ impl ReviewRunContext {
                         RunHistoryFinish {
                             result: "error".to_string(),
                             preview: Some(self.review_preview(repo, mr.iid)),
-                            error: Some(err.to_string()),
+                            error: Some(format!("{err:#}")),
                             ..RunHistoryFinish::default()
                         },
                     )

@@ -13,6 +13,7 @@ pub struct ThreadSnapshot {
 pub struct TurnSnapshot {
     pub id: String,
     pub status: String,
+    pub error: Option<String>,
     pub items: Vec<ThreadItemSnapshot>,
 }
 

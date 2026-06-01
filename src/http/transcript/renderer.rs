@@ -22,8 +22,8 @@ pub(crate) fn render_thread_stream(thread: &ThreadSnapshot, gitlab_base_url: &st
         .enumerate()
         .flat_map(|(index, turn)| {
             let mut rendered = Vec::new();
-            if multiple_turns {
-                rendered.push(render_turn_divider(&turn.id, &turn.status, index == 0));
+            if multiple_turns || turn.error.is_some() {
+                rendered.push(render_turn_divider(turn, index == 0));
             }
             rendered.extend(
                 turn.items
@@ -57,13 +57,20 @@ fn render_thread_item(item: &ThreadItemSnapshot, gitlab_base_url: &str) -> Strin
     }
 }
 
-fn render_turn_divider(turn_id: &str, status: &str, is_first: bool) -> String {
+fn render_turn_divider(turn: &super::models::TurnSnapshot, is_first: bool) -> String {
+    let error = turn.error.as_deref().map_or_else(String::new, |error| {
+        format!(
+            "<pre class=\"activity-body turn-error-body\">{}</pre>",
+            escape_html(error)
+        )
+    });
     format!(
-        "<div class=\"turn-divider{}\"><span class=\"turn-divider-label\">Turn {}</span><span class=\"status-pill status-{}\">{}</span></div>",
+        "<div class=\"turn-divider{}\"><span class=\"turn-divider-label\">Turn {}</span><span class=\"status-pill status-{}\">{}</span></div>{}",
         if is_first { " turn-divider-first" } else { "" },
-        escape_html(turn_id),
-        status_class(status),
-        escape_html(status)
+        escape_html(&turn.id),
+        status_class(&turn.status),
+        escape_html(&turn.status),
+        error
     )
 }
 

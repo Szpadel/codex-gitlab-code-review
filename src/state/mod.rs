@@ -183,6 +183,7 @@ pub struct RunHistoryListItem {
     pub started_at: i64,
     pub preview: Option<String>,
     pub summary: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

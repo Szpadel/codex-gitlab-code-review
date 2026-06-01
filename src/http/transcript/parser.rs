@@ -33,6 +33,7 @@ pub fn thread_snapshot_from_events(
             turns.push(TurnSnapshot {
                 id: turn_id.to_string(),
                 status: "in_progress".to_string(),
+                error: None,
                 items: Vec::new(),
             });
             turns.last_mut().expect("turn inserted")
@@ -47,6 +48,8 @@ pub fn thread_snapshot_from_events(
             "turn_completed" => {
                 turn.status = json_string(event.payload.get("status"))
                     .unwrap_or_else(|| "unknown".to_string());
+                turn.error = json_string(event.payload.get("error"))
+                    .filter(|value| !value.trim().is_empty());
             }
             _ => {}
         }
