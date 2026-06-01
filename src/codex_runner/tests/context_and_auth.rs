@@ -315,6 +315,59 @@ fn classify_auth_failure_preserves_non_auth_errors() {
     assert_eq!(kind, AuthFailureKind::Other);
 }
 
+#[tokio::test]
+async fn unclassified_review_failure_surfaces_error_chain_in_top_level_message() {
+    let runner = test_runner_with_fake_runtime(
+        test_codex_config(),
+        false,
+        Arc::new(FakeRunnerHarness::default()),
+        None,
+    )
+    .await;
+
+    let err = runner
+        .run_with_auth_fallback(AuthFallbackAction::Review, |_account| async {
+            Err::<(), anyhow::Error>(
+                anyhow!("codex app-server closed stdout")
+                    .context("recent runner errors: codex-runner-error: git clone failed"),
+            )
+        })
+        .await
+        .expect_err("unclassified review failure should stop fallback");
+
+    let message = err.to_string();
+    assert!(message.contains("codex review failed for account 'primary':"));
+    assert!(message.contains("recent runner errors: codex-runner-error: git clone failed"));
+    assert!(message.contains("codex app-server closed stdout"));
+    assert!(!message.contains("without fallback classification"));
+}
+
+#[tokio::test]
+async fn unclassified_mention_failure_surfaces_error_chain_in_top_level_message() {
+    let runner = test_runner_with_fake_runtime(
+        test_codex_config(),
+        true,
+        Arc::new(FakeRunnerHarness::default()),
+        None,
+    )
+    .await;
+
+    let err = runner
+        .run_with_auth_fallback(AuthFallbackAction::MentionCommand, |_account| async {
+            Err::<(), anyhow::Error>(
+                anyhow!("git status failed").context("mention command setup failed"),
+            )
+        })
+        .await
+        .expect_err("unclassified mention failure should stop fallback");
+
+    let message = err.to_string();
+    assert!(message.contains("mention command failed for account 'primary':"));
+    assert!(message.contains("mention command setup failed"));
+    assert!(message.contains("git status failed"));
+    assert!(!message.contains("without fallback classification"));
+}
+
 #[test]
 fn classify_auth_failure_ignores_non_codex_rate_limit_errors() {
     let now = Utc

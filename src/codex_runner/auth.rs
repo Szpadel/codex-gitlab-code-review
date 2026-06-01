@@ -103,14 +103,13 @@ impl AuthFallbackAction {
         }
     }
 
-    fn unexpected_failure_context(self, account_name: &str) -> String {
+    fn unexpected_failure_context(self, account_name: &str, err: &anyhow::Error) -> String {
+        let cause = error_chain_summary(err);
         match self {
-            Self::Review => format!(
-                "codex review failed for account '{account_name}' without fallback classification"
-            ),
-            Self::MentionCommand => format!(
-                "mention command failed for account '{account_name}' without fallback classification"
-            ),
+            Self::Review => format!("codex review failed for account '{account_name}': {cause}"),
+            Self::MentionCommand => {
+                format!("mention command failed for account '{account_name}': {cause}")
+            }
         }
     }
 }
@@ -295,9 +294,9 @@ impl DockerCodexRunner {
                             );
                         }
                         AuthFailureKind::Other => {
-                            return Err(err).with_context(|| {
-                                action.unexpected_failure_context(account.name.as_str())
-                            });
+                            let context =
+                                action.unexpected_failure_context(account.name.as_str(), &err);
+                            return Err(err).with_context(|| context);
                         }
                     }
                 }
@@ -309,6 +308,14 @@ impl DockerCodexRunner {
             action.all_accounts_failed_message(auth_fallback_errors.join(" | "))
         );
     }
+}
+
+fn error_chain_summary(err: &anyhow::Error) -> String {
+    err.chain()
+        .map(ToString::to_string)
+        .filter(|cause| !cause.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 pub(crate) fn classify_auth_failure(
