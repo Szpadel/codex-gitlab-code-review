@@ -4,8 +4,8 @@ use super::session_runner::{
 use super::{
     AppServerCommandOptions, AuthAccount, AuthFallbackAction, Context, DockerCodexRunner,
     MentionCommandContext, MentionCommandResult, MentionCommandStatus, Result,
-    RunHistorySessionUpdate, anyhow, bail, json, repo_checkout_root,
-    restore_push_remote_url_exec_command,
+    RunHistorySessionUpdate, anyhow, bail, debug, info, json, repo_checkout_root,
+    restore_push_remote_url_exec_command, warn,
 };
 use std::collections::BTreeSet;
 
@@ -25,6 +25,16 @@ fn git_status_paths(status_output: &str) -> BTreeSet<String> {
         }
     }
     paths
+}
+
+fn log_mention_git_error(ctx: &MentionCommandContext, command: &str) {
+    warn!(
+        repo = ctx.repo.as_str(),
+        iid = ctx.mr.iid,
+        run_history_id = ctx.run_history_id,
+        command,
+        "mention git command failed"
+    );
 }
 
 impl DockerCodexRunner {
@@ -64,6 +74,13 @@ impl DockerCodexRunner {
         account: &AuthAccount,
     ) -> Result<MentionCommandResult> {
         debug_assert_eq!(sandbox_mode, self.sandbox_mode_value());
+        info!(
+            repo = ctx.repo.as_str(),
+            iid = ctx.mr.iid,
+            run_history_id = ctx.run_history_id,
+            auth_account = account.name.as_str(),
+            "starting mention command session"
+        );
         let clone_url = self.clone_url(&ctx.repo)?;
         let repo_dir = repo_checkout_root(&ctx.project_path);
         let launch = self
@@ -97,6 +114,14 @@ impl DockerCodexRunner {
         let mut session = launch.session;
         let run_timeout = launch.run_timeout;
         let run_started_at = launch.run_started_at;
+        debug!(
+            repo = ctx.repo.as_str(),
+            iid = ctx.mr.iid,
+            run_history_id = ctx.run_history_id,
+            container_id = session.container_id.as_str(),
+            browser_container_id = session.browser_container_id.as_deref().unwrap_or("none"),
+            "launched mention command runner session"
+        );
 
         let browser_container_id = session.browser_container_id.clone();
         let browser_mcp = prepared.browser_mcp.clone();
@@ -115,6 +140,12 @@ impl DockerCodexRunner {
                         },
                     )
                     .await;
+                    debug!(
+                        repo = ctx.repo.as_str(),
+                        iid = ctx.mr.iid,
+                        run_history_id = ctx.run_history_id,
+                        "initializing mention command session and dependency step"
+                    );
                     self.initialize_session_and_install_deps(
                         &mut session,
                         SessionInitializeRequest {
@@ -127,13 +158,22 @@ impl DockerCodexRunner {
                         },
                     )
                     .await?;
+                    debug!(
+                        repo = ctx.repo.as_str(),
+                        iid = ctx.mr.iid,
+                        run_history_id = ctx.run_history_id,
+                        "mention command dependency step completed"
+                    );
                     let baseline_worktree_state = self
                         .exec_container_git_command(
                             &session.container_id,
                             &["status".to_string(), "--porcelain".to_string()],
                             Some(repo_dir.as_str()),
                         )
-                        .await?
+                        .await
+                        .inspect_err(|_| {
+                            log_mention_git_error(ctx, "git status --porcelain");
+                        })?
                         .stdout;
                     let baseline_worktree_paths = git_status_paths(&baseline_worktree_state);
                     let extra_writable_roots = prepared.extra_writable_roots();
@@ -151,6 +191,13 @@ impl DockerCodexRunner {
                             "thread/start missing thread id",
                         )
                         .await?;
+                    info!(
+                        repo = ctx.repo.as_str(),
+                        iid = ctx.mr.iid,
+                        run_history_id = ctx.run_history_id,
+                        thread_id = thread_id.as_str(),
+                        "started mention command thread"
+                    );
                     self.update_run_history_session(
                         ctx.run_history_id,
                         RunHistorySessionUpdate {
@@ -170,7 +217,10 @@ impl DockerCodexRunner {
                         ],
                         Some(repo_dir.as_str()),
                     )
-                    .await?;
+                    .await
+                    .inspect_err(|_| {
+                        log_mention_git_error(ctx, "git config user.name");
+                    })?;
                     self.exec_container_git_command(
                         &session.container_id,
                         &[
@@ -180,7 +230,10 @@ impl DockerCodexRunner {
                         ],
                         Some(repo_dir.as_str()),
                     )
-                    .await?;
+                    .await
+                    .inspect_err(|_| {
+                        log_mention_git_error(ctx, "git config user.email");
+                    })?;
                     self.exec_container_git_command(
                         &session.container_id,
                         &[
@@ -192,14 +245,23 @@ impl DockerCodexRunner {
                         ],
                         Some(repo_dir.as_str()),
                     )
-                    .await?;
+                    .await
+                    .inspect_err(|_| {
+                        log_mention_git_error(
+                            ctx,
+                            "git remote set-url --push origin no_push://disabled",
+                        );
+                    })?;
                     let before_sha = self
                         .exec_container_git_command(
                             &session.container_id,
                             &["rev-parse".to_string(), "HEAD".to_string()],
                             Some(repo_dir.as_str()),
                         )
-                        .await?
+                        .await
+                        .inspect_err(|_| {
+                            log_mention_git_error(ctx, "git rev-parse HEAD");
+                        })?
                         .stdout
                         .trim()
                         .to_string();
@@ -215,6 +277,14 @@ impl DockerCodexRunner {
                             "turn/start missing turn id",
                         )
                         .await?;
+                    info!(
+                        repo = ctx.repo.as_str(),
+                        iid = ctx.mr.iid,
+                        run_history_id = ctx.run_history_id,
+                        thread_id = thread_id.as_str(),
+                        turn_id = turn_id.as_str(),
+                        "started mention command turn"
+                    );
                     self.update_run_history_session(
                         ctx.run_history_id,
                         RunHistorySessionUpdate {
@@ -238,7 +308,10 @@ impl DockerCodexRunner {
                             &["rev-parse".to_string(), "HEAD".to_string()],
                             Some(repo_dir.as_str()),
                         )
-                        .await?
+                        .await
+                        .inspect_err(|_| {
+                            log_mention_git_error(ctx, "git rev-parse HEAD");
+                        })?
                         .stdout
                         .trim()
                         .to_string();
@@ -249,12 +322,27 @@ impl DockerCodexRunner {
                                 &["status".to_string(), "--porcelain".to_string()],
                                 Some(repo_dir.as_str()),
                             )
-                            .await?;
+                            .await
+                            .inspect_err(|_| {
+                                log_mention_git_error(ctx, "git status --porcelain");
+                            })?;
                         if worktree_state.stdout != baseline_worktree_state {
+                            warn!(
+                                repo = ctx.repo.as_str(),
+                                iid = ctx.mr.iid,
+                                run_history_id = ctx.run_history_id,
+                                "mention command left uncommitted changes without creating a commit"
+                            );
                             bail!(
                                 "mention command left uncommitted changes without creating a commit"
                             );
                         }
+                        info!(
+                            repo = ctx.repo.as_str(),
+                            iid = ctx.mr.iid,
+                            run_history_id = ctx.run_history_id,
+                            "mention command completed without commits"
+                        );
                         (MentionCommandStatus::NoChanges, None)
                     } else {
                         let source_branch = ctx
@@ -276,6 +364,12 @@ impl DockerCodexRunner {
                             )
                             .await
                         {
+                            warn!(
+                                repo = ctx.repo.as_str(),
+                                iid = ctx.mr.iid,
+                                run_history_id = ctx.run_history_id,
+                                "mention command moved HEAD outside MR ancestry"
+                            );
                             bail!("mention command moved HEAD outside MR ancestry: {err}");
                         }
                         let commit_count_output = self
@@ -288,7 +382,10 @@ impl DockerCodexRunner {
                                 ],
                                 Some(repo_dir.as_str()),
                             )
-                            .await?;
+                            .await
+                            .inspect_err(|_| {
+                                log_mention_git_error(ctx, "git rev-list --count");
+                            })?;
                         let commit_count = commit_count_output
                             .stdout
                             .trim()
@@ -299,6 +396,12 @@ impl DockerCodexRunner {
                                 )
                             })?;
                         if commit_count == 0 {
+                            warn!(
+                                repo = ctx.repo.as_str(),
+                                iid = ctx.mr.iid,
+                                run_history_id = ctx.run_history_id,
+                                "mention command moved HEAD without producing new commits"
+                            );
                             bail!("mention command moved HEAD without producing new commits");
                         }
                         if !baseline_worktree_paths.is_empty() {
@@ -312,7 +415,10 @@ impl DockerCodexRunner {
                                     ],
                                     Some(repo_dir.as_str()),
                                 )
-                                .await?;
+                                .await
+                                .inspect_err(|_| {
+                                    log_mention_git_error(ctx, "git diff --name-only");
+                                })?;
                             let committed_paths = committed_paths_output
                                 .stdout
                                 .lines()
@@ -325,6 +431,12 @@ impl DockerCodexRunner {
                                 .cloned()
                                 .collect::<Vec<_>>();
                             if !overlapping_baseline_paths.is_empty() {
+                                warn!(
+                                    repo = ctx.repo.as_str(),
+                                    iid = ctx.mr.iid,
+                                    run_history_id = ctx.run_history_id,
+                                    "mention command commit included baseline composer-install changes"
+                                );
                                 bail!(
                                     "mention command commit included baseline composer-install changes: {}",
                                     overlapping_baseline_paths.join(", ")
@@ -337,7 +449,10 @@ impl DockerCodexRunner {
                             Some(repo_dir.as_str()),
                             Some(vec![format!("GITLAB_TOKEN={}", self.gitlab_token)]),
                         )
-                        .await?;
+                        .await
+                        .inspect_err(|_| {
+                            log_mention_git_error(ctx, "restore git push remote");
+                        })?;
                         self.exec_container_git_command(
                             &session.container_id,
                             &[
@@ -347,7 +462,16 @@ impl DockerCodexRunner {
                             ],
                             Some(repo_dir.as_str()),
                         )
-                        .await?;
+                        .await
+                        .inspect_err(|_| {
+                            log_mention_git_error(ctx, "git push origin HEAD");
+                        })?;
+                        info!(
+                            repo = ctx.repo.as_str(),
+                            iid = ctx.mr.iid,
+                            run_history_id = ctx.run_history_id,
+                            "mention command pushed commits to source branch"
+                        );
                         (MentionCommandStatus::Committed, Some(after_sha))
                     };
 
@@ -360,6 +484,14 @@ impl DockerCodexRunner {
             )
             .await;
 
+        if mention_result.is_err() {
+            warn!(
+                repo = ctx.repo.as_str(),
+                iid = ctx.mr.iid,
+                run_history_id = ctx.run_history_id,
+                "mention command session failed"
+            );
+        }
         self.close_runner_session(session).await;
 
         mention_result
