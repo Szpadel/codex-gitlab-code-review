@@ -125,6 +125,7 @@ impl Drop for ActiveMentionGuard {
     }
 }
 
+/// Shared dependencies for merge-request flows (review and mention).
 #[derive(Clone)]
 pub(crate) struct FlowShared {
     pub(crate) config: Config,
@@ -138,29 +139,6 @@ pub(crate) struct FlowShared {
 }
 
 impl FlowShared {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        config: Config,
-        gitlab: Arc<dyn GitLabApi>,
-        state: Arc<ReviewStateStore>,
-        codex: Arc<dyn CodexRunner>,
-        bot_user_id: u64,
-        semaphore: Arc<Semaphore>,
-        lifecycle: Arc<ServiceLifecycle>,
-        active_tasks: Arc<ActiveTaskRegistry>,
-    ) -> Self {
-        Self {
-            config,
-            gitlab,
-            state,
-            codex,
-            bot_user_id,
-            semaphore,
-            lifecycle,
-            active_tasks,
-        }
-    }
-
     pub(crate) fn shutdown_requested(&self) -> bool {
         !self.lifecycle.accepts_new_work()
     }

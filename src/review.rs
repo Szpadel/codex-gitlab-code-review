@@ -102,16 +102,16 @@ impl ReviewService {
         let retry_backoff = Arc::new(RetryBackoff::new(Duration::hours(1)));
         let lifecycle = Arc::new(ServiceLifecycle::default());
         let active_tasks = Arc::new(ActiveTaskRegistry::default());
-        let flow_shared = FlowShared::new(
-            config.clone(),
-            Arc::clone(&gitlab),
-            Arc::clone(&state),
-            Arc::clone(&codex),
+        let flow_shared = FlowShared {
+            config: config.clone(),
+            gitlab: Arc::clone(&gitlab),
+            state: Arc::clone(&state),
+            codex: Arc::clone(&codex),
             bot_user_id,
-            Arc::clone(&semaphore),
-            Arc::clone(&lifecycle),
-            Arc::clone(&active_tasks),
-        );
+            semaphore: Arc::clone(&semaphore),
+            lifecycle: Arc::clone(&lifecycle),
+            active_tasks: Arc::clone(&active_tasks),
+        };
         let mention_flow = Arc::new(MentionFlow::new(flow_shared.clone(), mention_branch_locks));
         let general_review_flow = Arc::new(ReviewFlow::new(
             flow_shared.clone(),
