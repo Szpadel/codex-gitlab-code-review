@@ -435,6 +435,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tar",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

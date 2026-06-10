@@ -1,37 +1,66 @@
 use super::*;
 use anyhow::Result;
 use std::env;
-use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
 use std::sync::Mutex;
-use uuid::Uuid;
+use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-fn write_temp_config(contents: &str) -> PathBuf {
-    let mut path = env::temp_dir();
-    path.push(format!("codex-review-config-{}.yaml", Uuid::new_v4()));
-    fs::write(&path, contents).expect("write temp config");
-    path
+struct EnvVarGuard {
+    name: String,
+    previous: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &str, value: Option<&str>) -> Self {
+        let previous = env::var(name).ok();
+        match value {
+            Some(value) => unsafe {
+                env::set_var(name, value);
+            },
+            None => unsafe {
+                env::remove_var(name);
+            },
+        }
+        Self {
+            name: name.to_string(),
+            previous,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => unsafe {
+                env::set_var(&self.name, value);
+            },
+            None => unsafe {
+                env::remove_var(&self.name);
+            },
+        }
+    }
+}
+
+fn write_temp_config(contents: &str) -> NamedTempFile {
+    let mut file = TempFileBuilder::new()
+        .prefix("codex-review-config-")
+        .suffix(".yaml")
+        .tempfile()
+        .expect("create temp config");
+    file.write_all(contents.as_bytes())
+        .expect("write temp config");
+    file.flush().expect("flush temp config");
+    file
 }
 
 fn try_load_from_yaml(contents: &str) -> Result<Config> {
     let _lock = ENV_LOCK.lock().expect("lock env");
-    let path = write_temp_config(contents);
-    let previous = env::var("CONFIG_PATH").ok();
-    unsafe {
-        env::set_var("CONFIG_PATH", &path);
-    }
+    let file = write_temp_config(contents);
+    let path = file.path().to_path_buf();
+    let _config_path = EnvVarGuard::set("CONFIG_PATH", Some(path.to_string_lossy().as_ref()));
     let loaded = load_raw_config().and_then(validate_config);
-    match previous {
-        Some(value) => unsafe {
-            env::set_var("CONFIG_PATH", value);
-        },
-        None => unsafe {
-            env::remove_var("CONFIG_PATH");
-        },
-    }
-    let _ = fs::remove_file(&path);
     loaded.map(ValidatedConfig::into_inner)
 }
 
@@ -41,25 +70,8 @@ fn load_from_yaml(contents: &str) -> Config {
 
 fn with_env_var<T>(name: &str, value: Option<&str>, action: impl FnOnce() -> T) -> T {
     let _lock = ENV_LOCK.lock().expect("lock env");
-    let previous = env::var(name).ok();
-    match value {
-        Some(value) => unsafe {
-            env::set_var(name, value);
-        },
-        None => unsafe {
-            env::remove_var(name);
-        },
-    }
-    let result = action();
-    match previous {
-        Some(value) => unsafe {
-            env::set_var(name, value);
-        },
-        None => unsafe {
-            env::remove_var(name);
-        },
-    }
-    result
+    let _guard = EnvVarGuard::set(name, value);
+    action()
 }
 
 fn base_config_yaml(extra: &str) -> String {
@@ -264,12 +276,11 @@ proxy:
   http_proxy: "http://proxy.internal:3128"
 "#,
     );
-    let path = write_temp_config(&yaml);
+    let file = write_temp_config(&yaml);
     let cfg = config::Config::builder()
-        .add_source(config::File::from(path.as_path()))
+        .add_source(config::File::from(file.path()))
         .build()
         .expect("load raw config");
-    let _ = fs::remove_file(&path);
 
     assert!(legacy_proxy_config_present(&cfg));
 }
