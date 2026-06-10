@@ -28,7 +28,6 @@ use bollard::query_parameters::{
 };
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use futures::{FutureExt, StreamExt, future::BoxFuture, future::Shared};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -53,6 +52,7 @@ mod gitlab_discovery;
 mod mention_flow;
 mod mention_inputs;
 mod review_flow;
+mod review_output;
 mod scripts;
 mod session_runner;
 #[cfg(test)]
@@ -69,7 +69,7 @@ use self::gitlab_discovery::{
     GitLabDiscoveryHandle, GitLabDiscoveryMcpRuntimeConfig, PreparedGitLabDiscoveryMcp,
     RegisteredGitLabDiscoverySession,
 };
-use self::review_flow::parse_review_output_for_lane;
+use self::review_output::parse_review_output_for_lane;
 use self::scripts::{
     AppServerCommandOptions, effective_browser_mcp, restore_push_remote_url_exec_command,
     shell_quote,

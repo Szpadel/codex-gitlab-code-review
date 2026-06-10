@@ -13,7 +13,8 @@ use super::container::{
 use super::gitlab_discovery::{
     gitlab_discovery_mcp_probe_exec_command, gitlab_discovery_mcp_startup_failure_events,
 };
-use super::review_flow::{ReviewTargetRequest, parse_review_output};
+use super::review_flow::ReviewTargetRequest;
+use super::review_output::parse_review_output;
 use super::scripts::{
     BuildCommandScriptInput, ConfiguredSessionOverride, browser_mcp_prereq_script,
     browser_wait_script, codex_app_server_exec_command, git_bootstrap_auth_setup_script,
