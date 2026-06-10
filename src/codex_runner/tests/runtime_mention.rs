@@ -307,7 +307,7 @@ async fn prepare_mention_inputs_downloads_images_inside_container() {
                 requester_email: "requester@example.com".to_string(),
                 additional_developer_instructions: None,
                 prompt: "Please fix it".to_string(),
-                image_uploads: vec![crate::gitlab_links::GitLabMarkdownImageUpload {
+                image_uploads: vec![crate::gitlab::links::GitLabMarkdownImageUpload {
                     markdown_path: "/uploads/hash/screenshot.png".to_string(),
                     absolute_url: "https://gitlab.example.com/uploads/hash/screenshot.png"
                         .to_string(),

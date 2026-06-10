@@ -2,8 +2,8 @@ use crate::codex_runner::{MentionCommandContext, MentionCommandResult, MentionCo
 use crate::feature_flags::FeatureFlagSnapshot;
 use crate::flow::mention_assets::collect_note_image_uploads;
 use crate::flow::{ActiveMentionKey, FlowShared, MergeRequestFlow};
+use crate::gitlab::links::{extract_root_relative_markdown_urls, gitlab_web_base};
 use crate::gitlab::{DiscussionNote, GitLabApi, GitLabUser, MergeRequest, MergeRequestDiscussion};
-use crate::gitlab_links::{extract_root_relative_markdown_urls, gitlab_web_base};
 use crate::state::{MentionCommandScanState, NewRunHistory, RunHistoryFinish, RunHistoryKind};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;

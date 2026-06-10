@@ -7,7 +7,7 @@ use super::{
     SecurityContextBuildCompletionGuard, SecurityContextBuildKey, SecurityContextBuildRegistration,
     Utc, Value, anyhow, bail, debug, json, warn,
 };
-use crate::placeholders::render_placeholders;
+use crate::codex_runner::placeholders::render_placeholders;
 
 #[derive(Default)]
 pub(super) struct SecurityContextPayloadResolution {

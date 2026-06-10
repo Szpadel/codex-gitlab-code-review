@@ -3,6 +3,8 @@ use super::{
     GitLabCheckoutKind, GitLabDiscoverySessionBinding, GitLabDiscoverySessionRegistry,
     ResolvedGitLabDiscoveryAllowList, resolve_allow_list,
 };
+use crate::codex_runner::docker::connect_docker;
+use crate::codex_runner::placeholders::render_placeholders;
 use crate::composer_install::{
     ComposerInstallExecOutput, ComposerInstallMode, ComposerInstallResult,
     DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS, composer_debug_lines, composer_install_exec_command,
@@ -10,9 +12,7 @@ use crate::composer_install::{
     redact_composer_related_output, resolve_composer_auth,
 };
 use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig};
-use crate::docker_utils::connect_docker;
 use crate::gitlab::GitLabClient;
-use crate::placeholders::render_placeholders;
 use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
 use bollard::container::LogOutput;
@@ -692,8 +692,10 @@ mod tests {
     fn redact_sensitive_output_removes_gitlab_tokens_from_urls_and_plain_text() {
         let service = GitLabDiscoveryMcpService {
             config: crate::config::GitLabDiscoveryMcpConfig::default(),
-            docker: crate::docker_utils::connect_docker(&crate::config::DockerConfig::default())
-                .expect("docker client"),
+            docker: crate::codex_runner::docker::connect_docker(
+                &crate::config::DockerConfig::default(),
+            )
+            .expect("docker client"),
             gitlab: crate::gitlab::GitLabClient::new("https://gitlab.example.com", "secret-token")
                 .expect("gitlab client"),
             git_base: url::Url::parse("https://gitlab.example.com").expect("git base"),

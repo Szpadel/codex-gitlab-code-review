@@ -1,9 +1,11 @@
 mod api;
 mod client;
 mod discussions;
+pub(crate) mod links;
 mod merge_requests;
 mod pagination;
 mod projects;
+pub(crate) mod tls;
 mod transport;
 mod types;
 mod uploads;

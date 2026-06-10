@@ -1,10 +1,10 @@
 use crate::codex_runner::{ReviewComment, ReviewFinding, repo_checkout_root};
 use crate::config::Config;
+use crate::gitlab::links::gitlab_web_base;
 use crate::gitlab::{
     DiffDiscussionPosition, GitLabApi, MergeRequest, MergeRequestDiff, MergeRequestDiffDiscussion,
     MergeRequestDiffVersion,
 };
-use crate::gitlab_links::gitlab_web_base;
 use crate::review_lane::ReviewLane;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};

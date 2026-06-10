@@ -2,7 +2,7 @@ use super::{
     COMPOSER_SKIP_EXIT_CODE, COMPOSER_SKIP_MARKER, COMPOSER_SKIP_REASON_MISSING_JSON,
     ComposerInstallMode,
 };
-use crate::placeholders::render_placeholders;
+use crate::codex_runner::placeholders::render_placeholders;
 
 const COMPOSER_INSTALL_SCRIPT_TEMPLATE: &str = include_str!("assets/install.sh");
 

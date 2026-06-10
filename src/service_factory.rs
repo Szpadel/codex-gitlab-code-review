@@ -7,13 +7,13 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::codex_runner::docker::wait_for_docker_ready;
 use crate::codex_runner::{CodexRunner, DockerCodexRunner, RunnerRuntimeOptions};
 use crate::config::{
     Config, DockerConfig, TargetSelector, ValidatedConfig,
     gitlab_discovery_mcp_uses_cluster_service_advertise_url, load_raw_config, validate_config,
 };
 use crate::dev_mode::{DEV_MODE_BASE_URL, DevToolsService, MockCodexRunner};
-use crate::docker_utils::wait_for_docker_ready;
 use crate::gitlab::{GitLabApi, GitLabClient, GitLabUser, GitLabUserDetail};
 use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use crate::http::HttpServices;

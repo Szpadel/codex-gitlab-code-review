@@ -3,7 +3,7 @@ use super::{
     GitLabDiscoveryMcpRuntimeConfig, MentionCommandContext, Result, ReviewContext, Url, anyhow,
     repo_checkout_root,
 };
-use crate::placeholders::render_placeholders;
+use crate::codex_runner::placeholders::render_placeholders;
 use std::fmt::Write as _;
 
 const MENTION_COMMAND_TEMPLATE: &str = include_str!("assets/mention_command.sh");

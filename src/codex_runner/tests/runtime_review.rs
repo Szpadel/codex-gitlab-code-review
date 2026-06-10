@@ -362,7 +362,7 @@ async fn docker_work_tmpfs_mount_is_visible_in_inspect_mounts_when_enabled() -> 
 
     let image = std::env::var("CODEX_REVIEW_DOCKER_TMPFS_TEST_IMAGE")
         .unwrap_or_else(|_| "fedora:43".to_string());
-    let docker = crate::docker_utils::connect_docker(&DockerConfig::default())?;
+    let docker = crate::codex_runner::docker::connect_docker(&DockerConfig::default())?;
     let mut codex = test_codex_config();
     codex.work_tmpfs.enabled = true;
     codex.work_tmpfs.size_mib = Some(16);

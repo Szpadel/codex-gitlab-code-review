@@ -1,11 +1,9 @@
 use crate::config::{
     BROWSER_MCP_REMOTE_DEBUGGING_PORT, BrowserMcpConfig, CodexConfig, DockerConfig,
 };
-use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
 use crate::feature_flags::FeatureFlagSnapshot;
-use crate::gitlab::MergeRequest;
+use crate::gitlab::{MergeRequest, links::GitLabMarkdownImageUpload};
 use crate::gitlab_discovery_mcp::{GitLabDiscoveryMcpService, ResolvedGitLabDiscoveryAllowList};
-use crate::gitlab_links::GitLabMarkdownImageUpload;
 use crate::review_lane::ReviewLane;
 use crate::review_prompt_templates::{
     append_additional_review_instructions, build_base_branch_review_prompt,
@@ -48,9 +46,12 @@ mod auth;
 mod browser_mcp;
 mod composer;
 mod container;
+pub mod docker;
+pub(crate) mod duration;
 mod gitlab_discovery;
 mod mention_flow;
 mod mention_inputs;
+pub(crate) mod placeholders;
 mod review_flow;
 mod review_output;
 mod scripts;
@@ -66,6 +67,7 @@ use self::auth::{AuthAccount, AuthFallbackAction};
 #[cfg(test)]
 use self::auth::{AuthFailureKind, classify_auth_failure, classify_auth_failure_for_account};
 use self::container::{InFlightImagePull, format_command_for_log};
+use self::docker::{connect_docker, ensure_image, normalize_image_reference};
 use self::gitlab_discovery::{
     GitLabDiscoveryHandle, GitLabDiscoveryMcpRuntimeConfig, PreparedGitLabDiscoveryMcp,
     RegisteredGitLabDiscoverySession,

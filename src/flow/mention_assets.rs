@@ -1,5 +1,5 @@
 use crate::gitlab::DiscussionNote;
-use crate::gitlab_links::{GitLabMarkdownImageUpload, extract_markdown_image_uploads};
+use crate::gitlab::links::{GitLabMarkdownImageUpload, extract_markdown_image_uploads};
 
 pub(crate) fn collect_note_image_uploads(
     notes: &[DiscussionNote],

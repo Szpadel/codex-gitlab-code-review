@@ -4,17 +4,17 @@ use tokio::net::TcpListener;
 use tokio::time::{Duration, sleep};
 
 pub(crate) fn test_client_builder() -> reqwest::ClientBuilder {
-    crate::tls::ensure_reqwest_rustls_provider();
+    crate::gitlab::tls::ensure_reqwest_rustls_provider();
     reqwest::Client::builder()
 }
 
 pub(crate) fn test_client() -> reqwest::Client {
-    crate::tls::ensure_reqwest_rustls_provider();
+    crate::gitlab::tls::ensure_reqwest_rustls_provider();
     reqwest::Client::new()
 }
 
 pub(crate) async fn test_get(url: impl reqwest::IntoUrl) -> reqwest::Result<reqwest::Response> {
-    crate::tls::ensure_reqwest_rustls_provider();
+    crate::gitlab::tls::ensure_reqwest_rustls_provider();
     reqwest::get(url).await
 }
 

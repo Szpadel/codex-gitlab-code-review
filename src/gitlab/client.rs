@@ -3,7 +3,7 @@ use super::transport::{
     ensure_success, ensure_success_bytes, ensure_success_empty, is_retryable_gitlab_status,
 };
 use super::types::{MergeRequestDiscussion, Note};
-use crate::tls::ensure_reqwest_rustls_provider;
+use crate::gitlab::tls::ensure_reqwest_rustls_provider;
 use anyhow::{Context, Result};
 use reqwest::{Client, RequestBuilder, Response, header};
 use serde::Deserialize;

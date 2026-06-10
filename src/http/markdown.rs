@@ -1,4 +1,4 @@
-use crate::gitlab_links::{
+use crate::gitlab::links::{
     absolutize_root_relative_url, gitlab_web_base, normalize_gitlab_upload_image_url,
 };
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
