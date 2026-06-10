@@ -30,7 +30,11 @@ use crate::http::test_support::{
 mod feature_flags;
 mod history;
 mod rate_limits;
-mod run_detail_backfill;
+mod run_detail_backfill_async_security;
+mod run_detail_backfill_core;
+mod run_detail_backfill_fallback;
+mod run_detail_backfill_recovery;
+mod run_detail_backfill_retry;
 mod run_detail_rendering;
 mod skills;
 mod status_page;
