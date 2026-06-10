@@ -17,3 +17,4 @@ mod scheduler;
 pub mod service_factory;
 pub mod skills;
 pub mod state;
+pub(crate) mod text;

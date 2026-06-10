@@ -8,6 +8,7 @@ use super::{
     StartContainerOptionsBuilder, StreamExt, Url, Uuid, anyhow, format_command_for_log, info,
     sleep, warn,
 };
+use crate::text::truncate_with_marker;
 #[cfg(test)]
 use anyhow::bail;
 
@@ -451,20 +452,12 @@ pub(crate) fn tail_log_lines(text: &str) -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(|line| truncate_log_line(line, BROWSER_CONTAINER_LOG_LINE_MAX_CHARS))
+        .map(|line| truncate_with_marker(line, BROWSER_CONTAINER_LOG_LINE_MAX_CHARS, "..."))
         .collect::<Vec<_>>();
     if lines.len() > BROWSER_CONTAINER_LOG_LINE_LIMIT {
         lines = lines[lines.len() - BROWSER_CONTAINER_LOG_LINE_LIMIT..].to_vec();
     }
     lines
-}
-
-pub(crate) fn truncate_log_line(line: &str, max_chars: usize) -> String {
-    let mut truncated = line.chars().take(max_chars).collect::<String>();
-    if line.chars().count() > max_chars {
-        truncated.push_str("...");
-    }
-    truncated
 }
 
 pub(crate) fn browser_logs_report_ready(log_tail: &BrowserLogTail, expected_port: u16) -> bool {

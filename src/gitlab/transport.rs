@@ -1,3 +1,4 @@
+use crate::text::truncate_with_marker;
 use anyhow::{Context, Result, anyhow};
 use reqwest::{Response, StatusCode, header};
 use serde::Deserialize;
@@ -139,11 +140,7 @@ fn format_gitlab_error_body(body: &str) -> String {
     if sanitized.is_empty() {
         return "<whitespace>".to_string();
     }
-    if sanitized.chars().count() <= GITLAB_ERROR_BODY_LIMIT {
-        return sanitized.to_string();
-    }
-    let truncated: String = sanitized.chars().take(GITLAB_ERROR_BODY_LIMIT).collect();
-    format!("{truncated}...")
+    truncate_with_marker(sanitized, GITLAB_ERROR_BODY_LIMIT, "...")
 }
 
 fn format_gitlab_error_body_bytes(body: &[u8]) -> String {

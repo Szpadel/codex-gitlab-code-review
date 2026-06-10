@@ -1,6 +1,7 @@
 use super::auth::{collect_string_leaves, composer_auth_notice};
 use super::command::composer_skip_line;
 use super::{COMPOSER_SKIP_EXIT_CODE, ComposerInstallMode, ComposerInstallResult};
+use crate::text::truncate_with_marker;
 use serde_json::Value;
 
 const COMPOSER_DEBUG_PREAMBLE_MAX_CHARS: usize = 1_200;
@@ -138,7 +139,7 @@ fn composer_failure_log_excerpt(
     };
     let excerpt = compose_excerpt_with_debug_notice(auth_source, debug_lines, Some(combined))
         .expect("failure excerpts always include fallback output");
-    truncate_excerpt(&excerpt, 8_000)
+    truncate_with_marker(&excerpt, 8_000, "\n[truncated]")
 }
 
 fn composer_success_log_excerpt(
@@ -159,7 +160,7 @@ fn composer_success_log_excerpt(
         debug_lines,
         (!sections.is_empty()).then(|| sections.join("\n")),
     )
-    .map(|excerpt| truncate_excerpt(&excerpt, 8_000))
+    .map(|excerpt| truncate_with_marker(&excerpt, 8_000, "\n[truncated]"))
 }
 
 fn compose_excerpt_with_debug_notice(
@@ -173,22 +174,19 @@ fn compose_excerpt_with_debug_notice(
     {
         notices.push(notice);
     }
-    let notices = (!notices.is_empty())
-        .then(|| truncate_excerpt(&notices.join("\n"), COMPOSER_DEBUG_PREAMBLE_MAX_CHARS));
+    let notices = (!notices.is_empty()).then(|| {
+        truncate_with_marker(
+            &notices.join("\n"),
+            COMPOSER_DEBUG_PREAMBLE_MAX_CHARS,
+            "\n[truncated]",
+        )
+    });
     match (notices, body) {
         (Some(notice), Some(body)) => Some(format!("{notice}\n{body}")),
         (Some(notice), None) => Some(notice),
         (None, Some(body)) => Some(body),
         (None, None) => None,
     }
-}
-
-fn truncate_excerpt(input: &str, max_chars: usize) -> String {
-    if input.chars().count() <= max_chars {
-        return input.to_string();
-    }
-    let truncated = input.chars().take(max_chars).collect::<String>();
-    format!("{truncated}\n[truncated]")
 }
 
 #[cfg(test)]

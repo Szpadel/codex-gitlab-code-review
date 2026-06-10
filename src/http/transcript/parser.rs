@@ -4,6 +4,7 @@ use super::models::{
 use crate::composer_install::COMPOSER_INSTALL_TURN_ID;
 use crate::http::timestamp::UiTimestamp;
 use crate::state::{RunHistoryEventRecord, RunHistoryRecord};
+use crate::text::truncate_with_marker;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -412,19 +413,7 @@ fn single_line_preview(value: &Value) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    truncate_preview(&compact, 140)
-}
-
-fn truncate_preview(value: &str, max_chars: usize) -> String {
-    let mut output = String::new();
-    for (index, ch) in value.chars().enumerate() {
-        if index >= max_chars {
-            output.push('…');
-            break;
-        }
-        output.push(ch);
-    }
-    output
+    truncate_with_marker(&compact, 140, "…")
 }
 
 struct FileChangeSummary {
