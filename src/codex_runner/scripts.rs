@@ -3,6 +3,7 @@ use super::{
     GitLabDiscoveryMcpRuntimeConfig, MentionCommandContext, Result, ReviewContext, Url, anyhow,
     repo_checkout_root,
 };
+use crate::placeholders::render_placeholders;
 use std::fmt::Write as _;
 
 const MENTION_COMMAND_TEMPLATE: &str = include_str!("assets/mention_command.sh");
@@ -41,12 +42,8 @@ pub(crate) struct BuildCommandScriptInput<'a> {
     pub(crate) deps_enabled: bool,
 }
 
-fn render_template(template: &str, replacements: &[(&str, &str)]) -> String {
-    let mut rendered = template.to_string();
-    for (needle, replacement) in replacements {
-        rendered = rendered.replace(needle, replacement);
-    }
-    rendered
+fn render_script_template(template: &str, replacements: &[(&str, &str)]) -> String {
+    render_placeholders(template, replacements).expect("script template placeholders are valid")
 }
 
 impl DockerCodexRunner {
@@ -247,19 +244,19 @@ impl DockerCodexRunner {
             app_server.mcp_server_overrides,
             app_server.session_override,
         );
-        render_template(
+        render_script_template(
             MENTION_COMMAND_TEMPLATE,
             &[
-                ("@@CLONE_URL_DQ@@", &clone_url_dq),
-                ("@@GITLAB_TOKEN_Q@@", &gitlab_token_q),
-                ("@@HEAD_SHA_Q@@", &head_sha_q),
-                ("@@AUTH_MOUNT_PATH_Q@@", &auth_mount_path_q),
-                ("@@REPO_DIR_Q@@", &repo_dir_q),
-                ("@@GIT_AUTH_SETUP_SCRIPT@@", &git_auth_setup_script),
-                ("@@GIT_AUTH_CLEANUP_SCRIPT@@", git_auth_cleanup_script),
-                ("@@BROWSER_PREREQ_SCRIPT@@", &browser_prereq_script),
-                ("@@BROWSER_WAIT_SCRIPT@@", &browser_wait_script),
-                ("@@APP_SERVER_EXEC_CMD@@", &app_server_exec_cmd),
+                ("CLONE_URL_DQ", &clone_url_dq),
+                ("GITLAB_TOKEN_Q", &gitlab_token_q),
+                ("HEAD_SHA_Q", &head_sha_q),
+                ("AUTH_MOUNT_PATH_Q", &auth_mount_path_q),
+                ("REPO_DIR_Q", &repo_dir_q),
+                ("GIT_AUTH_SETUP_SCRIPT", &git_auth_setup_script),
+                ("GIT_AUTH_CLEANUP_SCRIPT", git_auth_cleanup_script),
+                ("BROWSER_PREREQ_SCRIPT", &browser_prereq_script),
+                ("BROWSER_WAIT_SCRIPT", &browser_wait_script),
+                ("APP_SERVER_EXEC_CMD", &app_server_exec_cmd),
             ],
         )
     }
@@ -297,21 +294,21 @@ run_git fetch git fetch --unshallow\n"
             app_server.mcp_server_overrides,
             app_server.session_override,
         );
-        render_template(
+        render_script_template(
             REVIEW_COMMAND_TEMPLATE,
             &[
-                ("@@CLONE_URL@@", input.clone_url),
-                ("@@GITLAB_TOKEN_Q@@", &gitlab_token_q),
-                ("@@REPO_DIR_Q@@", &repo_dir_q),
-                ("@@HEAD_SHA@@", input.head_sha),
-                ("@@AUTH_MOUNT_PATH@@", input.auth_mount_path),
-                ("@@TARGET_BRANCH_SCRIPT@@", &target_branch_script),
-                ("@@DEPS_PREFETCH_SCRIPT@@", deps_prefetch_script),
-                ("@@GIT_AUTH_SETUP_SCRIPT@@", &git_auth_setup_script),
-                ("@@GIT_AUTH_CLEANUP_SCRIPT@@", git_auth_cleanup_script),
-                ("@@BROWSER_PREREQ_SCRIPT@@", &browser_prereq_script),
-                ("@@BROWSER_WAIT_SCRIPT@@", &browser_wait_script),
-                ("@@APP_SERVER_EXEC_CMD@@", &app_server_exec_cmd),
+                ("CLONE_URL", input.clone_url),
+                ("GITLAB_TOKEN_Q", &gitlab_token_q),
+                ("REPO_DIR_Q", &repo_dir_q),
+                ("HEAD_SHA", input.head_sha),
+                ("AUTH_MOUNT_PATH", input.auth_mount_path),
+                ("TARGET_BRANCH_SCRIPT", &target_branch_script),
+                ("DEPS_PREFETCH_SCRIPT", deps_prefetch_script),
+                ("GIT_AUTH_SETUP_SCRIPT", &git_auth_setup_script),
+                ("GIT_AUTH_CLEANUP_SCRIPT", git_auth_cleanup_script),
+                ("BROWSER_PREREQ_SCRIPT", &browser_prereq_script),
+                ("BROWSER_WAIT_SCRIPT", &browser_wait_script),
+                ("APP_SERVER_EXEC_CMD", &app_server_exec_cmd),
             ],
         )
     }
@@ -322,9 +319,9 @@ run_git fetch git fetch --unshallow\n"
     }
 
     pub(crate) fn build_history_reader_script(auth_mount_path: &str) -> String {
-        render_template(
+        render_script_template(
             HISTORY_READER_TEMPLATE,
-            &[("@@AUTH_MOUNT_PATH@@", auth_mount_path)],
+            &[("AUTH_MOUNT_PATH", auth_mount_path)],
         )
     }
 }
@@ -447,10 +444,7 @@ pub(crate) fn browser_mcp_prereq_script(browser_mcp: Option<&BrowserMcpConfig>) 
         return String::new();
     };
     let command_q = shell_quote(&browser_mcp.mcp_command);
-    render_template(
-        BROWSER_MCP_PREREQ_TEMPLATE,
-        &[("@@COMMAND_Q@@", &command_q)],
-    )
+    render_script_template(BROWSER_MCP_PREREQ_TEMPLATE, &[("COMMAND_Q", &command_q)])
 }
 
 pub(crate) fn effective_browser_mcp<'a>(
@@ -472,7 +466,7 @@ pub(crate) fn browser_wait_script(browser_mcp: Option<&BrowserMcpConfig>) -> Str
         return String::new();
     }
     let port = BROWSER_MCP_REMOTE_DEBUGGING_PORT.to_string();
-    render_template(BROWSER_WAIT_TEMPLATE, &[("@@PORT@@", &port)])
+    render_script_template(BROWSER_WAIT_TEMPLATE, &[("PORT", &port)])
 }
 
 pub(crate) fn configured_model(value: Option<&str>) -> Option<&str> {
@@ -573,4 +567,138 @@ pub(crate) fn codex_app_server_exec_command(
     }
     cmd_parts.push("app-server".to_string());
     cmd_parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feature_flags::FeatureFlagSnapshot;
+    use crate::gitlab::MergeRequest;
+    use insta::assert_snapshot;
+
+    fn browser_mcp_config() -> BrowserMcpConfig {
+        BrowserMcpConfig {
+            enabled: true,
+            server_name: "browser".to_string(),
+            mcp_command: "browser-mcp".to_string(),
+            mcp_args: vec!["--headless".to_string()],
+            ..BrowserMcpConfig::default()
+        }
+    }
+
+    fn gitlab_discovery_mcp_config() -> GitLabDiscoveryMcpRuntimeConfig {
+        GitLabDiscoveryMcpRuntimeConfig {
+            server_name: "gitlab-discovery".to_string(),
+            advertise_url: "http://127.0.0.1:8787/mcp".to_string(),
+            clone_root: "/tmp/gitlab-discovery".to_string(),
+        }
+    }
+
+    fn mention_context() -> MentionCommandContext {
+        MentionCommandContext {
+            repo: "group/repo".to_string(),
+            project_path: "group/repo".to_string(),
+            discussion_project_path: "group/repo".to_string(),
+            mr: MergeRequest {
+                iid: 11,
+                title: Some("Title".to_string()),
+                web_url: Some(
+                    "https://gitlab.example.com/group/repo/-/merge_requests/11".to_string(),
+                ),
+                draft: false,
+                created_at: None,
+                updated_at: None,
+                sha: Some("abc123".to_string()),
+                source_branch: None,
+                target_branch: Some("main".to_string()),
+                author: None,
+                source_project_id: None,
+                target_project_id: None,
+                diff_refs: None,
+            },
+            head_sha: "abc123".to_string(),
+            discussion_id: "discussion-1".to_string(),
+            trigger_note_id: 77,
+            requester_name: "Alice Example".to_string(),
+            requester_email: "alice@example.com".to_string(),
+            additional_developer_instructions: None,
+            prompt: "Do the change".to_string(),
+            image_uploads: Vec::new(),
+            feature_flags: FeatureFlagSnapshot::default(),
+            run_history_id: None,
+        }
+    }
+
+    fn assert_no_placeholders(script: &str) {
+        assert!(!script.contains("@@"), "{script}");
+    }
+
+    #[test]
+    fn rendered_command_script_templates_match_snapshots() {
+        let browser_mcp = browser_mcp_config();
+        let gitlab_discovery_mcp = gitlab_discovery_mcp_config();
+        let mcp_overrides = BTreeMap::from([("filesystem".to_string(), true)]);
+        let app_server = AppServerCommandOptions {
+            browser_mcp: Some(&browser_mcp),
+            gitlab_discovery_mcp: Some(&gitlab_discovery_mcp),
+            mcp_server_overrides: &mcp_overrides,
+            session_override: ConfiguredSessionOverride {
+                model: Some("gpt-test"),
+                reasoning_summary: Some("auto"),
+                reasoning_effort: Some("medium"),
+            },
+        };
+
+        let review = DockerCodexRunner::build_command_script(
+            BuildCommandScriptInput {
+                clone_url: "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git",
+                gitlab_token: "token-value",
+                repo: "group/repo",
+                project_path: "group/repo",
+                head_sha: "abc123",
+                auth_mount_path: "/root/.codex",
+                target_branch: Some("main"),
+                deps_enabled: true,
+            },
+            app_server,
+        );
+        assert_no_placeholders(&review);
+        assert_snapshot!("review_command_script", review);
+
+        let mention = DockerCodexRunner::build_mention_command_script(
+            &mention_context(),
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git",
+            "token-value",
+            "/root/.codex",
+            app_server,
+        );
+        assert_no_placeholders(&mention);
+        assert_snapshot!("mention_command_script", mention);
+    }
+
+    #[test]
+    fn rendered_support_script_templates_match_snapshots() {
+        let browser_mcp = browser_mcp_config();
+
+        let history_reader = DockerCodexRunner::build_history_reader_script("/root/.codex");
+        assert_no_placeholders(&history_reader);
+        assert_snapshot!("history_reader_script", history_reader);
+
+        let browser_prereq = browser_mcp_prereq_script(Some(&browser_mcp));
+        assert_no_placeholders(&browser_prereq);
+        assert_snapshot!("browser_mcp_prereq_script", browser_prereq);
+
+        let browser_wait = browser_wait_script(Some(&browser_mcp));
+        assert_no_placeholders(&browser_wait);
+        assert_snapshot!("browser_wait_script", browser_wait);
+
+        assert_no_placeholders(DEPS_PREFETCH_TEMPLATE);
+        assert_snapshot!("deps_prefetch_script", DEPS_PREFETCH_TEMPLATE);
+
+        assert_no_placeholders(git_bootstrap_auth_cleanup_script());
+        assert_snapshot!(
+            "git_bootstrap_auth_cleanup_script",
+            git_bootstrap_auth_cleanup_script()
+        );
+    }
 }

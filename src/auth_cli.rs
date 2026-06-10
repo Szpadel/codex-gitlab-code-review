@@ -1,5 +1,6 @@
 use crate::config::{CodexConfig, DockerConfig};
 use crate::docker_utils::{connect_docker, ensure_image, normalize_image_reference};
+use crate::placeholders::render_placeholders;
 use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
 use bollard::container::LogOutput;
@@ -168,9 +169,14 @@ fn build_auth_script(auth_mount_path: &str, action: AuthAction) -> String {
         AuthAction::Login => "login --device-auth",
         AuthAction::Status => "login status",
     };
-    AUTH_SCRIPT_TEMPLATE
-        .replace("@@AUTH_MOUNT_PATH@@", auth_mount_path)
-        .replace("@@ACTION_ARGS@@", action_args)
+    render_placeholders(
+        AUTH_SCRIPT_TEMPLATE,
+        &[
+            ("AUTH_MOUNT_PATH", auth_mount_path),
+            ("ACTION_ARGS", action_args),
+        ],
+    )
+    .expect("auth script template placeholders are valid")
 }
 
 async fn stream_output(
@@ -241,5 +247,13 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn auth_script_renders_snapshot_without_placeholders() {
+        let script = build_auth_script("/root/.codex", AuthAction::Login);
+
+        assert!(!script.contains("@@"), "{script}");
+        insta::assert_snapshot!("auth_login_script", script);
     }
 }

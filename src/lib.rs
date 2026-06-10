@@ -16,6 +16,7 @@ pub mod gitlab_discovery_mcp;
 mod gitlab_links;
 pub mod http;
 pub mod lifecycle;
+mod placeholders;
 pub mod review;
 pub mod review_lane;
 pub mod review_prompt_templates;

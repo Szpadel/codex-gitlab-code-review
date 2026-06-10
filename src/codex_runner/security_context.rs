@@ -7,6 +7,7 @@ use super::{
     SecurityContextBuildCompletionGuard, SecurityContextBuildKey, SecurityContextBuildRegistration,
     Utc, Value, anyhow, bail, debug, json, warn,
 };
+use crate::placeholders::render_placeholders;
 
 #[derive(Default)]
 pub(super) struct SecurityContextPayloadResolution {
@@ -43,6 +44,15 @@ pub(super) const SECURITY_CONTEXT_PROMPT_VERSION: &str = "security-review-contex
 const SECURITY_REVIEW_INSTRUCTIONS_TEMPLATE: &str =
     include_str!("assets/security_review_instructions.md");
 
+fn security_review_instructions_template(min_confidence_score: f32) -> String {
+    let min_confidence_score = format!("{min_confidence_score:.2}");
+    render_placeholders(
+        SECURITY_REVIEW_INSTRUCTIONS_TEMPLATE,
+        &[("MIN_CONFIDENCE_SCORE", &min_confidence_score)],
+    )
+    .expect("security review instructions placeholders are valid")
+}
+
 impl DockerCodexRunner {
     pub(crate) fn security_context_cache_repo_key<'a>(&self, ctx: &'a ReviewContext) -> &'a str {
         ctx.repo.as_str()
@@ -53,10 +63,7 @@ impl DockerCodexRunner {
         min_confidence_score: f32,
         additional_developer_instructions: Option<&str>,
     ) -> String {
-        let base = SECURITY_REVIEW_INSTRUCTIONS_TEMPLATE.replace(
-            "@@MIN_CONFIDENCE_SCORE@@",
-            &format!("{min_confidence_score:.2}"),
-        );
+        let base = security_review_instructions_template(min_confidence_score);
         if let Some(extra) = additional_developer_instructions
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -703,5 +710,19 @@ impl DockerCodexRunner {
         }
 
         build_result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::security_review_instructions_template;
+    use insta::assert_snapshot;
+
+    #[test]
+    fn security_review_instructions_render_snapshot_without_placeholders() {
+        let instructions = security_review_instructions_template(0.75);
+
+        assert!(!instructions.contains("@@"), "{instructions}");
+        assert_snapshot!("security_review_instructions", instructions);
     }
 }

@@ -1,0 +1,98 @@
+---
+source: src/codex_runner/scripts.rs
+expression: mention
+---
+set -eu
+GITLAB_TOKEN='token-value'
+repo_dir='/work/repo/group/repo'
+log_file="/tmp/codex-mention-git.log"
+mkdir -p /work
+mkdir -p "$(dirname "$repo_dir")"
+run_git() {
+  action="$1"
+  shift
+  if [ "${CODEX_RUNNER_DEBUG:-}" = "1" ]; then
+    "$@" || { echo "codex-runner-error: git ${action} failed"; exit 1; }
+  else
+    if ! "$@" >"$log_file" 2>&1; then
+      echo "codex-runner-error: git ${action} failed"
+      tail -n 50 "$log_file" | sed 's/^/codex-runner-error: /'
+      exit 1
+    fi
+  fi
+}
+export GITLAB_TOKEN='token-value'
+export GIT_CONFIG_COUNT='3'
+export GIT_CONFIG_KEY_0='url.https://oauth2:token-value@gitlab.example.com/.insteadOf'
+export GIT_CONFIG_VALUE_0='git@gitlab.example.com:'
+export GIT_CONFIG_KEY_1='url.https://oauth2:token-value@gitlab.example.com/.insteadOf'
+export GIT_CONFIG_VALUE_1='ssh://git@gitlab.example.com/'
+export GIT_CONFIG_KEY_2='url.https://oauth2:token-value@gitlab.example.com/.insteadOf'
+export GIT_CONFIG_VALUE_2='https://gitlab.example.com/'
+
+run_git clone git clone --depth 1 --recurse-submodules "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git" "$repo_dir"
+cd "$repo_dir"
+run_git fetch git fetch --depth 1 origin 'abc123'
+run_git checkout git checkout 'abc123'
+run_git submodule_update git submodule update --init --recursive
+if [ -n "${GIT_CONFIG_COUNT:-}" ]; then
+  git_config_count="$GIT_CONFIG_COUNT"
+  unset GIT_CONFIG_COUNT
+  i=0
+  while [ "$i" -lt "$git_config_count" ]; do
+    unset "GIT_CONFIG_KEY_$i" "GIT_CONFIG_VALUE_$i"
+    i=$((i + 1))
+  done
+fi
+unset GITLAB_TOKEN
+
+origin_url="$(git remote get-url origin || true)"
+if [ -n "$origin_url" ]; then
+  sanitized_origin="$(printf '%s' "$origin_url" | sed -E 's#(https?://)oauth2:[^@]*@#\1#')"
+  run_git set_url git remote set-url origin "$sanitized_origin"
+fi
+run_git set_pushurl git remote set-url --push origin "no_push://disabled"
+mkdir -p '/root/.codex'
+export CODEX_HOME='/root/.codex'
+if ! command -v codex >/dev/null 2>&1; then
+  echo "codex-runner: codex not found, installing"
+  if command -v npm >/dev/null 2>&1; then
+    if [ "${CODEX_RUNNER_DEBUG:-}" = "1" ]; then
+      npm install -g @openai/codex
+    else
+      if ! npm install -g @openai/codex >/tmp/codex-install.log 2>&1; then
+        echo "codex-runner-error: codex install failed"
+        tail -n 50 /tmp/codex-install.log | sed 's/^/codex-runner-error: /'
+        exit 1
+      fi
+    fi
+  else
+    echo "codex-runner-error: npm not found; provide a base image with node/npm or preinstall codex"
+    exit 1
+  fi
+fi
+browser_mcp_command='browser-mcp'
+if ! command -v "$browser_mcp_command" >/dev/null 2>&1; then
+  echo "codex-runner-error: browser MCP requires $browser_mcp_command in the Codex image"
+  exit 1
+fi
+wait_for_browser_mcp() {
+  deadline=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if exec 3<>/dev/tcp/127.0.0.1/9222 2>/dev/null; then
+      printf 'GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3
+      if IFS= read -r status_line <&3 && printf '%s' "$status_line" | grep -q ' 200 '; then
+        exec 3<&-
+        exec 3>&-
+        return 0
+      fi
+      exec 3<&-
+      exec 3>&-
+    fi
+    sleep 1
+  done
+  echo "codex-runner-error: browser MCP endpoint did not become ready at http://127.0.0.1:9222/json/version"
+  exit 1
+}
+wait_for_browser_mcp
+exec codex -c 'model="gpt-test"' -c 'model_reasoning_summary="auto"' -c 'model_reasoning_effort="medium"' -c 'mcp_servers.browser.command="browser-mcp"' -c 'mcp_servers.browser.args=["--headless","--browserUrl=http://127.0.0.1:9222"]' -c 'mcp_servers.browser.enabled=true' -c 'mcp_servers.gitlab-discovery.url="http://127.0.0.1:8787/mcp"' -c 'mcp_servers.gitlab-discovery.enabled=true' -c 'mcp_servers.filesystem.enabled=true' app-server

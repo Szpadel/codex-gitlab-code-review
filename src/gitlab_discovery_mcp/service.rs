@@ -12,6 +12,7 @@ use crate::composer_install::{
 use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig};
 use crate::docker_utils::connect_docker;
 use crate::gitlab::GitLabClient;
+use crate::placeholders::render_placeholders;
 use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
 use bollard::container::LogOutput;
@@ -195,14 +196,11 @@ impl GitLabDiscoveryMcpService {
         binding: &GitLabDiscoverySessionBinding,
         repo_path: &str,
     ) -> Result<String> {
-        let clone_url = self
-            .clone_url_template(repo_path)?
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        let script = CLONE_REPOSITORY_SCRIPT_TEMPLATE
-            .replace("@@CLONE_ROOT@@", &shell_quote(&binding.clone_root))
-            .replace("@@REPO_PATH@@", &shell_quote(repo_path))
-            .replace("@@CLONE_URL@@", &clone_url);
+        let script = clone_repository_script(
+            &binding.clone_root,
+            repo_path,
+            &self.clone_url_template(repo_path)?,
+        );
         let output = self
             .exec_container_command(
                 &binding.container_id,
@@ -661,6 +659,19 @@ pub(crate) fn resolve_checkout_target(
     }
 }
 
+fn clone_repository_script(clone_root: &str, repo_path: &str, clone_url: &str) -> String {
+    let clone_url = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
+    render_placeholders(
+        CLONE_REPOSITORY_SCRIPT_TEMPLATE,
+        &[
+            ("CLONE_ROOT", &shell_quote(clone_root)),
+            ("REPO_PATH", &shell_quote(repo_path)),
+            ("CLONE_URL", &clone_url),
+        ],
+    )
+    .expect("clone repository script template placeholders are valid")
+}
+
 pub(crate) fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
@@ -671,7 +682,10 @@ pub(crate) fn mcp_internal_error(err: anyhow::Error) -> McpError {
 
 #[cfg(test)]
 mod tests {
-    use super::{GitLabDiscoveryMcpService, ResolvedCheckoutTarget, resolve_checkout_target};
+    use super::{
+        GitLabDiscoveryMcpService, ResolvedCheckoutTarget, clone_repository_script,
+        resolve_checkout_target,
+    };
     use crate::gitlab_discovery_mcp::GitLabCheckoutKind;
 
     #[test]
@@ -694,6 +708,18 @@ mod tests {
         assert!(!output.contains("secret-token"));
         assert!(output.contains("oauth2:[REDACTED]@gitlab.example.com/group/repo.git"));
         assert!(output.contains("[REDACTED_GITLAB_TOKEN]"));
+    }
+
+    #[test]
+    fn clone_repository_script_renders_snapshot_without_placeholders() {
+        let script = clone_repository_script(
+            "/tmp/gitlab-discovery",
+            "group/repo",
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git",
+        );
+
+        assert!(!script.contains("@@"), "{script}");
+        insta::assert_snapshot!("clone_repository_script", script);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::feature_flags::FeatureFlagSnapshot;
 use crate::gitlab::{GitLabApi, GitLabCiVariable};
+use crate::placeholders::render_placeholders;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -151,12 +152,17 @@ export COMPOSER_HOME=\"$composer_home\"\n"
             )
         })
         .unwrap_or_default();
-    let script = COMPOSER_INSTALL_SCRIPT_TEMPLATE
-        .replace("@@SKIP_LINE@@", &skip_line)
-        .replace("@@SKIP_EXIT_CODE@@", &skip_exit_code)
-        .replace("@@COMPOSER_HOME_SETUP@@", &composer_home_setup)
-        .replace("@@COMPOSER_COMMAND@@", &composer_command)
-        .replace("@@TIMEOUT_SECONDS@@", &timeout_seconds_text);
+    let script = render_placeholders(
+        COMPOSER_INSTALL_SCRIPT_TEMPLATE,
+        &[
+            ("SKIP_LINE", &skip_line),
+            ("SKIP_EXIT_CODE", &skip_exit_code),
+            ("COMPOSER_HOME_SETUP", &composer_home_setup),
+            ("COMPOSER_COMMAND", &composer_command),
+            ("TIMEOUT_SECONDS", &timeout_seconds_text),
+        ],
+    )
+    .expect("composer install script template placeholders are valid");
     vec!["bash".to_string(), "-lc".to_string(), script]
 }
 
@@ -976,6 +982,19 @@ mod tests {
         assert!(script.contains("export COMPOSER_HOME=\"$composer_home\""));
         assert!(script.contains("config.json"));
         assert!(script.contains("rm -rf \"$composer_home\""));
+    }
+
+    #[test]
+    fn composer_install_exec_command_renders_snapshot_without_placeholders() {
+        let command = composer_install_exec_command(
+            ComposerInstallMode::Safe,
+            42,
+            Some(r#"{"repositories":[{"type":"composer","url":"https://example.com"}]}"#),
+        );
+        let script = command.last().expect("bash script");
+
+        assert!(!script.contains("@@"), "{script}");
+        insta::assert_snapshot!("composer_install_script", script);
     }
 
     #[test]
