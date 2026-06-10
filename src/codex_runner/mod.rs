@@ -54,6 +54,7 @@ mod mention_inputs;
 mod review_flow;
 mod review_output;
 mod scripts;
+mod security_context;
 mod session_runner;
 #[cfg(test)]
 pub(crate) mod test_support;
