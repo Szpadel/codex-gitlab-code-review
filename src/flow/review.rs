@@ -1,4 +1,4 @@
-use crate::codex_runner::{CodexResult, ReviewContext};
+use crate::codex_runner::{CodexResult, ReviewComment, ReviewContext};
 use crate::config::Config;
 use crate::feature_flags::FeatureFlagSnapshot;
 use crate::flow::review_comments::{PostReviewCommentRequest, post_review_comment};
@@ -108,6 +108,45 @@ pub(crate) enum ReviewScheduleOutcome {
     SkippedCompleted,
     SkippedLocked,
     Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewRunResult {
+    Pass,
+    DryRunPass,
+    Comment,
+    DryRunComment,
+    Error,
+    Cancelled,
+}
+
+impl ReviewRunResult {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::DryRunPass => "dry_run_pass",
+            Self::Comment => "comment",
+            Self::DryRunComment => "dry_run_comment",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pass" => Some(Self::Pass),
+            "dry_run_pass" => Some(Self::DryRunPass),
+            "comment" => Some(Self::Comment),
+            "dry_run_comment" => Some(Self::DryRunComment),
+            "error" => Some(Self::Error),
+            "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn is_completed_review(self) -> bool {
+        matches!(self, Self::Pass | Self::Comment)
+    }
 }
 
 enum ReviewGateOutcome {
@@ -229,7 +268,7 @@ impl ReviewFlow {
                         review.iid,
                         review.head_sha.as_str(),
                         review.lane,
-                        "cancelled",
+                        ReviewRunResult::Cancelled.as_str(),
                     )
                     .await
                 {
@@ -298,7 +337,10 @@ impl ReviewFlow {
             .review_state
             .review_result_for_lane(repo, mr.iid, head_sha, self.lane)
             .await?;
-        if self.lane.is_security() && matches!(review_result.as_deref(), Some("pass" | "comment")) {
+        let parsed_review_result = review_result.as_deref().and_then(ReviewRunResult::parse);
+        if self.lane.is_security()
+            && parsed_review_result.is_some_and(ReviewRunResult::is_completed_review)
+        {
             return Ok(ReviewGateOutcome::Decision(
                 ReviewScheduleOutcome::SkippedCompleted,
             ));
@@ -313,8 +355,9 @@ impl ReviewFlow {
                         self.shared.bot_user_id,
                         head_sha,
                         self.finding_marker_prefix(),
-                    ) && review_result.as_deref() != Some("error")
-                        && (completed_inline_review || review_result.as_deref() == Some("comment"))
+                    ) && parsed_review_result != Some(ReviewRunResult::Error)
+                        && (completed_inline_review
+                            || parsed_review_result == Some(ReviewRunResult::Comment))
                     {
                         return Ok(ReviewGateOutcome::Decision(
                             ReviewScheduleOutcome::SkippedMarker,
@@ -377,7 +420,13 @@ impl ReviewFlow {
                 self.shared
                     .state
                     .review_state
-                    .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, "cancelled")
+                    .finish_review_for_lane(
+                        repo,
+                        mr.iid,
+                        head_sha,
+                        self.lane,
+                        ReviewRunResult::Cancelled.as_str(),
+                    )
                     .await?;
                 self.shared
                     .state
@@ -412,7 +461,13 @@ impl ReviewFlow {
                 .shared
                 .state
                 .review_state
-                .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, "cancelled")
+                .finish_review_for_lane(
+                    repo,
+                    mr.iid,
+                    head_sha,
+                    self.lane,
+                    ReviewRunResult::Cancelled.as_str(),
+                )
                 .await
             {
                 if let Some(refund_err) = refund_err {
@@ -799,7 +854,13 @@ impl ReviewFlow {
             .shared
             .state
             .review_state
-            .finish_review_for_lane(repo, iid, head_sha, self.lane, "error")
+            .finish_review_for_lane(
+                repo,
+                iid,
+                head_sha,
+                self.lane,
+                ReviewRunResult::Error.as_str(),
+            )
             .await
         {
             warn!(
@@ -841,7 +902,13 @@ impl ReviewFlow {
             .shared
             .state
             .review_state
-            .finish_review_for_lane(repo, iid, head_sha, self.lane, "error")
+            .finish_review_for_lane(
+                repo,
+                iid,
+                head_sha,
+                self.lane,
+                ReviewRunResult::Error.as_str(),
+            )
             .await
         {
             warn!(
@@ -872,7 +939,7 @@ impl ReviewFlow {
             .finish_run_history(
                 run_history_id,
                 RunHistoryFinish {
-                    result: "error".to_string(),
+                    result: ReviewRunResult::Error.as_str().to_string(),
                     preview: Some(format!("{} {repo} !{iid}", self.lane.review_label())),
                     error: Some(format!("{err:#}")),
                     ..RunHistoryFinish::default()
@@ -920,6 +987,14 @@ pub(crate) struct ReviewRunContext {
     pub(crate) bot_user_id: u64,
     pub(crate) lifecycle: Arc<ServiceLifecycle>,
     pub(crate) acquired_rate_limit_rule_ids: Vec<String>,
+}
+
+struct ReviewRunIdentity<'a> {
+    repo: &'a str,
+    iid: u64,
+    head_sha: &'a str,
+    run_history_id: i64,
+    retry_key: &'a RetryKey,
 }
 
 impl ReviewRunContext {
@@ -1006,6 +1081,17 @@ impl ReviewRunContext {
         }
     }
 
+    async fn add_eyes_best_effort(&self, repo: &str, iid: u64) {
+        if self.config.review.dry_run || !self.uses_awards() {
+            info!(repo = repo, iid = iid, "dry run: skipping eyes award");
+        } else {
+            self.gitlab
+                .add_award(repo, iid, &self.config.review.eyes_emoji)
+                .await
+                .ok();
+        }
+    }
+
     async fn finalize_cancelled(
         &self,
         repo: &str,
@@ -1027,14 +1113,20 @@ impl ReviewRunContext {
         self.retry_backoff.clear(retry_key);
         self.state
             .review_state
-            .finish_review_for_lane(repo, iid, head_sha, self.lane, "cancelled")
+            .finish_review_for_lane(
+                repo,
+                iid,
+                head_sha,
+                self.lane,
+                ReviewRunResult::Cancelled.as_str(),
+            )
             .await?;
         self.state
             .run_history
             .finish_run_history(
                 run_history_id,
                 RunHistoryFinish {
-                    result: "cancelled".to_string(),
+                    result: ReviewRunResult::Cancelled.as_str().to_string(),
                     preview: Some(self.review_preview(repo, iid)),
                     ..RunHistoryFinish::default()
                 },
@@ -1073,7 +1165,13 @@ impl ReviewRunContext {
         if let Err(recovery_err) = self
             .state
             .review_state
-            .finish_review_for_lane(repo, iid, head_sha, self.lane, "error")
+            .finish_review_for_lane(
+                repo,
+                iid,
+                head_sha,
+                self.lane,
+                ReviewRunResult::Error.as_str(),
+            )
             .await
         {
             warn!(
@@ -1090,7 +1188,7 @@ impl ReviewRunContext {
             .finish_run_history(
                 run_history_id,
                 RunHistoryFinish {
-                    result: "error".to_string(),
+                    result: ReviewRunResult::Error.as_str().to_string(),
                     preview: Some(self.review_preview(repo, iid)),
                     error: Some(format!("{err:#}")),
                     ..RunHistoryFinish::default()
@@ -1108,37 +1206,46 @@ impl ReviewRunContext {
         }
     }
 
-    pub(crate) async fn run(
+    async fn bail_if_start_rejected(&self, run: &ReviewRunIdentity<'_>) -> Result<bool> {
+        if self.should_reject_new_starts() {
+            self.finalize_cancelled(
+                run.repo,
+                run.iid,
+                run.head_sha,
+                run.retry_key,
+                run.run_history_id,
+            )
+            .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn bail_if_cancelled(&self, run: &ReviewRunIdentity<'_>) -> Result<bool> {
+        if self.should_cancel_active_work() {
+            self.finalize_cancelled(
+                run.repo,
+                run.iid,
+                run.head_sha,
+                run.retry_key,
+                run.run_history_id,
+            )
+            .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn build_codex_review_context(
         &self,
         repo: &str,
-        mr: MergeRequest,
+        mr: &MergeRequest,
         head_sha: &str,
+        project_path: String,
         feature_flags: FeatureFlagSnapshot,
         run_history_id: i64,
-    ) -> Result<()> {
-        let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
-        let inline_review_comments_enabled = feature_flags.gitlab_inline_review_comments;
-        if self.should_reject_new_starts() {
-            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
-                .await?;
-            return Ok(());
-        }
-
-        if self.config.review.dry_run || !self.uses_awards() {
-            info!(repo = repo, iid = mr.iid, "dry run: skipping eyes award");
-        } else {
-            self.gitlab
-                .add_award(repo, mr.iid, &self.config.review.eyes_emoji)
-                .await
-                .ok();
-        }
-
-        let project_path = if self.lane.is_security() {
-            repo.to_string()
-        } else {
-            self.resolve_review_project_path(repo, &mr).await
-        };
-        let review_ctx = ReviewContext {
+    ) -> ReviewContext {
+        ReviewContext {
             lane: self.lane,
             repo: repo.to_string(),
             project_path,
@@ -1163,157 +1270,231 @@ impl ReviewRunContext {
                 .is_security()
                 .then_some(self.config.review.security.context_ttl_seconds),
             run_history_id: Some(run_history_id),
+        }
+    }
+
+    async fn build_codex_review_context_for_run(
+        &self,
+        repo: &str,
+        mr: &MergeRequest,
+        head_sha: &str,
+        feature_flags: FeatureFlagSnapshot,
+        run_history_id: i64,
+    ) -> ReviewContext {
+        let project_path = if self.lane.is_security() {
+            repo.to_string()
+        } else {
+            self.resolve_review_project_path(repo, mr).await
         };
+        self.build_codex_review_context(
+            repo,
+            mr,
+            head_sha,
+            project_path,
+            feature_flags,
+            run_history_id,
+        )
+    }
+
+    async fn record_outcome(
+        &self,
+        run: &ReviewRunIdentity<'_>,
+        clear_retry_key: bool,
+        result: ReviewRunResult,
+        mut finish: RunHistoryFinish,
+    ) -> Result<()> {
+        if clear_retry_key {
+            self.retry_backoff.clear(run.retry_key);
+        }
+        self.state
+            .review_state
+            .finish_review_for_lane(run.repo, run.iid, run.head_sha, self.lane, result.as_str())
+            .await?;
+        finish.result = result.as_str().to_string();
+        self.state
+            .run_history
+            .finish_run_history(run.run_history_id, finish)
+            .await
+    }
+
+    async fn handle_pass(&self, run: &ReviewRunIdentity<'_>, summary: String) -> Result<()> {
+        if self.bail_if_cancelled(run).await? {
+            return Ok(());
+        }
+        if self.config.review.dry_run || !self.uses_awards() {
+            info!(
+                repo = run.repo,
+                iid = run.iid,
+                "dry run: skipping thumbs up"
+            );
+        } else {
+            self.gitlab
+                .add_award(run.repo, run.iid, &self.config.review.thumbs_emoji)
+                .await?;
+        }
+        let result = if self.config.review.dry_run {
+            ReviewRunResult::DryRunPass
+        } else {
+            ReviewRunResult::Pass
+        };
+        self.record_outcome(
+            run,
+            true,
+            result,
+            RunHistoryFinish {
+                preview: Some(self.review_preview(run.repo, run.iid)),
+                summary: Some(summary.clone()),
+                ..RunHistoryFinish::default()
+            },
+        )
+        .await?;
+        info!(
+            repo = run.repo,
+            iid = run.iid,
+            summary = summary.as_str(),
+            "review pass"
+        );
+        Ok(())
+    }
+
+    async fn handle_comment(
+        &self,
+        run: &ReviewRunIdentity<'_>,
+        mr: &MergeRequest,
+        inline_review_comments_enabled: bool,
+        review_project_path: &str,
+        comment: ReviewComment,
+    ) -> Result<()> {
+        if self.bail_if_cancelled(run).await? {
+            return Ok(());
+        }
+        if self.config.review.dry_run {
+            info!(repo = run.repo, iid = run.iid, "dry run: skipping comment");
+        } else {
+            post_review_comment(PostReviewCommentRequest {
+                inline_review_comments_enabled,
+                lane: self.lane,
+                config: &self.config,
+                gitlab: self.gitlab.as_ref(),
+                bot_user_id: self.bot_user_id,
+                project_path: review_project_path,
+                repo: run.repo,
+                mr,
+                head_sha: run.head_sha,
+                comment: &comment,
+            })
+            .await?;
+        }
+        let result = if self.config.review.dry_run {
+            ReviewRunResult::DryRunComment
+        } else {
+            ReviewRunResult::Comment
+        };
+        self.record_outcome(
+            run,
+            true,
+            result,
+            RunHistoryFinish {
+                preview: Some(self.review_preview(run.repo, run.iid)),
+                summary: Some(comment.summary.clone()),
+                error: Some(comment.body.clone()),
+                ..RunHistoryFinish::default()
+            },
+        )
+        .await?;
+        info!(
+            repo = run.repo,
+            iid = run.iid,
+            summary = comment.summary.as_str(),
+            "review comment"
+        );
+        Ok(())
+    }
+
+    async fn handle_error(&self, run: &ReviewRunIdentity<'_>, err: Error) -> Result<()> {
+        let next_retry_at = self
+            .retry_backoff
+            .record_failure((*run.retry_key).clone(), Utc::now());
+        error!(
+            repo = run.repo,
+            iid = run.iid,
+            error = ?err,
+            next_retry_at = %next_retry_at,
+            "review failed"
+        );
+        if self.bail_if_cancelled(run).await? {
+            return Ok(());
+        }
+        self.record_outcome(
+            run,
+            false,
+            ReviewRunResult::Error,
+            RunHistoryFinish {
+                preview: Some(self.review_preview(run.repo, run.iid)),
+                error: Some(format!("{err:#}")),
+                ..RunHistoryFinish::default()
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn run(
+        &self,
+        repo: &str,
+        mr: MergeRequest,
+        head_sha: &str,
+        feature_flags: FeatureFlagSnapshot,
+        run_history_id: i64,
+    ) -> Result<()> {
+        let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
+        let run_identity = ReviewRunIdentity {
+            repo,
+            iid: mr.iid,
+            head_sha,
+            run_history_id,
+            retry_key: &retry_key,
+        };
+        let inline_review_comments_enabled = feature_flags.gitlab_inline_review_comments;
+        if self.bail_if_start_rejected(&run_identity).await? {
+            return Ok(());
+        }
+
+        self.add_eyes_best_effort(repo, mr.iid).await;
+        let review_ctx = self
+            .build_codex_review_context_for_run(repo, &mr, head_sha, feature_flags, run_history_id)
+            .await;
         let review_project_path = review_ctx.project_path.clone();
 
-        if self.should_reject_new_starts() {
-            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
-                .await?;
+        if self.bail_if_start_rejected(&run_identity).await? {
             return Ok(());
         }
 
         let _started_run = self.lifecycle.track_started_run();
         let result = self.codex.run_review(review_ctx).await;
-        if self.should_cancel_active_work() {
-            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
-                .await?;
+        if self.bail_if_cancelled(&run_identity).await? {
             return Ok(());
         }
         self.remove_eyes_best_effort(repo, mr.iid).await;
-        if self.should_cancel_active_work() {
-            self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
-                .await?;
+        if self.bail_if_cancelled(&run_identity).await? {
             return Ok(());
         }
 
         match result {
             Ok(CodexResult::Pass { summary }) => {
-                if self.should_cancel_active_work() {
-                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
-                        .await?;
-                    return Ok(());
-                }
-                if self.config.review.dry_run || !self.uses_awards() {
-                    info!(repo = repo, iid = mr.iid, "dry run: skipping thumbs up");
-                } else {
-                    self.gitlab
-                        .add_award(repo, mr.iid, &self.config.review.thumbs_emoji)
-                        .await?;
-                }
-                self.retry_backoff.clear(&retry_key);
-                let review_result = if self.config.review.dry_run {
-                    "dry_run_pass"
-                } else {
-                    "pass"
-                };
-                self.state
-                    .review_state
-                    .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, review_result)
-                    .await?;
-                self.state
-                    .run_history
-                    .finish_run_history(
-                        run_history_id,
-                        RunHistoryFinish {
-                            result: review_result.to_string(),
-                            preview: Some(self.review_preview(repo, mr.iid)),
-                            summary: Some(summary.clone()),
-                            ..RunHistoryFinish::default()
-                        },
-                    )
-                    .await?;
-                info!(
-                    repo = repo,
-                    iid = mr.iid,
-                    summary = summary.as_str(),
-                    "review pass"
-                );
+                self.handle_pass(&run_identity, summary).await?;
             }
             Ok(CodexResult::Comment(comment)) => {
-                if self.should_cancel_active_work() {
-                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
-                        .await?;
-                    return Ok(());
-                }
-                if self.config.review.dry_run {
-                    info!(repo = repo, iid = mr.iid, "dry run: skipping comment");
-                } else {
-                    post_review_comment(PostReviewCommentRequest {
-                        inline_review_comments_enabled,
-                        lane: self.lane,
-                        config: &self.config,
-                        gitlab: self.gitlab.as_ref(),
-                        bot_user_id: self.bot_user_id,
-                        project_path: &review_project_path,
-                        repo,
-                        mr: &mr,
-                        head_sha,
-                        comment: &comment,
-                    })
-                    .await?;
-                }
-                self.retry_backoff.clear(&retry_key);
-                let review_result = if self.config.review.dry_run {
-                    "dry_run_comment"
-                } else {
-                    "comment"
-                };
-                self.state
-                    .review_state
-                    .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, review_result)
-                    .await?;
-                self.state
-                    .run_history
-                    .finish_run_history(
-                        run_history_id,
-                        RunHistoryFinish {
-                            result: review_result.to_string(),
-                            preview: Some(self.review_preview(repo, mr.iid)),
-                            summary: Some(comment.summary.clone()),
-                            error: Some(comment.body.clone()),
-                            ..RunHistoryFinish::default()
-                        },
-                    )
-                    .await?;
-                info!(
-                    repo = repo,
-                    iid = mr.iid,
-                    summary = comment.summary.as_str(),
-                    "review comment"
-                );
+                self.handle_comment(
+                    &run_identity,
+                    &mr,
+                    inline_review_comments_enabled,
+                    &review_project_path,
+                    comment,
+                )
+                .await?;
             }
             Err(err) => {
-                let next_retry_at = self
-                    .retry_backoff
-                    .record_failure(retry_key.clone(), Utc::now());
-                error!(
-                    repo = repo,
-                    iid = mr.iid,
-                    error = ?err,
-                    next_retry_at = %next_retry_at,
-                    "review failed"
-                );
-                if self.should_cancel_active_work() {
-                    self.finalize_cancelled(repo, mr.iid, head_sha, &retry_key, run_history_id)
-                        .await?;
-                    return Ok(());
-                }
-                self.state
-                    .review_state
-                    .finish_review_for_lane(repo, mr.iid, head_sha, self.lane, "error")
-                    .await?;
-                self.state
-                    .run_history
-                    .finish_run_history(
-                        run_history_id,
-                        RunHistoryFinish {
-                            result: "error".to_string(),
-                            preview: Some(self.review_preview(repo, mr.iid)),
-                            error: Some(format!("{err:#}")),
-                            ..RunHistoryFinish::default()
-                        },
-                    )
-                    .await?;
+                self.handle_error(&run_identity, err).await?;
             }
         }
 
@@ -1394,4 +1575,23 @@ pub(crate) async fn remove_bot_award(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReviewRunResult;
+
+    #[test]
+    fn review_run_result_roundtrips_persisted_strings() {
+        for result in [
+            ReviewRunResult::Pass,
+            ReviewRunResult::DryRunPass,
+            ReviewRunResult::Comment,
+            ReviewRunResult::DryRunComment,
+            ReviewRunResult::Error,
+            ReviewRunResult::Cancelled,
+        ] {
+            assert_eq!(ReviewRunResult::parse(result.as_str()), Some(result));
+        }
+    }
 }
