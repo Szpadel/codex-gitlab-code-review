@@ -19,11 +19,13 @@ use tokio::time::{Duration, sleep};
 
 use crate::http::test_support::{
     CapturingTranscriptBackfillSource, CountingThreadReaderRunner,
-    ErroringTranscriptBackfillSource, SequencedTranscriptBackfillSource,
+    ErroringTranscriptBackfillSource, RunFixture, SequencedTranscriptBackfillSource,
     StaticTranscriptBackfillSource, TestAuthDir, ThreadReaderRunner,
-    TurnScopedFallbackTranscriptBackfillSource, build_skill_zip, insert_run_history,
-    insert_run_history_events, spawn_test_server, test_client, test_client_builder, test_config,
-    test_get, write_skill,
+    TurnScopedFallbackTranscriptBackfillSource, agent_message_event, agent_message_event_at,
+    build_skill_zip, empty_reasoning_event, insert_run_history, insert_run_history_events,
+    reasoning_event, run_event, spawn_test_server, test_client, test_client_builder, test_config,
+    test_get, turn_completed_event, turn_completed_event_at, turn_started_event,
+    turn_started_event_at, write_skill,
 };
 
 mod feature_flags;

@@ -2,35 +2,18 @@ use super::*;
 #[tokio::test]
 async fn run_detail_page_shows_unavailable_transcript_for_legacy_runs() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Mention,
-            repo: "group/repo".to_string(),
-            iid: 11,
-            head_sha: "feed123".to_string(),
-            discussion_id: Some("discussion-11".to_string()),
-            trigger_note_id: Some(777),
-            trigger_note_author_name: Some("qa".to_string()),
-            trigger_note_body: Some("please inspect the legacy thread".to_string()),
-            command_repo: Some("group/repo".to_string()),
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-legacy".to_string()),
-            turn_id: Some("turn-legacy".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "committed".to_string(),
-            preview: Some("Mention group/repo !11 legacy thread".to_string()),
-            summary: Some("Used legacy thread replay".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::mention("group/repo", 11, "feed123")
+        .discussion("discussion-11", 777)
+        .trigger_note("qa", "please inspect the legacy thread")
+        .command_repo("group/repo")
+        .thread("thread-legacy")
+        .turn("turn-legacy")
+        .auth_account("primary")
+        .result("committed")
+        .preview("Mention group/repo !11 legacy thread")
+        .summary("Used legacy thread replay")
+        .insert(&state)
+        .await?;
     let runner = Arc::new(ThreadReaderRunner {
         response: json!({
             "thread": {
@@ -67,46 +50,16 @@ async fn run_detail_page_shows_unavailable_transcript_for_legacy_runs() -> Resul
 #[tokio::test]
 async fn run_detail_keeps_partial_persisted_history_without_thread_reader() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 12,
-            head_sha: "feed456".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-live".to_string()),
-            turn_id: Some("turn-live".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !12".to_string()),
-            summary: Some("Used complete live thread".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
-    insert_run_history_events(
-        &state,
-        run_id,
-        vec![NewRunHistoryEvent {
-            sequence: 1,
-            turn_id: Some("turn-live".to_string()),
-            event_type: "turn_started".to_string(),
-            payload: json!({}),
-        }],
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 12, "feed456")
+        .thread("thread-live")
+        .turn("turn-live")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !12")
+        .summary("Used complete live thread")
+        .insert(&state)
+        .await?;
+    insert_run_history_events(&state, run_id, vec![turn_started_event(1, "turn-live")]).await?;
     let runner = Arc::new(ThreadReaderRunner {
         response: json!({
             "thread": {
@@ -154,60 +107,22 @@ async fn run_detail_keeps_partial_persisted_history_without_thread_reader() -> R
 #[tokio::test]
 async fn run_detail_prefers_complete_persisted_event_history() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 13,
-            head_sha: "feed789".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-persisted".to_string()),
-            turn_id: Some("turn-persisted".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !13".to_string()),
-            summary: Some("Prefer persisted event history".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 13, "feed789")
+        .thread("thread-persisted")
+        .turn("turn-persisted")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !13")
+        .summary("Prefer persisted event history")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-persisted".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-persisted".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "Persisted transcript wins."
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-persisted".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-persisted"),
+            agent_message_event(2, "turn-persisted", "Persisted transcript wins."),
+            turn_completed_event(3, "turn-persisted"),
         ],
     )
     .await?;
@@ -247,60 +162,22 @@ async fn run_detail_prefers_complete_persisted_event_history() -> Result<()> {
 #[tokio::test]
 async fn run_detail_skips_live_thread_when_complete_persisted_history_exists() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 14,
-            head_sha: "feedabc".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-richer".to_string()),
-            turn_id: Some("turn-richer".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !14".to_string()),
-            summary: Some("Prefer richer live transcript".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 14, "feedabc")
+        .thread("thread-richer")
+        .turn("turn-richer")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !14")
+        .summary("Prefer richer live transcript")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-richer".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-richer".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "Persisted transcript item."
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-richer".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-richer"),
+            agent_message_event(2, "turn-richer", "Persisted transcript item."),
+            turn_completed_event(3, "turn-richer"),
         ],
     )
     .await?;
@@ -327,51 +204,21 @@ async fn run_detail_skips_live_thread_when_complete_persisted_history_exists() -
 #[tokio::test]
 async fn run_detail_keeps_incomplete_persisted_history_without_thread_reader() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 15,
-            head_sha: "feeddef".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-incomplete".to_string()),
-            turn_id: Some("turn-incomplete".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !15".to_string()),
-            summary: Some("Use live replay after persistence failure".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 15, "feeddef")
+        .thread("thread-incomplete")
+        .turn("turn-incomplete")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !15")
+        .summary("Use live replay after persistence failure")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-incomplete".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-incomplete".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-incomplete"),
+            turn_completed_event(2, "turn-incomplete"),
         ],
     )
     .await?;
@@ -415,51 +262,24 @@ async fn run_detail_keeps_incomplete_persisted_history_without_thread_reader() -
 #[tokio::test]
 async fn run_detail_keeps_completed_turn_without_items_without_thread_reader() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Mention,
-            repo: "group/repo".to_string(),
-            iid: 16,
-            head_sha: "feed000".to_string(),
-            discussion_id: Some("discussion-16".to_string()),
-            trigger_note_id: Some(16),
-            trigger_note_author_name: Some("qa".to_string()),
-            trigger_note_body: Some("show delta-only completion".to_string()),
-            command_repo: Some("group/repo".to_string()),
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-delta-only".to_string()),
-            turn_id: Some("turn-delta-only".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "committed".to_string(),
-            preview: Some("Mention group/repo !16".to_string()),
-            summary: Some("Recover delta-only turn via live replay".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::mention("group/repo", 16, "feed000")
+        .discussion("discussion-16", 16)
+        .trigger_note("qa", "show delta-only completion")
+        .command_repo("group/repo")
+        .thread("thread-delta-only")
+        .turn("turn-delta-only")
+        .auth_account("primary")
+        .result("committed")
+        .preview("Mention group/repo !16")
+        .summary("Recover delta-only turn via live replay")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-delta-only".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-delta-only".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-delta-only"),
+            turn_completed_event(2, "turn-delta-only"),
         ],
     )
     .await?;
@@ -499,61 +319,31 @@ async fn run_detail_keeps_completed_turn_without_items_without_thread_reader() -
 #[tokio::test]
 async fn run_detail_keeps_command_without_body_without_thread_reader() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 17,
-            head_sha: "feed111".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-command-body".to_string()),
-            turn_id: Some("turn-command-body".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !17".to_string()),
-            summary: Some("Recover command output from live replay".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 17, "feed111")
+        .thread("thread-command-body")
+        .turn("turn-command-body")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !17")
+        .summary("Recover command output from live replay")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-command-body".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-command-body".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
+            turn_started_event(1, "turn-command-body"),
+            run_event(
+                2,
+                Some("turn-command-body"),
+                "item_completed",
+                json!({
                     "type": "commandExecution",
                     "command": "cargo test",
                     "status": "completed"
                 }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-command-body".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            ),
+            turn_completed_event(3, "turn-command-body"),
         ],
     )
     .await?;
@@ -594,61 +384,22 @@ async fn run_detail_keeps_command_without_body_without_thread_reader() -> Result
 #[tokio::test]
 async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 18,
-            head_sha: "feed222".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-backfill".to_string()),
-            turn_id: Some("turn-backfill".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !18".to_string()),
-            summary: Some("Queue background transcript backfill".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 18, "feed222")
+        .thread("thread-backfill")
+        .turn("turn-backfill")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !18")
+        .summary("Queue background transcript backfill")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-backfill".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-backfill".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-backfill".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-backfill"),
+            empty_reasoning_event(2, "turn-backfill"),
+            turn_completed_event(3, "turn-backfill"),
         ],
     )
     .await?;
@@ -659,28 +410,9 @@ async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let backfill_source = Arc::new(StaticTranscriptBackfillSource {
         events: vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-backfill".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-backfill".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": "Recovered summary"}],
-                    "content": [{"type": "reasoning_text", "text": "Recovered detail"}]
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-backfill".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-backfill"),
+            reasoning_event(2, "turn-backfill", "Recovered summary", "Recovered detail"),
+            turn_completed_event(3, "turn-backfill"),
         ],
         calls: Arc::clone(&backfill_calls),
     });
@@ -724,60 +456,25 @@ async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history
 #[tokio::test]
 async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Security,
-            repo: "group/repo".to_string(),
-            iid: 19,
-            head_sha: "feed333".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-security".to_string()),
-            turn_id: Some("turn-review".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "pass".to_string(),
-            preview: Some("Security review group/repo !19".to_string()),
-            summary: Some("Rebuild shared-thread security transcript".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::security("group/repo", 19, "feed333")
+        .thread("thread-security")
+        .turn("turn-review")
+        .auth_account("primary")
+        .result("pass")
+        .preview("Security review group/repo !19")
+        .summary("Rebuild shared-thread security transcript")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
+            turn_started_event(1, "turn-review"),
+            run_event(2, Some("turn-review"), "item_completed", json!({
                     "type": "agentMessage",
                     "content": [{"type": "text", "text": "{\"findings\":[],\"overall_correctness\":\"patch is correct\"}"}]
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+                })),
+            turn_completed_event(3, "turn-review"),
         ],
     )
     .await?;
@@ -792,71 +489,41 @@ async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread(
         .expect("run history should exist");
     let source = TurnScopedFallbackTranscriptBackfillSource {
         turn_events: Some(vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
+            turn_started_event(1, "turn-review"),
+            run_event(
+                2,
+                Some("turn-review"),
+                "item_completed",
+                json!({
                     "type": "agentMessage",
                     "content": [{"type": "text", "text": "{\"findings\":[],\"overall_correctness\":\"patch is correct\"}"}]
                 }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            ),
+            turn_completed_event(3, "turn-review"),
         ]),
         full_thread_events: vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-threat".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-threat".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
+            turn_started_event(1, "turn-threat"),
+            run_event(
+                2,
+                Some("turn-threat"),
+                "item_completed",
+                json!({
                     "type": "agentMessage",
                     "content": [{"type": "text", "text": "{\"focus_paths\":[]}"}]
                 }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-threat".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
+            ),
+            turn_completed_event(3, "turn-threat"),
+            turn_started_event(4, "turn-review"),
+            run_event(
+                5,
+                Some("turn-review"),
+                "item_completed",
+                json!({
                     "type": "agentMessage",
                     "content": [{"type": "text", "text": "{\"findings\":[],\"overall_correctness\":\"patch is correct\"}"}]
                 }),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            ),
+            turn_completed_event(6, "turn-review"),
         ],
         seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
     };
@@ -878,60 +545,22 @@ async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread(
 #[tokio::test]
 async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 27,
-            head_sha: "feedchild".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-wrapper".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !27".to_string()),
-            summary: Some("Replace child-only persisted review turn".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 27, "feedchild")
+        .thread("thread-review-wrapper")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !27")
+        .summary("Replace child-only persisted review turn")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "stale child transcript"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-stale-child"),
+            agent_message_event(2, "turn-stale-child", "stale child transcript"),
+            turn_completed_event(3, "turn-stale-child"),
         ],
     )
     .await?;
@@ -944,37 +573,19 @@ async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Res
         HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: vec![
-                    NewRunHistoryEvent {
-                        sequence: 1,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "turn_started".to_string(),
-                        payload: json!({}),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 2,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "item_completed".to_string(),
-                        payload: json!({
+                    turn_started_event(1, "turn-parent"),
+                    run_event(
+                        2,
+                        Some("turn-parent"),
+                        "item_completed",
+                        json!({
                             "type": "enteredReviewMode",
                             "review": "Investigating",
                             "reviewChildTurnIds": ["turn-stale-child"]
                         }),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 3,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "item_completed".to_string(),
-                        payload: json!({
-                            "type": "agentMessage",
-                            "text": "fresh review transcript"
-                        }),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 4,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "turn_completed".to_string(),
-                        payload: json!({"status": "completed"}),
-                    },
+                    ),
+                    agent_message_event(3, "turn-parent", "fresh review transcript"),
+                    turn_completed_event(4, "turn-parent"),
                 ],
                 calls: Arc::clone(&backfill_calls),
             })),
@@ -1017,60 +628,22 @@ async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Res
 async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after_sanitize_empties_persisted_events()
 -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 127,
-            head_sha: "feedsanitize".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-missing-parent-only-child".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !127".to_string()),
-            summary: Some("Recover missing parent turn from full thread".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 127, "feedsanitize")
+        .thread("thread-review-missing-parent-only-child")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !127")
+        .summary("Recover missing parent turn from full thread")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "stale child transcript"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-stale-child"),
+            agent_message_event(2, "turn-stale-child", "stale child transcript"),
+            turn_completed_event(3, "turn-stale-child"),
         ],
     )
     .await?;
@@ -1085,37 +658,19 @@ async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event(1, "turn-parent"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "review": "Investigating",
                                 "reviewChildTurnIds": ["turn-stale-child"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "fresh review transcript"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        ),
+                        agent_message_event(3, "turn-parent", "fresh review transcript"),
+                        turn_completed_event(4, "turn-parent"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -1156,82 +711,25 @@ async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after
 #[tokio::test]
 async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewrite() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 28,
-            head_sha: "feeddup".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-duplicate".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !28".to_string()),
-            summary: Some("Drop partial stale child review items".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 28, "feeddup")
+        .thread("thread-review-duplicate")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !28")
+        .summary("Drop partial stale child review items")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-parent".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-parent".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "stale child transcript"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-parent".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-parent"),
+            empty_reasoning_event(2, "turn-parent"),
+            turn_started_event(3, "turn-stale-child"),
+            agent_message_event(4, "turn-stale-child", "stale child transcript"),
+            turn_completed_event(5, "turn-stale-child"),
+            turn_completed_event(6, "turn-parent"),
         ],
     )
     .await?;
@@ -1244,37 +742,19 @@ async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewri
         HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: vec![
-                    NewRunHistoryEvent {
-                        sequence: 1,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "turn_started".to_string(),
-                        payload: json!({}),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 2,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "item_completed".to_string(),
-                        payload: json!({
+                    turn_started_event(1, "turn-parent"),
+                    run_event(
+                        2,
+                        Some("turn-parent"),
+                        "item_completed",
+                        json!({
                             "type": "enteredReviewMode",
                             "review": "Investigating",
                             "reviewChildTurnIds": ["turn-stale-child"]
                         }),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 3,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "item_completed".to_string(),
-                        payload: json!({
-                            "type": "agentMessage",
-                            "text": "fresh review transcript"
-                        }),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 4,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "turn_completed".to_string(),
-                        payload: json!({"status": "completed"}),
-                    },
+                    ),
+                    agent_message_event(3, "turn-parent", "fresh review transcript"),
+                    turn_completed_event(4, "turn-parent"),
                 ],
                 calls: Arc::clone(&backfill_calls),
             })),
@@ -1322,105 +802,28 @@ async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewri
 async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_child_turns()
 -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 29,
-            head_sha: "feedlater".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-later".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !29".to_string()),
-            summary: Some(
-                "Preserve later turns while removing stale child review turns".to_string(),
-            ),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 29, "feedlater")
+        .thread("thread-review-later")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !29")
+        .summary("Preserve later turns while removing stale child review turns".to_string())
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-parent".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-parent".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "stale child transcript"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-parent".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 7,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 8,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "later legitimate turn"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 9,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-parent"),
+            empty_reasoning_event(2, "turn-parent"),
+            turn_started_event(3, "turn-stale-child"),
+            agent_message_event(4, "turn-stale-child", "stale child transcript"),
+            turn_completed_event(5, "turn-stale-child"),
+            turn_completed_event(6, "turn-parent"),
+            turn_started_event(7, "turn-later"),
+            agent_message_event(8, "turn-later", "later legitimate turn"),
+            turn_completed_event(9, "turn-later"),
         ],
     )
     .await?;
@@ -1433,37 +836,19 @@ async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_c
         HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: vec![
-                    NewRunHistoryEvent {
-                        sequence: 1,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "turn_started".to_string(),
-                        payload: json!({}),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 2,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "item_completed".to_string(),
-                        payload: json!({
+                    turn_started_event(1, "turn-parent"),
+                    run_event(
+                        2,
+                        Some("turn-parent"),
+                        "item_completed",
+                        json!({
                             "type": "enteredReviewMode",
                             "review": "Investigating",
                             "reviewChildTurnIds": ["turn-stale-child"]
                         }),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 3,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "item_completed".to_string(),
-                        payload: json!({
-                            "type": "agentMessage",
-                            "text": "fresh review transcript"
-                        }),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 4,
-                        turn_id: Some("turn-parent".to_string()),
-                        event_type: "turn_completed".to_string(),
-                        payload: json!({"status": "completed"}),
-                    },
+                    ),
+                    agent_message_event(3, "turn-parent", "fresh review transcript"),
+                    turn_completed_event(4, "turn-parent"),
                 ],
                 calls: Arc::clone(&backfill_calls),
             })),
@@ -1507,89 +892,35 @@ async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_c
 #[tokio::test]
 async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 30,
-            head_sha: "feedmissing".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-missing-parent".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !30".to_string()),
-            summary: Some("Preserve later turns when parent turn is missing".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 30, "feedmissing")
+        .thread("thread-review-missing-parent")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !30")
+        .summary("Preserve later turns when parent turn is missing")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({"createdAt": "2026-03-11T21:32:37.161Z"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "stale child transcript",
-                    "createdAt": "2026-03-11T21:32:37.162Z"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({
-                    "status": "completed",
-                    "createdAt": "2026-03-11T21:32:37.163Z"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({"createdAt": "2026-03-11T21:40:00.000Z"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "later legitimate turn",
-                    "createdAt": "2026-03-11T21:40:01.000Z"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({
-                    "status": "completed",
-                    "createdAt": "2026-03-11T21:40:02.000Z"
-                }),
-            },
+            turn_started_event_at(1, "turn-stale-child", "2026-03-11T21:32:37.161Z"),
+            agent_message_event_at(
+                2,
+                "turn-stale-child",
+                "stale child transcript",
+                "2026-03-11T21:32:37.162Z",
+            ),
+            turn_completed_event_at(3, "turn-stale-child", "2026-03-11T21:32:37.163Z"),
+            turn_started_event_at(4, "turn-later", "2026-03-11T21:40:00.000Z"),
+            agent_message_event_at(
+                5,
+                "turn-later",
+                "later legitimate turn",
+                "2026-03-11T21:40:01.000Z",
+            ),
+            turn_completed_event_at(6, "turn-later", "2026-03-11T21:40:02.000Z"),
         ],
     )
     .await?;
@@ -1603,105 +934,54 @@ async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing(
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:32:37.160Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "review": "Investigating",
                                 "createdAt": "2026-03-11T21:32:37.160Z",
                                 "reviewChildTurnIds": ["turn-stale-child"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "fresh review transcript",
-                                "createdAt": "2026-03-11T21:32:37.162Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:32:37.164Z"
-                            }),
-                        },
+                        ),
+                        agent_message_event_at(
+                            3,
+                            "turn-parent",
+                            "fresh review transcript",
+                            "2026-03-11T21:32:37.162Z",
+                        ),
+                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
                     ]),
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:32:37.160Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "review": "Investigating",
                                 "createdAt": "2026-03-11T21:32:37.160Z",
                                 "reviewChildTurnIds": ["turn-stale-child"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "fresh review transcript",
-                                "createdAt": "2026-03-11T21:32:37.162Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:32:37.164Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:40:00.000Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "later legitimate turn",
-                                "createdAt": "2026-03-11T21:40:01.000Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 7,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:40:02.000Z"
-                            }),
-                        },
+                        ),
+                        agent_message_event_at(
+                            3,
+                            "turn-parent",
+                            "fresh review transcript",
+                            "2026-03-11T21:32:37.162Z",
+                        ),
+                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
+                        turn_started_event_at(5, "turn-later", "2026-03-11T21:40:00.000Z"),
+                        agent_message_event_at(
+                            6,
+                            "turn-later",
+                            "later legitimate turn",
+                            "2026-03-11T21:40:01.000Z",
+                        ),
+                        turn_completed_event_at(7, "turn-later", "2026-03-11T21:40:02.000Z"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -1743,89 +1023,35 @@ async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing(
 #[tokio::test]
 async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 31,
-            head_sha: "feedtargetonly".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-target-only".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !31".to_string()),
-            summary: Some("Preserve later turns during target-only fallback".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 31, "feedtargetonly")
+        .thread("thread-review-target-only")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !31")
+        .summary("Preserve later turns during target-only fallback")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({"createdAt": "2026-03-11T21:32:37.161Z"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "stale child transcript",
-                    "createdAt": "2026-03-11T21:32:37.162Z"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-stale-child".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({
-                    "status": "completed",
-                    "createdAt": "2026-03-11T21:32:37.163Z"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({"createdAt": "2026-03-11T21:40:00.000Z"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "later legitimate turn",
-                    "createdAt": "2026-03-11T21:40:01.000Z"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({
-                    "status": "completed",
-                    "createdAt": "2026-03-11T21:40:02.000Z"
-                }),
-            },
+            turn_started_event_at(1, "turn-stale-child", "2026-03-11T21:32:37.161Z"),
+            agent_message_event_at(
+                2,
+                "turn-stale-child",
+                "stale child transcript",
+                "2026-03-11T21:32:37.162Z",
+            ),
+            turn_completed_event_at(3, "turn-stale-child", "2026-03-11T21:32:37.163Z"),
+            turn_started_event_at(4, "turn-later", "2026-03-11T21:40:00.000Z"),
+            agent_message_event_at(
+                5,
+                "turn-later",
+                "later legitimate turn",
+                "2026-03-11T21:40:01.000Z",
+            ),
+            turn_completed_event_at(6, "turn-later", "2026-03-11T21:40:02.000Z"),
         ],
     )
     .await?;
@@ -1839,80 +1065,46 @@ async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> R
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:32:37.160Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "review": "Investigating",
                                 "createdAt": "2026-03-11T21:32:37.160Z",
                                 "reviewChildTurnIds": ["turn-stale-child"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "fresh review transcript",
-                                "createdAt": "2026-03-11T21:32:37.162Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:32:37.164Z"
-                            }),
-                        },
+                        ),
+                        agent_message_event_at(
+                            3,
+                            "turn-parent",
+                            "fresh review transcript",
+                            "2026-03-11T21:32:37.162Z",
+                        ),
+                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
                     ]),
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:32:37.160Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "review": "Investigating",
                                 "createdAt": "2026-03-11T21:32:37.160Z",
                                 "reviewChildTurnIds": ["turn-stale-child"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "fresh review transcript",
-                                "createdAt": "2026-03-11T21:32:37.162Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:32:37.164Z"
-                            }),
-                        },
+                        ),
+                        agent_message_event_at(
+                            3,
+                            "turn-parent",
+                            "fresh review transcript",
+                            "2026-03-11T21:32:37.162Z",
+                        ),
+                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -1955,60 +1147,22 @@ async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> R
 async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_turns() -> Result<()>
 {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 34,
-            head_sha: "feedplainmissing".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-plain-missing".to_string()),
-            turn_id: Some("turn-target".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !34".to_string()),
-            summary: Some("Recover plain missing target turn before later turns".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 34, "feedplainmissing")
+        .thread("thread-review-plain-missing")
+        .turn("turn-target")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !34")
+        .summary("Recover plain missing target turn before later turns")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "later legitimate turn"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-later"),
+            agent_message_event(2, "turn-later", "later legitimate turn"),
+            turn_completed_event(3, "turn-later"),
         ],
     )
     .await?;
@@ -2022,71 +1176,17 @@ async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_tu
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "recovered target turn"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        turn_started_event(1, "turn-target"),
+                        agent_message_event(2, "turn-target", "recovered target turn"),
+                        turn_completed_event(3, "turn-target"),
                     ]),
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "recovered target turn"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "later legitimate turn"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        turn_started_event(1, "turn-target"),
+                        agent_message_event(2, "turn-target", "recovered target turn"),
+                        turn_completed_event(3, "turn-target"),
+                        turn_started_event(4, "turn-later"),
+                        agent_message_event(5, "turn-later", "later legitimate turn"),
+                        turn_completed_event(6, "turn-later"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -2134,37 +1234,15 @@ async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_tu
 #[tokio::test]
 async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 32,
-            head_sha: "feedempty".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-empty".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !32".to_string()),
-            summary: Some(
-                "Recover only the target turn when persisted history is empty".to_string(),
-            ),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 32, "feedempty")
+        .thread("thread-review-empty")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !32")
+        .summary("Recover only the target turn when persisted history is empty".to_string())
+        .insert(&state)
+        .await?;
     state
         .run_history
         .mark_run_history_events_incomplete(run_id)
@@ -2176,56 +1254,22 @@ async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:32:37.160Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "fresh review transcript",
-                                "createdAt": "2026-03-11T21:32:37.162Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:32:37.164Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:40:00.000Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "later legitimate turn",
-                                "createdAt": "2026-03-11T21:40:01.000Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:40:02.000Z"
-                            }),
-                        },
+                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                        agent_message_event_at(
+                            2,
+                            "turn-parent",
+                            "fresh review transcript",
+                            "2026-03-11T21:32:37.162Z",
+                        ),
+                        turn_completed_event_at(3, "turn-parent", "2026-03-11T21:32:37.164Z"),
+                        turn_started_event_at(4, "turn-later", "2026-03-11T21:40:00.000Z"),
+                        agent_message_event_at(
+                            5,
+                            "turn-later",
+                            "later legitimate turn",
+                            "2026-03-11T21:40:01.000Z",
+                        ),
+                        turn_completed_event_at(6, "turn-later", "2026-03-11T21:40:02.000Z"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -2273,38 +1317,18 @@ async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<
 async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_markers() -> Result<()>
 {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 33,
-            head_sha: "feedemptyother".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-empty-other".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !33".to_string()),
-            summary: Some(
-                "Recover target turn even when another turn is still waiting for review child history"
-                    .to_string(),
-            ),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 33, "feedemptyother")
+        .thread("thread-review-empty-other")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !33")
+        .summary(
+            "Recover target turn even when another turn is still waiting for review child history"
+                .to_string(),
+        )
+        .insert(&state)
+        .await?;
     state
         .run_history
         .mark_run_history_events_incomplete(run_id)
@@ -2316,56 +1340,26 @@ async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_mark
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:32:37.160Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "fresh review transcript",
-                                "createdAt": "2026-03-11T21:32:37.162Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:32:37.164Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-unrelated".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:40:00.000Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-unrelated".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                        agent_message_event_at(
+                            2,
+                            "turn-parent",
+                            "fresh review transcript",
+                            "2026-03-11T21:32:37.162Z",
+                        ),
+                        turn_completed_event_at(3, "turn-parent", "2026-03-11T21:32:37.164Z"),
+                        turn_started_event_at(4, "turn-unrelated", "2026-03-11T21:40:00.000Z"),
+                        run_event(
+                            5,
+                            Some("turn-unrelated"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "reviewMissingChildTurnIds": ["turn-unrelated-child"],
                                 "createdAt": "2026-03-11T21:40:01.000Z"
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-unrelated".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:40:02.000Z"
-                            }),
-                        },
+                        ),
+                        turn_completed_event_at(6, "turn-unrelated", "2026-03-11T21:40:02.000Z"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -2412,63 +1406,23 @@ async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_mark
 #[tokio::test]
 async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 36,
-            head_sha: "feedtargetothermissing".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-target-other-missing".to_string()),
-            turn_id: Some("turn-target".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !36".to_string()),
-            summary: Some(
-                "Recover missing target turn even when another persisted turn still waits on review child history"
-                    .to_string(),
-            ),
-            ..Default::default()
-        },
-    )
+    let run_id = RunFixture::review("group/repo", 36, "feedtargetothermissing")
+        .thread("thread-review-target-other-missing")
+        .turn("turn-target")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !36")
+        .summary("Recover missing target turn even when another persisted turn still waits on review child history"
+                    .to_string(),)
+        .insert(&state)
     .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-unrelated".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-unrelated".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "persisted unrelated turn"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-unrelated".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-unrelated"),
+            agent_message_event(2, "turn-unrelated", "persisted unrelated turn"),
+            turn_completed_event(3, "turn-unrelated"),
         ],
     )
     .await?;
@@ -2483,49 +1437,21 @@ async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-unrelated".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-unrelated".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event(1, "turn-unrelated"),
+                        run_event(
+                            2,
+                            Some("turn-unrelated"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "review": "Waiting on unrelated child",
                                 "reviewMissingChildTurnIds": ["turn-unrelated-child"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-unrelated".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "recovered target turn"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        ),
+                        turn_completed_event(3, "turn-unrelated"),
+                        turn_started_event(4, "turn-target"),
+                        agent_message_event(5, "turn-target", "recovered target turn"),
+                        turn_completed_event(6, "turn-target"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -2568,37 +1494,15 @@ async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history
 async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_target_missing()
 -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 137,
-            head_sha: "feedstaleoldertargetmissing".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-stale-older-target-missing".to_string()),
-            turn_id: Some("turn-target".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !137".to_string()),
-            summary: Some(
-                "Recover stale older review-wrapper turns from full-thread backfill when the current target turn is missing"
-                    .to_string(),
-            ),
-            ..Default::default()
-        },
-    )
+    let run_id = RunFixture::review("group/repo", 137, "feedstaleoldertargetmissing")
+        .thread("thread-review-stale-older-target-missing")
+        .turn("turn-target")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !137")
+        .summary("Recover stale older review-wrapper turns from full-thread backfill when the current target turn is missing"
+                    .to_string(),)
+        .insert(&state)
     .await?;
     sqlx::query("UPDATE run_history SET finished_at = 0, updated_at = 0 WHERE id = ?")
         .bind(run_id)
@@ -2608,27 +1512,17 @@ async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_t
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
+            turn_started_event(1, "turn-old"),
+            run_event(
+                2,
+                Some("turn-old"),
+                "item_completed",
+                json!({
                     "type": "enteredReviewMode",
                     "reviewMissingChildTurnIds": ["turn-old-child"]
                 }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            ),
+            turn_completed_event(3, "turn-old"),
         ],
     )
     .await?;
@@ -2643,58 +1537,30 @@ async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_t
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event(1, "turn-old"),
+                        run_event(
+                            2,
+                            Some("turn-old"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "reviewMissingChildTurnIds": ["turn-old-child"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        ),
+                        run_event(
+                            3,
+                            Some("turn-old"),
+                            "item_completed",
+                            json!({
                                 "type": "agentMessage",
                                 "text": "Recovered older turn",
                                 "reviewMissingChildTurnIds": ["turn-old-child"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "Recovered current turn"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 7,
-                            turn_id: Some("turn-target".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        ),
+                        turn_completed_event(4, "turn-old"),
+                        turn_started_event(5, "turn-target"),
+                        agent_message_event(6, "turn-target", "Recovered current turn"),
+                        turn_completed_event(7, "turn-target"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -2737,37 +1603,15 @@ async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_t
 async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_sibling()
 -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 35,
-            head_sha: "feedemptytargetreview".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-empty-target".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !35".to_string()),
-            summary: Some(
-                "Do not finalize target-only recovery while review sibling is missing".to_string(),
-            ),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 35, "feedemptytargetreview")
+        .thread("thread-review-empty-target")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !35")
+        .summary("Do not finalize target-only recovery while review sibling is missing".to_string())
+        .insert(&state)
+        .await?;
     state
         .run_history
         .mark_run_history_events_incomplete(run_id)
@@ -2778,36 +1622,18 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event(1, "turn-parent"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "reviewMissingChildTurnIds": ["turn-child-missing"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "wrapper summary"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        ),
+                        agent_message_event(3, "turn-parent", "wrapper summary"),
+                        turn_completed_event(4, "turn-parent"),
                     ],
                     seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
                 },
@@ -2858,37 +1684,15 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
 async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_failed()
 -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 37,
-            head_sha: "feedstalemissingsibling".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-stale-missing-sibling".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !37".to_string()),
-            summary: Some(
-                "Do not accept stale missing review siblings when the wrapper has no renderable fallback"
-                    .to_string(),
-            ),
-            ..Default::default()
-        },
-    )
+    let run_id = RunFixture::review("group/repo", 37, "feedstalemissingsibling")
+        .thread("thread-review-stale-missing-sibling")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !37")
+        .summary("Do not accept stale missing review siblings when the wrapper has no renderable fallback"
+                    .to_string(),)
+        .insert(&state)
     .await?;
     sqlx::query("UPDATE run_history SET finished_at = 0, updated_at = 0 WHERE id = ?")
         .bind(run_id)
@@ -2903,50 +1707,30 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event(1, "turn-parent"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "reviewMissingChildTurnIds": ["turn-child-missing"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        ),
+                        turn_completed_event(3, "turn-parent"),
                     ]),
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event(1, "turn-parent"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "reviewMissingChildTurnIds": ["turn-child-missing"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        ),
+                        turn_completed_event(3, "turn-parent"),
                     ],
                     seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
                 },
@@ -2996,38 +1780,17 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
 #[tokio::test]
 async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 38,
-            head_sha: "feedstalewrapperfallback".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-stale-wrapper-fallback".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !38".to_string()),
-            summary: Some(
-                "Recover stale missing review siblings when wrapper output is renderable"
-                    .to_string(),
-            ),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 38, "feedstalewrapperfallback")
+        .thread("thread-review-stale-wrapper-fallback")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !38")
+        .summary(
+            "Recover stale missing review siblings when wrapper output is renderable".to_string(),
+        )
+        .insert(&state)
+        .await?;
     sqlx::query("UPDATE run_history SET finished_at = 0, updated_at = 0 WHERE id = ?")
         .bind(run_id)
         .execute(state.pool())
@@ -3041,70 +1804,50 @@ async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers(
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event(1, "turn-parent"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "reviewMissingChildTurnIds": ["turn-child-missing"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        ),
+                        run_event(
+                            3,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "agentMessage",
                                 "text": "Wrapper fallback summary",
                                 "reviewMissingChildTurnIds": ["turn-child-missing"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        ),
+                        turn_completed_event(4, "turn-parent"),
                     ]),
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event(1, "turn-parent"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "reviewMissingChildTurnIds": ["turn-child-missing"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        ),
+                        run_event(
+                            3,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "agentMessage",
                                 "text": "Wrapper fallback summary",
                                 "reviewMissingChildTurnIds": ["turn-child-missing"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        ),
+                        turn_completed_event(4, "turn-parent"),
                     ],
                     seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
                 },
@@ -3148,106 +1891,33 @@ async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers(
 #[tokio::test]
 async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 31,
-            head_sha: "feedmultichild".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-review-multi-child-missing-parent".to_string()),
-            turn_id: Some("turn-parent".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !31".to_string()),
-            summary: Some("Drop multiple stale child turns without timestamps".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 31, "feedmultichild")
+        .thread("thread-review-multi-child-missing-parent")
+        .turn("turn-parent")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !31")
+        .summary("Drop multiple stale child turns without timestamps")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-stale-child-one".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-stale-child-one".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "stale child one"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-stale-child-one".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-stale-child-two".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-stale-child-two".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "stale child two"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-stale-child-two".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 7,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({"createdAt": "2026-03-11T21:40:00.000Z"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 8,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "agentMessage",
-                    "text": "later legitimate turn",
-                    "createdAt": "2026-03-11T21:40:01.000Z"
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 9,
-                turn_id: Some("turn-later".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({
-                    "status": "completed",
-                    "createdAt": "2026-03-11T21:40:02.000Z"
-                }),
-            },
+            turn_started_event(1, "turn-stale-child-one"),
+            agent_message_event(2, "turn-stale-child-one", "stale child one"),
+            turn_completed_event(3, "turn-stale-child-one"),
+            turn_started_event(4, "turn-stale-child-two"),
+            agent_message_event(5, "turn-stale-child-two", "stale child two"),
+            turn_completed_event(6, "turn-stale-child-two"),
+            turn_started_event_at(7, "turn-later", "2026-03-11T21:40:00.000Z"),
+            agent_message_event_at(
+                8,
+                "turn-later",
+                "later legitimate turn",
+                "2026-03-11T21:40:01.000Z",
+            ),
+            turn_completed_event_at(9, "turn-later", "2026-03-11T21:40:02.000Z"),
         ],
     )
     .await?;
@@ -3261,17 +1931,12 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:32:37.160Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "review": "Investigating",
                                 "createdAt": "2026-03-11T21:32:37.160Z",
@@ -3280,39 +1945,22 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
                                     "turn-stale-child-two"
                                 ]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "fresh review transcript",
-                                "createdAt": "2026-03-11T21:32:37.162Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:32:37.164Z"
-                            }),
-                        },
+                        ),
+                        agent_message_event_at(
+                            3,
+                            "turn-parent",
+                            "fresh review transcript",
+                            "2026-03-11T21:32:37.162Z",
+                        ),
+                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
                     ]),
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:32:37.160Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                        run_event(
+                            2,
+                            Some("turn-parent"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "review": "Investigating",
                                 "createdAt": "2026-03-11T21:32:37.160Z",
@@ -3321,51 +1969,22 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
                                     "turn-stale-child-two"
                                 ]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "fresh review transcript",
-                                "createdAt": "2026-03-11T21:32:37.162Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-parent".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:32:37.164Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({"createdAt": "2026-03-11T21:40:00.000Z"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "later legitimate turn",
-                                "createdAt": "2026-03-11T21:40:01.000Z"
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 7,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({
-                                "status": "completed",
-                                "createdAt": "2026-03-11T21:40:02.000Z"
-                            }),
-                        },
+                        ),
+                        agent_message_event_at(
+                            3,
+                            "turn-parent",
+                            "fresh review transcript",
+                            "2026-03-11T21:32:37.162Z",
+                        ),
+                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
+                        turn_started_event_at(5, "turn-later", "2026-03-11T21:40:00.000Z"),
+                        agent_message_event_at(
+                            6,
+                            "turn-later",
+                            "later legitimate turn",
+                            "2026-03-11T21:40:01.000Z",
+                        ),
+                        turn_completed_event_at(7, "turn-later", "2026-03-11T21:40:02.000Z"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -3408,54 +2027,18 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
 #[tokio::test]
 async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = state
-        .run_history
-        .start_run_history(NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 19,
-            head_sha: "feed333".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        })
-        .await?;
-    state
-        .run_history
-        .update_run_history_session(
-            run_id,
-            RunHistorySessionUpdate {
-                thread_id: Some("thread-active".to_string()),
-                turn_id: Some("turn-active".to_string()),
-                review_thread_id: None,
-                security_context_source_run_id: None,
-                auth_account_name: Some("primary".to_string()),
-                ..RunHistorySessionUpdate::default()
-            },
-        )
+    let run_id = RunFixture::review("group/repo", 19, "feed333")
+        .thread("thread-active")
+        .turn("turn-active")
+        .auth_account("primary")
+        .start(&state)
         .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-active".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-active".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
+            turn_started_event(1, "turn-active"),
+            empty_reasoning_event(2, "turn-active"),
         ],
     )
     .await?;
@@ -3481,61 +2064,22 @@ async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
 #[tokio::test]
 async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 20,
-            head_sha: "feed444".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-stale-backfill".to_string()),
-            turn_id: Some("turn-stale-backfill".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !20".to_string()),
-            summary: Some("Retry stale transcript backfill".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 20, "feed444")
+        .thread("thread-stale-backfill")
+        .turn("turn-stale-backfill")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !20")
+        .summary("Retry stale transcript backfill")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-stale-backfill".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-stale-backfill".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-stale-backfill".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-stale-backfill"),
+            empty_reasoning_event(2, "turn-stale-backfill"),
+            turn_completed_event(3, "turn-stale-backfill"),
         ],
     )
     .await?;
@@ -3548,28 +2092,14 @@ async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result
         HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: vec![
-                    NewRunHistoryEvent {
-                        sequence: 1,
-                        turn_id: Some("turn-stale-backfill".to_string()),
-                        event_type: "turn_started".to_string(),
-                        payload: json!({}),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 2,
-                        turn_id: Some("turn-stale-backfill".to_string()),
-                        event_type: "item_completed".to_string(),
-                        payload: json!({
-                            "type": "reasoning",
-                            "summary": [{"type": "summary_text", "text": "Recovered after restart"}],
-                            "content": [{"type": "reasoning_text", "text": "Backfill retried successfully"}]
-                        }),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 3,
-                        turn_id: Some("turn-stale-backfill".to_string()),
-                        event_type: "turn_completed".to_string(),
-                        payload: json!({"status": "completed"}),
-                    },
+                    turn_started_event(1, "turn-stale-backfill"),
+                    reasoning_event(
+                        2,
+                        "turn-stale-backfill",
+                        "Recovered after restart",
+                        "Backfill retried successfully",
+                    ),
+                    turn_completed_event(3, "turn-stale-backfill"),
                 ],
                 calls: Arc::clone(&backfill_calls),
             })),
@@ -3607,61 +2137,22 @@ async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result
 #[tokio::test]
 async fn run_detail_retries_after_transient_missing_session_history() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 21,
-            head_sha: "feed555".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-transient".to_string()),
-            turn_id: Some("turn-transient".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !21".to_string()),
-            summary: Some("Retry after transient session-history miss".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 21, "feed555")
+        .thread("thread-transient")
+        .turn("turn-transient")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !21")
+        .summary("Retry after transient session-history miss")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-transient".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-transient".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-transient".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-transient"),
+            empty_reasoning_event(2, "turn-transient"),
+            turn_completed_event(3, "turn-transient"),
         ],
     )
     .await?;
@@ -3671,28 +2162,14 @@ async fn run_detail_retries_after_transient_missing_session_history() -> Result<
             None,
             None,
             Some(vec![
-                NewRunHistoryEvent {
-                    sequence: 1,
-                    turn_id: Some("turn-transient".to_string()),
-                    event_type: "turn_started".to_string(),
-                    payload: json!({}),
-                },
-                NewRunHistoryEvent {
-                    sequence: 2,
-                    turn_id: Some("turn-transient".to_string()),
-                    event_type: "item_completed".to_string(),
-                    payload: json!({
-                        "type": "reasoning",
-                        "summary": [{"type": "summary_text", "text": "Recovered after missing file"}],
-                        "content": [{"type": "reasoning_text", "text": "Second attempt found session history"}]
-                    }),
-                },
-                NewRunHistoryEvent {
-                    sequence: 3,
-                    turn_id: Some("turn-transient".to_string()),
-                    event_type: "turn_completed".to_string(),
-                    payload: json!({"status": "completed"}),
-                },
+                turn_started_event(1, "turn-transient"),
+                reasoning_event(
+                    2,
+                    "turn-transient",
+                    "Recovered after missing file",
+                    "Second attempt found session history",
+                ),
+                turn_completed_event(3, "turn-transient"),
             ]),
         ])),
         calls: Arc::clone(&backfill_calls),
@@ -3779,61 +2256,22 @@ async fn run_detail_retries_after_transient_missing_session_history() -> Result<
 #[tokio::test]
 async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 24,
-            head_sha: "feed888".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-partial-file".to_string()),
-            turn_id: Some("turn-partial-file".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !24".to_string()),
-            summary: Some("Retry partial session-history file after cooldown".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 24, "feed888")
+        .thread("thread-partial-file")
+        .turn("turn-partial-file")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !24")
+        .summary("Retry partial session-history file after cooldown")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-partial-file".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-partial-file".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-partial-file".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-partial-file"),
+            empty_reasoning_event(2, "turn-partial-file"),
+            turn_completed_event(3, "turn-partial-file"),
         ],
     )
     .await?;
@@ -3841,46 +2279,18 @@ async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
     let backfill_source = Arc::new(SequencedTranscriptBackfillSource {
         responses: Arc::new(Mutex::new(vec![
             Some(vec![
-                NewRunHistoryEvent {
-                    sequence: 1,
-                    turn_id: Some("turn-partial-file".to_string()),
-                    event_type: "turn_started".to_string(),
-                    payload: json!({}),
-                },
-                NewRunHistoryEvent {
-                    sequence: 2,
-                    turn_id: Some("turn-partial-file".to_string()),
-                    event_type: "item_completed".to_string(),
-                    payload: json!({
-                        "type": "reasoning",
-                        "summary": [],
-                        "content": []
-                    }),
-                },
+                turn_started_event(1, "turn-partial-file"),
+                empty_reasoning_event(2, "turn-partial-file"),
             ]),
             Some(vec![
-                NewRunHistoryEvent {
-                    sequence: 1,
-                    turn_id: Some("turn-partial-file".to_string()),
-                    event_type: "turn_started".to_string(),
-                    payload: json!({}),
-                },
-                NewRunHistoryEvent {
-                    sequence: 2,
-                    turn_id: Some("turn-partial-file".to_string()),
-                    event_type: "item_completed".to_string(),
-                    payload: json!({
-                        "type": "reasoning",
-                        "summary": [{"type": "summary_text", "text": "Recovered after partial write"}],
-                        "content": [{"type": "reasoning_text", "text": "Second parse saw the finished turn"}]
-                    }),
-                },
-                NewRunHistoryEvent {
-                    sequence: 3,
-                    turn_id: Some("turn-partial-file".to_string()),
-                    event_type: "turn_completed".to_string(),
-                    payload: json!({"status": "completed"}),
-                },
+                turn_started_event(1, "turn-partial-file"),
+                reasoning_event(
+                    2,
+                    "turn-partial-file",
+                    "Recovered after partial write",
+                    "Second parse saw the finished turn",
+                ),
+                turn_completed_event(3, "turn-partial-file"),
             ]),
         ])),
         calls: Arc::clone(&backfill_calls),
@@ -3922,83 +2332,25 @@ async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
 #[tokio::test]
 async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 22,
-            head_sha: "feed666".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-partial".to_string()),
-            turn_id: Some("turn-new".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !22".to_string()),
-            summary: Some("Do not mark partial multi-turn transcript complete".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 22, "feed666")
+        .thread("thread-partial")
+        .turn("turn-new")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !22")
+        .summary("Do not mark partial multi-turn transcript complete")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-old"),
+            empty_reasoning_event(2, "turn-old"),
+            turn_completed_event(3, "turn-old"),
+            turn_started_event(4, "turn-new"),
+            empty_reasoning_event(5, "turn-new"),
+            turn_completed_event(6, "turn-new"),
         ],
     )
     .await?;
@@ -4007,28 +2359,14 @@ async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -
         HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
                 events: vec![
-                    NewRunHistoryEvent {
-                        sequence: 1,
-                        turn_id: Some("turn-new".to_string()),
-                        event_type: "turn_started".to_string(),
-                        payload: json!({}),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 2,
-                        turn_id: Some("turn-new".to_string()),
-                        event_type: "item_completed".to_string(),
-                        payload: json!({
-                            "type": "reasoning",
-                            "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
-                            "content": [{"type": "reasoning_text", "text": "Older turn still missing"}]
-                        }),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 3,
-                        turn_id: Some("turn-new".to_string()),
-                        event_type: "turn_completed".to_string(),
-                        payload: json!({"status": "completed"}),
-                    },
+                    turn_started_event(1, "turn-new"),
+                    reasoning_event(
+                        2,
+                        "turn-new",
+                        "Recovered current turn",
+                        "Older turn still missing",
+                    ),
+                    turn_completed_event(3, "turn-new"),
                 ],
                 calls: Arc::clone(&backfill_calls),
             })),
@@ -4075,83 +2413,25 @@ async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -
 #[tokio::test]
 async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 23,
-            head_sha: "feed777".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-full-fallback".to_string()),
-            turn_id: Some("turn-new".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !23".to_string()),
-            summary: Some("Recover older turns from the full local thread".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 23, "feed777")
+        .thread("thread-full-fallback")
+        .turn("turn-new")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !23")
+        .summary("Recover older turns from the full local thread")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-old"),
+            empty_reasoning_event(2, "turn-old"),
+            turn_completed_event(3, "turn-old"),
+            turn_started_event(4, "turn-new"),
+            empty_reasoning_event(5, "turn-new"),
+            turn_completed_event(6, "turn-new"),
         ],
     )
     .await?;
@@ -4161,89 +2441,29 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing()
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Current turn detail"}]
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        turn_started_event(1, "turn-new"),
+                        reasoning_event(
+                            2,
+                            "turn-new",
+                            "Recovered current turn",
+                            "Current turn detail",
+                        ),
+                        turn_completed_event(3, "turn-new"),
                     ]),
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Recovered older turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Older turn detail"}]
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Current turn detail"}]
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 7,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 8,
-                            turn_id: Some("turn-later".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "agentMessage",
-                                "text": "Later turn should be ignored"
-                            }),
-                        },
+                        turn_started_event(1, "turn-old"),
+                        reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
+                        turn_completed_event(3, "turn-old"),
+                        turn_started_event(4, "turn-new"),
+                        reasoning_event(
+                            5,
+                            "turn-new",
+                            "Recovered current turn",
+                            "Current turn detail",
+                        ),
+                        turn_completed_event(6, "turn-new"),
+                        turn_started_event(7, "turn-later"),
+                        agent_message_event(8, "turn-later", "Later turn should be ignored"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -4287,85 +2507,25 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing()
 #[tokio::test]
 async fn run_detail_full_thread_fallback_ignores_unrelated_pending_review_markers() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 123,
-            head_sha: "feedignore".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-ignore-unrelated-pending".to_string()),
-            turn_id: Some("turn-new".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !123".to_string()),
-            summary: Some(
-                "Ignore unrelated pending review markers during full-thread fallback".to_string(),
-            ),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 123, "feedignore")
+        .thread("thread-ignore-unrelated-pending")
+        .turn("turn-new")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !123")
+        .summary("Ignore unrelated pending review markers during full-thread fallback".to_string())
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-old"),
+            empty_reasoning_event(2, "turn-old"),
+            turn_completed_event(3, "turn-old"),
+            turn_started_event(4, "turn-new"),
+            empty_reasoning_event(5, "turn-new"),
+            turn_completed_event(6, "turn-new"),
         ],
     )
     .await?;
@@ -4375,96 +2535,39 @@ async fn run_detail_full_thread_fallback_ignores_unrelated_pending_review_marker
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Current turn detail"}]
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        turn_started_event(1, "turn-new"),
+                        reasoning_event(
+                            2,
+                            "turn-new",
+                            "Recovered current turn",
+                            "Current turn detail",
+                        ),
+                        turn_completed_event(3, "turn-new"),
                     ]),
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Recovered older turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Older turn detail"}]
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Current turn detail"}]
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 7,
-                            turn_id: Some("turn-unrelated-pending".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 8,
-                            turn_id: Some("turn-unrelated-pending".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
+                        turn_started_event(1, "turn-old"),
+                        reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
+                        turn_completed_event(3, "turn-old"),
+                        turn_started_event(4, "turn-new"),
+                        reasoning_event(
+                            5,
+                            "turn-new",
+                            "Recovered current turn",
+                            "Current turn detail",
+                        ),
+                        turn_completed_event(6, "turn-new"),
+                        turn_started_event(7, "turn-unrelated-pending"),
+                        run_event(
+                            8,
+                            Some("turn-unrelated-pending"),
+                            "item_completed",
+                            json!({
                                 "type": "enteredReviewMode",
                                 "review": "Waiting on unrelated child",
                                 "reviewMissingChildTurnIds": ["turn-unrelated-child"]
                             }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 9,
-                            turn_id: Some("turn-unrelated-pending".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        ),
+                        turn_completed_event(9, "turn-unrelated-pending"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -4508,85 +2611,25 @@ async fn run_detail_full_thread_fallback_ignores_unrelated_pending_review_marker
 async fn run_detail_uses_full_thread_fallback_when_turn_scoped_backfill_is_incomplete() -> Result<()>
 {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 124,
-            head_sha: "feedfullthread".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-turn-incomplete-full-ready".to_string()),
-            turn_id: Some("turn-new".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !124".to_string()),
-            summary: Some(
-                "Use full-thread fallback when turn-scoped backfill is incomplete".to_string(),
-            ),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 124, "feedfullthread")
+        .thread("thread-turn-incomplete-full-ready")
+        .turn("turn-new")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !124")
+        .summary("Use full-thread fallback when turn-scoped backfill is incomplete".to_string())
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-old"),
+            empty_reasoning_event(2, "turn-old"),
+            turn_completed_event(3, "turn-old"),
+            turn_started_event(4, "turn-new"),
+            empty_reasoning_event(5, "turn-new"),
+            turn_completed_event(6, "turn-new"),
         ],
     )
     .await?;
@@ -4596,68 +2639,26 @@ async fn run_detail_uses_full_thread_fallback_when_turn_scoped_backfill_is_incom
             .with_transcript_backfill_source(Arc::new(
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: Some(vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Partial current turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Missing turn completion"}]
-                            }),
-                        },
+                        turn_started_event(1, "turn-new"),
+                        reasoning_event(
+                            2,
+                            "turn-new",
+                            "Partial current turn",
+                            "Missing turn completion",
+                        ),
                     ]),
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Recovered older turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Older turn detail"}]
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Current turn detail"}]
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        turn_started_event(1, "turn-old"),
+                        reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
+                        turn_completed_event(3, "turn-old"),
+                        turn_started_event(4, "turn-new"),
+                        reasoning_event(
+                            5,
+                            "turn-new",
+                            "Recovered current turn",
+                            "Current turn detail",
+                        ),
+                        turn_completed_event(6, "turn-new"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -4700,85 +2701,25 @@ async fn run_detail_uses_full_thread_fallback_when_turn_scoped_backfill_is_incom
 #[tokio::test]
 async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missing() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 26,
-            head_sha: "feedabc".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-missing-turn".to_string()),
-            turn_id: Some("turn-new".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !26".to_string()),
-            summary: Some(
-                "Fallback to whole-thread session history when turn lookup is missing".to_string(),
-            ),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 26, "feedabc")
+        .thread("thread-missing-turn")
+        .turn("turn-new")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !26")
+        .summary("Fallback to whole-thread session history when turn lookup is missing".to_string())
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-old".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
-            NewRunHistoryEvent {
-                sequence: 4,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 5,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 6,
-                turn_id: Some("turn-new".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-old"),
+            empty_reasoning_event(2, "turn-old"),
+            turn_completed_event(3, "turn-old"),
+            turn_started_event(4, "turn-new"),
+            empty_reasoning_event(5, "turn-new"),
+            turn_completed_event(6, "turn-new"),
         ],
     )
     .await?;
@@ -4789,50 +2730,17 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missi
                 TurnScopedFallbackTranscriptBackfillSource {
                     turn_events: None,
                     full_thread_events: vec![
-                        NewRunHistoryEvent {
-                            sequence: 1,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 2,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Recovered older turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Older turn detail"}]
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 3,
-                            turn_id: Some("turn-old".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 4,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_started".to_string(),
-                            payload: json!({}),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 5,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "item_completed".to_string(),
-                            payload: json!({
-                                "type": "reasoning",
-                                "summary": [{"type": "summary_text", "text": "Recovered current turn"}],
-                                "content": [{"type": "reasoning_text", "text": "Current turn detail"}]
-                            }),
-                        },
-                        NewRunHistoryEvent {
-                            sequence: 6,
-                            turn_id: Some("turn-new".to_string()),
-                            event_type: "turn_completed".to_string(),
-                            payload: json!({"status": "completed"}),
-                        },
+                        turn_started_event(1, "turn-old"),
+                        reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
+                        turn_completed_event(3, "turn-old"),
+                        turn_started_event(4, "turn-new"),
+                        reasoning_event(
+                            5,
+                            "turn-new",
+                            "Recovered current turn",
+                            "Current turn detail",
+                        ),
+                        turn_completed_event(6, "turn-new"),
                     ],
                     seen_turn_ids: Arc::clone(&seen_turn_ids),
                 },
@@ -4879,61 +2787,23 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missi
 #[tokio::test]
 async fn run_detail_backfill_uses_base_thread_id_when_review_thread_differs() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 25,
-            head_sha: "feed999".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-base".to_string()),
-            turn_id: Some("turn-review".to_string()),
-            review_thread_id: Some("thread-review".to_string()),
-            auth_account_name: Some("primary".to_string()),
-            security_context_source_run_id: None,
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !25".to_string()),
-            summary: Some("Backfill should read base thread history".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 25, "feed999")
+        .thread("thread-base")
+        .turn("turn-review")
+        .review_thread("thread-review")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !25")
+        .summary("Backfill should read base thread history")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
-            NewRunHistoryEvent {
-                sequence: 3,
-                turn_id: Some("turn-review".to_string()),
-                event_type: "turn_completed".to_string(),
-                payload: json!({"status": "completed"}),
-            },
+            turn_started_event(1, "turn-review"),
+            empty_reasoning_event(2, "turn-review"),
+            turn_completed_event(3, "turn-review"),
         ],
     )
     .await?;
@@ -4944,28 +2814,9 @@ async fn run_detail_backfill_uses_base_thread_id_when_review_thread_differs() ->
         HttpServices::new(test_config(), Arc::clone(&state), false, None)
             .with_transcript_backfill_source(Arc::new(CapturingTranscriptBackfillSource {
                 events: vec![
-                    NewRunHistoryEvent {
-                        sequence: 1,
-                        turn_id: Some("turn-review".to_string()),
-                        event_type: "turn_started".to_string(),
-                        payload: json!({}),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 2,
-                        turn_id: Some("turn-review".to_string()),
-                        event_type: "item_completed".to_string(),
-                        payload: json!({
-                            "type": "reasoning",
-                            "summary": [{"type": "summary_text", "text": "Recovered"}],
-                            "content": [{"type": "reasoning_text", "text": "Base thread history used"}]
-                        }),
-                    },
-                    NewRunHistoryEvent {
-                        sequence: 3,
-                        turn_id: Some("turn-review".to_string()),
-                        event_type: "turn_completed".to_string(),
-                        payload: json!({"status": "completed"}),
-                    },
+                    turn_started_event(1, "turn-review"),
+                    reasoning_event(2, "turn-review", "Recovered", "Base thread history used"),
+                    turn_completed_event(3, "turn-review"),
                 ],
                 calls: Arc::clone(&backfill_calls),
                 seen_thread_id: Arc::clone(&seen_thread_id),
@@ -5006,55 +2857,21 @@ async fn run_detail_backfill_uses_base_thread_id_when_review_thread_differs() ->
 #[tokio::test]
 async fn run_detail_retries_when_session_history_directory_appears_later() -> Result<()> {
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = insert_run_history(
-        &state,
-        NewRunHistory {
-            kind: RunHistoryKind::Review,
-            repo: "group/repo".to_string(),
-            iid: 23,
-            head_sha: "feed777".to_string(),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-        },
-        RunHistorySessionUpdate {
-            thread_id: Some("thread-unavailable".to_string()),
-            turn_id: Some("turn-unavailable".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            auth_account_name: Some("primary".to_string()),
-            ..RunHistorySessionUpdate::default()
-        },
-        RunHistoryFinish {
-            result: "commented".to_string(),
-            preview: Some("Review group/repo !23".to_string()),
-            summary: Some("Do not retry unavailable local session history".to_string()),
-            ..Default::default()
-        },
-    )
-    .await?;
+    let run_id = RunFixture::review("group/repo", 23, "feed777")
+        .thread("thread-unavailable")
+        .turn("turn-unavailable")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !23")
+        .summary("Do not retry unavailable local session history")
+        .insert(&state)
+        .await?;
     insert_run_history_events(
         &state,
         run_id,
         vec![
-            NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-unavailable".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: json!({}),
-            },
-            NewRunHistoryEvent {
-                sequence: 2,
-                turn_id: Some("turn-unavailable".to_string()),
-                event_type: "item_completed".to_string(),
-                payload: json!({
-                    "type": "reasoning",
-                    "summary": [],
-                    "content": []
-                }),
-            },
+            turn_started_event(1, "turn-unavailable"),
+            empty_reasoning_event(2, "turn-unavailable"),
         ],
     )
     .await?;
