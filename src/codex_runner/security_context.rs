@@ -1,8 +1,9 @@
 //! Security-review context cache lifecycle and separate-session context building.
 
+use super::session_runner::{PreparedRunnerSessionComponents, SessionLaunchRequest};
 use super::{
     AppServerClient, AppServerCommandOptions, Arc, AuthAccount, BrowserMcpConfig, Context,
-    DockerCodexRunner, Mutex, Result, ReviewContext, RunHistorySessionUpdate, RunnerSessionConfig,
+    DockerCodexRunner, Mutex, Result, ReviewContext, RunHistorySessionUpdate,
     SecurityContextBuildCompletionGuard, SecurityContextBuildKey, SecurityContextBuildRegistration,
     Utc, Value, anyhow, bail, debug, json, warn,
 };
@@ -615,25 +616,28 @@ impl DockerCodexRunner {
         ctx: &ReviewContext,
         request: SeparateSecurityContextSessionRequest<'_>,
     ) -> Result<String> {
-        let script = self.command(
-            ctx,
-            AppServerCommandOptions {
-                browser_mcp: request.browser_mcp,
-                gitlab_discovery_mcp: None,
-                mcp_server_overrides: &self.codex.mcp_server_overrides.review,
-                session_override: self.security_context_session_override(),
-            },
-        )?;
-        let mut session = self
-            .start_runner_session(RunnerSessionConfig {
-                script,
-                auth_account: request.account.clone(),
+        let launch = self
+            .launch_runner_session(SessionLaunchRequest {
                 run_history_id: ctx.run_history_id,
-                browser_mcp: request.browser_mcp.cloned(),
-                gitlab_discovery_mcp: None,
-                gitlab_discovery_extra_hosts: Vec::new(),
+                feature_flags: &ctx.feature_flags,
+                project_path: &ctx.project_path,
+                mcp_server_overrides: &self.codex.mcp_server_overrides.review,
+                allow_gitlab_discovery: false,
+                auth_account: request.account,
+                build_script: |_prepared: &PreparedRunnerSessionComponents| {
+                    self.command(
+                        ctx,
+                        AppServerCommandOptions {
+                            browser_mcp: request.browser_mcp,
+                            gitlab_discovery_mcp: None,
+                            mcp_server_overrides: &self.codex.mcp_server_overrides.review,
+                            session_override: self.security_context_session_override(),
+                        },
+                    )
+                },
             })
             .await?;
+        let mut session = launch.session;
         {
             let mut slot = request
                 .extra_session_container

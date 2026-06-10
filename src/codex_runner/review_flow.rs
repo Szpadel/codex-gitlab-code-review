@@ -3,15 +3,16 @@ use super::security_context::{
     ExtraSecurityContextSessionContainer, SECURITY_CONTEXT_PROMPT_VERSION,
     SecurityContextPayloadResolution, SeparateSecurityContextSessionRequest,
 };
-use super::session_runner::{PreparedRunnerSessionComponents, RunnerSession};
-use super::{
-    AppServerCommandOptions, Arc, AuthAccount, AuthFallbackAction, DockerCodexRunner, Duration,
-    Instant, PreparedGitLabDiscoveryMcp, Result, ReviewContext, RunHistorySessionUpdate,
-    RunnerSessionConfig, Utc, Value, append_additional_review_instructions, bail,
-    build_base_branch_review_prompt, build_commit_review_prompt, json, repo_checkout_root,
-    upstream_review_prompt_source_commit, upstream_review_prompt_source_path, warn,
+use super::session_runner::{
+    PreparedRunnerSessionComponents, RunnerSession, SessionInitializeRequest, SessionLaunchRequest,
 };
-use crate::composer_install::composer_install_timeout_seconds;
+use super::{
+    AppServerCommandOptions, Arc, AuthAccount, AuthFallbackAction, DockerCodexRunner, Instant,
+    PreparedGitLabDiscoveryMcp, Result, ReviewContext, RunHistorySessionUpdate, Utc, Value,
+    append_additional_review_instructions, build_base_branch_review_prompt,
+    build_commit_review_prompt, json, repo_checkout_root, upstream_review_prompt_source_commit,
+    upstream_review_prompt_source_path, warn,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewTargetRequest {
@@ -457,49 +458,6 @@ impl DockerCodexRunner {
             .await
     }
 
-    async fn start_review_runner_session(
-        &self,
-        ctx: &ReviewContext,
-        account: &AuthAccount,
-    ) -> Result<(PreparedRunnerSessionComponents, RunnerSession)> {
-        let prepared = self
-            .prepare_runner_session_components(
-                ctx.run_history_id,
-                &ctx.feature_flags,
-                &ctx.project_path,
-                &self.codex.mcp_server_overrides.review,
-                !ctx.lane.is_security(),
-            )
-            .await;
-        let script = self.command(
-            ctx,
-            AppServerCommandOptions {
-                browser_mcp: prepared.browser_mcp.as_ref(),
-                gitlab_discovery_mcp: prepared
-                    .gitlab_discovery_mcp
-                    .as_ref()
-                    .map(|prepared| &prepared.runtime_config),
-                mcp_server_overrides: &prepared.effective_mcp_server_overrides,
-                session_override: if ctx.lane.is_security() {
-                    self.security_review_session_override()
-                } else {
-                    self.review_session_override()
-                },
-            },
-        )?;
-        let session = self
-            .start_runner_session(RunnerSessionConfig {
-                script,
-                auth_account: account.clone(),
-                run_history_id: ctx.run_history_id,
-                browser_mcp: prepared.browser_mcp.clone(),
-                gitlab_discovery_mcp: prepared.gitlab_discovery_mcp.clone(),
-                gitlab_discovery_extra_hosts: prepared.gitlab_discovery_extra_hosts.clone(),
-            })
-            .await?;
-        Ok((prepared, session))
-    }
-
     async fn cleanup_extra_security_context_session(
         &self,
         extra_session: &ExtraSecurityContextSessionContainer,
@@ -524,7 +482,37 @@ impl DockerCodexRunner {
         ctx: &ReviewContext,
         account: &AuthAccount,
     ) -> Result<String> {
-        let (prepared, mut session) = self.start_review_runner_session(ctx, account).await?;
+        let launch = self
+            .launch_runner_session(SessionLaunchRequest {
+                run_history_id: ctx.run_history_id,
+                feature_flags: &ctx.feature_flags,
+                project_path: &ctx.project_path,
+                mcp_server_overrides: &self.codex.mcp_server_overrides.review,
+                allow_gitlab_discovery: !ctx.lane.is_security(),
+                auth_account: account,
+                build_script: |prepared: &PreparedRunnerSessionComponents| {
+                    self.command(
+                        ctx,
+                        AppServerCommandOptions {
+                            browser_mcp: prepared.browser_mcp.as_ref(),
+                            gitlab_discovery_mcp: prepared
+                                .gitlab_discovery_mcp
+                                .as_ref()
+                                .map(|prepared| &prepared.runtime_config),
+                            mcp_server_overrides: &prepared.effective_mcp_server_overrides,
+                            session_override: if ctx.lane.is_security() {
+                                self.security_review_session_override()
+                            } else {
+                                self.review_session_override()
+                            },
+                        },
+                    )
+                },
+            })
+            .await?;
+        let prepared = launch.prepared;
+        let mut session = launch.session;
+        let run_timeout = launch.run_timeout;
         let repo_path = repo_checkout_root(&ctx.project_path);
         self.update_run_history_session(
             ctx.run_history_id,
@@ -535,7 +523,6 @@ impl DockerCodexRunner {
         )
         .await;
 
-        let run_timeout = Duration::from_secs(self.codex.timeout_seconds);
         let run_started_at = Instant::now();
         let extra_security_context_session = ExtraSecurityContextSessionContainer::default();
         let browser_container_id = session.browser_container_id.clone();
@@ -547,24 +534,18 @@ impl DockerCodexRunner {
                 run_timeout.saturating_sub(run_started_at.elapsed()),
                 "codex review timed out",
                 async {
-                    session.client.initialize().await?;
-                    session.client.initialized().await?;
-
-                    let Some(composer_timeout_seconds) = composer_install_timeout_seconds(
-                        run_timeout.saturating_sub(run_started_at.elapsed()),
-                    ) else {
-                        bail!("codex review timed out");
-                    };
-                    let _composer_install = self
-                        .run_composer_install_step(
-                            &session.container_id,
-                            repo_path.as_str(),
-                            &ctx.project_path,
-                            &ctx.feature_flags,
-                            composer_timeout_seconds,
-                            ctx.run_history_id,
-                        )
-                        .await;
+                    self.initialize_session_and_install_deps(
+                        &mut session,
+                        SessionInitializeRequest {
+                            repo_dir: repo_path.as_str(),
+                            project_path: &ctx.project_path,
+                            feature_flags: &ctx.feature_flags,
+                            run_timeout,
+                            run_started_at,
+                            timeout_error: "codex review timed out",
+                        },
+                    )
+                    .await?;
 
                     let extra_writable_roots = prepared.extra_writable_roots();
                     let mut security_plan = if ctx.lane.is_security() {

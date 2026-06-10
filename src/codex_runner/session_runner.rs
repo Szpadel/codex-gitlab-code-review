@@ -1,8 +1,9 @@
 use super::{
-    AppServerClient, AuthAccount, BrowserMcpConfig, DockerCodexRunner, Duration,
+    AppServerClient, AuthAccount, BrowserMcpConfig, DockerCodexRunner, Duration, Instant,
     PreparedGitLabDiscoveryMcp, RegisteredGitLabDiscoverySession, Result, StartedAppServer, Value,
     anyhow, timeout, warn,
 };
+use crate::composer_install::composer_install_timeout_seconds;
 use crate::feature_flags::FeatureFlagSnapshot;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -42,6 +43,32 @@ pub(crate) struct RunnerSession {
     pub(crate) run_history_id: Option<i64>,
     gitlab_discovery_mcp: Option<PreparedGitLabDiscoveryMcp>,
     gitlab_discovery_session: Option<RegisteredGitLabDiscoverySession>,
+}
+
+pub(crate) struct SessionLaunch {
+    pub(crate) session: RunnerSession,
+    pub(crate) prepared: PreparedRunnerSessionComponents,
+    pub(crate) run_timeout: Duration,
+    pub(crate) run_started_at: Instant,
+}
+
+pub(crate) struct SessionLaunchRequest<'a, F> {
+    pub(crate) run_history_id: Option<i64>,
+    pub(crate) feature_flags: &'a FeatureFlagSnapshot,
+    pub(crate) project_path: &'a str,
+    pub(crate) mcp_server_overrides: &'a BTreeMap<String, bool>,
+    pub(crate) allow_gitlab_discovery: bool,
+    pub(crate) auth_account: &'a AuthAccount,
+    pub(crate) build_script: F,
+}
+
+pub(crate) struct SessionInitializeRequest<'a> {
+    pub(crate) repo_dir: &'a str,
+    pub(crate) project_path: &'a str,
+    pub(crate) feature_flags: &'a FeatureFlagSnapshot,
+    pub(crate) run_timeout: Duration,
+    pub(crate) run_started_at: Instant,
+    pub(crate) timeout_error: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +195,68 @@ impl DockerCodexRunner {
         .await;
 
         Ok(session)
+    }
+
+    pub(crate) async fn launch_runner_session<F>(
+        &self,
+        request: SessionLaunchRequest<'_, F>,
+    ) -> Result<SessionLaunch>
+    where
+        F: FnOnce(&PreparedRunnerSessionComponents) -> Result<String>,
+    {
+        let prepared = self
+            .prepare_runner_session_components(
+                request.run_history_id,
+                request.feature_flags,
+                request.project_path,
+                request.mcp_server_overrides,
+                request.allow_gitlab_discovery,
+            )
+            .await;
+        let script = (request.build_script)(&prepared)?;
+        let session = self
+            .start_runner_session(RunnerSessionConfig {
+                script,
+                auth_account: request.auth_account.clone(),
+                run_history_id: request.run_history_id,
+                browser_mcp: prepared.browser_mcp.clone(),
+                gitlab_discovery_mcp: prepared.gitlab_discovery_mcp.clone(),
+                gitlab_discovery_extra_hosts: prepared.gitlab_discovery_extra_hosts.clone(),
+            })
+            .await?;
+        Ok(SessionLaunch {
+            session,
+            prepared,
+            run_timeout: Duration::from_secs(self.codex.timeout_seconds),
+            run_started_at: Instant::now(),
+        })
+    }
+
+    pub(crate) async fn initialize_session_and_install_deps(
+        &self,
+        session: &mut RunnerSession,
+        request: SessionInitializeRequest<'_>,
+    ) -> Result<()> {
+        session.client.initialize().await?;
+        session.client.initialized().await?;
+        let Some(composer_timeout_seconds) = composer_install_timeout_seconds(
+            request
+                .run_timeout
+                .saturating_sub(request.run_started_at.elapsed()),
+        ) else {
+            return Err(anyhow!(request.timeout_error));
+        };
+        let _composer_install = self
+            .run_composer_install_step(
+                &session.container_id,
+                request.repo_dir,
+                request.project_path,
+                request.feature_flags,
+                composer_timeout_seconds,
+                session.run_history_id,
+            )
+            .await;
+        Ok(())
     }
 
     pub(crate) async fn close_runner_session(&self, session: RunnerSession) {

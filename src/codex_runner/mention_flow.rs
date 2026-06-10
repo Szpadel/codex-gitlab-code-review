@@ -1,10 +1,12 @@
+use super::session_runner::{
+    PreparedRunnerSessionComponents, SessionInitializeRequest, SessionLaunchRequest,
+};
 use super::{
-    AppServerCommandOptions, AuthAccount, AuthFallbackAction, Context, DockerCodexRunner, Duration,
-    Instant, MentionCommandContext, MentionCommandResult, MentionCommandStatus, Result,
-    RunHistorySessionUpdate, RunnerSessionConfig, anyhow, bail, json, repo_checkout_root,
+    AppServerCommandOptions, AuthAccount, AuthFallbackAction, Context, DockerCodexRunner,
+    MentionCommandContext, MentionCommandResult, MentionCommandStatus, Result,
+    RunHistorySessionUpdate, anyhow, bail, json, repo_checkout_root,
     restore_push_remote_url_exec_command,
 };
-use crate::composer_install::composer_install_timeout_seconds;
 use std::collections::BTreeSet;
 
 fn git_status_paths(status_output: &str) -> BTreeSet<String> {
@@ -64,43 +66,38 @@ impl DockerCodexRunner {
         debug_assert_eq!(sandbox_mode, self.sandbox_mode_value());
         let clone_url = self.clone_url(&ctx.repo)?;
         let repo_dir = repo_checkout_root(&ctx.project_path);
-        let prepared = self
-            .prepare_runner_session_components(
-                ctx.run_history_id,
-                &ctx.feature_flags,
-                &ctx.project_path,
-                &self.codex.mcp_server_overrides.mention,
-                true,
-            )
-            .await;
-        let script = Self::build_mention_command_script(
-            ctx,
-            &clone_url,
-            &self.gitlab_token,
-            &self.codex.auth_mount_path,
-            AppServerCommandOptions {
-                browser_mcp: prepared.browser_mcp.as_ref(),
-                gitlab_discovery_mcp: prepared
-                    .gitlab_discovery_mcp
-                    .as_ref()
-                    .map(|prepared| &prepared.runtime_config),
-                mcp_server_overrides: &prepared.effective_mcp_server_overrides,
-                session_override: self.mention_session_override(),
-            },
-        );
-        let mut session = self
-            .start_runner_session(RunnerSessionConfig {
-                script,
-                auth_account: account.clone(),
+        let launch = self
+            .launch_runner_session(SessionLaunchRequest {
                 run_history_id: ctx.run_history_id,
-                browser_mcp: prepared.browser_mcp.clone(),
-                gitlab_discovery_mcp: prepared.gitlab_discovery_mcp.clone(),
-                gitlab_discovery_extra_hosts: prepared.gitlab_discovery_extra_hosts.clone(),
+                feature_flags: &ctx.feature_flags,
+                project_path: &ctx.project_path,
+                mcp_server_overrides: &self.codex.mcp_server_overrides.mention,
+                allow_gitlab_discovery: true,
+                auth_account: account,
+                build_script: |prepared: &PreparedRunnerSessionComponents| {
+                    Ok(Self::build_mention_command_script(
+                        ctx,
+                        &clone_url,
+                        &self.gitlab_token,
+                        &self.codex.auth_mount_path,
+                        AppServerCommandOptions {
+                            browser_mcp: prepared.browser_mcp.as_ref(),
+                            gitlab_discovery_mcp: prepared
+                                .gitlab_discovery_mcp
+                                .as_ref()
+                                .map(|prepared| &prepared.runtime_config),
+                            mcp_server_overrides: &prepared.effective_mcp_server_overrides,
+                            session_override: self.mention_session_override(),
+                        },
+                    ))
+                },
             })
             .await?;
+        let prepared = launch.prepared;
+        let mut session = launch.session;
+        let run_timeout = launch.run_timeout;
+        let run_started_at = launch.run_started_at;
 
-        let run_timeout = Duration::from_secs(self.codex.timeout_seconds);
-        let run_started_at = Instant::now();
         let browser_container_id = session.browser_container_id.clone();
         let browser_mcp = prepared.browser_mcp.clone();
         let mention_result = self
@@ -110,31 +107,26 @@ impl DockerCodexRunner {
                 run_timeout.saturating_sub(run_started_at.elapsed()),
                 "codex mention command timed out",
                 async {
-                self.update_run_history_session(
-                    ctx.run_history_id,
-                    RunHistorySessionUpdate {
-                        auth_account_name: Some(session.auth_account_name.clone()),
-                        ..RunHistorySessionUpdate::default()
-                    },
-                )
-                .await;
-                    session.client.initialize().await?;
-                    session.client.initialized().await?;
-                    let Some(composer_timeout_seconds) = composer_install_timeout_seconds(
-                        run_timeout.saturating_sub(run_started_at.elapsed()),
-                    ) else {
-                        bail!("codex mention command timed out");
-                    };
-                    let _composer_install = self
-                        .run_composer_install_step(
-                            &session.container_id,
-                            repo_dir.as_str(),
-                            &ctx.project_path,
-                            &ctx.feature_flags,
-                            composer_timeout_seconds,
-                            ctx.run_history_id,
-                        )
-                        .await;
+                    self.update_run_history_session(
+                        ctx.run_history_id,
+                        RunHistorySessionUpdate {
+                            auth_account_name: Some(session.auth_account_name.clone()),
+                            ..RunHistorySessionUpdate::default()
+                        },
+                    )
+                    .await;
+                    self.initialize_session_and_install_deps(
+                        &mut session,
+                        SessionInitializeRequest {
+                            repo_dir: repo_dir.as_str(),
+                            project_path: &ctx.project_path,
+                            feature_flags: &ctx.feature_flags,
+                            run_timeout,
+                            run_started_at,
+                            timeout_error: "codex mention command timed out",
+                        },
+                    )
+                    .await?;
                     let baseline_worktree_state = self
                         .exec_container_git_command(
                             &session.container_id,
