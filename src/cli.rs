@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 
 use crate::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
 use crate::bootstrap::{BootstrapOptions, bootstrap_runtime, load_config};
-use crate::demo_history::seed_example_history;
+use crate::dev_mode::demo_history::seed_example_history;
 use crate::scheduler;
 
 #[derive(Parser, Debug)]

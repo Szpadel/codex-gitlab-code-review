@@ -1,3 +1,4 @@
+pub mod demo_history;
 mod runner;
 mod transcript;
 
