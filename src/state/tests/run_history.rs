@@ -543,8 +543,8 @@ async fn list_run_history_pages_with_cursors_and_preserves_filtering() -> Result
     let first_page = store.run_history.list_run_history(&filtered).await?;
     assert_eq!(first_page.runs.len(), 1);
     assert_eq!(first_page.runs[0].id, run_ids[2]);
-    assert_eq!(first_page.has_previous, false);
-    assert_eq!(first_page.has_next, true);
+    assert!(!first_page.has_previous);
+    assert!(first_page.has_next);
 
     let second_page = store
         .run_history
@@ -555,8 +555,8 @@ async fn list_run_history_pages_with_cursors_and_preserves_filtering() -> Result
         .await?;
     assert_eq!(second_page.runs.len(), 1);
     assert_eq!(second_page.runs[0].id, run_ids[1]);
-    assert_eq!(second_page.has_previous, true);
-    assert_eq!(second_page.has_next, true);
+    assert!(second_page.has_previous);
+    assert!(second_page.has_next);
 
     let previous_page = store
         .run_history
@@ -567,8 +567,8 @@ async fn list_run_history_pages_with_cursors_and_preserves_filtering() -> Result
         .await?;
     assert_eq!(previous_page.runs.len(), 1);
     assert_eq!(previous_page.runs[0].id, run_ids[2]);
-    assert_eq!(previous_page.has_previous, false);
-    assert_eq!(previous_page.has_next, true);
+    assert!(!previous_page.has_previous);
+    assert!(previous_page.has_next);
     Ok(())
 }
 

@@ -13,26 +13,6 @@ pub struct ServiceStateRepository {
     pool: SqlitePool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::ReviewStateStore;
-
-    #[tokio::test]
-    async fn created_after_roundtrip() -> Result<()> {
-        let store = ReviewStateStore::new(":memory:").await?;
-        store
-            .service_state
-            .set_created_after("2026-01-01T00:00:00Z")
-            .await?;
-        assert_eq!(
-            store.service_state.get_created_after().await?,
-            Some("2026-01-01T00:00:00Z".to_string())
-        );
-        Ok(())
-    }
-}
-
 impl ServiceStateRepository {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -249,6 +229,26 @@ impl ServiceStateRepository {
         .execute(&self.pool)
         .await
         .with_context(|| format!("upsert service_state value for key {key}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ReviewStateStore;
+
+    #[tokio::test]
+    async fn created_after_roundtrip() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        store
+            .service_state
+            .set_created_after("2026-01-01T00:00:00Z")
+            .await?;
+        assert_eq!(
+            store.service_state.get_created_after().await?,
+            Some("2026-01-01T00:00:00Z".to_string())
+        );
         Ok(())
     }
 }

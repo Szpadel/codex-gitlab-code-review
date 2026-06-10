@@ -46,7 +46,7 @@ async fn finish_review_ignores_outdated_sha_for_new_in_progress_review() -> Resu
     store.review_state.clear_stale_in_progress(1).await?;
 
     let restarted = store.review_state.begin_review(repo, iid, "sha2").await?;
-    assert_eq!(restarted, true);
+    assert!(restarted);
 
     store
         .review_state
@@ -100,8 +100,8 @@ async fn begin_mention_command_is_idempotent() -> Result<()> {
         .mention_commands
         .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha2")
         .await?;
-    assert_eq!(first, true);
-    assert_eq!(second, false);
+    assert!(first);
+    assert!(!second);
 
     let row = sqlx::query(
         r#"
@@ -202,7 +202,7 @@ async fn finish_mention_command_transitions_only_in_progress_rows() -> Result<()
         .mention_commands
         .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha1")
         .await?;
-    assert_eq!(started, true);
+    assert!(started);
 
     store
         .mention_commands

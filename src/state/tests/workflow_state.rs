@@ -11,8 +11,8 @@ async fn begin_review_locks_in_progress() -> Result<()> {
         .review_state
         .begin_review("group/repo", 1, "sha1")
         .await?;
-    assert_eq!(first, true);
-    assert_eq!(second, false);
+    assert!(first);
+    assert!(!second);
 
     store
         .review_state
@@ -22,7 +22,7 @@ async fn begin_review_locks_in_progress() -> Result<()> {
         .review_state
         .begin_review("group/repo", 1, "sha2")
         .await?;
-    assert_eq!(third, true);
+    assert!(third);
     Ok(())
 }
 
@@ -45,7 +45,7 @@ async fn clear_stale_releases_lock() -> Result<()> {
         .review_state
         .begin_review("group/repo", 2, "sha2")
         .await?;
-    assert_eq!(again, true);
+    assert!(again);
     Ok(())
 }
 
@@ -84,7 +84,7 @@ async fn clear_stale_mentions_mark_error_and_block_replay() -> Result<()> {
         .begin_mention_command(repo, iid, discussion_id, trigger_note_id, "sha2")
         .await?;
 
-    assert_eq!(again, false);
+    assert!(!again);
     let row = sqlx::query(
         r#"
         SELECT status, result

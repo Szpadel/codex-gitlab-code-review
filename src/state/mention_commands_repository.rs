@@ -11,42 +11,6 @@ pub struct MentionCommandsRepository {
     pool: SqlitePool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::ReviewStateStore;
-
-    #[tokio::test]
-    async fn begin_and_finish_mention_command_roundtrip() -> Result<()> {
-        let store = ReviewStateStore::new(":memory:").await?;
-        assert!(
-            store
-                .mention_commands
-                .begin_mention_command("group/repo", 12, "discussion-1", 99, "sha-12")
-                .await?
-        );
-        assert_eq!(
-            store
-                .mention_commands
-                .mention_command_scan_state("group/repo", 12, "discussion-1", 99)
-                .await?,
-            MentionCommandScanState::InProgress
-        );
-        store
-            .mention_commands
-            .finish_mention_command("group/repo", 12, "discussion-1", 99, "sha-12", "done")
-            .await?;
-        assert_eq!(
-            store
-                .mention_commands
-                .mention_command_scan_state("group/repo", 12, "discussion-1", 99)
-                .await?,
-            MentionCommandScanState::Completed
-        );
-        Ok(())
-    }
-}
-
 impl MentionCommandsRepository {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -306,5 +270,41 @@ impl MentionCommandsRepository {
             return Ok(MentionCommandScanState::Ready);
         }
         Ok(MentionCommandScanState::Completed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ReviewStateStore;
+
+    #[tokio::test]
+    async fn begin_and_finish_mention_command_roundtrip() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        assert!(
+            store
+                .mention_commands
+                .begin_mention_command("group/repo", 12, "discussion-1", 99, "sha-12")
+                .await?
+        );
+        assert_eq!(
+            store
+                .mention_commands
+                .mention_command_scan_state("group/repo", 12, "discussion-1", 99)
+                .await?,
+            MentionCommandScanState::InProgress
+        );
+        store
+            .mention_commands
+            .finish_mention_command("group/repo", 12, "discussion-1", 99, "sha-12", "done")
+            .await?;
+        assert_eq!(
+            store
+                .mention_commands
+                .mention_command_scan_state("group/repo", 12, "discussion-1", 99)
+                .await?,
+            MentionCommandScanState::Completed
+        );
+        Ok(())
     }
 }

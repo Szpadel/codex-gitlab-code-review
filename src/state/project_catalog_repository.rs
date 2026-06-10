@@ -9,29 +9,6 @@ pub struct ProjectCatalogRepository {
     pool: SqlitePool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::ReviewStateStore;
-
-    #[tokio::test]
-    async fn save_and_load_catalog_roundtrip() -> Result<()> {
-        let store = ReviewStateStore::new(":memory:").await?;
-        let projects = vec!["group/a".to_string(), "group/b".to_string()];
-        store
-            .project_catalog
-            .save_project_catalog("all", &projects)
-            .await?;
-        let cached = store
-            .project_catalog
-            .load_project_catalog("all")
-            .await?
-            .expect("catalog should exist");
-        assert_eq!(cached.projects, projects);
-        Ok(())
-    }
-}
-
 impl ProjectCatalogRepository {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -189,5 +166,28 @@ impl ProjectCatalogRepository {
         .await
         .with_context(|| format!("backfill legacy project count for key {key}"))?;
         Ok(project_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ReviewStateStore;
+
+    #[tokio::test]
+    async fn save_and_load_catalog_roundtrip() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let projects = vec!["group/a".to_string(), "group/b".to_string()];
+        store
+            .project_catalog
+            .save_project_catalog("all", &projects)
+            .await?;
+        let cached = store
+            .project_catalog
+            .load_project_catalog("all")
+            .await?
+            .expect("catalog should exist");
+        assert_eq!(cached.projects, projects);
+        Ok(())
     }
 }

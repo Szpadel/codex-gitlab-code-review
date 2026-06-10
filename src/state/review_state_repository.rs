@@ -10,44 +10,6 @@ pub struct ReviewStateRepository {
     pool: SqlitePool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::ReviewStateStore;
-
-    #[tokio::test]
-    async fn begin_and_finish_general_review_roundtrip() -> Result<()> {
-        let store = ReviewStateStore::new(":memory:").await?;
-
-        assert!(
-            store
-                .review_state
-                .begin_review("group/repo", 101, "sha-101")
-                .await?
-        );
-        assert_eq!(
-            store
-                .review_state
-                .review_result("group/repo", 101, "sha-101")
-                .await?,
-            None
-        );
-
-        store
-            .review_state
-            .finish_review("group/repo", 101, "sha-101", "pass")
-            .await?;
-        assert_eq!(
-            store
-                .review_state
-                .review_result("group/repo", 101, "sha-101")
-                .await?,
-            Some("pass".to_string())
-        );
-        Ok(())
-    }
-}
-
 impl ReviewStateRepository {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -308,6 +270,44 @@ impl ReviewStateRepository {
         .execute(&self.pool)
         .await
         .context("touch in-progress review")?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ReviewStateStore;
+
+    #[tokio::test]
+    async fn begin_and_finish_general_review_roundtrip() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+
+        assert!(
+            store
+                .review_state
+                .begin_review("group/repo", 101, "sha-101")
+                .await?
+        );
+        assert_eq!(
+            store
+                .review_state
+                .review_result("group/repo", 101, "sha-101")
+                .await?,
+            None
+        );
+
+        store
+            .review_state
+            .finish_review("group/repo", 101, "sha-101", "pass")
+            .await?;
+        assert_eq!(
+            store
+                .review_state
+                .review_result("group/repo", 101, "sha-101")
+                .await?,
+            Some("pass".to_string())
+        );
         Ok(())
     }
 }
