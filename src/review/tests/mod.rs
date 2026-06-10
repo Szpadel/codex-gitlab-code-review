@@ -3,7 +3,7 @@ use crate::codex_runner::{
     CodexResult, DockerCodexRunner, RunnerRuntimeOptions,
     test_support::{FakeRunnerHarness, ScriptedAppChunk, ScriptedAppRequest, ScriptedAppServer},
 };
-use crate::config::{Config, TargetSelector};
+use crate::config::TargetSelector;
 use crate::dev_mode::{DevToolsService, MockCodexRunner};
 use crate::flow::mention::{contains_mention, extract_parent_chain};
 use crate::flow::review::{RetryBackoff, RetryKey, ReviewRunContext};

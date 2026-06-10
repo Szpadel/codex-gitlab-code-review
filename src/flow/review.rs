@@ -1698,12 +1698,7 @@ mod tests {
     use crate::codex_runner::{
         CodexResult, CodexRunner, MentionCommandContext, MentionCommandResult, ReviewContext,
     };
-    use crate::config::FeatureFlagDefaults;
-    use crate::config::{
-        CodexConfig, Config, DatabaseConfig, DepsConfig, DockerConfig, GitLabConfig, GitLabTargets,
-        McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ReviewSecurityConfig,
-        ScheduleConfig, ServerConfig, SessionOverridesConfig, TargetSelector, WorkTmpfsConfig,
-    };
+    use crate::config::{Config, test_builder::ConfigBuilder};
     use crate::gitlab::{
         AwardEmoji, GitLabApi, GitLabProject, GitLabProjectSummary, GitLabUser, MergeRequest, Note,
     };
@@ -1838,62 +1833,7 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        Config {
-            feature_flags: FeatureFlagDefaults::default(),
-            gitlab: GitLabConfig {
-                base_url: "https://gitlab.example.com".to_string(),
-                token: "token".to_string(),
-                bot_user_id: Some(1),
-                created_after: None,
-                targets: GitLabTargets {
-                    repos: TargetSelector::List(vec!["group/repo".to_string()]),
-                    ..Default::default()
-                },
-            },
-            schedule: ScheduleConfig {
-                cron: "* * * * *".to_string(),
-                timezone: None,
-            },
-            review: ReviewConfig {
-                max_concurrent: 1,
-                eyes_emoji: "eyes".to_string(),
-                thumbs_emoji: "thumbsup".to_string(),
-                rate_limit_emoji: "hourglass_flowing_sand".to_string(),
-                comment_marker_prefix: "<!-- codex-review:sha=".to_string(),
-                stale_in_progress_minutes: 60,
-                dry_run: false,
-                additional_developer_instructions: None,
-                security: ReviewSecurityConfig::default(),
-                mention_commands: ReviewMentionCommandsConfig::default(),
-            },
-            codex: CodexConfig {
-                image: "ghcr.io/openai/codex-universal:latest".to_string(),
-                timeout_seconds: 300,
-                auth_host_path: "/root/.codex".to_string(),
-                auth_mount_path: "/root/.codex".to_string(),
-                session_history_path: None,
-                exec_sandbox: "danger-full-access".to_string(),
-                fallback_auth_accounts: Vec::new(),
-                usage_limit_fallback_cooldown_seconds: 3600,
-                deps: DepsConfig { enabled: false },
-                browser_mcp: crate::config::BrowserMcpConfig::default(),
-                work_tmpfs: WorkTmpfsConfig::default(),
-                gitlab_discovery_mcp: crate::config::GitLabDiscoveryMcpConfig::default(),
-                mcp_server_overrides: McpServerOverridesConfig::default(),
-                session_overrides: SessionOverridesConfig::default(),
-                reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
-            },
-            docker: DockerConfig {
-                host: "tcp://localhost:2375".to_string(),
-            },
-            database: DatabaseConfig {
-                path: ":memory:".to_string(),
-            },
-            server: ServerConfig {
-                bind_addr: "127.0.0.1:0".to_string(),
-                status_ui_enabled: false,
-            },
-        }
+        ConfigBuilder::for_review_tests().build()
     }
 
     async fn review_run_context(

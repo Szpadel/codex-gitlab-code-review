@@ -8,6 +8,8 @@ pub const BROWSER_MCP_REMOTE_DEBUGGING_PORT: u16 = 9222;
 pub(crate) mod defaults;
 pub mod feature_flags;
 mod load;
+#[cfg(test)]
+pub(crate) mod test_builder;
 mod validate;
 
 use self::defaults::{
