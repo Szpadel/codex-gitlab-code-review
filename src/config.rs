@@ -32,8 +32,10 @@ use self::load::{
 };
 
 #[cfg(test)]
+pub(crate) use self::load::apply_dev_mode_profile;
+#[cfg(test)]
 pub(crate) use self::load::legacy_proxy_config_present;
-pub use self::load::load_raw_config;
+pub use self::load::{load_raw_config, load_validated_config};
 #[cfg(test)]
 pub(crate) use self::validate::apply_gitlab_discovery_mcp_runtime_defaults;
 pub use self::validate::{

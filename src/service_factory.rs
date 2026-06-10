@@ -5,15 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use crate::codex_runner::docker::wait_for_docker_ready;
 use crate::codex_runner::{CodexRunner, DockerCodexRunner, RunnerRuntimeOptions};
 use crate::config::{
-    Config, DockerConfig, TargetSelector, ValidatedConfig,
-    gitlab_discovery_mcp_uses_cluster_service_advertise_url, load_raw_config, validate_config,
+    Config, DockerConfig, ValidatedConfig, load_validated_config, validate_config,
 };
-use crate::dev_mode::{DEV_MODE_BASE_URL, DevToolsService, MockCodexRunner};
+use crate::dev_mode::{DevToolsService, MockCodexRunner};
 use crate::gitlab::{GitLabApi, GitLabClient, GitLabUser, GitLabUserDetail};
 use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use crate::http::HttpServices;
@@ -122,17 +120,7 @@ impl BotUserResolver for GitLabClient {
 }
 
 pub fn load_config(dev_mode: bool) -> Result<ValidatedConfig> {
-    let mut config = load_raw_config()?;
-    if dev_mode {
-        apply_dev_mode_profile(&mut config);
-    }
-    if gitlab_discovery_mcp_uses_cluster_service_advertise_url(&config.codex) {
-        warn!(
-            advertise_url = config.codex.gitlab_discovery_mcp.advertise_url.as_str(),
-            "gitlab discovery MCP advertise_url uses cluster service DNS; Docker review containers may fail to reach it, so prefer host.docker.internal with host-gateway mapping or another explicit routable address"
-        );
-    }
-    validate_config(config)
+    load_validated_config(dev_mode)
 }
 
 pub async fn build_service_bundle(
@@ -201,25 +189,6 @@ pub(crate) async fn build_review_state_store(config: &Config) -> Result<Arc<Revi
     Ok(Arc::new(
         ReviewStateStore::new(&config.database.path).await?,
     ))
-}
-
-pub fn apply_dev_mode_profile(config: &mut Config) {
-    config.gitlab.base_url = DEV_MODE_BASE_URL.to_string();
-    config.gitlab.token.clear();
-    config.gitlab.bot_user_id = Some(1);
-    config.gitlab.targets.repos = TargetSelector::All;
-    config.gitlab.targets.groups = TargetSelector::List(Vec::new());
-    config.gitlab.targets.exclude_repos.clear();
-    config.gitlab.targets.exclude_groups.clear();
-    config.review.mention_commands.enabled = false;
-    config.review.mention_commands.bot_username = None;
-    config.codex.browser_mcp.enabled = false;
-    config.codex.gitlab_discovery_mcp.enabled = false;
-    config.server.status_ui_enabled = true;
-    config.database.path = format!(
-        "/tmp/codex-gitlab-code-review-dev-{}.sqlite",
-        Uuid::new_v4()
-    );
 }
 
 fn build_dev_runtime(
@@ -659,30 +628,6 @@ mod tests {
 
         config.review.mention_commands.bot_username = Some("   ".to_string());
         assert!(!mention_commands_active(&config));
-    }
-
-    #[test]
-    fn apply_dev_mode_profile_switches_to_safe_mocked_runtime() {
-        let mut config = test_config();
-        config.server.status_ui_enabled = false;
-        config.codex.browser_mcp.enabled = true;
-        config.codex.gitlab_discovery_mcp.enabled = true;
-        config.review.mention_commands.enabled = true;
-
-        apply_dev_mode_profile(&mut config);
-
-        assert_eq!(config.gitlab.base_url, "https://dev-mode.invalid");
-        assert!(config.server.status_ui_enabled);
-        assert!(!config.codex.browser_mcp.enabled);
-        assert!(!config.codex.gitlab_discovery_mcp.enabled);
-        assert!(!config.review.mention_commands.enabled);
-        assert!(config.database.path.starts_with("/tmp/"));
-        assert!(
-            config
-                .database
-                .path
-                .contains("codex-gitlab-code-review-dev-")
-        );
     }
 
     fn test_config() -> Config {

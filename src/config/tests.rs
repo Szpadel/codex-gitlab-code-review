@@ -1,3 +1,5 @@
+use super::load::apply_dev_mode_profile;
+use super::test_builder::ConfigBuilder;
 use super::*;
 use anyhow::Result;
 use std::env;
@@ -72,6 +74,30 @@ fn with_env_var<T>(name: &str, value: Option<&str>, action: impl FnOnce() -> T) 
     let _lock = ENV_LOCK.lock().expect("lock env");
     let _guard = EnvVarGuard::set(name, value);
     action()
+}
+
+#[test]
+fn apply_dev_mode_profile_switches_to_safe_mocked_runtime() {
+    let mut config = ConfigBuilder::for_service_factory_tests().build();
+    config.server.status_ui_enabled = false;
+    config.codex.browser_mcp.enabled = true;
+    config.codex.gitlab_discovery_mcp.enabled = true;
+    config.review.mention_commands.enabled = true;
+
+    apply_dev_mode_profile(&mut config);
+
+    assert_eq!(config.gitlab.base_url, crate::dev_mode::DEV_MODE_BASE_URL);
+    assert!(config.server.status_ui_enabled);
+    assert!(!config.codex.browser_mcp.enabled);
+    assert!(!config.codex.gitlab_discovery_mcp.enabled);
+    assert!(!config.review.mention_commands.enabled);
+    assert!(config.database.path.starts_with("/tmp/"));
+    assert!(
+        config
+            .database
+            .path
+            .contains("codex-gitlab-code-review-dev-")
+    );
 }
 
 fn base_config_yaml(extra: &str) -> String {

@@ -470,8 +470,9 @@ async fn wait_for_shutdown_signal() -> Result<ServiceLifecycleSignal> {
 mod tests {
     use super::*;
     use crate::bootstrap::{BootstrapOptions, bootstrap_runtime};
+    use crate::config::apply_dev_mode_profile;
     use crate::config::{Config, test_builder::ConfigBuilder, validate_config};
-    use crate::service_factory::{apply_dev_mode_profile, build_review_state_store};
+    use crate::service_factory::build_review_state_store;
     use sqlx::Executor;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

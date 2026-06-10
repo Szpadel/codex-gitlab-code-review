@@ -1,11 +1,15 @@
 use super::defaults::{
     default_security_context_session_override, default_security_review_session_override,
 };
-use super::{Config, SessionModeOverrideConfig};
+use super::validate::{
+    ValidatedConfig, gitlab_discovery_mcp_uses_cluster_service_advertise_url, validate_config,
+};
+use super::{Config, SessionModeOverrideConfig, TargetSelector};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde::de::Deserializer;
 use std::env;
+use uuid::Uuid;
 
 /// # Errors
 ///
@@ -28,6 +32,43 @@ pub fn load_raw_config() -> Result<Config> {
     validate_no_legacy_reasoning_effort_config(&cfg)?;
 
     cfg.try_deserialize().context("deserialize config")
+}
+
+/// # Errors
+///
+/// Returns an error if configuration files, environment overrides, or
+/// validation fail.
+pub fn load_validated_config(dev_mode: bool) -> Result<ValidatedConfig> {
+    let mut config = load_raw_config()?;
+    if dev_mode {
+        apply_dev_mode_profile(&mut config);
+    }
+    if gitlab_discovery_mcp_uses_cluster_service_advertise_url(&config.codex) {
+        tracing::warn!(
+            advertise_url = config.codex.gitlab_discovery_mcp.advertise_url.as_str(),
+            "gitlab discovery MCP advertise_url uses cluster service DNS; Docker review containers may fail to reach it, so prefer host.docker.internal with host-gateway mapping or another explicit routable address"
+        );
+    }
+    validate_config(config)
+}
+
+pub(crate) fn apply_dev_mode_profile(config: &mut Config) {
+    config.gitlab.base_url = crate::dev_mode::DEV_MODE_BASE_URL.to_string();
+    config.gitlab.token.clear();
+    config.gitlab.bot_user_id = Some(1);
+    config.gitlab.targets.repos = TargetSelector::All;
+    config.gitlab.targets.groups = TargetSelector::List(Vec::new());
+    config.gitlab.targets.exclude_repos.clear();
+    config.gitlab.targets.exclude_groups.clear();
+    config.review.mention_commands.enabled = false;
+    config.review.mention_commands.bot_username = None;
+    config.codex.browser_mcp.enabled = false;
+    config.codex.gitlab_discovery_mcp.enabled = false;
+    config.server.status_ui_enabled = true;
+    config.database.path = format!(
+        "/tmp/codex-gitlab-code-review-dev-{}.sqlite",
+        Uuid::new_v4()
+    );
 }
 
 pub(crate) fn empty_string_as_none<'de, D>(
