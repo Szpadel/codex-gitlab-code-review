@@ -68,6 +68,22 @@ pub fn upstream_review_prompt_source_commit() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated_review_prompt_templates::{BASE_BRANCH_PROMPT_BACKUP, UNCOMMITTED_PROMPT};
+
+    #[test]
+    fn sync_constants_present() {
+        assert!(!SOURCE_PATH.trim().is_empty());
+        assert!(!SOURCE_COMMIT.trim().is_empty());
+        assert!(!BASE_BRANCH_PROMPT.trim().is_empty());
+        assert!(!COMMIT_PROMPT_WITH_TITLE.trim().is_empty());
+        assert!(!COMMIT_PROMPT.trim().is_empty());
+        assert!(!LOCAL_BASE_BRANCH_PROMPT_BACKUP.trim().is_empty());
+
+        // Keep currently-unused generated prompt variants with the upstream
+        // set so Codex prompt-sync drift remains visible during upgrades.
+        assert!(!UNCOMMITTED_PROMPT.trim().is_empty());
+        assert!(!BASE_BRANCH_PROMPT_BACKUP.trim().is_empty());
+    }
 
     #[test]
     fn builds_base_branch_prompt_with_merge_base() {
