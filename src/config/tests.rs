@@ -63,6 +63,25 @@ fn with_env_var<T>(name: &str, value: Option<&str>, action: impl FnOnce() -> T) 
 }
 
 fn base_config_yaml(extra: &str) -> String {
+    base_config_yaml_with("", "", extra)
+}
+
+fn base_config_yaml_with(review_extra: &str, codex_extra: &str, extra: &str) -> String {
+    base_config_yaml_with_targets(
+        r#"    repos:
+      - "group/repo""#,
+        review_extra,
+        codex_extra,
+        extra,
+    )
+}
+
+fn base_config_yaml_with_targets(
+    gitlab_targets: &str,
+    review_extra: &str,
+    codex_extra: &str,
+    extra: &str,
+) -> String {
     format!(
         r#"
 gitlab:
@@ -70,8 +89,7 @@ gitlab:
   token: "token"
   bot_user_id: 1
   targets:
-    repos:
-      - "group/repo"
+{}
 schedule:
   cron: "* * * * *"
   timezone: null
@@ -81,20 +99,20 @@ review:
   thumbs_emoji: "thumbsup"
   comment_marker_prefix: "<!-- codex-review:sha="
   stale_in_progress_minutes: 60
-  dry_run: false
+  dry_run: false{}
 codex:
   image: "ghcr.io/openai/codex-universal:latest"
   timeout_seconds: 300
   auth_host_path: "/root/.codex"
   auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+  exec_sandbox: "danger-full-access"{}
 database:
   path: "/tmp/state.sqlite"
 server:
   bind_addr: "127.0.0.1:0"
 {}
 "#,
-        extra
+        gitlab_targets, review_extra, codex_extra, extra
     )
 }
 
@@ -177,78 +195,32 @@ fn defaults_mention_commands_when_missing() {
 
 #[test]
 fn preserves_rate_limit_emoji_override() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
+    let yaml = base_config_yaml_with(
+        r#"
   rate_limit_emoji: "alarm_clock"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert_eq!(config.review.rate_limit_emoji, "alarm_clock");
 }
 
 #[test]
 fn parses_security_config_without_debounce() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
+    let yaml = base_config_yaml_with(
+        r#"
   security:
     context_ttl_seconds: 900
     min_confidence_score: 0.9
     comment_marker_prefix: "<!-- custom-security-review:sha="
     finding_marker_prefix: "<!-- custom-security-review-finding:sha="
     additional_developer_instructions: "Tighten the rubric."
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert_eq!(config.review.security.context_ttl_seconds, 900);
     assert_eq!(config.review.security.min_confidence_score, 0.9);
     assert_eq!(
@@ -304,42 +276,19 @@ proxy:
 
 #[test]
 fn loads_mention_commands_overrides() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
+    let yaml = base_config_yaml_with(
+        r#"
   additional_developer_instructions: "Check performance-sensitive paths."
   mention_commands:
     enabled: true
     bot_username: "botuser"
     eyes_emoji: "inspect"
     additional_developer_instructions: "Prefer small commits."
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert_eq!(
         config.review.additional_developer_instructions.as_deref(),
         Some("Check performance-sensitive paths.")
@@ -365,30 +314,9 @@ server:
 
 #[test]
 fn loads_mcp_server_overrides() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   mcp_server_overrides:
     review:
       github: false
@@ -396,12 +324,10 @@ codex:
     mention:
       github: true
       playwright: false
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert_eq!(
         config.codex.mcp_server_overrides.review.get("github"),
         Some(&false)
@@ -422,30 +348,9 @@ server:
 
 #[test]
 fn loads_session_overrides() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   session_overrides:
     review:
       model: "gpt-5.4"
@@ -459,12 +364,10 @@ codex:
     security_review:
       model: "gpt-5.4"
       reasoning_effort: "xhigh"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert_eq!(
         config.codex.session_overrides.review.model.as_deref(),
         Some("gpt-5.4")
@@ -531,39 +434,16 @@ server:
 
 #[test]
 fn loads_reasoning_summary_overrides() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   reasoning_summary:
     review: "detailed"
     mention: "none"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert_eq!(
         config.codex.reasoning_summary.review.as_deref(),
         Some("detailed")
@@ -576,30 +456,9 @@ server:
 
 #[test]
 fn loads_browser_mcp_config() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   browser_mcp:
     enabled: true
     server_name: "chrome-devtools"
@@ -608,12 +467,10 @@ codex:
     browser_args:
       - "--disable-gpu"
       - "--no-sandbox"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert!(config.codex.browser_mcp.enabled);
     assert_eq!(config.codex.browser_mcp.server_name, "chrome-devtools");
     assert_eq!(
@@ -635,78 +492,32 @@ server:
 
 #[test]
 fn loads_work_tmpfs_config() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   work_tmpfs:
     enabled: true
     size_mib: 512
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert!(config.codex.work_tmpfs.enabled);
     assert_eq!(config.codex.work_tmpfs.size_mib, Some(512));
 }
 
 #[test]
 fn errors_on_work_tmpfs_size_zero() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   work_tmpfs:
     enabled: true
     size_mib: 0
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("codex.work_tmpfs.size_mib must be greater than 0 when set"));
@@ -714,39 +525,16 @@ server:
 
 #[test]
 fn errors_on_work_tmpfs_size_above_docker_limit() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   work_tmpfs:
     enabled: true
     size_mib: 8796093022208
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("codex.work_tmpfs.size_mib must be at most"));
@@ -754,41 +542,18 @@ server:
 
 #[test]
 fn errors_on_browser_mcp_non_default_port() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   browser_mcp:
     enabled: true
     server_name: "chrome-devtools"
     browser_image: "chromedp/headless-shell:latest"
     remote_debugging_port: 9333
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("codex.browser_mcp.remote_debugging_port must be 9222"));
@@ -796,30 +561,9 @@ server:
 
 #[test]
 fn errors_on_browser_mcp_browser_args_overriding_debug_endpoint() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   browser_mcp:
     enabled: true
     server_name: "chrome-devtools"
@@ -827,12 +571,10 @@ codex:
     remote_debugging_port: 9222
     browser_args:
       - "--remote-debugging-port=9333"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("must not override --remote-debugging-port"));
@@ -840,30 +582,9 @@ server:
 
 #[test]
 fn errors_on_browser_mcp_browser_args_overriding_debug_endpoint_split_form() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   browser_mcp:
     enabled: true
     server_name: "chrome-devtools"
@@ -872,12 +593,10 @@ codex:
     browser_args:
       - "--remote-debugging-address"
       - "127.0.0.2"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("must not override --remote-debugging-address"));
@@ -885,41 +604,18 @@ server:
 
 #[test]
 fn errors_on_browser_mcp_server_name_with_control_characters() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   browser_mcp:
     enabled: true
     server_name: "chrome\ndevtools"
     browser_image: "chromedp/headless-shell:latest"
     remote_debugging_port: 9222
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("must not contain control characters"));
@@ -927,41 +623,18 @@ server:
 
 #[test]
 fn errors_on_browser_mcp_server_name_with_invalid_characters() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   browser_mcp:
     enabled: true
     server_name: "chrome.devtools"
     browser_image: "chromedp/headless-shell:latest"
     remote_debugging_port: 9222
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("must match ^[a-zA-Z0-9_-]+$"));
@@ -969,30 +642,9 @@ server:
 
 #[test]
 fn loads_enabled_gitlab_discovery_mcp_without_allow_rules() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   gitlab_discovery_mcp:
     enabled: true
     server_name: "gitlab-discovery"
@@ -1000,54 +652,29 @@ codex:
     advertise_url: "http://host.docker.internal:8081/mcp"
     clone_root: "/work/mcp"
     allow: []
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert!(config.codex.gitlab_discovery_mcp.enabled);
     assert!(config.codex.gitlab_discovery_mcp.allow.is_empty());
 }
 
 #[test]
 fn errors_on_gitlab_discovery_mcp_bind_addr_with_port_zero() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   gitlab_discovery_mcp:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "127.0.0.1:0"
     advertise_url: "http://host.docker.internal:8081/mcp"
     clone_root: "/work/mcp"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("codex.gitlab_discovery_mcp.bind_addr must include a non-zero port"));
@@ -1055,42 +682,19 @@ server:
 
 #[test]
 fn defaults_gitlab_discovery_advertise_url_to_host_gateway_when_unspecified() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   gitlab_discovery_mcp:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:8081"
     advertise_url: ""
     clone_root: "/work/mcp"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert_eq!(
         config.codex.gitlab_discovery_mcp.advertise_url,
         "http://host.docker.internal:8081/mcp"
@@ -1099,30 +703,9 @@ server:
 
 #[test]
 fn errors_on_duplicate_enabled_injected_mcp_server_names() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   browser_mcp:
     enabled: true
     server_name: "shared-mcp"
@@ -1134,12 +717,10 @@ codex:
     bind_addr: "0.0.0.0:8081"
     advertise_url: "http://host.docker.internal:8081/mcp"
     clone_root: "/work/mcp"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains(
@@ -1238,39 +819,16 @@ server:
 
 #[test]
 fn errors_on_mcp_server_override_key_with_invalid_characters() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   mcp_server_overrides:
     review:
       chrome.devtools: false
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("keys must match ^[a-zA-Z0-9_-]+$"));
@@ -1278,39 +836,16 @@ server:
 
 #[test]
 fn errors_on_empty_session_override_reasoning_effort() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   session_overrides:
     review:
       reasoning_effort: "   "
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("codex.session_overrides.review.reasoning_effort must not be empty"));
@@ -1318,39 +853,16 @@ server:
 
 #[test]
 fn errors_on_unsupported_session_override_reasoning_effort() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   session_overrides:
     mention:
       reasoning_effort: "fast"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains(
@@ -1360,39 +872,16 @@ server:
 
 #[test]
 fn errors_on_empty_session_override_model() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   session_overrides:
     review:
       model: "   "
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("codex.session_overrides.review.model must not be empty"));
@@ -1400,38 +889,15 @@ server:
 
 #[test]
 fn errors_on_legacy_reasoning_effort_block() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   reasoning_effort:
     review: "high"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("codex.reasoning_effort has been replaced by codex.session_overrides"));
@@ -1439,38 +905,15 @@ server:
 
 #[test]
 fn errors_on_empty_reasoning_summary_override() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   reasoning_summary:
     review: "   "
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("codex.reasoning_summary.review must not be empty"));
@@ -1478,38 +921,15 @@ server:
 
 #[test]
 fn errors_on_unsupported_reasoning_summary_override() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   reasoning_summary:
     mention: "verbose"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("codex.reasoning_summary.mention must be one of: none, auto, detailed"));
@@ -1517,110 +937,33 @@ server:
 
 #[test]
 fn loads_all_target_selector() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos: all
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+    let yaml = base_config_yaml_with_targets("    repos: all", "", "", "");
+    let config = load_from_yaml(&yaml);
     assert!(config.gitlab.targets.repos.is_all());
 }
 
 #[test]
 fn errors_on_invalid_target_selector() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos: everything
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+    let yaml = base_config_yaml_with_targets("    repos: everything", "", "", "");
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
 }
 
 #[test]
 fn loads_fallback_auth_accounts_in_declared_order() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   usage_limit_fallback_cooldown_seconds: 120
   fallback_auth_accounts:
     - name: "backup-high"
       auth_host_path: "/root/.codex-backup-high"
     - name: "backup-low"
       auth_host_path: "/root/.codex-backup-low"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let config = load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let config = load_from_yaml(&yaml);
     assert_eq!(config.codex.usage_limit_fallback_cooldown_seconds, 120);
     assert_eq!(config.codex.fallback_auth_accounts.len(), 2);
     assert_eq!(config.codex.fallback_auth_accounts[0].name, "backup-high");
@@ -1637,41 +980,18 @@ server:
 
 #[test]
 fn errors_on_duplicate_fallback_account_name() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   fallback_auth_accounts:
     - name: "backup"
       auth_host_path: "/root/.codex-backup-a"
     - name: "backup"
       auth_host_path: "/root/.codex-backup-b"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("duplicate codex fallback account name"));
@@ -1679,39 +999,16 @@ server:
 
 #[test]
 fn errors_on_duplicate_auth_host_path_between_primary_and_fallback() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   fallback_auth_accounts:
     - name: "backup"
       auth_host_path: "/root/.codex"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("duplicate codex auth_host_path"));
@@ -1719,39 +1016,16 @@ server:
 
 #[test]
 fn errors_on_reserved_primary_fallback_name() {
-    let yaml = r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
   fallback_auth_accounts:
     - name: "primary"
       auth_host_path: "/root/.codex-backup"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
-"#;
-    let result = try_load_from_yaml(yaml);
+"#,
+        "",
+    );
+    let result = try_load_from_yaml(&yaml);
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains("name 'primary' is reserved"));
@@ -1759,43 +1033,18 @@ server:
 
 #[test]
 fn detects_cluster_service_advertise_urls() {
-    let mut config = load_from_yaml(
+    let mut config = load_from_yaml(&base_config_yaml_with(
+        "",
         r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
   gitlab_discovery_mcp:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:8081"
     advertise_url: "http://host.docker.internal:8081/mcp"
     clone_root: "/work/mcp"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
 "#,
-    );
+        "",
+    ));
 
     config.codex.gitlab_discovery_mcp.advertise_url =
         "http://codex-gitlab-review.default.svc.cluster.local:8081/mcp".to_string();
@@ -1807,43 +1056,18 @@ server:
 
 #[test]
 fn ignores_non_cluster_service_advertise_urls() {
-    let config = load_from_yaml(
+    let config = load_from_yaml(&base_config_yaml_with(
+        "",
         r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
   gitlab_discovery_mcp:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:8081"
     advertise_url: "http://10.42.0.15:8081/mcp"
     clone_root: "/work/mcp"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
 "#,
-    );
+        "",
+    ));
 
     assert!(!gitlab_discovery_mcp_uses_cluster_service_advertise_url(
         &config.codex
@@ -1852,43 +1076,18 @@ server:
 
 #[test]
 fn fills_gitlab_discovery_advertise_url_from_pod_ip() {
-    let mut config = load_from_yaml(
+    let mut config = load_from_yaml(&base_config_yaml_with(
+        "",
         r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
   gitlab_discovery_mcp:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:19091"
     advertise_url: "http://10.42.0.15:19091/mcp"
     clone_root: "/work/mcp"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
 "#,
-    );
+        "",
+    ));
     config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
     with_env_var("POD_IP", Some("10.42.0.15"), || {
@@ -1904,43 +1103,18 @@ server:
 
 #[test]
 fn fills_gitlab_discovery_advertise_url_from_ipv6_pod_ip() {
-    let mut config = load_from_yaml(
+    let mut config = load_from_yaml(&base_config_yaml_with(
+        "",
         r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
   gitlab_discovery_mcp:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "[::]:8081"
     advertise_url: "http://[fd00::123]:8081/mcp"
     clone_root: "/work/mcp"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
 "#,
-    );
+        "",
+    ));
     config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
     with_env_var("POD_IP", Some("fd00::123"), || {
@@ -1956,43 +1130,18 @@ server:
 
 #[test]
 fn falls_back_to_host_gateway_when_pod_ip_is_absent() {
-    let mut config = load_from_yaml(
+    let mut config = load_from_yaml(&base_config_yaml_with(
+        "",
         r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
   gitlab_discovery_mcp:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:19091"
     advertise_url: "http://10.42.0.15:19091/mcp"
     clone_root: "/work/mcp"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
 "#,
-    );
+        "",
+    ));
     config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
     with_env_var("POD_IP", None, || {
@@ -2008,43 +1157,18 @@ server:
 
 #[test]
 fn falls_back_to_host_gateway_when_pod_ip_family_does_not_match_bind_host() {
-    let mut config = load_from_yaml(
+    let mut config = load_from_yaml(&base_config_yaml_with(
+        "",
         r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
   gitlab_discovery_mcp:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "0.0.0.0:19091"
     advertise_url: "http://10.42.0.15:19091/mcp"
     clone_root: "/work/mcp"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
 "#,
-    );
+        "",
+    ));
     config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
     with_env_var("POD_IP", Some("fd00::123"), || {
@@ -2060,43 +1184,18 @@ server:
 
 #[test]
 fn rejects_pod_ip_default_for_non_wildcard_bind_host() {
-    let mut config = load_from_yaml(
+    let mut config = load_from_yaml(&base_config_yaml_with(
+        "",
         r#"
-gitlab:
-  base_url: "https://gitlab.example.com"
-  token: "token"
-  bot_user_id: 1
-  targets:
-    repos:
-      - "group/repo"
-schedule:
-  cron: "* * * * *"
-  timezone: null
-review:
-  max_concurrent: 1
-  eyes_emoji: "eyes"
-  thumbs_emoji: "thumbsup"
-  comment_marker_prefix: "<!-- codex-review:sha="
-  stale_in_progress_minutes: 60
-  dry_run: false
-codex:
-  image: "ghcr.io/openai/codex-universal:latest"
-  timeout_seconds: 300
-  auth_host_path: "/root/.codex"
-  auth_mount_path: "/root/.codex"
-  exec_sandbox: "danger-full-access"
   gitlab_discovery_mcp:
     enabled: true
     server_name: "gitlab-discovery"
     bind_addr: "127.0.0.1:19091"
     advertise_url: "http://127.0.0.1:19091/mcp"
     clone_root: "/work/mcp"
-database:
-  path: "/tmp/state.sqlite"
-server:
-  bind_addr: "127.0.0.1:0"
 "#,
-    );
+        "",
+    ));
     config.codex.gitlab_discovery_mcp.advertise_url.clear();
 
     let err = with_env_var("POD_IP", Some("10.42.0.15"), || {
