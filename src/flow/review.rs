@@ -295,102 +295,167 @@ impl ReviewFlow {
             return Ok(ReviewGateOutcome::Decision(ReviewScheduleOutcome::Disabled));
         }
         let now = Utc::now().timestamp();
-        let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
-        if !self.retry_backoff.should_retry(&retry_key, Utc::now()) {
-            return Ok(ReviewGateOutcome::Decision(
-                ReviewScheduleOutcome::SkippedBackoff,
-            ));
+        if let Some(outcome) = self
+            .find_skip_reason(repo, mr, head_sha, &feature_flags)
+            .await?
+        {
+            return Ok(ReviewGateOutcome::Decision(outcome));
         }
-        if self.uses_awards() {
-            let awards = self.shared.gitlab.list_awards(repo, mr.iid).await?;
-            if has_bot_award(
-                &awards,
-                self.shared.bot_user_id,
-                &self.shared.config.review.thumbs_emoji,
-            ) {
-                return Ok(ReviewGateOutcome::Decision(
-                    ReviewScheduleOutcome::SkippedAward,
-                ));
-            }
+        self.acquire_review_slot(repo, mr, head_sha, now).await
+    }
+
+    async fn find_skip_reason(
+        &self,
+        repo: &str,
+        mr: &MergeRequest,
+        head_sha: &str,
+        feature_flags: &FeatureFlagSnapshot,
+    ) -> Result<Option<ReviewScheduleOutcome>> {
+        if self.skipped_by_backoff(repo, mr.iid, head_sha) {
+            return Ok(Some(ReviewScheduleOutcome::SkippedBackoff));
         }
-        let notes = self.shared.gitlab.list_notes(repo, mr.iid).await?;
-        if has_review_marker(
+        if self.skipped_by_thumbs_award(repo, mr.iid).await? {
+            return Ok(Some(ReviewScheduleOutcome::SkippedAward));
+        }
+        if self
+            .skipped_by_review_marker(repo, mr.iid, head_sha)
+            .await?
+        {
+            return Ok(Some(ReviewScheduleOutcome::SkippedMarker));
+        }
+        if let Some(outcome) = self
+            .skipped_by_inline_markers(repo, mr.iid, head_sha, feature_flags)
+            .await?
+        {
+            return Ok(Some(outcome));
+        }
+        if self.skipped_by_mention_lock(repo, mr.iid).await? {
+            return Ok(Some(ReviewScheduleOutcome::SkippedLocked));
+        }
+        Ok(None)
+    }
+
+    fn skipped_by_backoff(&self, repo: &str, iid: u64, head_sha: &str) -> bool {
+        let retry_key = RetryKey::new(self.lane, repo, iid, head_sha);
+        !self.retry_backoff.should_retry(&retry_key, Utc::now())
+    }
+
+    async fn skipped_by_thumbs_award(&self, repo: &str, iid: u64) -> Result<bool> {
+        if !self.uses_awards() {
+            return Ok(false);
+        }
+        let awards = self.shared.gitlab.list_awards(repo, iid).await?;
+        Ok(has_bot_award(
+            &awards,
+            self.shared.bot_user_id,
+            &self.shared.config.review.thumbs_emoji,
+        ))
+    }
+
+    async fn skipped_by_review_marker(&self, repo: &str, iid: u64, head_sha: &str) -> Result<bool> {
+        let notes = self.shared.gitlab.list_notes(repo, iid).await?;
+        Ok(has_review_marker(
             &notes,
             self.shared.bot_user_id,
             self.review_marker_prefix(),
             head_sha,
-        ) {
-            return Ok(ReviewGateOutcome::Decision(
-                ReviewScheduleOutcome::SkippedMarker,
-            ));
-        }
-        let inline_review_comments_enabled = feature_flags.gitlab_inline_review_comments;
+        ))
+    }
+
+    async fn skipped_by_inline_markers(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        feature_flags: &FeatureFlagSnapshot,
+    ) -> Result<Option<ReviewScheduleOutcome>> {
         let completed_inline_review = self
             .shared
             .state
             .run_history
-            .has_completed_inline_review_for_lane(repo, mr.iid, head_sha, self.lane)
+            .has_completed_inline_review_for_lane(repo, iid, head_sha, self.lane)
             .await?;
         let review_result = self
             .shared
             .state
             .review_state
-            .review_result_for_lane(repo, mr.iid, head_sha, self.lane)
+            .review_result_for_lane(repo, iid, head_sha, self.lane)
             .await?;
         let parsed_review_result = review_result.as_deref().and_then(ReviewRunResult::parse);
         if self.lane.is_security()
             && parsed_review_result.is_some_and(ReviewRunResult::is_completed_review)
         {
-            return Ok(ReviewGateOutcome::Decision(
-                ReviewScheduleOutcome::SkippedCompleted,
-            ));
+            return Ok(Some(ReviewScheduleOutcome::SkippedCompleted));
         }
-        let should_check_inline_markers =
-            inline_review_comments_enabled || completed_inline_review || review_result.is_some();
-        if should_check_inline_markers {
-            match self.shared.gitlab.list_discussions(repo, mr.iid).await {
-                Ok(discussions) => {
-                    if has_inline_review_marker(
-                        &discussions,
-                        self.shared.bot_user_id,
-                        head_sha,
-                        self.finding_marker_prefix(),
-                    ) && parsed_review_result != Some(ReviewRunResult::Error)
-                        && (completed_inline_review
-                            || parsed_review_result == Some(ReviewRunResult::Comment))
-                    {
-                        return Ok(ReviewGateOutcome::Decision(
-                            ReviewScheduleOutcome::SkippedMarker,
-                        ));
-                    }
+        let should_check_inline_markers = feature_flags.gitlab_inline_review_comments
+            || completed_inline_review
+            || review_result.is_some();
+        if !should_check_inline_markers {
+            return Ok(None);
+        }
+        self.inline_marker_discussion_skip(
+            repo,
+            iid,
+            head_sha,
+            completed_inline_review,
+            parsed_review_result,
+        )
+        .await
+    }
+
+    async fn inline_marker_discussion_skip(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        completed_inline_review: bool,
+        parsed_review_result: Option<ReviewRunResult>,
+    ) -> Result<Option<ReviewScheduleOutcome>> {
+        match self.shared.gitlab.list_discussions(repo, iid).await {
+            Ok(discussions) => {
+                if has_inline_review_marker(
+                    &discussions,
+                    self.shared.bot_user_id,
+                    head_sha,
+                    self.finding_marker_prefix(),
+                ) && parsed_review_result != Some(ReviewRunResult::Error)
+                    && (completed_inline_review
+                        || parsed_review_result == Some(ReviewRunResult::Comment))
+                {
+                    return Ok(Some(ReviewScheduleOutcome::SkippedMarker));
                 }
-                Err(err) => {
-                    warn!(
-                        repo,
-                        iid = mr.iid,
-                        head_sha,
-                        error = %err,
-                        "failed to load MR discussions while checking inline review markers"
-                    );
-                    if completed_inline_review {
-                        return Ok(ReviewGateOutcome::Decision(
-                            ReviewScheduleOutcome::SkippedMarker,
-                        ));
-                    }
+            }
+            Err(err) => {
+                warn!(
+                    repo,
+                    iid,
+                    head_sha,
+                    error = %err,
+                    "failed to load MR discussions while checking inline review markers"
+                );
+                if completed_inline_review {
+                    return Ok(Some(ReviewScheduleOutcome::SkippedMarker));
                 }
             }
         }
-        if self
-            .shared
+        Ok(None)
+    }
+
+    async fn skipped_by_mention_lock(&self, repo: &str, iid: u64) -> Result<bool> {
+        self.shared
             .state
             .mention_commands
-            .has_in_progress_mention_for_mr(repo, mr.iid)
-            .await?
-        {
-            return Ok(ReviewGateOutcome::Decision(
-                ReviewScheduleOutcome::SkippedLocked,
-            ));
-        }
+            .has_in_progress_mention_for_mr(repo, iid)
+            .await
+    }
+
+    async fn acquire_review_slot(
+        &self,
+        repo: &str,
+        mr: &MergeRequest,
+        head_sha: &str,
+        now: i64,
+    ) -> Result<ReviewGateOutcome> {
         if !self
             .shared
             .state
@@ -403,30 +468,55 @@ impl ReviewFlow {
             ));
         }
         let acquired_bucket_ids = match self
+            .consume_review_rate_limits_for_gate(repo, mr.iid, head_sha, now)
+            .await?
+        {
+            Some(bucket_ids) => bucket_ids,
+            None => {
+                return Ok(ReviewGateOutcome::Decision(
+                    ReviewScheduleOutcome::SkippedRateLimit,
+                ));
+            }
+        };
+        if self.shared.shutdown_requested() {
+            return self
+                .rollback_review_slot_for_shutdown(
+                    repo,
+                    mr.iid,
+                    head_sha,
+                    now,
+                    &acquired_bucket_ids,
+                )
+                .await;
+        }
+        Ok(ReviewGateOutcome::Ready(ReviewGateReady {
+            acquired_rule_ids: acquired_bucket_ids,
+        }))
+    }
+
+    async fn consume_review_rate_limits_for_gate(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        now: i64,
+    ) -> Result<Option<Vec<String>>> {
+        match self
             .shared
             .state
             .review_rate_limit
-            .try_consume_review_rate_limits(self.lane, repo, mr.iid, now)
+            .try_consume_review_rate_limits(self.lane, repo, iid, now)
             .await
         {
             Err(err) => {
-                self.release_review_lock_after_gate_failure(repo, mr.iid, head_sha, &err)
+                self.release_review_lock_after_gate_failure(repo, iid, head_sha, &err)
                     .await;
-                return Err(err);
+                Err(err)
             }
-            Ok(ReviewRateLimitAcquireOutcome::Unmatched) => Vec::new(),
-            Ok(ReviewRateLimitAcquireOutcome::Acquired { bucket_ids }) => bucket_ids,
+            Ok(ReviewRateLimitAcquireOutcome::Unmatched) => Ok(Some(Vec::new())),
+            Ok(ReviewRateLimitAcquireOutcome::Acquired { bucket_ids }) => Ok(Some(bucket_ids)),
             Ok(ReviewRateLimitAcquireOutcome::Blocked { next_retry_at }) => {
-                self.shared
-                    .state
-                    .review_state
-                    .finish_review_for_lane(
-                        repo,
-                        mr.iid,
-                        head_sha,
-                        self.lane,
-                        ReviewRunResult::Cancelled.as_str(),
-                    )
+                self.finish_review_slot_as_cancelled(repo, iid, head_sha)
                     .await?;
                 self.shared
                     .state
@@ -434,64 +524,77 @@ impl ReviewFlow {
                     .upsert_review_rate_limit_pending(
                         self.lane,
                         repo,
-                        mr.iid,
+                        iid,
                         head_sha,
                         now,
                         next_retry_at,
                     )
                     .await?;
-                self.ensure_rate_limit_award_best_effort(repo, mr.iid).await;
-                return Ok(ReviewGateOutcome::Decision(
-                    ReviewScheduleOutcome::SkippedRateLimit,
-                ));
+                self.ensure_rate_limit_award_best_effort(repo, iid).await;
+                Ok(None)
             }
-        };
-        if self.shared.shutdown_requested() {
-            let refund_err = if acquired_bucket_ids.is_empty() {
-                None
-            } else {
-                self.shared
-                    .state
-                    .review_rate_limit
-                    .refund_review_rate_limit_buckets(&acquired_bucket_ids, now)
-                    .await
-                    .err()
-            };
-            if let Err(lock_err) = self
-                .shared
-                .state
-                .review_state
-                .finish_review_for_lane(
-                    repo,
-                    mr.iid,
-                    head_sha,
-                    self.lane,
-                    ReviewRunResult::Cancelled.as_str(),
-                )
-                .await
-            {
-                if let Some(refund_err) = refund_err {
-                    warn!(
-                        repo = repo,
-                        iid = mr.iid,
-                        head_sha = head_sha,
-                        lane = self.lane.as_str(),
-                        error = %refund_err,
-                        "failed to refund rate limit rules while shutting down review gate"
-                    );
-                }
-                return Err(lock_err);
-            }
-            if let Some(refund_err) = refund_err {
-                return Err(refund_err);
-            }
-            return Ok(ReviewGateOutcome::Decision(
-                ReviewScheduleOutcome::Interrupted,
-            ));
         }
-        Ok(ReviewGateOutcome::Ready(ReviewGateReady {
-            acquired_rule_ids: acquired_bucket_ids,
-        }))
+    }
+
+    async fn rollback_review_slot_for_shutdown(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        now: i64,
+        acquired_bucket_ids: &[String],
+    ) -> Result<ReviewGateOutcome> {
+        let refund_err = if acquired_bucket_ids.is_empty() {
+            None
+        } else {
+            self.shared
+                .state
+                .review_rate_limit
+                .refund_review_rate_limit_buckets(acquired_bucket_ids, now)
+                .await
+                .err()
+        };
+        if let Err(lock_err) = self
+            .finish_review_slot_as_cancelled(repo, iid, head_sha)
+            .await
+        {
+            if let Some(refund_err) = refund_err {
+                warn!(
+                    repo = repo,
+                    iid = iid,
+                    head_sha = head_sha,
+                    lane = self.lane.as_str(),
+                    error = %refund_err,
+                    "failed to refund rate limit rules while shutting down review gate"
+                );
+            }
+            return Err(lock_err);
+        }
+        if let Some(refund_err) = refund_err {
+            return Err(refund_err);
+        }
+        Ok(ReviewGateOutcome::Decision(
+            ReviewScheduleOutcome::Interrupted,
+        ))
+    }
+
+    async fn finish_review_slot_as_cancelled(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+    ) -> Result<()> {
+        self.shared
+            .state
+            .review_state
+            .finish_review_for_lane(
+                repo,
+                iid,
+                head_sha,
+                self.lane,
+                ReviewRunResult::Cancelled.as_str(),
+            )
+            .await
     }
 
     fn new_review_run_history(&self, repo: &str, iid: u64, head_sha: &str) -> NewRunHistory {
