@@ -1,5 +1,6 @@
 ---
-source: src/composer_install.rs
+source: src/composer_install/command.rs
+assertion_line: 107
 expression: script
 ---
 set +e
