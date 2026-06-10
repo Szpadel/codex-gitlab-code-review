@@ -18,4 +18,3 @@ mod scheduler;
 pub mod service_factory;
 pub mod skills;
 pub mod state;
-pub mod transcript_backfill;

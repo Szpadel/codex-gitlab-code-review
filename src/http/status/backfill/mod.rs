@@ -2,19 +2,38 @@ mod execution;
 mod retry;
 mod rewrite;
 mod sources;
+mod sources_impl;
 
 use self::execution::transcript_needs_backfill;
 use self::sources::build_account_transcript_backfill_sources;
+use self::sources_impl::SessionHistoryBackfillSource;
 use crate::config::Config;
-use crate::state::{ReviewStateStore, RunHistoryRecord, TranscriptBackfillState};
-use crate::transcript_backfill::{SessionHistoryBackfillSource, TranscriptBackfillSource};
+use crate::state::{
+    NewRunHistoryEvent, ReviewStateStore, RunHistoryRecord, TranscriptBackfillState,
+};
 use anyhow::Result;
+use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::warn;
+
+pub const TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR: &str =
+    "local Codex session history directory is unavailable";
+pub const TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR: &str =
+    "local session history is still being written";
+pub const REVIEW_MISSING_CHILD_TURN_IDS_KEY: &str = "reviewMissingChildTurnIds";
+
+#[async_trait]
+pub trait TranscriptBackfillSource: Send + Sync {
+    async fn load_events(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<Option<Vec<NewRunHistoryEvent>>>;
+}
 
 #[derive(Clone)]
 pub struct BackfillService {

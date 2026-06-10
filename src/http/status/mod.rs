@@ -8,7 +8,7 @@ mod status_service;
 
 pub use super::transcript::ThreadSnapshot;
 pub use admin_service::AdminService;
-pub use backfill::BackfillService;
+pub use backfill::{BackfillService, TranscriptBackfillSource};
 pub use http_services::HttpServices;
 pub use models::{
     HistoryQuery, HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, SecurityContextPreview,
@@ -21,7 +21,8 @@ pub use status_service::StatusService;
 
 #[cfg(test)]
 pub(crate) use backfill::{
-    TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR, TRANSCRIPT_BACKFILL_STALE_INCOMPLETE_ERROR,
+    TRANSCRIPT_BACKFILL_MISSING_HISTORY_ERROR, TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR,
+    TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR, TRANSCRIPT_BACKFILL_STALE_INCOMPLETE_ERROR,
     TRANSCRIPT_BACKFILL_STALE_MISSING_HISTORY_ERROR, events_have_missing_review_child_history,
     fallback_session_history_path, initial_backfill_candidate_events,
     is_final_retry_window_attempt_pending, merge_recovered_target_turn_events,

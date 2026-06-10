@@ -5,6 +5,10 @@ use super::rewrite::{
     preserve_auxiliary_persisted_events, sanitize_persisted_events_for_backfill,
     turn_events_include_review_wrapper_items, turn_ids_from_new_events,
 };
+use super::{
+    REVIEW_MISSING_CHILD_TURN_IDS_KEY, TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR,
+    TranscriptBackfillSource,
+};
 use crate::http::transcript::{
     thread_snapshot_from_events, thread_snapshot_is_complete,
     thread_snapshot_only_target_turn_is_incomplete,
@@ -12,10 +16,6 @@ use crate::http::transcript::{
 use crate::state::{
     ReviewStateStore, RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord,
     TranscriptBackfillState,
-};
-use crate::transcript_backfill::{
-    REVIEW_MISSING_CHILD_TURN_IDS_KEY, TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR,
-    TranscriptBackfillSource,
 };
 use anyhow::Result;
 

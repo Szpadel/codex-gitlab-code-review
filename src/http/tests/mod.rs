@@ -8,7 +8,6 @@ use crate::state::{
     ReviewRateLimitTargetKind, ReviewStateStore, RunHistoryFinish, RunHistoryKind,
     RunHistorySessionUpdate, ScanMode, ScanOutcome, ScanState, TranscriptBackfillState,
 };
-use crate::transcript_backfill::TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use reqwest::{StatusCode, multipart};
@@ -17,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, sleep};
 
+use super::status::TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR;
 use crate::http::test_support::{
     CapturingTranscriptBackfillSource, CountingThreadReaderRunner,
     ErroringTranscriptBackfillSource, RunFixture, SequencedTranscriptBackfillSource,

@@ -1,3 +1,7 @@
+use super::{
+    REVIEW_MISSING_CHILD_TURN_IDS_KEY, TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR,
+    TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR, TranscriptBackfillSource,
+};
 use crate::state::NewRunHistoryEvent;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -7,21 +11,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::task;
-
-pub const TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR: &str =
-    "local Codex session history directory is unavailable";
-pub const TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR: &str =
-    "local session history is still being written";
-pub const REVIEW_MISSING_CHILD_TURN_IDS_KEY: &str = "reviewMissingChildTurnIds";
-
-#[async_trait]
-pub trait TranscriptBackfillSource: Send + Sync {
-    async fn load_events(
-        &self,
-        thread_id: &str,
-        turn_id: Option<&str>,
-    ) -> Result<Option<Vec<NewRunHistoryEvent>>>;
-}
 
 #[derive(Clone, Debug)]
 pub struct SessionHistoryBackfillSource {

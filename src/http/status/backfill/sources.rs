@@ -1,5 +1,6 @@
+use super::TranscriptBackfillSource;
+use super::sources_impl::SessionHistoryBackfillSource;
 use crate::config::Config;
-use crate::transcript_backfill::{SessionHistoryBackfillSource, TranscriptBackfillSource};
 use std::collections::HashMap;
 use std::sync::Arc;
 

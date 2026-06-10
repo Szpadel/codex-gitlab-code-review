@@ -26,6 +26,7 @@ use tracing::error;
 pub use status::{
     AdminService, BackfillService, HistoryQuery, HistorySnapshot, HttpServices, MrHistorySnapshot,
     RateLimitService, RunDetailSnapshot, SecurityContextPreview, SkillsService, StatusService,
+    TranscriptBackfillSource,
 };
 use view::{
     render_development_page, render_history_page, render_mr_history_page, render_rate_limits_page,
