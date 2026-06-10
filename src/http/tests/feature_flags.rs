@@ -103,7 +103,7 @@ async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
         .feature_flags
-        .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
+        .set_runtime_feature_flag_overrides(&crate::config::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
             security_context_ignore_base_head: None,

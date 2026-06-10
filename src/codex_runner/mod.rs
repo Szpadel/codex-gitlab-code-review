@@ -1,10 +1,10 @@
+use crate::config::FeatureFlagSnapshot;
 use crate::config::{
     BROWSER_MCP_REMOTE_DEBUGGING_PORT, BrowserMcpConfig, CodexConfig, DockerConfig,
 };
-use crate::feature_flags::FeatureFlagSnapshot;
 use crate::gitlab::{MergeRequest, links::GitLabMarkdownImageUpload};
 use crate::gitlab_discovery_mcp::{GitLabDiscoveryMcpService, ResolvedGitLabDiscoveryAllowList};
-use crate::review_lane::ReviewLane;
+use crate::review::ReviewLane;
 use crate::review_prompt_templates::{
     append_additional_review_instructions, build_base_branch_review_prompt,
     build_commit_review_prompt, upstream_review_prompt_source_commit,

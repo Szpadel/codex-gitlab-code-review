@@ -5,7 +5,7 @@ use crate::gitlab::{
     DiffDiscussionPosition, GitLabApi, MergeRequest, MergeRequestDiff, MergeRequestDiffDiscussion,
     MergeRequestDiffVersion,
 };
-use crate::review_lane::ReviewLane;
+use crate::review::ReviewLane;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;

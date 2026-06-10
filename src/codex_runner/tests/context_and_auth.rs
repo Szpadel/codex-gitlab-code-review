@@ -41,7 +41,7 @@ fn security_review_disables_gitlab_discovery_mcp() {
     let mut runner = test_runner_with_codex(codex);
     runner.gitlab_discovery_mcp = Some(service as Arc<dyn GitLabDiscoveryHandle>);
     let mut ctx = review_context_with_target_branch(Some("main"));
-    ctx.lane = crate::review_lane::ReviewLane::Security;
+    ctx.lane = crate::review::ReviewLane::Security;
     ctx.project_path = "fork/source".to_string();
     ctx.feature_flags.gitlab_discovery_mcp = true;
 
@@ -84,7 +84,7 @@ async fn prepare_runner_session_components_respects_discovery_toggle() {
             .await;
     runner.gitlab_discovery_mcp = Some(service as Arc<dyn GitLabDiscoveryHandle>);
     let mut ctx = review_context_with_target_branch(Some("main"));
-    ctx.lane = crate::review_lane::ReviewLane::Security;
+    ctx.lane = crate::review::ReviewLane::Security;
     ctx.project_path = "fork/source".to_string();
     ctx.feature_flags.gitlab_discovery_mcp = true;
 

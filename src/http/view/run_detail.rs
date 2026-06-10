@@ -346,7 +346,7 @@ fn thread_status_class(status: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::FeatureFlagSnapshot;
+    use crate::config::FeatureFlagSnapshot;
     use crate::http::status::{RunDetailSnapshot, SecurityContextPreview};
     use crate::state::{RunHistoryKind, RunHistoryRecord, TranscriptBackfillState};
 

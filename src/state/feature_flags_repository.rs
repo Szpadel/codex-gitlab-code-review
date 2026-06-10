@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 
-use crate::feature_flags::RuntimeFeatureFlagOverrides;
+use crate::config::RuntimeFeatureFlagOverrides;
 
 use super::{FEATURE_FLAG_OVERRIDES_KEY, ServiceStateRepository};
 

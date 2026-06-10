@@ -3,7 +3,7 @@ use super::html::{
     NavItem, escape_html, render_csrf_hidden_input, render_shell, render_table_section,
     render_unix_timestamp,
 };
-use crate::review_lane::ReviewLane;
+use crate::review::ReviewLane;
 use crate::state::{
     ReviewRateLimitBucketMode, ReviewRateLimitBucketSnapshot, ReviewRateLimitPendingEntry,
     ReviewRateLimitRule, ReviewRateLimitScope, ReviewRateLimitTarget, ReviewRateLimitTargetKind,

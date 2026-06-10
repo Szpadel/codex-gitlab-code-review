@@ -572,7 +572,7 @@ async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes()
         calls: Mutex::new(0),
     });
     let review_context = ReviewRunContext {
-        lane: crate::review_lane::ReviewLane::General,
+        lane: crate::review::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
         codex: runner.clone(),
@@ -588,7 +588,7 @@ async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes()
             "group/repo",
             mr(22, "sha22"),
             "sha22",
-            crate::feature_flags::FeatureFlagSnapshot::default(),
+            crate::config::FeatureFlagSnapshot::default(),
             0,
         )
         .await?;
@@ -664,7 +664,7 @@ async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_
         .begin_review("group/repo", 23, "sha23")
         .await?;
     let review_context = ReviewRunContext {
-        lane: crate::review_lane::ReviewLane::General,
+        lane: crate::review::ReviewLane::General,
         config,
         gitlab,
         codex: runner.clone(),
@@ -680,7 +680,7 @@ async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_
             "group/repo",
             mr(23, "sha23"),
             "sha23",
-            crate::feature_flags::FeatureFlagSnapshot::default(),
+            crate::config::FeatureFlagSnapshot::default(),
             0,
         )
         .await?;
@@ -768,7 +768,7 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
         .begin_review("group/repo", 24, "sha24")
         .await?;
     let review_context = ReviewRunContext {
-        lane: crate::review_lane::ReviewLane::General,
+        lane: crate::review::ReviewLane::General,
         config,
         gitlab,
         codex: runner.clone(),
@@ -784,7 +784,7 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
             "group/repo",
             mr(24, "sha24"),
             "sha24",
-            crate::feature_flags::FeatureFlagSnapshot::default(),
+            crate::config::FeatureFlagSnapshot::default(),
             0,
         )
         .await?;
@@ -862,7 +862,7 @@ async fn review_finishes_successfully_when_graceful_drain_starts_after_runner_be
         calls: Mutex::new(0),
     });
     let review_context = ReviewRunContext {
-        lane: crate::review_lane::ReviewLane::General,
+        lane: crate::review::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
         codex: runner.clone(),
@@ -878,7 +878,7 @@ async fn review_finishes_successfully_when_graceful_drain_starts_after_runner_be
             "group/repo",
             mr(26, "sha26"),
             "sha26",
-            crate::feature_flags::FeatureFlagSnapshot::default(),
+            crate::config::FeatureFlagSnapshot::default(),
             0,
         )
         .await?;

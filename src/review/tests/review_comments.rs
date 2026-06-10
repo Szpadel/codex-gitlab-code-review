@@ -340,9 +340,9 @@ async fn completed_review_state_skips_same_sha_without_note_marker() -> Result<(
         .run_history
         .set_run_history_feature_flags(
             run_id,
-            &crate::feature_flags::FeatureFlagSnapshot {
+            &crate::config::FeatureFlagSnapshot {
                 gitlab_inline_review_comments: true,
-                ..crate::feature_flags::FeatureFlagSnapshot::default()
+                ..crate::config::FeatureFlagSnapshot::default()
             },
         )
         .await?;
@@ -415,9 +415,9 @@ async fn legacy_dry_run_comment_history_without_gitlab_markers_does_not_skip_sam
         .run_history
         .set_run_history_feature_flags(
             run_id,
-            &crate::feature_flags::FeatureFlagSnapshot {
+            &crate::config::FeatureFlagSnapshot {
                 gitlab_inline_review_comments: true,
-                ..crate::feature_flags::FeatureFlagSnapshot::default()
+                ..crate::config::FeatureFlagSnapshot::default()
             },
         )
         .await?;
@@ -481,9 +481,9 @@ async fn completed_inline_review_state_skips_when_discussion_lookup_fails() -> R
         .run_history
         .set_run_history_feature_flags(
             run_id,
-            &crate::feature_flags::FeatureFlagSnapshot {
+            &crate::config::FeatureFlagSnapshot {
                 gitlab_inline_review_comments: true,
-                ..crate::feature_flags::FeatureFlagSnapshot::default()
+                ..crate::config::FeatureFlagSnapshot::default()
             },
         )
         .await?;
@@ -543,9 +543,9 @@ async fn errored_review_state_does_not_skip_same_sha() -> Result<()> {
         .run_history
         .set_run_history_feature_flags(
             run_id,
-            &crate::feature_flags::FeatureFlagSnapshot {
+            &crate::config::FeatureFlagSnapshot {
                 gitlab_inline_review_comments: true,
-                ..crate::feature_flags::FeatureFlagSnapshot::default()
+                ..crate::config::FeatureFlagSnapshot::default()
             },
         )
         .await?;

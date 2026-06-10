@@ -4,7 +4,7 @@ use super::{
     anyhow, timeout, warn,
 };
 use crate::composer_install::composer_install_timeout_seconds;
-use crate::feature_flags::FeatureFlagSnapshot;
+use crate::config::FeatureFlagSnapshot;
 use std::collections::BTreeMap;
 use std::future::Future;
 

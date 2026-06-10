@@ -703,7 +703,7 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::FeatureFlagSnapshot;
+    use crate::config::FeatureFlagSnapshot;
     use crate::http::transcript::parser::thread_snapshot_from_events;
     use crate::state::{
         RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord, TranscriptBackfillState,

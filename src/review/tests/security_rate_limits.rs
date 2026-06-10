@@ -98,11 +98,11 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
             "group/repo",
             25,
             "sha25",
-            crate::review_lane::ReviewLane::Security,
+            crate::review::ReviewLane::Security,
         )
         .await?;
     let review_context = ReviewRunContext {
-        lane: crate::review_lane::ReviewLane::Security,
+        lane: crate::review::ReviewLane::Security,
         config,
         gitlab: gitlab.clone(),
         codex: runner.clone(),
@@ -118,10 +118,10 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
             "group/repo",
             merge_request,
             "sha25",
-            crate::feature_flags::FeatureFlagSnapshot {
+            crate::config::FeatureFlagSnapshot {
                 gitlab_inline_review_comments: true,
                 security_review: true,
-                ..crate::feature_flags::FeatureFlagSnapshot::default()
+                ..crate::config::FeatureFlagSnapshot::default()
             },
             0,
         )
@@ -200,11 +200,11 @@ async fn security_review_pass_stays_silent() -> Result<()> {
             "group/repo",
             25,
             "sha25",
-            crate::review_lane::ReviewLane::Security,
+            crate::review::ReviewLane::Security,
         )
         .await?;
     let review_context = ReviewRunContext {
-        lane: crate::review_lane::ReviewLane::Security,
+        lane: crate::review::ReviewLane::Security,
         config,
         gitlab: gitlab.clone(),
         codex: runner.clone(),
@@ -220,9 +220,9 @@ async fn security_review_pass_stays_silent() -> Result<()> {
             "group/repo",
             mr(25, "sha25"),
             "sha25",
-            crate::feature_flags::FeatureFlagSnapshot {
+            crate::config::FeatureFlagSnapshot {
                 security_review: true,
-                ..crate::feature_flags::FeatureFlagSnapshot::default()
+                ..crate::config::FeatureFlagSnapshot::default()
             },
             0,
         )
@@ -313,7 +313,7 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
         .list_review_rate_limit_pending()
         .await?;
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].lane, crate::review_lane::ReviewLane::General);
+    assert_eq!(pending[0].lane, crate::review::ReviewLane::General);
     assert_eq!(pending[0].repo, "group/repo".to_string());
     assert_eq!(pending[0].iid, 26);
     assert_eq!(pending[0].last_seen_head_sha, "sha26-newer".to_string());
@@ -722,7 +722,7 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
             .lock()
             .unwrap()
             .iter()
-            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::General)
+            .filter(|ctx| ctx.lane == crate::review::ReviewLane::General)
             .count(),
         1
     );
@@ -732,7 +732,7 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
             .lock()
             .unwrap()
             .iter()
-            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
+            .filter(|ctx| ctx.lane == crate::review::ReviewLane::Security)
             .count(),
         1
     );
@@ -852,7 +852,7 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
         .feature_flags
-        .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
+        .set_runtime_feature_flag_overrides(&crate::config::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
             security_context_ignore_base_head: None,
@@ -892,7 +892,7 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
 
     state
         .feature_flags
-        .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
+        .set_runtime_feature_flag_overrides(&crate::config::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(false),
             gitlab_inline_review_comments: None,
             security_context_ignore_base_head: None,
@@ -916,7 +916,7 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
                 .map(|row| {
                     let json: String = row.try_get("feature_flags_json")?;
                     let snapshot =
-                        serde_json::from_str::<crate::feature_flags::FeatureFlagSnapshot>(&json)?;
+                        serde_json::from_str::<crate::config::FeatureFlagSnapshot>(&json)?;
                     Ok(snapshot)
                 })
                 .collect::<Result<Vec<_>>>()?;

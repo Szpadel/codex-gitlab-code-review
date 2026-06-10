@@ -1,6 +1,3 @@
-use crate::feature_flags::{
-    FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
-};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
@@ -9,6 +6,7 @@ use std::collections::BTreeMap;
 pub const BROWSER_MCP_REMOTE_DEBUGGING_PORT: u16 = 9222;
 
 pub(crate) mod defaults;
+pub mod feature_flags;
 mod load;
 mod validate;
 
@@ -22,6 +20,9 @@ use self::defaults::{
     default_security_review_context_ttl_seconds, default_security_review_finding_marker_prefix,
     default_security_review_min_confidence_score, default_security_review_session_override,
     default_usage_limit_fallback_cooldown_seconds,
+};
+pub use self::feature_flags::{
+    FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
 };
 use self::load::{
     deserialize_security_context_session_override, deserialize_security_review_session_override,

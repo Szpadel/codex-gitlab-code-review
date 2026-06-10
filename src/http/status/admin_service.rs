@@ -1,5 +1,5 @@
 use super::StatusFeatureFlagSnapshot;
-use crate::feature_flags::{
+use crate::config::{
     FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
 };
 use crate::state::{ReviewStateStore, ScanMode, ScanOutcome, ScanState};

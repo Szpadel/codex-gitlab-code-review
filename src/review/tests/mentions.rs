@@ -525,7 +525,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     state
         .feature_flags
-        .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
+        .set_runtime_feature_flag_overrides(&crate::config::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
             security_context_ignore_base_head: None,
@@ -565,7 +565,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
 
     state
         .feature_flags
-        .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
+        .set_runtime_feature_flag_overrides(&crate::config::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(false),
             gitlab_inline_review_comments: None,
             security_context_ignore_base_head: None,
@@ -589,7 +589,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
                 .map(|row| {
                     let json: String = row.try_get("feature_flags_json")?;
                     let snapshot =
-                        serde_json::from_str::<crate::feature_flags::FeatureFlagSnapshot>(&json)?;
+                        serde_json::from_str::<crate::config::FeatureFlagSnapshot>(&json)?;
                     Ok(snapshot)
                 })
                 .collect::<Result<Vec<_>>>()?;

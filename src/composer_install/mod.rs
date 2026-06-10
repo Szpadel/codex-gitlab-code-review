@@ -6,7 +6,7 @@ mod auth_prepare_tests;
 mod command;
 mod output;
 
-use crate::feature_flags::FeatureFlagSnapshot;
+use crate::config::FeatureFlagSnapshot;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -129,7 +129,7 @@ pub fn composer_install_timeout_seconds(remaining: Duration) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::FeatureFlagSnapshot;
+    use crate::config::FeatureFlagSnapshot;
     use std::time::Duration;
 
     #[test]

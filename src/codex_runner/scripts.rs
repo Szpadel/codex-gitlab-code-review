@@ -572,7 +572,7 @@ pub(crate) fn codex_app_server_exec_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::FeatureFlagSnapshot;
+    use crate::config::FeatureFlagSnapshot;
     use crate::gitlab::MergeRequest;
     use insta::assert_snapshot;
 

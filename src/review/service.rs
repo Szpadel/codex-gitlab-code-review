@@ -6,9 +6,9 @@ use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
 use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome, remove_bot_award};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
+use crate::review::ReviewLane;
 use crate::review::scan_coordinator::{DefaultScanCoordinator, ScanCoordinator};
 use crate::review::target_resolver::{DefaultTargetResolver, TargetResolver};
-use crate::review_lane::ReviewLane;
 use crate::state::{ReviewRateLimitPendingEntry, ReviewStateStore};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -951,13 +951,13 @@ fn should_clear_pending_retry_after_mr_lookup_error(err: &anyhow::Error) -> bool
 mod pending_rate_limit_tests {
     use super::*;
     use crate::codex_runner::{CodexResult, ReviewContext};
+    use crate::config::FeatureFlagDefaults;
     use crate::config::{
         BrowserMcpConfig, CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
         McpServerOverridesConfig, ReasoningSummaryOverridesConfig, ReviewConfig,
         ReviewMentionCommandsConfig, ReviewSecurityConfig, ScheduleConfig, ServerConfig,
         SessionOverridesConfig, TargetSelector,
     };
-    use crate::feature_flags::FeatureFlagDefaults;
     use crate::gitlab::GitLabUser;
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;

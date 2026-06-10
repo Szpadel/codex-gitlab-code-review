@@ -125,7 +125,7 @@ async fn list_in_progress_reviews_returns_only_active_rows() -> Result<()> {
     assert_eq!(
         in_progress,
         vec![InProgressReview {
-            lane: crate::review_lane::ReviewLane::General,
+            lane: crate::review::ReviewLane::General,
             repo: "group/repo-a".to_string(),
             iid: 1,
             head_sha: "sha1".to_string(),

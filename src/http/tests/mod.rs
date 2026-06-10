@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::FallbackAuthAccountConfig;
 use crate::dev_mode::DevToolsService;
-use crate::review_lane::ReviewLane;
+use crate::review::ReviewLane;
 use crate::state::{
     NewRunHistory, NewRunHistoryEvent, PersistedScanStatus, ReviewRateLimitBucketMode,
     ReviewRateLimitRuleUpsert, ReviewRateLimitScope, ReviewRateLimitTarget,

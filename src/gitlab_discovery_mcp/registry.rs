@@ -1,5 +1,5 @@
+use crate::config::FeatureFlagSnapshot;
 use crate::config::GitLabDiscoveryAllowRule;
-use crate::feature_flags::FeatureFlagSnapshot;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeSet, HashMap};

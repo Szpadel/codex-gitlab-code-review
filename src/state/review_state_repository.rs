@@ -1,4 +1,4 @@
-use crate::review_lane::ReviewLane;
+use crate::review::ReviewLane;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::{Row, SqlitePool};

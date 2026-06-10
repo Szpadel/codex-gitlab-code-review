@@ -219,14 +219,14 @@ async fn security_reviews_use_canonical_project_path_for_runner_context() -> Res
         assert_eq!(
             contexts
                 .iter()
-                .find(|ctx| ctx.lane == crate::review_lane::ReviewLane::General)
+                .find(|ctx| ctx.lane == crate::review::ReviewLane::General)
                 .map(|ctx| ctx.project_path.as_str()),
             Some("forks/source-repo")
         );
         assert_eq!(
             contexts
                 .iter()
-                .find(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
+                .find(|ctx| ctx.lane == crate::review::ReviewLane::Security)
                 .map(|ctx| ctx.project_path.as_str()),
             Some("target/repo")
         );
@@ -247,12 +247,7 @@ async fn security_reviews_use_canonical_project_path_for_runner_context() -> Res
 #[test]
 fn retry_backoff_doubles_delay() {
     let backoff = RetryBackoff::new(Duration::hours(1));
-    let key = RetryKey::new(
-        crate::review_lane::ReviewLane::General,
-        "group/repo",
-        1,
-        "sha1",
-    );
+    let key = RetryKey::new(crate::review::ReviewLane::General, "group/repo", 1, "sha1");
     let start = Utc
         .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
         .single()

@@ -16,8 +16,8 @@ use crate::config::{
     ReasoningSummaryOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
     ServerConfig, SessionOverridesConfig, TargetSelector,
 };
-use crate::feature_flags::{FeatureFlagDefaults, FeatureFlagSnapshot};
-use crate::review_lane::ReviewLane;
+use crate::config::{FeatureFlagDefaults, FeatureFlagSnapshot};
+use crate::review::ReviewLane;
 use crate::state::{
     NewRunHistory, ReviewRateLimitBucketMode, ReviewRateLimitRuleUpsert, ReviewRateLimitScope,
     ReviewRateLimitTarget, ReviewRateLimitTargetKind, ReviewStateStore, RunHistoryEventRecord,
@@ -618,7 +618,7 @@ async fn update_runtime_feature_flag_allows_clearing_unavailable_override() -> a
     let store = Arc::new(ReviewStateStore::new(":memory:").await?);
     store
         .feature_flags
-        .set_runtime_feature_flag_overrides(&crate::feature_flags::RuntimeFeatureFlagOverrides {
+        .set_runtime_feature_flag_overrides(&crate::config::RuntimeFeatureFlagOverrides {
             gitlab_discovery_mcp: Some(true),
             gitlab_inline_review_comments: None,
             security_context_ignore_base_head: None,

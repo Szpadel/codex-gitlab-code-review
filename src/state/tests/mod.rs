@@ -1,5 +1,5 @@
 use super::*;
-use crate::feature_flags::RuntimeFeatureFlagOverrides;
+use crate::config::RuntimeFeatureFlagOverrides;
 use sqlx::Row;
 use std::env;
 use std::fs;

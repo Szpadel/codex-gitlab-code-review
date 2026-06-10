@@ -281,7 +281,7 @@ async fn security_run_history_roundtrip_uses_security_kind() -> Result<()> {
                 trigger_note_body: None,
                 command_repo: None,
             },
-            Some(crate::review_lane::ReviewLane::Security),
+            Some(crate::review::ReviewLane::Security),
         )
         .await?;
 
@@ -429,7 +429,7 @@ async fn completed_inline_review_detection_respects_security_kind() -> Result<()
                 trigger_note_body: None,
                 command_repo: None,
             },
-            Some(crate::review_lane::ReviewLane::Security),
+            Some(crate::review::ReviewLane::Security),
         )
         .await?;
     store
@@ -460,7 +460,7 @@ async fn completed_inline_review_detection_respects_security_kind() -> Result<()
                 "group/repo",
                 21,
                 "sha-security-inline",
-                crate::review_lane::ReviewLane::Security,
+                crate::review::ReviewLane::Security,
             )
             .await?
     );

@@ -2,7 +2,7 @@ use crate::codex_runner::CodexRunner;
 use crate::config::Config;
 use crate::gitlab::GitLabApi;
 use crate::lifecycle::ServiceLifecycle;
-use crate::review_lane::ReviewLane;
+use crate::review::ReviewLane;
 use crate::state::ReviewStateStore;
 use anyhow::Result;
 use async_trait::async_trait;

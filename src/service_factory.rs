@@ -506,13 +506,13 @@ mod tests {
     use crate::codex_runner::{
         CodexResult, MentionCommandContext, MentionCommandResult, ReviewContext,
     };
+    use crate::config::FeatureFlagDefaults;
     use crate::config::{
         BrowserMcpConfig, CodexConfig, DatabaseConfig, DockerConfig, GitLabConfig,
         GitLabDiscoveryMcpConfig, GitLabTargets, McpServerOverridesConfig,
         ReasoningSummaryOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ScheduleConfig,
         ServerConfig, SessionOverridesConfig,
     };
-    use crate::feature_flags::FeatureFlagDefaults;
     use anyhow::anyhow;
     use async_trait::async_trait;
     use chrono::TimeZone;

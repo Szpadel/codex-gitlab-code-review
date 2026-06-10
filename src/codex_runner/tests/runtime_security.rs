@@ -124,7 +124,7 @@ async fn run_review_with_fake_runtime_security_lane_uses_split_sessions_on_cache
         })
         .await?;
     let mut ctx = review_context_with_target_branch(Some("main"));
-    ctx.lane = crate::review_lane::ReviewLane::Security;
+    ctx.lane = crate::review::ReviewLane::Security;
     ctx.min_confidence_score = Some(0.85);
     ctx.run_history_id = Some(run_history_id);
 
@@ -414,12 +414,12 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
         .await?;
 
     let mut ctx1 = review_context_with_target_branch(Some("main"));
-    ctx1.lane = crate::review_lane::ReviewLane::Security;
+    ctx1.lane = crate::review::ReviewLane::Security;
     ctx1.min_confidence_score = Some(0.85);
     ctx1.run_history_id = Some(run_history_id_1);
 
     let mut ctx2 = review_context_with_target_branch(Some("main"));
-    ctx2.lane = crate::review_lane::ReviewLane::Security;
+    ctx2.lane = crate::review::ReviewLane::Security;
     ctx2.min_confidence_score = Some(0.85);
     ctx2.run_history_id = Some(run_history_id_2);
     ctx2.head_sha = "def456".to_string();
@@ -693,14 +693,14 @@ async fn concurrent_security_reviews_wake_followers_when_context_build_fails() -
         .await?;
 
     let mut ctx1 = review_context_with_target_branch(Some("main"));
-    ctx1.lane = crate::review_lane::ReviewLane::Security;
+    ctx1.lane = crate::review::ReviewLane::Security;
     ctx1.min_confidence_score = Some(0.85);
     ctx1.run_history_id = Some(run_history_id_1);
     ctx1.mr.iid = 21;
     ctx1.mr.web_url = Some("https://gitlab.example.com/group/repo/-/merge_requests/21".to_string());
 
     let mut ctx2 = review_context_with_target_branch(Some("main"));
-    ctx2.lane = crate::review_lane::ReviewLane::Security;
+    ctx2.lane = crate::review::ReviewLane::Security;
     ctx2.min_confidence_score = Some(0.85);
     ctx2.run_history_id = Some(run_history_id_2);
     ctx2.head_sha = "def456".to_string();
@@ -840,7 +840,7 @@ async fn security_review_reuses_branch_cached_context_when_ignore_base_head_enab
         .await?;
 
     let mut ctx = review_context_with_target_branch(Some("main"));
-    ctx.lane = crate::review_lane::ReviewLane::Security;
+    ctx.lane = crate::review::ReviewLane::Security;
     ctx.feature_flags = FeatureFlagSnapshot {
         security_context_ignore_base_head: true,
         ..FeatureFlagSnapshot::default()

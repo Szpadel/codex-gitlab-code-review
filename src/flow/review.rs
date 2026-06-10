@@ -1,11 +1,11 @@
 use crate::codex_runner::{CodexResult, ReviewComment, ReviewContext};
 use crate::config::Config;
-use crate::feature_flags::FeatureFlagSnapshot;
+use crate::config::FeatureFlagSnapshot;
 use crate::flow::review_comments::{PostReviewCommentRequest, post_review_comment};
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
 use crate::lifecycle::ServiceLifecycle;
-use crate::review_lane::ReviewLane;
+use crate::review::ReviewLane;
 use crate::state::{
     NewRunHistory, ReviewRateLimitAcquireOutcome, ReviewStateStore, RunHistoryFinish,
     RunHistoryKind,
@@ -1698,17 +1698,17 @@ mod tests {
     use crate::codex_runner::{
         CodexResult, CodexRunner, MentionCommandContext, MentionCommandResult, ReviewContext,
     };
+    use crate::config::FeatureFlagDefaults;
     use crate::config::{
         CodexConfig, Config, DatabaseConfig, DepsConfig, DockerConfig, GitLabConfig, GitLabTargets,
         McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ReviewSecurityConfig,
         ScheduleConfig, ServerConfig, SessionOverridesConfig, TargetSelector, WorkTmpfsConfig,
     };
-    use crate::feature_flags::FeatureFlagDefaults;
     use crate::gitlab::{
         AwardEmoji, GitLabApi, GitLabProject, GitLabProjectSummary, GitLabUser, MergeRequest, Note,
     };
     use crate::lifecycle::ServiceLifecycle;
-    use crate::review_lane::ReviewLane;
+    use crate::review::ReviewLane;
     use crate::state::ReviewStateStore;
     use anyhow::{Result, anyhow, bail};
     use async_trait::async_trait;

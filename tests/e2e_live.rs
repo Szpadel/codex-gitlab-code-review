@@ -32,7 +32,7 @@ async fn e2e_live_dry_run() -> Result<()> {
     let created_after = Utc::now() - Duration::days(3650);
 
     let config = Config {
-        feature_flags: codex_gitlab_code_review::feature_flags::FeatureFlagDefaults::default(),
+        feature_flags: codex_gitlab_code_review::config::FeatureFlagDefaults::default(),
         gitlab: GitLabConfig {
             base_url: base_url.clone(),
             token: token.clone(),

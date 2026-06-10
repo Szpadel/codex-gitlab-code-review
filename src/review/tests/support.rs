@@ -1002,7 +1002,7 @@ impl GitLabApi for RefreshedMentionGitLab {
 
 pub(super) fn test_config() -> Config {
     Config {
-        feature_flags: crate::feature_flags::FeatureFlagDefaults::default(),
+        feature_flags: crate::config::FeatureFlagDefaults::default(),
         gitlab: GitLabConfig {
             base_url: "https://gitlab.example.com".to_string(),
             token: "token".to_string(),

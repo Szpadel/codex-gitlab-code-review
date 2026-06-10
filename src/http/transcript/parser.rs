@@ -572,7 +572,7 @@ fn compact_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::FeatureFlagSnapshot;
+    use crate::config::FeatureFlagSnapshot;
     use crate::state::{RunHistoryKind, TranscriptBackfillState};
     use serde_json::json;
 
