@@ -729,7 +729,21 @@ impl GitLabApi for ShutdownOnEyesAwardGitLab {
         if name == self.eyes_emoji {
             self.lifecycle.request_fast_stop();
         }
-        self.inner.add_award(project, iid, name).await
+        self.inner.add_award(project, iid, name).await?;
+        if name == self.eyes_emoji {
+            self.inner
+                .awards
+                .lock()
+                .unwrap()
+                .entry((project.to_string(), iid))
+                .or_default()
+                .push(AwardEmoji {
+                    id: iid.saturating_mul(10),
+                    name: name.to_string(),
+                    user: self.inner.bot_user.clone(),
+                });
+        }
+        Ok(())
     }
 
     async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()> {
@@ -805,13 +819,13 @@ impl GitLabApi for ShutdownOnListOpenGitLab {
     }
 }
 
-pub(super) struct ShutdownOnListAwardsGitLab {
+pub(super) struct ShutdownOnDeleteAwardGitLab {
     pub(super) inner: Arc<FakeGitLab>,
     pub(super) lifecycle: Arc<ServiceLifecycle>,
 }
 
 #[async_trait]
-impl GitLabApi for ShutdownOnListAwardsGitLab {
+impl GitLabApi for ShutdownOnDeleteAwardGitLab {
     async fn current_user(&self) -> Result<GitLabUser> {
         self.inner.current_user().await
     }
@@ -844,7 +858,6 @@ impl GitLabApi for ShutdownOnListAwardsGitLab {
     }
 
     async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>> {
-        self.lifecycle.request_fast_stop();
         self.inner.list_awards(project, iid).await
     }
 
@@ -853,6 +866,7 @@ impl GitLabApi for ShutdownOnListAwardsGitLab {
     }
 
     async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()> {
+        self.lifecycle.request_fast_stop();
         self.inner.delete_award(project, iid, award_id).await
     }
 

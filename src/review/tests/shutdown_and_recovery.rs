@@ -598,11 +598,6 @@ async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes()
     assert!(
         calls
             .iter()
-            .any(|call| call == "add_award:group/repo:22:eyes")
-    );
-    assert!(
-        calls
-            .iter()
             .any(|call| call == "delete_award:group/repo:22:220")
     );
     assert!(
@@ -640,14 +635,7 @@ async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_
     let base_gitlab = Arc::new(FakeGitLab {
         bot_user: bot_user.clone(),
         mrs: Mutex::new(Vec::new()),
-        awards: Mutex::new(HashMap::from([(
-            ("group/repo".to_string(), 23),
-            vec![AwardEmoji {
-                id: 230,
-                name: "eyes".to_string(),
-                user: bot_user,
-            }],
-        )])),
+        awards: Mutex::new(HashMap::new()),
         notes: Mutex::new(HashMap::new()),
         discussions: Mutex::new(HashMap::new()),
         users: Mutex::new(HashMap::new()),
@@ -764,7 +752,7 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
         delete_award_fails: false,
     });
     let lifecycle = Arc::new(ServiceLifecycle::default());
-    let gitlab = Arc::new(ShutdownOnListAwardsGitLab {
+    let gitlab = Arc::new(ShutdownOnDeleteAwardGitLab {
         inner: Arc::clone(&base_gitlab),
         lifecycle: Arc::clone(&lifecycle),
     });
@@ -803,11 +791,6 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
 
     assert_eq!(*runner.calls.lock().unwrap(), 1);
     let calls = base_gitlab.calls.lock().unwrap().clone();
-    assert!(
-        calls
-            .iter()
-            .any(|call| call == "add_award:group/repo:24:eyes")
-    );
     assert!(
         calls
             .iter()
@@ -902,11 +885,6 @@ async fn review_finishes_successfully_when_graceful_drain_starts_after_runner_be
 
     assert_eq!(*runner.calls.lock().unwrap(), 1);
     let calls = gitlab.calls.lock().unwrap().clone();
-    assert!(
-        calls
-            .iter()
-            .any(|call| call == "add_award:group/repo:26:eyes")
-    );
     assert!(
         calls
             .iter()
