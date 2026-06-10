@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -116,6 +117,11 @@ enum ReviewGateOutcome {
 
 struct ReviewGateReady {
     acquired_rule_ids: Vec<String>,
+}
+
+struct PreparedReviewRun {
+    run_history_id: i64,
+    feature_flags: FeatureFlagSnapshot,
 }
 
 pub(crate) struct ReviewFlow {
@@ -433,37 +439,37 @@ impl ReviewFlow {
         }))
     }
 
-    pub(crate) async fn schedule_for_scan(
+    fn new_review_run_history(&self, repo: &str, iid: u64, head_sha: &str) -> NewRunHistory {
+        NewRunHistory {
+            kind: if self.lane.is_security() {
+                RunHistoryKind::Security
+            } else {
+                RunHistoryKind::Review
+            },
+            repo: repo.to_string(),
+            iid,
+            head_sha: head_sha.to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        }
+    }
+
+    async fn prepare_review_run(
         &self,
         repo: &str,
-        mr: MergeRequest,
+        iid: u64,
         head_sha: &str,
-        tasks: &mut Vec<JoinHandle<()>>,
-    ) -> Result<ReviewScheduleOutcome> {
-        let acquired_rule_ids = match self.evaluate_review_gate(repo, &mr, head_sha).await? {
-            ReviewGateOutcome::Decision(decision) => return Ok(decision),
-            ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
-        };
+        acquired_rule_ids: &[String],
+    ) -> Result<PreparedReviewRun> {
         let run_history_id = match self
             .shared
             .state
             .run_history
             .start_run_history_for_lane(
-                NewRunHistory {
-                    kind: if self.lane.is_security() {
-                        RunHistoryKind::Security
-                    } else {
-                        RunHistoryKind::Review
-                    },
-                    repo: repo.to_string(),
-                    iid: mr.iid,
-                    head_sha: head_sha.to_string(),
-                    discussion_id: None,
-                    trigger_note_id: None,
-                    trigger_note_author_name: None,
-                    trigger_note_body: None,
-                    command_repo: None,
-                },
+                self.new_review_run_history(repo, iid, head_sha),
                 Some(self.lane),
             )
             .await
@@ -472,9 +478,9 @@ impl ReviewFlow {
             Err(err) => {
                 self.release_review_lock_after_history_failure(
                     repo,
-                    mr.iid,
+                    iid,
                     head_sha,
-                    &acquired_rule_ids,
+                    acquired_rule_ids,
                 )
                 .await;
                 return Err(err);
@@ -485,10 +491,10 @@ impl ReviewFlow {
             Err(err) => {
                 self.abort_review_after_setup_failure(
                     repo,
-                    mr.iid,
+                    iid,
                     head_sha,
                     run_history_id,
-                    &acquired_rule_ids,
+                    acquired_rule_ids,
                     &err,
                 )
                 .await;
@@ -504,34 +510,23 @@ impl ReviewFlow {
         {
             self.abort_review_after_setup_failure(
                 repo,
-                mr.iid,
+                iid,
                 head_sha,
                 run_history_id,
-                &acquired_rule_ids,
+                acquired_rule_ids,
                 &err,
             )
             .await;
             return Err(err);
         }
-        if let Err(err) = self
-            .clear_review_rate_limit_pending_if_needed(repo, mr.iid)
-            .await
-        {
-            self.abort_review_after_setup_failure(
-                repo,
-                mr.iid,
-                head_sha,
-                run_history_id,
-                &acquired_rule_ids,
-                &err,
-            )
-            .await;
-            return Err(err);
-        }
-        let repo_name = repo.to_string();
-        let semaphore = Arc::clone(&self.shared.semaphore);
-        let active_tasks = Arc::clone(&self.shared.active_tasks);
-        let review_context = ReviewRunContext {
+        Ok(PreparedReviewRun {
+            run_history_id,
+            feature_flags,
+        })
+    }
+
+    fn run_context(&self, acquired_rate_limit_rule_ids: Vec<String>) -> ReviewRunContext {
+        ReviewRunContext {
             lane: self.lane,
             config: self.shared.config.clone(),
             gitlab: Arc::clone(&self.shared.gitlab),
@@ -540,9 +535,22 @@ impl ReviewFlow {
             retry_backoff: Arc::clone(&self.retry_backoff),
             bot_user_id: self.shared.bot_user_id,
             lifecycle: Arc::clone(&self.shared.lifecycle),
-            acquired_rate_limit_rule_ids: acquired_rule_ids.clone(),
-        };
-        let head_sha = head_sha.to_string();
+            acquired_rate_limit_rule_ids,
+        }
+    }
+
+    fn spawn_scheduled_review_task(
+        &self,
+        repo_name: String,
+        mr: MergeRequest,
+        head_sha: String,
+        prepared: PreparedReviewRun,
+        acquired_rule_ids: Vec<String>,
+        tasks: &mut Vec<JoinHandle<()>>,
+    ) {
+        let semaphore = Arc::clone(&self.shared.semaphore);
+        let active_tasks = Arc::clone(&self.shared.active_tasks);
+        let review_context = self.run_context(acquired_rule_ids);
         let active_review = active_tasks.track_review(ActiveReviewKey {
             lane: review_context.lane,
             repo: repo_name.clone(),
@@ -554,17 +562,87 @@ impl ReviewFlow {
             let Ok(_permit) = semaphore.acquire_owned().await else {
                 let err = Error::msg("review cancelled: semaphore closed");
                 review_context
-                    .finalize_setup_failure(&repo_name, mr.iid, &head_sha, run_history_id, &err)
+                    .finalize_setup_failure(
+                        &repo_name,
+                        mr.iid,
+                        &head_sha,
+                        prepared.run_history_id,
+                        &err,
+                    )
                     .await;
                 return;
             };
             if let Err(err) = review_context
-                .run(&repo_name, mr, &head_sha, feature_flags, run_history_id)
+                .run(
+                    &repo_name,
+                    mr,
+                    &head_sha,
+                    prepared.feature_flags,
+                    prepared.run_history_id,
+                )
                 .await
             {
                 warn!(repo = repo_name.as_str(), error = %err, "review failed");
             }
         }));
+    }
+
+    async fn acquire_review_permit_or_abort(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        run_history_id: i64,
+        acquired_rule_ids: &[String],
+    ) -> Result<OwnedSemaphorePermit> {
+        match self.shared.semaphore.clone().acquire_owned().await {
+            Ok(permit) => Ok(permit),
+            Err(err) => {
+                let err = Error::from(err);
+                self.abort_review_after_setup_failure(
+                    repo,
+                    iid,
+                    head_sha,
+                    run_history_id,
+                    acquired_rule_ids,
+                    &err,
+                )
+                .await;
+                Err(err)
+            }
+        }
+    }
+
+    pub(crate) async fn schedule_for_scan(
+        &self,
+        repo: &str,
+        mr: MergeRequest,
+        head_sha: &str,
+        tasks: &mut Vec<JoinHandle<()>>,
+    ) -> Result<ReviewScheduleOutcome> {
+        let acquired_rule_ids = match self.evaluate_review_gate(repo, &mr, head_sha).await? {
+            ReviewGateOutcome::Decision(decision) => return Ok(decision),
+            ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
+        };
+        let prepared = self
+            .prepare_review_run(repo, mr.iid, head_sha, &acquired_rule_ids)
+            .await?;
+        self.clear_review_rate_limit_pending_or_abort(
+            repo,
+            mr.iid,
+            head_sha,
+            prepared.run_history_id,
+            &acquired_rule_ids,
+        )
+        .await?;
+        self.spawn_scheduled_review_task(
+            repo.to_string(),
+            mr,
+            head_sha.to_string(),
+            prepared,
+            acquired_rule_ids,
+            tasks,
+        );
         Ok(ReviewScheduleOutcome::Scheduled)
     }
 
@@ -578,117 +656,27 @@ impl ReviewFlow {
             ReviewGateOutcome::Decision(decision) => return Ok(decision),
             ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
         };
-        let run_history_id = match self
-            .shared
-            .state
-            .run_history
-            .start_run_history_for_lane(
-                NewRunHistory {
-                    kind: if self.lane.is_security() {
-                        RunHistoryKind::Security
-                    } else {
-                        RunHistoryKind::Review
-                    },
-                    repo: repo.to_string(),
-                    iid: mr.iid,
-                    head_sha: head_sha.to_string(),
-                    discussion_id: None,
-                    trigger_note_id: None,
-                    trigger_note_author_name: None,
-                    trigger_note_body: None,
-                    command_repo: None,
-                },
-                Some(self.lane),
-            )
-            .await
-        {
-            Ok(run_history_id) => run_history_id,
-            Err(err) => {
-                self.release_review_lock_after_history_failure(
-                    repo,
-                    mr.iid,
-                    head_sha,
-                    &acquired_rule_ids,
-                )
-                .await;
-                return Err(err);
-            }
-        };
-        let feature_flags = match self.resolve_feature_flags().await {
-            Ok(feature_flags) => feature_flags,
-            Err(err) => {
-                self.abort_review_after_setup_failure(
-                    repo,
-                    mr.iid,
-                    head_sha,
-                    run_history_id,
-                    &acquired_rule_ids,
-                    &err,
-                )
-                .await;
-                return Err(err);
-            }
-        };
-        if let Err(err) = self
-            .shared
-            .state
-            .run_history
-            .set_run_history_feature_flags(run_history_id, &feature_flags)
-            .await
-        {
-            self.abort_review_after_setup_failure(
+        let prepared = self
+            .prepare_review_run(repo, mr.iid, head_sha, &acquired_rule_ids)
+            .await?;
+        let _permit = self
+            .acquire_review_permit_or_abort(
                 repo,
                 mr.iid,
                 head_sha,
-                run_history_id,
+                prepared.run_history_id,
                 &acquired_rule_ids,
-                &err,
             )
-            .await;
-            return Err(err);
-        }
-        let _permit = match self.shared.semaphore.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(err) => {
-                let err = Error::from(err);
-                self.abort_review_after_setup_failure(
-                    repo,
-                    mr.iid,
-                    head_sha,
-                    run_history_id,
-                    &acquired_rule_ids,
-                    &err,
-                )
-                .await;
-                return Err(err);
-            }
-        };
-        if let Err(err) = self
-            .clear_review_rate_limit_pending_if_needed(repo, mr.iid)
-            .await
-        {
-            self.abort_review_after_setup_failure(
-                repo,
-                mr.iid,
-                head_sha,
-                run_history_id,
-                &acquired_rule_ids,
-                &err,
-            )
-            .await;
-            return Err(err);
-        }
-        let review_context = ReviewRunContext {
-            lane: self.lane,
-            config: self.shared.config.clone(),
-            gitlab: Arc::clone(&self.shared.gitlab),
-            codex: Arc::clone(&self.shared.codex),
-            state: Arc::clone(&self.shared.state),
-            retry_backoff: Arc::clone(&self.retry_backoff),
-            bot_user_id: self.shared.bot_user_id,
-            lifecycle: Arc::clone(&self.shared.lifecycle),
-            acquired_rate_limit_rule_ids: acquired_rule_ids.clone(),
-        };
+            .await?;
+        self.clear_review_rate_limit_pending_or_abort(
+            repo,
+            mr.iid,
+            head_sha,
+            prepared.run_history_id,
+            &acquired_rule_ids,
+        )
+        .await?;
+        let review_context = self.run_context(acquired_rule_ids.clone());
         let _active_review = self.shared.active_tasks.track_review(ActiveReviewKey {
             lane: self.lane,
             repo: repo.to_string(),
@@ -696,7 +684,13 @@ impl ReviewFlow {
             head_sha: head_sha.to_string(),
         });
         review_context
-            .run(repo, mr, head_sha, feature_flags, run_history_id)
+            .run(
+                repo,
+                mr,
+                head_sha,
+                prepared.feature_flags,
+                prepared.run_history_id,
+            )
             .await?;
         Ok(ReviewScheduleOutcome::Scheduled)
     }
@@ -720,6 +714,32 @@ impl ReviewFlow {
             .await?;
         if cleared {
             self.remove_rate_limit_award_best_effort(repo, iid).await;
+        }
+        Ok(())
+    }
+
+    async fn clear_review_rate_limit_pending_or_abort(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        run_history_id: i64,
+        acquired_rule_ids: &[String],
+    ) -> Result<()> {
+        if let Err(err) = self
+            .clear_review_rate_limit_pending_if_needed(repo, iid)
+            .await
+        {
+            self.abort_review_after_setup_failure(
+                repo,
+                iid,
+                head_sha,
+                run_history_id,
+                acquired_rule_ids,
+                &err,
+            )
+            .await;
+            return Err(err);
         }
         Ok(())
     }
