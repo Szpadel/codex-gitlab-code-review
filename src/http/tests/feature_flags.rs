@@ -1,7 +1,6 @@
 use super::*;
 #[tokio::test]
 async fn feature_flag_update_endpoint_persists_runtime_override() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.gitlab_discovery_mcp.enabled = true;
     config.codex.gitlab_discovery_mcp.allow = vec![crate::config::GitLabDiscoveryAllowRule {
@@ -10,9 +9,13 @@ async fn feature_flag_update_endpoint_persists_runtime_override() -> Result<()> 
         target_repos: vec!["group/target".to_string()],
         target_groups: Vec::new(),
     }];
-    let status_service = Arc::new(HttpServices::new(config, Arc::clone(&state), false, None));
-    let csrf_token = status_service.admin.feature_flag_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .spawn()
+        .await?;
+    let state = Arc::clone(&srv.state);
+    let csrf_token = srv.services.admin.feature_flag_csrf_token().to_string();
+    let address = srv.address;
     let client = test_client();
 
     let response = client
@@ -41,11 +44,14 @@ async fn feature_flag_update_endpoint_persists_runtime_override() -> Result<()> 
 
 #[tokio::test]
 async fn feature_flag_update_endpoint_requires_csrf_header() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.gitlab_discovery_mcp.enabled = true;
-    let status_service = Arc::new(HttpServices::new(config, Arc::clone(&state), false, None));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .spawn()
+        .await?;
+    let state = Arc::clone(&srv.state);
+    let address = srv.address;
 
     let response = test_client()
         .post(format!(
@@ -68,15 +74,10 @@ async fn feature_flag_update_endpoint_requires_csrf_header() -> Result<()> {
 
 #[tokio::test]
 async fn feature_flag_update_endpoint_rejects_unavailable_flags() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let csrf_token = status_service.admin.feature_flag_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
+    let csrf_token = srv.services.admin.feature_flag_csrf_token().to_string();
+    let address = srv.address;
 
     let response = test_client()
         .post(format!(
@@ -100,7 +101,8 @@ async fn feature_flag_update_endpoint_rejects_unavailable_flags() -> Result<()> 
 
 #[tokio::test]
 async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     state
         .feature_flags
         .set_runtime_feature_flag_overrides(&crate::config::RuntimeFeatureFlagOverrides {
@@ -113,14 +115,8 @@ async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()
             security_review: None,
         })
         .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let csrf_token = status_service.admin.feature_flag_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let csrf_token = srv.services.admin.feature_flag_csrf_token().to_string();
+    let address = srv.address;
 
     let response = test_client()
         .post(format!(
@@ -144,15 +140,10 @@ async fn feature_flag_update_endpoint_clears_unavailable_override() -> Result<()
 
 #[tokio::test]
 async fn feature_flag_update_endpoint_persists_composer_install_override() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let csrf_token = status_service.admin.feature_flag_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
+    let csrf_token = srv.services.admin.feature_flag_csrf_token().to_string();
+    let address = srv.address;
 
     let response = test_client()
         .post(format!(
@@ -176,15 +167,10 @@ async fn feature_flag_update_endpoint_persists_composer_install_override() -> Re
 
 #[tokio::test]
 async fn feature_flag_update_endpoint_persists_composer_auto_repositories_override() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let csrf_token = status_service.admin.feature_flag_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
+    let csrf_token = srv.services.admin.feature_flag_csrf_token().to_string();
+    let address = srv.address;
 
     let response = test_client()
         .post(format!(
@@ -208,7 +194,8 @@ async fn feature_flag_update_endpoint_persists_composer_auto_repositories_overri
 
 #[tokio::test]
 async fn status_service_snapshot_exposes_project_catalog_summary() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     state
         .project_catalog
         .save_project_catalog("all", &["group/a".to_string(), "group/b".to_string()])
@@ -226,8 +213,7 @@ async fn status_service_snapshot_exposes_project_catalog_summary() -> Result<()>
         })
         .await?;
 
-    let status_service = HttpServices::new(test_config(), state, false, None);
-    let snapshot = status_service.status.snapshot().await?;
+    let snapshot = srv.services.status.snapshot().await?;
     assert_eq!(snapshot.project_catalogs.len(), 1);
     assert_eq!(snapshot.project_catalogs[0].cache_key, "all".to_string());
     assert_eq!(snapshot.project_catalogs[0].project_count, 2);
@@ -239,13 +225,13 @@ async fn status_service_snapshot_exposes_project_catalog_summary() -> Result<()>
 
 #[tokio::test]
 async fn status_service_snapshot_tolerates_malformed_scan_status() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     sqlx::query("INSERT INTO service_state (key, value) VALUES ('scan_status', 'not-json')")
         .execute(state.pool())
         .await?;
 
-    let status_service = HttpServices::new(test_config(), state, false, None);
-    let snapshot = status_service.status.snapshot().await?;
+    let snapshot = srv.services.status.snapshot().await?;
 
     assert_eq!(snapshot.scan.scan_state, "idle".to_string());
     assert_eq!(snapshot.scan.mode, None);
@@ -254,20 +240,17 @@ async fn status_service_snapshot_tolerates_malformed_scan_status() -> Result<()>
 
 #[tokio::test]
 async fn status_service_scan_updates_roundtrip() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = HttpServices::new(test_config(), Arc::clone(&state), false, None);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
 
-    status_service
+    srv.services
         .admin
         .set_next_scan_at(Some(
             DateTime::parse_from_rfc3339("2026-03-10T12:10:00Z")?.with_timezone(&Utc),
         ))
         .await?;
-    status_service
-        .admin
-        .mark_scan_started(ScanMode::Full)
-        .await?;
-    status_service
+    srv.services.admin.mark_scan_started(ScanMode::Full).await?;
+    srv.services
         .admin
         .mark_scan_finished(ScanMode::Full, ScanOutcome::Success, None)
         .await?;
@@ -285,11 +268,13 @@ async fn status_service_scan_updates_roundtrip() -> Result<()> {
 
 #[tokio::test]
 async fn status_routes_are_not_registered_when_ui_disabled() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.server.status_ui_enabled = false;
-    let status_service = Arc::new(HttpServices::new(config, state, false, None));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .spawn()
+        .await?;
+    let address = srv.address;
 
     let status_response = reqwest::get(format!("http://{address}/status")).await?;
     assert_eq!(status_response.status(), StatusCode::NOT_FOUND);
@@ -301,7 +286,8 @@ async fn status_routes_are_not_registered_when_ui_disabled() -> Result<()> {
 
 #[tokio::test]
 async fn startup_recovery_clears_stale_scanning_state() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -335,9 +321,7 @@ async fn startup_recovery_clears_stale_scanning_state() -> Result<()> {
             next_scan_at: Some("2026-03-10T10:10:00Z".to_string()),
         })
         .await?;
-    let status_service = HttpServices::new(test_config(), Arc::clone(&state), false, None);
-
-    status_service.admin.recover_startup_status().await?;
+    srv.services.admin.recover_startup_status().await?;
 
     let persisted = state.service_state.get_scan_status().await?;
     assert_eq!(persisted.state, ScanState::Idle);

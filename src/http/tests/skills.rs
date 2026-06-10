@@ -8,11 +8,13 @@ async fn skills_page_renders_upload_form_and_installed_skill_list() -> Result<()
         "---\nname: web-skill\ndescription: Web skill\n---\n",
         &[("scripts/run.sh", b"echo web")],
     )?;
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.auth_host_path = auth_home.path().display().to_string();
-    let status_service = Arc::new(HttpServices::new(config, state, false, None));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .spawn()
+        .await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/skills")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -40,15 +42,17 @@ async fn skill_preview_page_renders_account_status_and_delete_form() -> Result<(
         "---\nname: preview-skill\ndescription: Preview me\n---\n",
         &[("scripts/run.sh", b"echo primary")],
     )?;
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.auth_host_path = primary.path().display().to_string();
     config.codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
         name: "backup".to_string(),
         auth_host_path: backup.path().display().to_string(),
     }];
-    let status_service = Arc::new(HttpServices::new(config, state, false, None));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .spawn()
+        .await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/skills/preview-skill")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -65,16 +69,18 @@ async fn skill_preview_page_renders_account_status_and_delete_form() -> Result<(
 async fn upload_skill_endpoint_installs_into_primary_and_fallback_auth_homes() -> Result<()> {
     let primary = TestAuthDir::new("http-upload-primary");
     let backup = TestAuthDir::new("http-upload-backup");
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.auth_host_path = primary.path().display().to_string();
     config.codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
         name: "backup".to_string(),
         auth_host_path: backup.path().display().to_string(),
     }];
-    let status_service = Arc::new(HttpServices::new(config, state, false, None));
-    let csrf_token = status_service.admin.admin_csrf_token().to_string();
-    let address = spawn_test_server(app_router(Arc::clone(&status_service))).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .spawn()
+        .await?;
+    let csrf_token = srv.services.admin.admin_csrf_token().to_string();
+    let address = srv.address;
     let archive = build_skill_zip(&[
         (
             "wrapped/web-skill/SKILL.md",
@@ -107,12 +113,14 @@ async fn upload_skill_endpoint_installs_into_primary_and_fallback_auth_homes() -
 #[tokio::test]
 async fn upload_skill_endpoint_rejects_unsupported_archive_type() -> Result<()> {
     let auth_home = TestAuthDir::new("http-upload-invalid");
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.auth_host_path = auth_home.path().display().to_string();
-    let status_service = Arc::new(HttpServices::new(config, state, false, None));
-    let csrf_token = status_service.admin.admin_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .spawn()
+        .await?;
+    let csrf_token = srv.services.admin.admin_csrf_token().to_string();
+    let address = srv.address;
     let client = test_client();
 
     let response = client
@@ -137,12 +145,14 @@ async fn delete_skill_endpoint_requires_csrf_and_removes_skill() -> Result<()> {
         "---\nname: delete-skill\n---\n",
         &[("scripts/run.sh", b"echo delete")],
     )?;
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     let mut config = test_config();
     config.codex.auth_host_path = auth_home.path().display().to_string();
-    let status_service = Arc::new(HttpServices::new(config, state, false, None));
-    let csrf_token = status_service.admin.admin_csrf_token().to_string();
-    let address = spawn_test_server(app_router(Arc::clone(&status_service))).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .spawn()
+        .await?;
+    let csrf_token = srv.services.admin.admin_csrf_token().to_string();
+    let address = srv.address;
     let client = test_client();
 
     let forbidden = client

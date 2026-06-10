@@ -1,19 +1,6 @@
 use super::*;
 #[tokio::test]
 async fn run_detail_page_shows_unavailable_transcript_for_legacy_runs() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = RunFixture::mention("group/repo", 11, "feed123")
-        .discussion("discussion-11", 777)
-        .trigger_note("qa", "please inspect the legacy thread")
-        .command_repo("group/repo")
-        .thread("thread-legacy")
-        .turn("turn-legacy")
-        .auth_account("primary")
-        .result("committed")
-        .preview("Mention group/repo !11 legacy thread")
-        .summary("Used legacy thread replay")
-        .insert(&state)
-        .await?;
     let runner = Arc::new(ThreadReaderRunner {
         response: json!({
             "thread": {
@@ -31,14 +18,25 @@ async fn run_detail_page_shows_unavailable_transcript_for_legacy_runs() -> Resul
             }
         }),
     });
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        Some(runner),
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_runner(runner)
+        .spawn()
+        .await?;
+    let address = srv.address;
 
+    let state = Arc::clone(&srv.state);
+    let run_id = RunFixture::mention("group/repo", 11, "feed123")
+        .discussion("discussion-11", 777)
+        .trigger_note("qa", "please inspect the legacy thread")
+        .command_repo("group/repo")
+        .thread("thread-legacy")
+        .turn("turn-legacy")
+        .auth_account("primary")
+        .result("committed")
+        .preview("Mention group/repo !11 legacy thread")
+        .summary("Used legacy thread replay")
+        .insert(&state)
+        .await?;
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -49,17 +47,6 @@ async fn run_detail_page_shows_unavailable_transcript_for_legacy_runs() -> Resul
 
 #[tokio::test]
 async fn run_detail_keeps_partial_persisted_history_without_thread_reader() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = RunFixture::review("group/repo", 12, "feed456")
-        .thread("thread-live")
-        .turn("turn-live")
-        .auth_account("primary")
-        .result("commented")
-        .preview("Review group/repo !12")
-        .summary("Used complete live thread")
-        .insert(&state)
-        .await?;
-    insert_run_history_events(&state, run_id, vec![turn_started_event(1, "turn-live")]).await?;
     let runner = Arc::new(ThreadReaderRunner {
         response: json!({
             "thread": {
@@ -87,14 +74,23 @@ async fn run_detail_keeps_partial_persisted_history_without_thread_reader() -> R
             }
         }),
     });
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        Some(runner),
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_runner(runner)
+        .spawn()
+        .await?;
+    let address = srv.address;
 
+    let state = Arc::clone(&srv.state);
+    let run_id = RunFixture::review("group/repo", 12, "feed456")
+        .thread("thread-live")
+        .turn("turn-live")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !12")
+        .summary("Used complete live thread")
+        .insert(&state)
+        .await?;
+    insert_run_history_events(&state, run_id, vec![turn_started_event(1, "turn-live")]).await?;
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -106,7 +102,30 @@ async fn run_detail_keeps_partial_persisted_history_without_thread_reader() -> R
 
 #[tokio::test]
 async fn run_detail_prefers_complete_persisted_event_history() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let runner = Arc::new(ThreadReaderRunner {
+        response: json!({
+            "thread": {
+                "id": "thread-persisted",
+                "preview": "Live thread replay",
+                "status": "completed",
+                "turns": [{
+                    "id": "turn-persisted",
+                    "status": "completed",
+                    "items": [{
+                        "type": "agentMessage",
+                        "text": "Live replay should not replace persisted transcript."
+                    }]
+                }]
+            }
+        }),
+    });
+    let srv = HttpTestServerBuilder::new()
+        .with_runner(runner)
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 13, "feed789")
         .thread("thread-persisted")
         .turn("turn-persisted")
@@ -126,31 +145,6 @@ async fn run_detail_prefers_complete_persisted_event_history() -> Result<()> {
         ],
     )
     .await?;
-    let runner = Arc::new(ThreadReaderRunner {
-        response: json!({
-            "thread": {
-                "id": "thread-persisted",
-                "preview": "Live thread replay",
-                "status": "completed",
-                "turns": [{
-                    "id": "turn-persisted",
-                    "status": "completed",
-                    "items": [{
-                        "type": "agentMessage",
-                        "text": "Live replay should not replace persisted transcript."
-                    }]
-                }]
-            }
-        }),
-    });
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        Some(runner),
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -161,7 +155,17 @@ async fn run_detail_prefers_complete_persisted_event_history() -> Result<()> {
 
 #[tokio::test]
 async fn run_detail_skips_live_thread_when_complete_persisted_history_exists() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let read_calls = Arc::new(AtomicUsize::new(0));
+    let runner = Arc::new(CountingThreadReaderRunner {
+        read_calls: Arc::clone(&read_calls),
+    });
+    let srv = HttpTestServerBuilder::new()
+        .with_runner(runner)
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 14, "feedabc")
         .thread("thread-richer")
         .turn("turn-richer")
@@ -181,18 +185,6 @@ async fn run_detail_skips_live_thread_when_complete_persisted_history_exists() -
         ],
     )
     .await?;
-    let read_calls = Arc::new(AtomicUsize::new(0));
-    let runner = Arc::new(CountingThreadReaderRunner {
-        read_calls: Arc::clone(&read_calls),
-    });
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        Some(runner),
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -203,7 +195,30 @@ async fn run_detail_skips_live_thread_when_complete_persisted_history_exists() -
 
 #[tokio::test]
 async fn run_detail_keeps_incomplete_persisted_history_without_thread_reader() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let runner = Arc::new(ThreadReaderRunner {
+        response: json!({
+            "thread": {
+                "id": "thread-incomplete",
+                "preview": "Live thread replay",
+                "status": "completed",
+                "turns": [{
+                    "id": "turn-incomplete",
+                    "status": "completed",
+                    "items": [{
+                        "type": "agentMessage",
+                        "text": "Recovered from live replay."
+                    }]
+                }]
+            }
+        }),
+    });
+    let srv = HttpTestServerBuilder::new()
+        .with_runner(runner)
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 15, "feeddef")
         .thread("thread-incomplete")
         .turn("turn-incomplete")
@@ -226,31 +241,6 @@ async fn run_detail_keeps_incomplete_persisted_history_without_thread_reader() -
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let runner = Arc::new(ThreadReaderRunner {
-        response: json!({
-            "thread": {
-                "id": "thread-incomplete",
-                "preview": "Live thread replay",
-                "status": "completed",
-                "turns": [{
-                    "id": "turn-incomplete",
-                    "status": "completed",
-                    "items": [{
-                        "type": "agentMessage",
-                        "text": "Recovered from live replay."
-                    }]
-                }]
-            }
-        }),
-    });
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        Some(runner),
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -261,7 +251,30 @@ async fn run_detail_keeps_incomplete_persisted_history_without_thread_reader() -
 
 #[tokio::test]
 async fn run_detail_keeps_completed_turn_without_items_without_thread_reader() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let runner = Arc::new(ThreadReaderRunner {
+        response: json!({
+            "thread": {
+                "id": "thread-delta-only",
+                "preview": "Live thread replay",
+                "status": "completed",
+                "turns": [{
+                    "id": "turn-delta-only",
+                    "status": "completed",
+                    "items": [{
+                        "type": "agentMessage",
+                        "text": "Recovered delta-only reply."
+                    }]
+                }]
+            }
+        }),
+    });
+    let srv = HttpTestServerBuilder::new()
+        .with_runner(runner)
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::mention("group/repo", 16, "feed000")
         .discussion("discussion-16", 16)
         .trigger_note("qa", "show delta-only completion")
@@ -283,31 +296,6 @@ async fn run_detail_keeps_completed_turn_without_items_without_thread_reader() -
         ],
     )
     .await?;
-    let runner = Arc::new(ThreadReaderRunner {
-        response: json!({
-            "thread": {
-                "id": "thread-delta-only",
-                "preview": "Live thread replay",
-                "status": "completed",
-                "turns": [{
-                    "id": "turn-delta-only",
-                    "status": "completed",
-                    "items": [{
-                        "type": "agentMessage",
-                        "text": "Recovered delta-only reply."
-                    }]
-                }]
-            }
-        }),
-    });
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        Some(runner),
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -318,7 +306,31 @@ async fn run_detail_keeps_completed_turn_without_items_without_thread_reader() -
 
 #[tokio::test]
 async fn run_detail_keeps_command_without_body_without_thread_reader() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let runner = Arc::new(ThreadReaderRunner {
+        response: json!({
+            "thread": {
+                "id": "thread-command-body",
+                "preview": "Live thread replay",
+                "status": "completed",
+                "turns": [{
+                    "id": "turn-command-body",
+                    "status": "completed",
+                    "items": [{
+                        "type": "commandExecution",
+                        "command": "cargo test",
+                        "aggregatedOutput": "Recovered command output"
+                    }]
+                }]
+            }
+        }),
+    });
+    let srv = HttpTestServerBuilder::new()
+        .with_runner(runner)
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 17, "feed111")
         .thread("thread-command-body")
         .turn("turn-command-body")
@@ -347,32 +359,6 @@ async fn run_detail_keeps_command_without_body_without_thread_reader() -> Result
         ],
     )
     .await?;
-    let runner = Arc::new(ThreadReaderRunner {
-        response: json!({
-            "thread": {
-                "id": "thread-command-body",
-                "preview": "Live thread replay",
-                "status": "completed",
-                "turns": [{
-                    "id": "turn-command-body",
-                    "status": "completed",
-                    "items": [{
-                        "type": "commandExecution",
-                        "command": "cargo test",
-                        "aggregatedOutput": "Recovered command output"
-                    }]
-                }]
-            }
-        }),
-    });
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        Some(runner),
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -383,7 +369,27 @@ async fn run_detail_keeps_command_without_body_without_thread_reader() -> Result
 
 #[tokio::test]
 async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let read_calls = Arc::new(AtomicUsize::new(0));
+    let runner = Arc::new(CountingThreadReaderRunner {
+        read_calls: Arc::clone(&read_calls),
+    });
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let backfill_source = Arc::new(StaticTranscriptBackfillSource {
+        events: vec![
+            turn_started_event(1, "turn-backfill"),
+            reasoning_event(2, "turn-backfill", "Recovered summary", "Recovered detail"),
+            turn_completed_event(3, "turn-backfill"),
+        ],
+        calls: Arc::clone(&backfill_calls),
+    });
+    let srv = HttpTestServerBuilder::new()
+        .with_runner(runner)
+        .with_transcript_backfill_source(backfill_source)
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 18, "feed222")
         .thread("thread-backfill")
         .turn("turn-backfill")
@@ -403,25 +409,6 @@ async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history
         ],
     )
     .await?;
-    let read_calls = Arc::new(AtomicUsize::new(0));
-    let runner = Arc::new(CountingThreadReaderRunner {
-        read_calls: Arc::clone(&read_calls),
-    });
-    let backfill_calls = Arc::new(AtomicUsize::new(0));
-    let backfill_source = Arc::new(StaticTranscriptBackfillSource {
-        events: vec![
-            turn_started_event(1, "turn-backfill"),
-            reasoning_event(2, "turn-backfill", "Recovered summary", "Recovered detail"),
-            turn_completed_event(3, "turn-backfill"),
-        ],
-        calls: Arc::clone(&backfill_calls),
-    });
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, Some(runner))
-            .with_transcript_backfill_source(backfill_source),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -455,7 +442,8 @@ async fn run_detail_queues_async_backfill_and_serves_rewritten_persisted_history
 
 #[tokio::test]
 async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::security("group/repo", 19, "feed333")
         .thread("thread-security")
         .turn("turn-review")
@@ -544,7 +532,31 @@ async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread(
 
 #[tokio::test]
 async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
+            events: vec![
+                turn_started_event(1, "turn-parent"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Investigating",
+                        "reviewChildTurnIds": ["turn-stale-child"]
+                    }),
+                ),
+                agent_message_event(3, "turn-parent", "fresh review transcript"),
+                turn_completed_event(4, "turn-parent"),
+            ],
+            calls: Arc::clone(&backfill_calls),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 27, "feedchild")
         .thread("thread-review-wrapper")
         .turn("turn-parent")
@@ -568,30 +580,6 @@ async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Res
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let backfill_calls = Arc::new(AtomicUsize::new(0));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
-                events: vec![
-                    turn_started_event(1, "turn-parent"),
-                    run_event(
-                        2,
-                        Some("turn-parent"),
-                        "item_completed",
-                        json!({
-                            "type": "enteredReviewMode",
-                            "review": "Investigating",
-                            "reviewChildTurnIds": ["turn-stale-child"]
-                        }),
-                    ),
-                    agent_message_event(3, "turn-parent", "fresh review transcript"),
-                    turn_completed_event(4, "turn-parent"),
-                ],
-                calls: Arc::clone(&backfill_calls),
-            })),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -627,7 +615,32 @@ async fn run_detail_backfill_replaces_child_only_persisted_review_turns() -> Res
 #[tokio::test]
 async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after_sanitize_empties_persisted_events()
 -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: None,
+            full_thread_events: vec![
+                turn_started_event(1, "turn-parent"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Investigating",
+                        "reviewChildTurnIds": ["turn-stale-child"]
+                    }),
+                ),
+                agent_message_event(3, "turn-parent", "fresh review transcript"),
+                turn_completed_event(4, "turn-parent"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 127, "feedsanitize")
         .thread("thread-review-missing-parent-only-child")
         .turn("turn-parent")
@@ -651,33 +664,6 @@ async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: None,
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-parent"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "review": "Investigating",
-                                "reviewChildTurnIds": ["turn-stale-child"]
-                            }),
-                        ),
-                        agent_message_event(3, "turn-parent", "fresh review transcript"),
-                        turn_completed_event(4, "turn-parent"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _body = response.text().await?;
@@ -710,7 +696,31 @@ async fn run_detail_backfill_recovers_missing_parent_turn_from_full_thread_after
 
 #[tokio::test]
 async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewrite() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
+            events: vec![
+                turn_started_event(1, "turn-parent"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Investigating",
+                        "reviewChildTurnIds": ["turn-stale-child"]
+                    }),
+                ),
+                agent_message_event(3, "turn-parent", "fresh review transcript"),
+                turn_completed_event(4, "turn-parent"),
+            ],
+            calls: Arc::clone(&backfill_calls),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 28, "feeddup")
         .thread("thread-review-duplicate")
         .turn("turn-parent")
@@ -737,30 +747,6 @@ async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewri
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let backfill_calls = Arc::new(AtomicUsize::new(0));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
-                events: vec![
-                    turn_started_event(1, "turn-parent"),
-                    run_event(
-                        2,
-                        Some("turn-parent"),
-                        "item_completed",
-                        json!({
-                            "type": "enteredReviewMode",
-                            "review": "Investigating",
-                            "reviewChildTurnIds": ["turn-stale-child"]
-                        }),
-                    ),
-                    agent_message_event(3, "turn-parent", "fresh review transcript"),
-                    turn_completed_event(4, "turn-parent"),
-                ],
-                calls: Arc::clone(&backfill_calls),
-            })),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
@@ -801,7 +787,31 @@ async fn run_detail_backfill_drops_partial_stale_review_child_items_before_rewri
 #[tokio::test]
 async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_child_turns()
 -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
+            events: vec![
+                turn_started_event(1, "turn-parent"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Investigating",
+                        "reviewChildTurnIds": ["turn-stale-child"]
+                    }),
+                ),
+                agent_message_event(3, "turn-parent", "fresh review transcript"),
+                turn_completed_event(4, "turn-parent"),
+            ],
+            calls: Arc::clone(&backfill_calls),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 29, "feedlater")
         .thread("thread-review-later")
         .turn("turn-parent")
@@ -831,30 +841,6 @@ async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_c
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let backfill_calls = Arc::new(AtomicUsize::new(0));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
-                events: vec![
-                    turn_started_event(1, "turn-parent"),
-                    run_event(
-                        2,
-                        Some("turn-parent"),
-                        "item_completed",
-                        json!({
-                            "type": "enteredReviewMode",
-                            "review": "Investigating",
-                            "reviewChildTurnIds": ["turn-stale-child"]
-                        }),
-                    ),
-                    agent_message_event(3, "turn-parent", "fresh review transcript"),
-                    turn_completed_event(4, "turn-parent"),
-                ],
-                calls: Arc::clone(&backfill_calls),
-            })),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -891,7 +877,66 @@ async fn run_detail_backfill_preserves_later_turns_while_removing_stale_review_c
 
 #[tokio::test]
 async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: Some(vec![
+                turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Investigating",
+                        "createdAt": "2026-03-11T21:32:37.160Z",
+                        "reviewChildTurnIds": ["turn-stale-child"]
+                    }),
+                ),
+                agent_message_event_at(
+                    3,
+                    "turn-parent",
+                    "fresh review transcript",
+                    "2026-03-11T21:32:37.162Z",
+                ),
+                turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
+            ]),
+            full_thread_events: vec![
+                turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Investigating",
+                        "createdAt": "2026-03-11T21:32:37.160Z",
+                        "reviewChildTurnIds": ["turn-stale-child"]
+                    }),
+                ),
+                agent_message_event_at(
+                    3,
+                    "turn-parent",
+                    "fresh review transcript",
+                    "2026-03-11T21:32:37.162Z",
+                ),
+                turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
+                turn_started_event_at(5, "turn-later", "2026-03-11T21:40:00.000Z"),
+                agent_message_event_at(
+                    6,
+                    "turn-later",
+                    "later legitimate turn",
+                    "2026-03-11T21:40:01.000Z",
+                ),
+                turn_completed_event_at(7, "turn-later", "2026-03-11T21:40:02.000Z"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 30, "feedmissing")
         .thread("thread-review-missing-parent")
         .turn("turn-parent")
@@ -928,67 +973,6 @@ async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing(
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: Some(vec![
-                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "review": "Investigating",
-                                "createdAt": "2026-03-11T21:32:37.160Z",
-                                "reviewChildTurnIds": ["turn-stale-child"]
-                            }),
-                        ),
-                        agent_message_event_at(
-                            3,
-                            "turn-parent",
-                            "fresh review transcript",
-                            "2026-03-11T21:32:37.162Z",
-                        ),
-                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
-                    ]),
-                    full_thread_events: vec![
-                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "review": "Investigating",
-                                "createdAt": "2026-03-11T21:32:37.160Z",
-                                "reviewChildTurnIds": ["turn-stale-child"]
-                            }),
-                        ),
-                        agent_message_event_at(
-                            3,
-                            "turn-parent",
-                            "fresh review transcript",
-                            "2026-03-11T21:32:37.162Z",
-                        ),
-                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
-                        turn_started_event_at(5, "turn-later", "2026-03-11T21:40:00.000Z"),
-                        agent_message_event_at(
-                            6,
-                            "turn-later",
-                            "later legitimate turn",
-                            "2026-03-11T21:40:01.000Z",
-                        ),
-                        turn_completed_event_at(7, "turn-later", "2026-03-11T21:40:02.000Z"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -1022,7 +1006,58 @@ async fn run_detail_backfill_preserves_later_turns_when_parent_turn_was_missing(
 
 #[tokio::test]
 async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: Some(vec![
+                turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Investigating",
+                        "createdAt": "2026-03-11T21:32:37.160Z",
+                        "reviewChildTurnIds": ["turn-stale-child"]
+                    }),
+                ),
+                agent_message_event_at(
+                    3,
+                    "turn-parent",
+                    "fresh review transcript",
+                    "2026-03-11T21:32:37.162Z",
+                ),
+                turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
+            ]),
+            full_thread_events: vec![
+                turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Investigating",
+                        "createdAt": "2026-03-11T21:32:37.160Z",
+                        "reviewChildTurnIds": ["turn-stale-child"]
+                    }),
+                ),
+                agent_message_event_at(
+                    3,
+                    "turn-parent",
+                    "fresh review transcript",
+                    "2026-03-11T21:32:37.162Z",
+                ),
+                turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 31, "feedtargetonly")
         .thread("thread-review-target-only")
         .turn("turn-parent")
@@ -1059,59 +1094,6 @@ async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> R
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: Some(vec![
-                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "review": "Investigating",
-                                "createdAt": "2026-03-11T21:32:37.160Z",
-                                "reviewChildTurnIds": ["turn-stale-child"]
-                            }),
-                        ),
-                        agent_message_event_at(
-                            3,
-                            "turn-parent",
-                            "fresh review transcript",
-                            "2026-03-11T21:32:37.162Z",
-                        ),
-                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
-                    ]),
-                    full_thread_events: vec![
-                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "review": "Investigating",
-                                "createdAt": "2026-03-11T21:32:37.160Z",
-                                "reviewChildTurnIds": ["turn-stale-child"]
-                            }),
-                        ),
-                        agent_message_event_at(
-                            3,
-                            "turn-parent",
-                            "fresh review transcript",
-                            "2026-03-11T21:32:37.162Z",
-                        ),
-                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -1146,7 +1128,29 @@ async fn run_detail_target_only_fallback_preserves_known_good_later_turns() -> R
 #[tokio::test]
 async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_turns() -> Result<()>
 {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: Some(vec![
+                turn_started_event(1, "turn-target"),
+                agent_message_event(2, "turn-target", "recovered target turn"),
+                turn_completed_event(3, "turn-target"),
+            ]),
+            full_thread_events: vec![
+                turn_started_event(1, "turn-target"),
+                agent_message_event(2, "turn-target", "recovered target turn"),
+                turn_completed_event(3, "turn-target"),
+                turn_started_event(4, "turn-later"),
+                agent_message_event(5, "turn-later", "later legitimate turn"),
+                turn_completed_event(6, "turn-later"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 34, "feedplainmissing")
         .thread("thread-review-plain-missing")
         .turn("turn-target")
@@ -1170,30 +1174,6 @@ async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_tu
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: Some(vec![
-                        turn_started_event(1, "turn-target"),
-                        agent_message_event(2, "turn-target", "recovered target turn"),
-                        turn_completed_event(3, "turn-target"),
-                    ]),
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-target"),
-                        agent_message_event(2, "turn-target", "recovered target turn"),
-                        turn_completed_event(3, "turn-target"),
-                        turn_started_event(4, "turn-later"),
-                        agent_message_event(5, "turn-later", "later legitimate turn"),
-                        turn_completed_event(6, "turn-later"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -1233,7 +1213,35 @@ async fn run_detail_recovers_missing_plain_target_turn_before_later_persisted_tu
 
 #[tokio::test]
 async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: None,
+            full_thread_events: vec![
+                turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                agent_message_event_at(
+                    2,
+                    "turn-parent",
+                    "fresh review transcript",
+                    "2026-03-11T21:32:37.162Z",
+                ),
+                turn_completed_event_at(3, "turn-parent", "2026-03-11T21:32:37.164Z"),
+                turn_started_event_at(4, "turn-later", "2026-03-11T21:40:00.000Z"),
+                agent_message_event_at(
+                    5,
+                    "turn-later",
+                    "later legitimate turn",
+                    "2026-03-11T21:40:01.000Z",
+                ),
+                turn_completed_event_at(6, "turn-later", "2026-03-11T21:40:02.000Z"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 32, "feedempty")
         .thread("thread-review-empty")
         .turn("turn-parent")
@@ -1247,36 +1255,6 @@ async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: None,
-                    full_thread_events: vec![
-                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
-                        agent_message_event_at(
-                            2,
-                            "turn-parent",
-                            "fresh review transcript",
-                            "2026-03-11T21:32:37.162Z",
-                        ),
-                        turn_completed_event_at(3, "turn-parent", "2026-03-11T21:32:37.164Z"),
-                        turn_started_event_at(4, "turn-later", "2026-03-11T21:40:00.000Z"),
-                        agent_message_event_at(
-                            5,
-                            "turn-later",
-                            "later legitimate turn",
-                            "2026-03-11T21:40:01.000Z",
-                        ),
-                        turn_completed_event_at(6, "turn-later", "2026-03-11T21:40:02.000Z"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -1316,7 +1294,39 @@ async fn run_detail_empty_history_recovery_keeps_target_turn_scoped() -> Result<
 #[tokio::test]
 async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_markers() -> Result<()>
 {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: None,
+            full_thread_events: vec![
+                turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                agent_message_event_at(
+                    2,
+                    "turn-parent",
+                    "fresh review transcript",
+                    "2026-03-11T21:32:37.162Z",
+                ),
+                turn_completed_event_at(3, "turn-parent", "2026-03-11T21:32:37.164Z"),
+                turn_started_event_at(4, "turn-unrelated", "2026-03-11T21:40:00.000Z"),
+                run_event(
+                    5,
+                    Some("turn-unrelated"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "reviewMissingChildTurnIds": ["turn-unrelated-child"],
+                        "createdAt": "2026-03-11T21:40:01.000Z"
+                    }),
+                ),
+                turn_completed_event_at(6, "turn-unrelated", "2026-03-11T21:40:02.000Z"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 33, "feedemptyother")
         .thread("thread-review-empty-other")
         .turn("turn-parent")
@@ -1333,40 +1343,6 @@ async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_mark
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: None,
-                    full_thread_events: vec![
-                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
-                        agent_message_event_at(
-                            2,
-                            "turn-parent",
-                            "fresh review transcript",
-                            "2026-03-11T21:32:37.162Z",
-                        ),
-                        turn_completed_event_at(3, "turn-parent", "2026-03-11T21:32:37.164Z"),
-                        turn_started_event_at(4, "turn-unrelated", "2026-03-11T21:40:00.000Z"),
-                        run_event(
-                            5,
-                            Some("turn-unrelated"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "reviewMissingChildTurnIds": ["turn-unrelated-child"],
-                                "createdAt": "2026-03-11T21:40:01.000Z"
-                            }),
-                        ),
-                        turn_completed_event_at(6, "turn-unrelated", "2026-03-11T21:40:02.000Z"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -1405,7 +1381,34 @@ async fn run_detail_empty_history_recovery_ignores_unrelated_pending_review_mark
 
 #[tokio::test]
 async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: None,
+            full_thread_events: vec![
+                turn_started_event(1, "turn-unrelated"),
+                run_event(
+                    2,
+                    Some("turn-unrelated"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Waiting on unrelated child",
+                        "reviewMissingChildTurnIds": ["turn-unrelated-child"]
+                    }),
+                ),
+                turn_completed_event(3, "turn-unrelated"),
+                turn_started_event(4, "turn-target"),
+                agent_message_event(5, "turn-target", "recovered target turn"),
+                turn_completed_event(6, "turn-target"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 36, "feedtargetothermissing")
         .thread("thread-review-target-other-missing")
         .turn("turn-target")
@@ -1430,35 +1433,6 @@ async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: None,
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-unrelated"),
-                        run_event(
-                            2,
-                            Some("turn-unrelated"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "review": "Waiting on unrelated child",
-                                "reviewMissingChildTurnIds": ["turn-unrelated-child"]
-                            }),
-                        ),
-                        turn_completed_event(3, "turn-unrelated"),
-                        turn_started_event(4, "turn-target"),
-                        agent_message_event(5, "turn-target", "recovered target turn"),
-                        turn_completed_event(6, "turn-target"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -1493,7 +1467,43 @@ async fn run_detail_target_only_recovery_ignores_unrelated_missing_child_history
 #[tokio::test]
 async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_target_missing()
 -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: None,
+            full_thread_events: vec![
+                turn_started_event(1, "turn-old"),
+                run_event(
+                    2,
+                    Some("turn-old"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "reviewMissingChildTurnIds": ["turn-old-child"]
+                    }),
+                ),
+                run_event(
+                    3,
+                    Some("turn-old"),
+                    "item_completed",
+                    json!({
+                        "type": "agentMessage",
+                        "text": "Recovered older turn",
+                        "reviewMissingChildTurnIds": ["turn-old-child"]
+                    }),
+                ),
+                turn_completed_event(4, "turn-old"),
+                turn_started_event(5, "turn-target"),
+                agent_message_event(6, "turn-target", "Recovered current turn"),
+                turn_completed_event(7, "turn-target"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 137, "feedstaleoldertargetmissing")
         .thread("thread-review-stale-older-target-missing")
         .turn("turn-target")
@@ -1530,44 +1540,6 @@ async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_t
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: None,
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-old"),
-                        run_event(
-                            2,
-                            Some("turn-old"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "reviewMissingChildTurnIds": ["turn-old-child"]
-                            }),
-                        ),
-                        run_event(
-                            3,
-                            Some("turn-old"),
-                            "item_completed",
-                            json!({
-                                "type": "agentMessage",
-                                "text": "Recovered older turn",
-                                "reviewMissingChildTurnIds": ["turn-old-child"]
-                            }),
-                        ),
-                        turn_completed_event(4, "turn-old"),
-                        turn_started_event(5, "turn-target"),
-                        agent_message_event(6, "turn-target", "Recovered current turn"),
-                        turn_completed_event(7, "turn-target"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -1602,7 +1574,30 @@ async fn run_detail_full_thread_recovery_replaces_recoverable_stale_turns_when_t
 #[tokio::test]
 async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_sibling()
 -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: None,
+            full_thread_events: vec![
+                turn_started_event(1, "turn-parent"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "reviewMissingChildTurnIds": ["turn-child-missing"]
+                    }),
+                ),
+                agent_message_event(3, "turn-parent", "wrapper summary"),
+                turn_completed_event(4, "turn-parent"),
+            ],
+            seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 35, "feedemptytargetreview")
         .thread("thread-review-empty-target")
         .turn("turn-parent")
@@ -1616,31 +1611,6 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: None,
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-parent"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "reviewMissingChildTurnIds": ["turn-child-missing"]
-                            }),
-                        ),
-                        agent_message_event(3, "turn-parent", "wrapper summary"),
-                        turn_completed_event(4, "turn-parent"),
-                    ],
-                    seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -1683,7 +1653,41 @@ async fn run_detail_empty_history_target_only_recovery_waits_for_missing_review_
 #[tokio::test]
 async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_failed()
 -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: Some(vec![
+                turn_started_event(1, "turn-parent"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "reviewMissingChildTurnIds": ["turn-child-missing"]
+                    }),
+                ),
+                turn_completed_event(3, "turn-parent"),
+            ]),
+            full_thread_events: vec![
+                turn_started_event(1, "turn-parent"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "reviewMissingChildTurnIds": ["turn-child-missing"]
+                    }),
+                ),
+                turn_completed_event(3, "turn-parent"),
+            ],
+            seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 37, "feedstalemissingsibling")
         .thread("thread-review-stale-missing-sibling")
         .turn("turn-parent")
@@ -1702,42 +1706,6 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: Some(vec![
-                        turn_started_event(1, "turn-parent"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "reviewMissingChildTurnIds": ["turn-child-missing"]
-                            }),
-                        ),
-                        turn_completed_event(3, "turn-parent"),
-                    ]),
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-parent"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "reviewMissingChildTurnIds": ["turn-child-missing"]
-                            }),
-                        ),
-                        turn_completed_event(3, "turn-parent"),
-                    ],
-                    seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -1779,7 +1747,61 @@ async fn run_detail_stale_missing_review_sibling_without_wrapper_fallback_stays_
 
 #[tokio::test]
 async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: Some(vec![
+                turn_started_event(1, "turn-parent"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "reviewMissingChildTurnIds": ["turn-child-missing"]
+                    }),
+                ),
+                run_event(
+                    3,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "agentMessage",
+                        "text": "Wrapper fallback summary",
+                        "reviewMissingChildTurnIds": ["turn-child-missing"]
+                    }),
+                ),
+                turn_completed_event(4, "turn-parent"),
+            ]),
+            full_thread_events: vec![
+                turn_started_event(1, "turn-parent"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "reviewMissingChildTurnIds": ["turn-child-missing"]
+                    }),
+                ),
+                run_event(
+                    3,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "agentMessage",
+                        "text": "Wrapper fallback summary",
+                        "reviewMissingChildTurnIds": ["turn-child-missing"]
+                    }),
+                ),
+                turn_completed_event(4, "turn-parent"),
+            ],
+            seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 38, "feedstalewrapperfallback")
         .thread("thread-review-stale-wrapper-fallback")
         .turn("turn-parent")
@@ -1799,62 +1821,6 @@ async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers(
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: Some(vec![
-                        turn_started_event(1, "turn-parent"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "reviewMissingChildTurnIds": ["turn-child-missing"]
-                            }),
-                        ),
-                        run_event(
-                            3,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "agentMessage",
-                                "text": "Wrapper fallback summary",
-                                "reviewMissingChildTurnIds": ["turn-child-missing"]
-                            }),
-                        ),
-                        turn_completed_event(4, "turn-parent"),
-                    ]),
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-parent"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "reviewMissingChildTurnIds": ["turn-child-missing"]
-                            }),
-                        ),
-                        run_event(
-                            3,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "agentMessage",
-                                "text": "Wrapper fallback summary",
-                                "reviewMissingChildTurnIds": ["turn-child-missing"]
-                            }),
-                        ),
-                        turn_completed_event(4, "turn-parent"),
-                    ],
-                    seen_turn_ids: Arc::new(Mutex::new(Vec::new())),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -1890,7 +1856,72 @@ async fn run_detail_stale_missing_review_sibling_with_wrapper_fallback_recovers(
 
 #[tokio::test]
 async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: Some(vec![
+                turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Investigating",
+                        "createdAt": "2026-03-11T21:32:37.160Z",
+                        "reviewChildTurnIds": [
+                            "turn-stale-child-one",
+                            "turn-stale-child-two"
+                        ]
+                    }),
+                ),
+                agent_message_event_at(
+                    3,
+                    "turn-parent",
+                    "fresh review transcript",
+                    "2026-03-11T21:32:37.162Z",
+                ),
+                turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
+            ]),
+            full_thread_events: vec![
+                turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
+                run_event(
+                    2,
+                    Some("turn-parent"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Investigating",
+                        "createdAt": "2026-03-11T21:32:37.160Z",
+                        "reviewChildTurnIds": [
+                            "turn-stale-child-one",
+                            "turn-stale-child-two"
+                        ]
+                    }),
+                ),
+                agent_message_event_at(
+                    3,
+                    "turn-parent",
+                    "fresh review transcript",
+                    "2026-03-11T21:32:37.162Z",
+                ),
+                turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
+                turn_started_event_at(5, "turn-later", "2026-03-11T21:40:00.000Z"),
+                agent_message_event_at(
+                    6,
+                    "turn-later",
+                    "later legitimate turn",
+                    "2026-03-11T21:40:01.000Z",
+                ),
+                turn_completed_event_at(7, "turn-later", "2026-03-11T21:40:02.000Z"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 31, "feedmultichild")
         .thread("thread-review-multi-child-missing-parent")
         .turn("turn-parent")
@@ -1925,73 +1956,6 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
         .run_history
         .mark_run_history_events_incomplete(run_id)
         .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: Some(vec![
-                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "review": "Investigating",
-                                "createdAt": "2026-03-11T21:32:37.160Z",
-                                "reviewChildTurnIds": [
-                                    "turn-stale-child-one",
-                                    "turn-stale-child-two"
-                                ]
-                            }),
-                        ),
-                        agent_message_event_at(
-                            3,
-                            "turn-parent",
-                            "fresh review transcript",
-                            "2026-03-11T21:32:37.162Z",
-                        ),
-                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
-                    ]),
-                    full_thread_events: vec![
-                        turn_started_event_at(1, "turn-parent", "2026-03-11T21:32:37.160Z"),
-                        run_event(
-                            2,
-                            Some("turn-parent"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "review": "Investigating",
-                                "createdAt": "2026-03-11T21:32:37.160Z",
-                                "reviewChildTurnIds": [
-                                    "turn-stale-child-one",
-                                    "turn-stale-child-two"
-                                ]
-                            }),
-                        ),
-                        agent_message_event_at(
-                            3,
-                            "turn-parent",
-                            "fresh review transcript",
-                            "2026-03-11T21:32:37.162Z",
-                        ),
-                        turn_completed_event_at(4, "turn-parent", "2026-03-11T21:32:37.164Z"),
-                        turn_started_event_at(5, "turn-later", "2026-03-11T21:40:00.000Z"),
-                        agent_message_event_at(
-                            6,
-                            "turn-later",
-                            "later legitimate turn",
-                            "2026-03-11T21:40:01.000Z",
-                        ),
-                        turn_completed_event_at(7, "turn-later", "2026-03-11T21:40:02.000Z"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let _initial_body = response.text().await?;
@@ -2026,7 +1990,17 @@ async fn run_detail_backfill_drops_multi_child_stale_turns_without_timestamps() 
 
 #[tokio::test]
 async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
+            events: Vec::new(),
+            calls: Arc::clone(&backfill_calls),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 19, "feed333")
         .thread("thread-active")
         .turn("turn-active")
@@ -2042,16 +2016,6 @@ async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
         ],
     )
     .await?;
-    let backfill_calls = Arc::new(AtomicUsize::new(0));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
-                events: Vec::new(),
-                calls: Arc::clone(&backfill_calls),
-            })),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -2063,7 +2027,26 @@ async fn run_detail_does_not_queue_backfill_for_active_runs() -> Result<()> {
 
 #[tokio::test]
 async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
+            events: vec![
+                turn_started_event(1, "turn-stale-backfill"),
+                reasoning_event(
+                    2,
+                    "turn-stale-backfill",
+                    "Recovered after restart",
+                    "Backfill retried successfully",
+                ),
+                turn_completed_event(3, "turn-stale-backfill"),
+            ],
+            calls: Arc::clone(&backfill_calls),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 20, "feed444")
         .thread("thread-stale-backfill")
         .turn("turn-stale-backfill")
@@ -2087,25 +2070,6 @@ async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result
         .run_history
         .update_run_history_transcript_backfill(run_id, TranscriptBackfillState::InProgress, None)
         .await?;
-    let backfill_calls = Arc::new(AtomicUsize::new(0));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
-                events: vec![
-                    turn_started_event(1, "turn-stale-backfill"),
-                    reasoning_event(
-                        2,
-                        "turn-stale-backfill",
-                        "Recovered after restart",
-                        "Backfill retried successfully",
-                    ),
-                    turn_completed_event(3, "turn-stale-backfill"),
-                ],
-                calls: Arc::clone(&backfill_calls),
-            })),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -2136,7 +2100,31 @@ async fn run_detail_retries_stale_in_progress_backfill_after_restart() -> Result
 
 #[tokio::test]
 async fn run_detail_retries_after_transient_missing_session_history() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let backfill_source = Arc::new(SequencedTranscriptBackfillSource {
+        responses: Arc::new(Mutex::new(vec![
+            None,
+            None,
+            Some(vec![
+                turn_started_event(1, "turn-transient"),
+                reasoning_event(
+                    2,
+                    "turn-transient",
+                    "Recovered after missing file",
+                    "Second attempt found session history",
+                ),
+                turn_completed_event(3, "turn-transient"),
+            ]),
+        ])),
+        calls: Arc::clone(&backfill_calls),
+    });
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(backfill_source)
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 21, "feed555")
         .thread("thread-transient")
         .turn("turn-transient")
@@ -2156,30 +2144,6 @@ async fn run_detail_retries_after_transient_missing_session_history() -> Result<
         ],
     )
     .await?;
-    let backfill_calls = Arc::new(AtomicUsize::new(0));
-    let backfill_source = Arc::new(SequencedTranscriptBackfillSource {
-        responses: Arc::new(Mutex::new(vec![
-            None,
-            None,
-            Some(vec![
-                turn_started_event(1, "turn-transient"),
-                reasoning_event(
-                    2,
-                    "turn-transient",
-                    "Recovered after missing file",
-                    "Second attempt found session history",
-                ),
-                turn_completed_event(3, "turn-transient"),
-            ]),
-        ])),
-        calls: Arc::clone(&backfill_calls),
-    });
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(backfill_source),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -2255,26 +2219,6 @@ async fn run_detail_retries_after_transient_missing_session_history() -> Result<
 
 #[tokio::test]
 async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let run_id = RunFixture::review("group/repo", 24, "feed888")
-        .thread("thread-partial-file")
-        .turn("turn-partial-file")
-        .auth_account("primary")
-        .result("commented")
-        .preview("Review group/repo !24")
-        .summary("Retry partial session-history file after cooldown")
-        .insert(&state)
-        .await?;
-    insert_run_history_events(
-        &state,
-        run_id,
-        vec![
-            turn_started_event(1, "turn-partial-file"),
-            empty_reasoning_event(2, "turn-partial-file"),
-            turn_completed_event(3, "turn-partial-file"),
-        ],
-    )
-    .await?;
     let backfill_calls = Arc::new(AtomicUsize::new(0));
     let backfill_source = Arc::new(SequencedTranscriptBackfillSource {
         responses: Arc::new(Mutex::new(vec![
@@ -2295,12 +2239,32 @@ async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
         ])),
         calls: Arc::clone(&backfill_calls),
     });
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(backfill_source),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(backfill_source)
+        .spawn()
+        .await?;
+    let address = srv.address;
 
+    let state = Arc::clone(&srv.state);
+    let run_id = RunFixture::review("group/repo", 24, "feed888")
+        .thread("thread-partial-file")
+        .turn("turn-partial-file")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !24")
+        .summary("Retry partial session-history file after cooldown")
+        .insert(&state)
+        .await?;
+    insert_run_history_events(
+        &state,
+        run_id,
+        vec![
+            turn_started_event(1, "turn-partial-file"),
+            empty_reasoning_event(2, "turn-partial-file"),
+            turn_completed_event(3, "turn-partial-file"),
+        ],
+    )
+    .await?;
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -2331,7 +2295,26 @@ async fn run_detail_retries_after_partial_session_history_file() -> Result<()> {
 
 #[tokio::test]
 async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
+            events: vec![
+                turn_started_event(1, "turn-new"),
+                reasoning_event(
+                    2,
+                    "turn-new",
+                    "Recovered current turn",
+                    "Older turn still missing",
+                ),
+                turn_completed_event(3, "turn-new"),
+            ],
+            calls: Arc::clone(&backfill_calls),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 22, "feed666")
         .thread("thread-partial")
         .turn("turn-new")
@@ -2354,25 +2337,6 @@ async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -
         ],
     )
     .await?;
-    let backfill_calls = Arc::new(AtomicUsize::new(0));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
-                events: vec![
-                    turn_started_event(1, "turn-new"),
-                    reasoning_event(
-                        2,
-                        "turn-new",
-                        "Recovered current turn",
-                        "Older turn still missing",
-                    ),
-                    turn_completed_event(3, "turn-new"),
-                ],
-                calls: Arc::clone(&backfill_calls),
-            })),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -2412,7 +2376,41 @@ async fn run_detail_marks_backfill_failed_when_other_turns_remain_incomplete() -
 
 #[tokio::test]
 async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: Some(vec![
+                turn_started_event(1, "turn-new"),
+                reasoning_event(
+                    2,
+                    "turn-new",
+                    "Recovered current turn",
+                    "Current turn detail",
+                ),
+                turn_completed_event(3, "turn-new"),
+            ]),
+            full_thread_events: vec![
+                turn_started_event(1, "turn-old"),
+                reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
+                turn_completed_event(3, "turn-old"),
+                turn_started_event(4, "turn-new"),
+                reasoning_event(
+                    5,
+                    "turn-new",
+                    "Recovered current turn",
+                    "Current turn detail",
+                ),
+                turn_completed_event(6, "turn-new"),
+                turn_started_event(7, "turn-later"),
+                agent_message_event(8, "turn-later", "Later turn should be ignored"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 23, "feed777")
         .thread("thread-full-fallback")
         .turn("turn-new")
@@ -2435,42 +2433,6 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing()
         ],
     )
     .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: Some(vec![
-                        turn_started_event(1, "turn-new"),
-                        reasoning_event(
-                            2,
-                            "turn-new",
-                            "Recovered current turn",
-                            "Current turn detail",
-                        ),
-                        turn_completed_event(3, "turn-new"),
-                    ]),
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-old"),
-                        reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
-                        turn_completed_event(3, "turn-old"),
-                        turn_started_event(4, "turn-new"),
-                        reasoning_event(
-                            5,
-                            "turn-new",
-                            "Recovered current turn",
-                            "Current turn detail",
-                        ),
-                        turn_completed_event(6, "turn-new"),
-                        turn_started_event(7, "turn-later"),
-                        agent_message_event(8, "turn-later", "Later turn should be ignored"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -2506,7 +2468,51 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_older_turn_missing()
 
 #[tokio::test]
 async fn run_detail_full_thread_fallback_ignores_unrelated_pending_review_markers() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: Some(vec![
+                turn_started_event(1, "turn-new"),
+                reasoning_event(
+                    2,
+                    "turn-new",
+                    "Recovered current turn",
+                    "Current turn detail",
+                ),
+                turn_completed_event(3, "turn-new"),
+            ]),
+            full_thread_events: vec![
+                turn_started_event(1, "turn-old"),
+                reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
+                turn_completed_event(3, "turn-old"),
+                turn_started_event(4, "turn-new"),
+                reasoning_event(
+                    5,
+                    "turn-new",
+                    "Recovered current turn",
+                    "Current turn detail",
+                ),
+                turn_completed_event(6, "turn-new"),
+                turn_started_event(7, "turn-unrelated-pending"),
+                run_event(
+                    8,
+                    Some("turn-unrelated-pending"),
+                    "item_completed",
+                    json!({
+                        "type": "enteredReviewMode",
+                        "review": "Waiting on unrelated child",
+                        "reviewMissingChildTurnIds": ["turn-unrelated-child"]
+                    }),
+                ),
+                turn_completed_event(9, "turn-unrelated-pending"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 123, "feedignore")
         .thread("thread-ignore-unrelated-pending")
         .turn("turn-new")
@@ -2529,52 +2535,6 @@ async fn run_detail_full_thread_fallback_ignores_unrelated_pending_review_marker
         ],
     )
     .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: Some(vec![
-                        turn_started_event(1, "turn-new"),
-                        reasoning_event(
-                            2,
-                            "turn-new",
-                            "Recovered current turn",
-                            "Current turn detail",
-                        ),
-                        turn_completed_event(3, "turn-new"),
-                    ]),
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-old"),
-                        reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
-                        turn_completed_event(3, "turn-old"),
-                        turn_started_event(4, "turn-new"),
-                        reasoning_event(
-                            5,
-                            "turn-new",
-                            "Recovered current turn",
-                            "Current turn detail",
-                        ),
-                        turn_completed_event(6, "turn-new"),
-                        turn_started_event(7, "turn-unrelated-pending"),
-                        run_event(
-                            8,
-                            Some("turn-unrelated-pending"),
-                            "item_completed",
-                            json!({
-                                "type": "enteredReviewMode",
-                                "review": "Waiting on unrelated child",
-                                "reviewMissingChildTurnIds": ["turn-unrelated-child"]
-                            }),
-                        ),
-                        turn_completed_event(9, "turn-unrelated-pending"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -2610,7 +2570,38 @@ async fn run_detail_full_thread_fallback_ignores_unrelated_pending_review_marker
 #[tokio::test]
 async fn run_detail_uses_full_thread_fallback_when_turn_scoped_backfill_is_incomplete() -> Result<()>
 {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: Some(vec![
+                turn_started_event(1, "turn-new"),
+                reasoning_event(
+                    2,
+                    "turn-new",
+                    "Partial current turn",
+                    "Missing turn completion",
+                ),
+            ]),
+            full_thread_events: vec![
+                turn_started_event(1, "turn-old"),
+                reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
+                turn_completed_event(3, "turn-old"),
+                turn_started_event(4, "turn-new"),
+                reasoning_event(
+                    5,
+                    "turn-new",
+                    "Recovered current turn",
+                    "Current turn detail",
+                ),
+                turn_completed_event(6, "turn-new"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 124, "feedfullthread")
         .thread("thread-turn-incomplete-full-ready")
         .turn("turn-new")
@@ -2633,39 +2624,6 @@ async fn run_detail_uses_full_thread_fallback_when_turn_scoped_backfill_is_incom
         ],
     )
     .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: Some(vec![
-                        turn_started_event(1, "turn-new"),
-                        reasoning_event(
-                            2,
-                            "turn-new",
-                            "Partial current turn",
-                            "Missing turn completion",
-                        ),
-                    ]),
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-old"),
-                        reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
-                        turn_completed_event(3, "turn-old"),
-                        turn_started_event(4, "turn-new"),
-                        reasoning_event(
-                            5,
-                            "turn-new",
-                            "Recovered current turn",
-                            "Current turn detail",
-                        ),
-                        turn_completed_event(6, "turn-new"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -2700,7 +2658,30 @@ async fn run_detail_uses_full_thread_fallback_when_turn_scoped_backfill_is_incom
 
 #[tokio::test]
 async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missing() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(TurnScopedFallbackTranscriptBackfillSource {
+            turn_events: None,
+            full_thread_events: vec![
+                turn_started_event(1, "turn-old"),
+                reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
+                turn_completed_event(3, "turn-old"),
+                turn_started_event(4, "turn-new"),
+                reasoning_event(
+                    5,
+                    "turn-new",
+                    "Recovered current turn",
+                    "Current turn detail",
+                ),
+                turn_completed_event(6, "turn-new"),
+            ],
+            seen_turn_ids: Arc::clone(&seen_turn_ids),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 26, "feedabc")
         .thread("thread-missing-turn")
         .turn("turn-new")
@@ -2723,31 +2704,6 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missi
         ],
     )
     .await?;
-    let seen_turn_ids = Arc::new(Mutex::new(Vec::new()));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(
-                TurnScopedFallbackTranscriptBackfillSource {
-                    turn_events: None,
-                    full_thread_events: vec![
-                        turn_started_event(1, "turn-old"),
-                        reasoning_event(2, "turn-old", "Recovered older turn", "Older turn detail"),
-                        turn_completed_event(3, "turn-old"),
-                        turn_started_event(4, "turn-new"),
-                        reasoning_event(
-                            5,
-                            "turn-new",
-                            "Recovered current turn",
-                            "Current turn detail",
-                        ),
-                        turn_completed_event(6, "turn-new"),
-                    ],
-                    seen_turn_ids: Arc::clone(&seen_turn_ids),
-                },
-            )),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
@@ -2786,7 +2742,25 @@ async fn run_detail_backfill_falls_back_to_full_thread_when_turn_lookup_is_missi
 
 #[tokio::test]
 async fn run_detail_backfill_uses_base_thread_id_when_review_thread_differs() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let seen_thread_id = Arc::new(Mutex::new(None));
+    let seen_turn_id = Arc::new(Mutex::new(None));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(CapturingTranscriptBackfillSource {
+            events: vec![
+                turn_started_event(1, "turn-review"),
+                reasoning_event(2, "turn-review", "Recovered", "Base thread history used"),
+                turn_completed_event(3, "turn-review"),
+            ],
+            calls: Arc::clone(&backfill_calls),
+            seen_thread_id: Arc::clone(&seen_thread_id),
+            seen_turn_id: Arc::clone(&seen_turn_id),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 25, "feed999")
         .thread("thread-base")
         .turn("turn-review")
@@ -2807,24 +2781,6 @@ async fn run_detail_backfill_uses_base_thread_id_when_review_thread_differs() ->
         ],
     )
     .await?;
-    let backfill_calls = Arc::new(AtomicUsize::new(0));
-    let seen_thread_id = Arc::new(Mutex::new(None));
-    let seen_turn_id = Arc::new(Mutex::new(None));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(CapturingTranscriptBackfillSource {
-                events: vec![
-                    turn_started_event(1, "turn-review"),
-                    reasoning_event(2, "turn-review", "Recovered", "Base thread history used"),
-                    turn_completed_event(3, "turn-review"),
-                ],
-                calls: Arc::clone(&backfill_calls),
-                seen_thread_id: Arc::clone(&seen_thread_id),
-                seen_turn_id: Arc::clone(&seen_turn_id),
-            })),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
@@ -2856,7 +2812,17 @@ async fn run_detail_backfill_uses_base_thread_id_when_review_thread_differs() ->
 
 #[tokio::test]
 async fn run_detail_retries_when_session_history_directory_appears_later() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let srv = HttpTestServerBuilder::new()
+        .with_transcript_backfill_source(Arc::new(ErroringTranscriptBackfillSource {
+            error: TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR,
+            calls: Arc::clone(&backfill_calls),
+        }))
+        .spawn()
+        .await?;
+    let address = srv.address;
+
+    let state = Arc::clone(&srv.state);
     let run_id = RunFixture::review("group/repo", 23, "feed777")
         .thread("thread-unavailable")
         .turn("turn-unavailable")
@@ -2875,16 +2841,6 @@ async fn run_detail_retries_when_session_history_directory_appears_later() -> Re
         ],
     )
     .await?;
-    let backfill_calls = Arc::new(AtomicUsize::new(0));
-    let status_service = Arc::new(
-        HttpServices::new(test_config(), Arc::clone(&state), false, None)
-            .with_transcript_backfill_source(Arc::new(ErroringTranscriptBackfillSource {
-                error: TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR,
-                calls: Arc::clone(&backfill_calls),
-            })),
-    );
-    let address = spawn_test_server(app_router(status_service)).await?;
-
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;

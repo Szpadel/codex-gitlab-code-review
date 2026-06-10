@@ -1,7 +1,8 @@
 use super::*;
 #[tokio::test]
 async fn api_status_returns_scan_and_in_progress_state() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     state
         .review_state
         .begin_review("group/repo", 7, "abcdef")
@@ -23,13 +24,7 @@ async fn api_status_returns_scan_and_in_progress_state() -> Result<()> {
         })
         .await?;
 
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = test_get(format!("http://{address}/api/status")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -43,7 +38,8 @@ async fn api_status_returns_scan_and_in_progress_state() -> Result<()> {
 
 #[tokio::test]
 async fn status_page_renders_sections_and_escapes_dynamic_content() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     state
         .review_state
         .begin_review("group/<repo>", 42, "abcdef")
@@ -65,13 +61,7 @@ async fn status_page_renders_sections_and_escapes_dynamic_content() -> Result<()
         })
         .await?;
 
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = test_get(format!("http://{address}/status")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -96,14 +86,13 @@ async fn status_page_renders_sections_and_escapes_dynamic_content() -> Result<()
 async fn development_page_renders_when_dev_tools_are_enabled() -> Result<()> {
     let mut config = test_config();
     config.database.path = "/tmp/codex-gitlab-code-review-dev-test.sqlite".to_string();
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(HttpServices::new(config.clone(), state, false, None));
-    let dev_tools = Arc::new(DevToolsService::new(&config.database.path));
-    let address = spawn_test_server(app_router_with_dev_tools(
-        Arc::clone(&status_service),
-        Some(dev_tools),
-    ))
-    .await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .with_runtime_mode("development")
+        .with_dev_tools()
+        .spawn()
+        .await?;
+    let address = srv.address;
 
     let response = test_get(format!("http://{address}/development")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -120,9 +109,8 @@ async fn development_page_renders_when_dev_tools_are_enabled() -> Result<()> {
 
 #[tokio::test]
 async fn development_page_is_not_mounted_without_dev_tools() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(HttpServices::new(test_config(), state, false, None));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let address = srv.address;
 
     let status_response = reqwest::get(format!("http://{address}/status")).await?;
     assert_eq!(status_response.status(), StatusCode::OK);
@@ -138,15 +126,13 @@ async fn development_page_is_not_mounted_without_dev_tools() -> Result<()> {
 async fn development_repo_actions_require_csrf_and_update_snapshot() -> Result<()> {
     let mut config = test_config();
     config.database.path = "/tmp/codex-gitlab-code-review-dev-test.sqlite".to_string();
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(HttpServices::new(config.clone(), state, false, None));
-    let csrf_token = status_service.admin.admin_csrf_token().to_string();
-    let dev_tools = Arc::new(DevToolsService::new(&config.database.path));
-    let address = spawn_test_server(app_router_with_dev_tools(
-        Arc::clone(&status_service),
-        Some(dev_tools),
-    ))
-    .await?;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .with_dev_tools()
+        .spawn()
+        .await?;
+    let csrf_token = srv.services.admin.admin_csrf_token().to_string();
+    let address = srv.address;
     let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;

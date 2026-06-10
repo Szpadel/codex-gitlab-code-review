@@ -1,7 +1,8 @@
 use super::*;
 #[tokio::test]
 async fn rate_limits_page_renders_create_form_and_empty_state() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     state
         .review_rate_limit
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
@@ -21,8 +22,7 @@ async fn rate_limits_page_renders_create_form_and_empty_state() -> Result<()> {
         })
         .await?;
 
-    let status_service = Arc::new(HttpServices::new(test_config(), state, false, None));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = test_get(format!("http://{address}/rate-limits")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -47,15 +47,10 @@ async fn rate_limits_page_renders_create_form_and_empty_state() -> Result<()> {
 
 #[tokio::test]
 async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let csrf_token = status_service.admin.admin_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
+    let csrf_token = srv.services.admin.admin_csrf_token().to_string();
+    let address = srv.address;
     let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -140,7 +135,8 @@ async fn create_rate_limit_rule_endpoint_requires_csrf_and_persists_rule() -> Re
 
 #[tokio::test]
 async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let rule_id = state
         .review_rate_limit
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
@@ -160,14 +156,8 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
         })
         .await?;
 
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let csrf_token = status_service.admin.admin_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let csrf_token = srv.services.admin.admin_csrf_token().to_string();
+    let address = srv.address;
     let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -226,7 +216,8 @@ async fn update_rate_limit_rule_endpoint_requires_csrf_and_applies_form_changes(
 
 #[tokio::test]
 async fn delete_rate_limit_rule_endpoint_requires_csrf_and_removes_rule() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let rule_id = state
         .review_rate_limit
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
@@ -246,14 +237,8 @@ async fn delete_rate_limit_rule_endpoint_requires_csrf_and_removes_rule() -> Res
         })
         .await?;
 
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let csrf_token = status_service.admin.admin_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let csrf_token = srv.services.admin.admin_csrf_token().to_string();
+    let address = srv.address;
     let client = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -291,7 +276,8 @@ async fn delete_rate_limit_rule_endpoint_requires_csrf_and_removes_rule() -> Res
 
 #[tokio::test]
 async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let rule_id = state
         .review_rate_limit
         .create_review_rate_limit_rule(&ReviewRateLimitRuleUpsert {
@@ -328,14 +314,8 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
     assert_eq!(before[0].available_slots, 0.0);
     let bucket_id = before[0].bucket_id.clone();
 
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let csrf_token = status_service.admin.admin_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let csrf_token = srv.services.admin.admin_csrf_token().to_string();
+    let address = srv.address;
     let response = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?
@@ -364,15 +344,10 @@ async fn regen_rate_limit_bucket_slot_endpoint_refunds_slot() -> Result<()> {
 
 #[tokio::test]
 async fn create_rate_limit_rule_endpoint_allows_global_rules_without_targets() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let csrf_token = status_service.admin.admin_csrf_token().to_string();
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
+    let csrf_token = srv.services.admin.admin_csrf_token().to_string();
+    let address = srv.address;
 
     let response = test_client_builder()
         .redirect(reqwest::redirect::Policy::none())

@@ -1,7 +1,8 @@
 use super::*;
 #[tokio::test]
 async fn history_snapshot_filters_runs_and_returns_summary_rows() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let matching_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -47,13 +48,8 @@ async fn history_snapshot_filters_runs_and_returns_summary_rows() -> Result<()> 
     )
     .await?;
 
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let snapshot = status_service
+    let snapshot = srv
+        .services
         .status
         .history_snapshot(
             HistoryQueryParams {
@@ -92,7 +88,8 @@ async fn history_snapshot_filters_runs_and_returns_summary_rows() -> Result<()> 
 
 #[tokio::test]
 async fn history_page_renders_field_based_filters_layout() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -124,13 +121,7 @@ async fn history_page_renders_field_based_filters_layout() -> Result<()> {
         .bind(run_id)
         .execute(state.pool())
         .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!(
         "http://{address}/history?repo=group%2Frepo&iid=7&kind=review&q=findings"
@@ -152,7 +143,8 @@ async fn history_page_renders_field_based_filters_layout() -> Result<()> {
 
 #[tokio::test]
 async fn history_pages_and_api_surface_error_run_details() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -175,13 +167,7 @@ async fn history_pages_and_api_surface_error_run_details() -> Result<()> {
         },
     )
     .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let history = reqwest::get(format!("http://{address}/history?result=error")).await?;
     assert_eq!(history.status(), StatusCode::OK);
@@ -215,7 +201,8 @@ async fn history_pages_and_api_surface_error_run_details() -> Result<()> {
 
 #[tokio::test]
 async fn history_snapshot_searches_review_comment_body() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -239,9 +226,8 @@ async fn history_snapshot_searches_review_comment_body() -> Result<()> {
         },
     )
     .await?;
-    let status_service = HttpServices::new(test_config(), Arc::clone(&state), false, None);
-
-    let snapshot = status_service
+    let snapshot = srv
+        .services
         .status
         .history_snapshot(
             HistoryQueryParams {
@@ -343,7 +329,8 @@ fn history_query_rejects_simultaneous_after_and_before() {
 
 #[tokio::test]
 async fn history_api_returns_cursor_metadata() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let mut run_ids = Vec::new();
     for (iid, started_at) in [(41u64, 1_000i64), (42, 2_000), (43, 3_000)] {
         let run_id = insert_run_history(
@@ -376,13 +363,7 @@ async fn history_api_returns_cursor_metadata() -> Result<()> {
             .await?;
         run_ids.push(run_id);
     }
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!(
         "http://{address}/api/history?repo=group%2Frepo&limit=1"
@@ -447,7 +428,8 @@ async fn history_api_returns_cursor_metadata() -> Result<()> {
 
 #[tokio::test]
 async fn history_page_renders_pagination_links_with_active_filters() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     for (iid, started_at) in [(51u64, 1_000i64), (52, 2_000)] {
         let run_id = insert_run_history(
             &state,
@@ -478,13 +460,7 @@ async fn history_page_renders_pagination_links_with_active_filters() -> Result<(
             .execute(state.pool())
             .await?;
     }
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!(
         "http://{address}/history?repo=group%2Frepo&kind=review&q=findings&limit=1"

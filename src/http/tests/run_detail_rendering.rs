@@ -1,7 +1,8 @@
 use super::*;
 #[tokio::test]
 async fn run_detail_page_renders_trigger_note_and_thread_preview() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -189,13 +190,7 @@ async fn run_detail_page_renders_trigger_note_and_thread_preview() -> Result<()>
         ],
     )
     .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -259,7 +254,8 @@ async fn run_detail_page_renders_trigger_note_and_thread_preview() -> Result<()>
 
 #[tokio::test]
 async fn run_detail_uses_review_thread_id_in_metadata_when_events_exist() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -323,13 +319,7 @@ async fn run_detail_uses_review_thread_id_in_metadata_when_events_exist() -> Res
         ],
     )
     .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -342,7 +332,8 @@ async fn run_detail_uses_review_thread_id_in_metadata_when_events_exist() -> Res
 
 #[tokio::test]
 async fn run_detail_renders_dynamic_tool_results_and_failed_command_status() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -416,13 +407,7 @@ async fn run_detail_renders_dynamic_tool_results_and_failed_command_status() -> 
         ],
     )
     .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -438,7 +423,8 @@ async fn run_detail_renders_dynamic_tool_results_and_failed_command_status() -> 
 
 #[tokio::test]
 async fn run_detail_formats_numeric_millisecond_timestamps_as_utc() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -497,13 +483,7 @@ async fn run_detail_formats_numeric_millisecond_timestamps_as_utc() -> Result<()
         ],
     )
     .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -516,7 +496,8 @@ async fn run_detail_formats_numeric_millisecond_timestamps_as_utc() -> Result<()
 
 #[tokio::test]
 async fn run_detail_page_falls_back_when_event_history_is_missing() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -546,13 +527,7 @@ async fn run_detail_page_falls_back_when_event_history_is_missing() -> Result<()
         },
     )
     .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -564,7 +539,8 @@ async fn run_detail_page_falls_back_when_event_history_is_missing() -> Result<()
 
 #[tokio::test]
 async fn run_detail_page_renders_failure_details_without_event_history() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -587,13 +563,7 @@ async fn run_detail_page_renders_failure_details_without_event_history() -> Resu
         },
     )
     .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -606,7 +576,8 @@ async fn run_detail_page_renders_failure_details_without_event_history() -> Resu
 
 #[tokio::test]
 async fn run_detail_page_renders_failed_turn_error_from_transcript_events() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -655,13 +626,7 @@ async fn run_detail_page_renders_failed_turn_error_from_transcript_events() -> R
         ],
     )
     .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -673,7 +638,8 @@ async fn run_detail_page_renders_failed_turn_error_from_transcript_events() -> R
 
 #[tokio::test]
 async fn run_detail_renders_non_diff_file_change_payload_as_plain_body() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -737,13 +703,7 @@ async fn run_detail_renders_non_diff_file_change_payload_as_plain_body() -> Resu
         ],
     )
     .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
@@ -757,7 +717,8 @@ async fn run_detail_renders_non_diff_file_change_payload_as_plain_body() -> Resu
 
 #[tokio::test]
 async fn run_detail_renders_mixed_file_change_payloads_with_diff_sections() -> Result<()> {
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
     let run_id = insert_run_history(
         &state,
         NewRunHistory {
@@ -825,13 +786,7 @@ async fn run_detail_renders_mixed_file_change_payloads_with_diff_sections() -> R
         ],
     )
     .await?;
-    let status_service = Arc::new(HttpServices::new(
-        test_config(),
-        Arc::clone(&state),
-        false,
-        None,
-    ));
-    let address = spawn_test_server(app_router(status_service)).await?;
+    let address = srv.address;
 
     let response = reqwest::get(format!("http://{address}/history/{run_id}")).await?;
     assert_eq!(response.status(), StatusCode::OK);
