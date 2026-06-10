@@ -13,7 +13,7 @@ use super::{
 const MISSING_ERROR_DETAILS: &str =
     "Run finished with result error, but no failure details were recorded.";
 /// Column list consumed by `map_run_history_row`; keep the two in sync.
-const RUN_HISTORY_COLUMNS: &str = "id, kind, review_lane, repo, iid, head_sha, status, result, \
+const RUN_HISTORY_COLUMNS: &str = "id, kind, repo, iid, head_sha, status, result, \
     started_at, finished_at, updated_at, thread_id, turn_id, review_thread_id, \
     security_context_source_run_id, security_context_base_branch, security_context_base_head_sha, \
     security_context_prompt_version, security_context_payload_json, security_context_generated_at, \
