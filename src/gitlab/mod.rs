@@ -20,7 +20,7 @@ pub use types::{
 };
 
 #[cfg(test)]
-pub(crate) use client::normalize_api_base;
+pub(crate) use client::{GitLabRetryPolicy, normalize_api_base};
 pub(crate) use transport::gitlab_error_has_status;
 
 #[cfg(test)]

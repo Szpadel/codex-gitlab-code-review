@@ -7,6 +7,8 @@ use crate::composer_install::{
     composer_install_result_from_exec_output, prepare_composer_auth, resolve_composer_auth,
 };
 use crate::gitlab::GitLabClient;
+#[cfg(test)]
+use crate::gitlab::GitLabRetryPolicy;
 
 impl DockerCodexRunner {
     pub(crate) async fn run_composer_install_step(
@@ -91,8 +93,18 @@ impl DockerCodexRunner {
     }
 
     async fn resolve_composer_auth_lookup(&self, project_path: &str) -> ComposerAuthLookup {
-        match GitLabClient::new(self.git_base.as_str(), &self.gitlab_token) {
-            Ok(gitlab) => resolve_composer_auth(&gitlab, project_path).await,
+        #[cfg(test)]
+        // Runner tests cover Composer auth lookup behavior separately and must not call live GitLab.
+        let git_base = "http://127.0.0.1:9";
+        #[cfg(not(test))]
+        let git_base = self.git_base.as_str();
+
+        match GitLabClient::new(git_base, &self.gitlab_token) {
+            Ok(gitlab) => {
+                #[cfg(test)]
+                let gitlab = gitlab.with_retry_policy(GitLabRetryPolicy::without_delay(1));
+                resolve_composer_auth(&gitlab, project_path).await
+            }
             Err(err) => {
                 warn!(
                     project_path,
