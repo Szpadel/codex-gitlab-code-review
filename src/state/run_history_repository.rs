@@ -12,6 +12,14 @@ use super::{
 
 const MISSING_ERROR_DETAILS: &str =
     "Run finished with result error, but no failure details were recorded.";
+/// Column list consumed by `map_run_history_row`; keep the two in sync.
+const RUN_HISTORY_COLUMNS: &str = "id, kind, review_lane, repo, iid, head_sha, status, result, \
+    started_at, finished_at, updated_at, thread_id, turn_id, review_thread_id, \
+    security_context_source_run_id, security_context_base_branch, security_context_base_head_sha, \
+    security_context_prompt_version, security_context_payload_json, security_context_generated_at, \
+    security_context_expires_at, preview, summary, error, auth_account_name, discussion_id, \
+    trigger_note_id, trigger_note_author_name, trigger_note_body, command_repo, commit_sha, \
+    feature_flags_json, events_persisted_cleanly, transcript_backfill_state, transcript_backfill_error";
 
 #[derive(Clone)]
 pub struct RunHistoryRepository {
@@ -560,27 +568,20 @@ impl RunHistoryRepository {
         repo: &str,
         iid: u64,
     ) -> Result<Vec<RunHistoryRecord>> {
-        let rows = sqlx::query(
+        let sql = format!(
             r"
-            SELECT id, kind, review_lane, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
-                   thread_id, turn_id, review_thread_id, security_context_source_run_id,
-                   security_context_base_branch, security_context_base_head_sha,
-                   security_context_prompt_version, security_context_payload_json,
-                   security_context_generated_at, security_context_expires_at,
-                   preview, summary, error, auth_account_name,
-                   discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
-                   command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
-                   transcript_backfill_state, transcript_backfill_error
+            SELECT {RUN_HISTORY_COLUMNS}
             FROM run_history
             WHERE repo = ? AND iid = ?
             ORDER BY started_at DESC, id DESC
-            ",
-        )
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .fetch_all(&self.pool)
-        .await
-        .context("list run history for MR")?;
+            "
+        );
+        let rows = sqlx::query(&sql)
+            .bind(repo)
+            .bind(sqlite_i64_from_u64(iid, "iid")?)
+            .fetch_all(&self.pool)
+            .await
+            .context("list run history for MR")?;
         rows.into_iter()
             .map(|row| map_run_history_row(&row))
             .collect()
@@ -590,25 +591,18 @@ impl RunHistoryRepository {
     ///
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_run_history(&self, run_id: i64) -> Result<Option<RunHistoryRecord>> {
-        let row = sqlx::query(
+        let sql = format!(
             r"
-            SELECT id, kind, review_lane, repo, iid, head_sha, status, result, started_at, finished_at, updated_at,
-                   thread_id, turn_id, review_thread_id, security_context_source_run_id,
-                   security_context_base_branch, security_context_base_head_sha,
-                   security_context_prompt_version, security_context_payload_json,
-                   security_context_generated_at, security_context_expires_at,
-                   preview, summary, error, auth_account_name,
-                   discussion_id, trigger_note_id, trigger_note_author_name, trigger_note_body,
-                   command_repo, commit_sha, feature_flags_json, events_persisted_cleanly,
-                   transcript_backfill_state, transcript_backfill_error
+            SELECT {RUN_HISTORY_COLUMNS}
             FROM run_history
             WHERE id = ?
-            ",
-        )
-        .bind(run_id)
-        .fetch_optional(&self.pool)
-        .await
-        .context("get run history")?;
+            "
+        );
+        let row = sqlx::query(&sql)
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("get run history")?;
         row.map(|row| map_run_history_row(&row)).transpose()
     }
 
