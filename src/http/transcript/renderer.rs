@@ -3,17 +3,6 @@ use crate::http::markdown::render_safe_markdown;
 use crate::http::timestamp;
 use serde::Deserialize;
 
-trait CollectHtml: Iterator<Item = String> + Sized {
-    fn collect_html(self) -> String {
-        self.fold(String::new(), |mut html, part| {
-            html.push_str(&part);
-            html
-        })
-    }
-}
-
-impl<I> CollectHtml for I where I: Iterator<Item = String> {}
-
 pub(crate) fn render_thread_stream(thread: &ThreadSnapshot, gitlab_base_url: &str) -> String {
     let multiple_turns = thread.turns.len() > 1;
     let items = thread
@@ -32,7 +21,7 @@ pub(crate) fn render_thread_stream(thread: &ThreadSnapshot, gitlab_base_url: &st
             );
             rendered
         })
-        .collect_html();
+        .collect::<String>();
 
     if items.is_empty() {
         "<div class=\"thread-empty\"><p class=\"empty\">No persisted items.</p></div>".to_string()
@@ -498,7 +487,7 @@ fn render_meta_pills(meta: &[(String, String)]) -> String {
                 escape_html(&display_meta_value(label, value))
             )
         })
-        .collect_html();
+        .collect::<String>();
 
     format!("<span class=\"meta-pills\">{pills}</span>")
 }
@@ -581,7 +570,7 @@ fn render_colored_diff(body: &str) -> String {
             };
             format!("<div class=\"{}\">{}</div>", class_name, escape_html(line))
         })
-        .collect_html();
+        .collect::<String>();
     format!("<div class=\"diff-view\">{lines}</div>")
 }
 
@@ -642,7 +631,7 @@ fn render_mixed_file_change_body(body: &str) -> String {
                 content
             )
         })
-        .collect_html()
+        .collect::<String>()
 }
 
 fn split_reasoning_content(body: Option<&str>) -> (Option<String>, Option<String>) {
