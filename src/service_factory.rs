@@ -47,6 +47,22 @@ struct RuntimeServices {
     dev_tools: Option<Arc<DevToolsService>>,
 }
 
+impl RuntimeServices {
+    fn into_bundle(self, config: ValidatedConfig, run_once: bool) -> ServiceBundle {
+        ServiceBundle {
+            config,
+            run_once,
+            state: self.state,
+            runner: self.runner,
+            gitlab_client: self.gitlab_client,
+            service: self.service,
+            http_services: self.http_services,
+            gitlab_discovery_mcp: self.gitlab_discovery_mcp,
+            dev_tools: self.dev_tools,
+        }
+    }
+}
+
 pub struct ServiceBundle {
     pub config: ValidatedConfig,
     pub run_once: bool,
@@ -178,17 +194,7 @@ async fn build_service_bundle_with_probe(
     };
     let config = validate_config(runtime_config)?;
 
-    Ok(ServiceBundle {
-        config,
-        run_once: options.run_once,
-        state: runtime.state,
-        runner: runtime.runner,
-        gitlab_client: runtime.gitlab_client,
-        service: runtime.service,
-        http_services: runtime.http_services,
-        gitlab_discovery_mcp: runtime.gitlab_discovery_mcp,
-        dev_tools: runtime.dev_tools,
-    })
+    Ok(runtime.into_bundle(config, options.run_once))
 }
 
 pub(crate) async fn build_review_state_store(config: &Config) -> Result<Arc<ReviewStateStore>> {
