@@ -8,6 +8,7 @@ use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
+use crate::review::lane_policies::{GeneralLanePolicy, SecurityLanePolicy};
 use crate::review::scan_coordinator::{DefaultScanCoordinator, ScanCoordinator};
 use crate::review::target_resolver::{DefaultTargetResolver, TargetResolver};
 use crate::state::{ReviewRateLimitPendingEntry, ReviewStateStore};
@@ -118,11 +119,13 @@ impl ReviewService {
             flow_shared.clone(),
             Arc::clone(&retry_backoff),
             ReviewLane::General,
+            Arc::new(GeneralLanePolicy),
         ));
         let security_review_flow = Arc::new(ReviewFlow::new(
             flow_shared,
             retry_backoff,
             ReviewLane::Security,
+            Arc::new(SecurityLanePolicy),
         ));
         let scan_coordinator = Box::new(DefaultScanCoordinator::new(
             Arc::clone(&state),
@@ -278,10 +281,9 @@ impl ReviewService {
     }
 
     fn review_flow_for_lane(&self, lane: ReviewLane) -> &ReviewFlow {
-        if lane.is_security() {
-            self.security_review_flow.as_ref()
-        } else {
-            self.general_review_flow.as_ref()
+        match lane {
+            ReviewLane::General => self.general_review_flow.as_ref(),
+            ReviewLane::Security => self.security_review_flow.as_ref(),
         }
     }
 
@@ -422,7 +424,7 @@ impl ReviewService {
         repo: &str,
         iid: u64,
     ) {
-        if lane.is_security() || self.config.review.dry_run {
+        if !self.review_flow_for_lane(lane).uses_awards() || self.config.review.dry_run {
             return;
         }
         if let Err(err) = self

@@ -14,6 +14,7 @@ use crate::gitlab::{
 };
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
+use crate::review::lane_policies::{GeneralLanePolicy, SecurityLanePolicy};
 use crate::state::{ReviewRateLimitScope, ReviewStateStore};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};

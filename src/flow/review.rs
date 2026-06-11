@@ -7,9 +7,9 @@ use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
+use crate::review::lane_policies::ReviewLanePolicy;
 use crate::state::{
     NewRunHistory, ReviewRateLimitAcquireOutcome, ReviewStateStore, RunHistoryFinish,
-    RunHistoryKind,
 };
 use anyhow::{Error, Result};
 use async_trait::async_trait;
@@ -19,8 +19,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-
-const INLINE_REVIEW_MARKER_PREFIX: &str = "<!-- codex-review-finding:sha=";
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct RetryKey {
@@ -168,6 +166,7 @@ pub(crate) struct ReviewFlow {
     shared: FlowShared,
     retry_backoff: Arc<RetryBackoff>,
     lane: ReviewLane,
+    policy: Arc<dyn ReviewLanePolicy>,
 }
 
 impl ReviewFlow {
@@ -175,36 +174,30 @@ impl ReviewFlow {
         shared: FlowShared,
         retry_backoff: Arc<RetryBackoff>,
         lane: ReviewLane,
+        policy: Arc<dyn ReviewLanePolicy>,
     ) -> Self {
         Self {
             shared,
             retry_backoff,
             lane,
+            policy,
         }
     }
 
     fn review_marker_prefix(&self) -> &str {
-        if self.lane.is_security() {
-            &self.shared.config.review.security.comment_marker_prefix
-        } else {
-            &self.shared.config.review.comment_marker_prefix
-        }
+        self.policy.comment_marker_prefix(&self.shared.config)
     }
 
     fn finding_marker_prefix(&self) -> &str {
-        if self.lane.is_security() {
-            &self.shared.config.review.security.finding_marker_prefix
-        } else {
-            INLINE_REVIEW_MARKER_PREFIX
-        }
+        self.policy.finding_marker_prefix(&self.shared.config)
     }
 
-    fn uses_awards(&self) -> bool {
-        !self.lane.is_security()
+    pub(crate) fn uses_awards(&self) -> bool {
+        self.policy.uses_awards()
     }
 
     fn is_enabled(&self, feature_flags: &FeatureFlagSnapshot) -> bool {
-        !self.lane.is_security() || feature_flags.security_review
+        self.policy.is_enabled(feature_flags)
     }
 
     pub(crate) async fn clear_stale_in_progress(&self) -> Result<()> {
@@ -382,7 +375,7 @@ impl ReviewFlow {
             .review_result_for_lane(repo, iid, head_sha, self.lane)
             .await?;
         let parsed_review_result = review_result.as_deref().and_then(ReviewRunResult::parse);
-        if self.lane.is_security()
+        if self.policy.skips_completed_review_result()
             && parsed_review_result.is_some_and(ReviewRunResult::is_completed_review)
         {
             return Ok(Some(ReviewScheduleOutcome::SkippedCompleted));
@@ -599,11 +592,7 @@ impl ReviewFlow {
 
     fn new_review_run_history(&self, repo: &str, iid: u64, head_sha: &str) -> NewRunHistory {
         NewRunHistory {
-            kind: if self.lane.is_security() {
-                RunHistoryKind::Security
-            } else {
-                RunHistoryKind::Review
-            },
+            kind: self.policy.run_history_kind(),
             repo: repo.to_string(),
             iid,
             head_sha: head_sha.to_string(),
@@ -689,6 +678,7 @@ impl ReviewFlow {
             config: self.shared.config.clone(),
             gitlab: Arc::clone(&self.shared.gitlab),
             award_service: self.shared.award_service.clone(),
+            policy: Arc::clone(&self.policy),
             codex: Arc::clone(&self.shared.codex),
             state: Arc::clone(&self.shared.state),
             retry_backoff: Arc::clone(&self.retry_backoff),
@@ -1059,11 +1049,7 @@ impl ReviewFlow {
 #[async_trait]
 impl MergeRequestFlow for ReviewFlow {
     fn flow_name(&self) -> &'static str {
-        if self.lane.is_security() {
-            "security_review"
-        } else {
-            "review"
-        }
+        self.policy.flow_name()
     }
 
     async fn clear_stale_in_progress(&self) -> Result<()> {
@@ -1080,6 +1066,7 @@ pub(crate) struct ReviewRunContext {
     pub(crate) config: Config,
     pub(crate) gitlab: Arc<dyn GitLabApi>,
     pub(crate) award_service: AwardService,
+    pub(crate) policy: Arc<dyn ReviewLanePolicy>,
     pub(crate) codex: Arc<dyn crate::codex_runner::CodexRunner>,
     pub(crate) state: Arc<ReviewStateStore>,
     pub(crate) retry_backoff: Arc<RetryBackoff>,
@@ -1098,7 +1085,7 @@ struct ReviewRunIdentity<'a> {
 
 impl ReviewRunContext {
     fn uses_awards(&self) -> bool {
-        !self.lane.is_security()
+        self.policy.uses_awards()
     }
 
     fn review_preview(&self, repo: &str, iid: u64) -> String {
@@ -1355,23 +1342,11 @@ impl ReviewRunContext {
             mr: mr.clone(),
             head_sha: head_sha.to_string(),
             feature_flags,
-            additional_developer_instructions: if self.lane.is_security() {
-                self.config
-                    .review
-                    .security
-                    .additional_developer_instructions
-                    .clone()
-            } else {
-                None
-            },
-            min_confidence_score: self
-                .lane
-                .is_security()
-                .then_some(self.config.review.security.min_confidence_score),
-            security_context_ttl_seconds: self
-                .lane
-                .is_security()
-                .then_some(self.config.review.security.context_ttl_seconds),
+            additional_developer_instructions: self
+                .policy
+                .additional_developer_instructions(&self.config),
+            min_confidence_score: self.policy.min_confidence_score(&self.config),
+            security_context_ttl_seconds: self.policy.context_ttl_seconds(&self.config),
             run_history_id: Some(run_history_id),
         }
     }
@@ -1384,10 +1359,10 @@ impl ReviewRunContext {
         feature_flags: FeatureFlagSnapshot,
         run_history_id: i64,
     ) -> ReviewContext {
-        let project_path = if self.lane.is_security() {
-            repo.to_string()
-        } else {
+        let project_path = if self.policy.resolves_review_project_path() {
             self.resolve_review_project_path(repo, mr).await
+        } else {
+            repo.to_string()
         };
         self.build_codex_review_context(
             repo,
