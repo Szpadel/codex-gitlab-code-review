@@ -700,6 +700,13 @@ impl DockerCodexRunner {
         }
         .await;
 
+        let build_result = match build_result {
+            Ok(payload) => Ok(payload),
+            Err(err) => Err(self
+                .enrich_app_server_io_error_if_needed(err, &session.container_id)
+                .await),
+        };
+
         self.close_runner_session(session).await;
         {
             let mut slot = request

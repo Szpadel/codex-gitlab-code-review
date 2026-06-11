@@ -1,6 +1,9 @@
 use super::app_server::{
-    TurnHistoryCapture, TurnNotificationContext, item_is_successful_gitlab_discovery_call,
-    with_recent_runner_errors,
+    AppServerIoFailure, TurnHistoryCapture, TurnNotificationContext, is_app_server_io_failure,
+    item_is_successful_gitlab_discovery_call, with_recent_runner_errors,
+};
+use super::app_server_diagnostics::{
+    AppServerContainerDiagnostics, AppServerContainerStateSnapshot, AppServerLogTail,
 };
 use super::auth::{
     CodexQuotaExhausted, QUOTA_LAST_PROBE_AT_KEY, auth_account_state_key,
@@ -40,10 +43,10 @@ use anyhow::Context;
 use chrono::TimeZone;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::process::{Command, Output};
+use std::net::{TcpListener, TcpStream};
+use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn empty_app_server_client() -> AppServerClient {
     AppServerClient {
@@ -61,6 +64,122 @@ fn empty_app_server_client() -> AppServerClient {
 
 fn run_bash_script(script: &str) -> Result<Output> {
     Ok(Command::new("bash").arg("-lc").arg(script).output()?)
+}
+
+fn run_bash_script_with_timeout(script: &str, timeout: Duration) -> Result<Option<Output>> {
+    let mut child = Command::new("bash")
+        .arg("-lc")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(Some(child.wait_with_output()?));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = Vec::new();
+    let mut buf = [0_u8; 256];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                request.extend_from_slice(&buf[..n]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(request)
+}
+
+fn spawn_browser_wait_server_with_open_plain_response(
+    listener: TcpListener,
+    plain_response: &'static [u8],
+    devtools_response: &'static [u8],
+) -> thread::JoinHandle<Result<Vec<Vec<u8>>>> {
+    thread::spawn(move || -> Result<Vec<Vec<u8>>> {
+        listener.set_nonblocking(true)?;
+        let mut requests = Vec::new();
+        let mut held_streams = Vec::new();
+        let mut idle_deadline = Instant::now() + Duration::from_secs(6);
+        while requests.len() < 2 && Instant::now() < idle_deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request = read_http_request(&mut stream)?;
+                    if requests.is_empty() {
+                        stream.write_all(plain_response)?;
+                        held_streams.push(stream);
+                    } else {
+                        stream.write_all(devtools_response)?;
+                    }
+                    requests.push(request);
+                    idle_deadline = Instant::now() + Duration::from_secs(6);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        drop(held_streams);
+        Ok(requests)
+    })
+}
+
+fn spawn_browser_wait_server(
+    listener: TcpListener,
+    responses: Vec<&'static [u8]>,
+    max_requests: usize,
+) -> thread::JoinHandle<Result<Vec<Vec<u8>>>> {
+    thread::spawn(move || -> Result<Vec<Vec<u8>>> {
+        listener.set_nonblocking(true)?;
+        let mut requests = Vec::new();
+        let mut idle_deadline = Instant::now() + Duration::from_secs(5);
+        while requests.len() < max_requests && Instant::now() < idle_deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let request = read_http_request(&mut stream)?;
+                    let response = responses
+                        .get(requests.len())
+                        .copied()
+                        .or_else(|| responses.last().copied())
+                        .unwrap_or(
+                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+                        );
+                    stream.write_all(response)?;
+                    requests.push(request);
+                    idle_deadline = Instant::now() + Duration::from_secs(2);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(requests)
+    })
 }
 
 fn test_browser_mcp_config(command: &str) -> BrowserMcpConfig {

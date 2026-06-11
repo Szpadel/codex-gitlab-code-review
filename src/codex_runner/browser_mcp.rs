@@ -12,6 +12,8 @@ use crate::text::truncate_with_marker;
 #[cfg(test)]
 use anyhow::bail;
 
+const HEADLESS_SHELL_WRAPPER_INTERNAL_DEVTOOLS_PORT: u16 = 9223;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BrowserLaunchConfig {
     pub(crate) image: String,
@@ -281,6 +283,15 @@ impl DockerCodexRunner {
                 );
                 return Ok(());
             }
+            if browser_logs_report_headless_shell_wrapper_ready(&diagnostics.log_tail, launch) {
+                info!(
+                    container_id = browser_container_id,
+                    expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+                    internal_port = HEADLESS_SHELL_WRAPPER_INTERNAL_DEVTOOLS_PORT,
+                    "browser container reported wrapper-managed DevTools process readiness"
+                );
+                return Ok(());
+            }
             if diagnostics.state.as_ref().and_then(|state| state.running) == Some(true) {
                 let running_since_ref = running_since.get_or_insert_with(Instant::now);
                 if running_since_ref.elapsed() >= BROWSER_CONTAINER_RUNNING_GRACE_PERIOD {
@@ -288,7 +299,7 @@ impl DockerCodexRunner {
                         container_id = browser_container_id,
                         expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
                         grace_period_secs = BROWSER_CONTAINER_RUNNING_GRACE_PERIOD.as_secs(),
-                        "browser container stayed running without a DevTools log marker; continuing"
+                        "browser container stayed running without a recognized DevTools log marker; deferring endpoint probe to app-server container"
                     );
                     return Ok(());
                 }
@@ -467,6 +478,14 @@ pub(crate) fn browser_logs_report_ready(log_tail: &BrowserLogTail, expected_port
         .chain(log_tail.stderr.iter())
         .filter_map(|line| extract_devtools_port(line))
         .any(|port| port == expected_port)
+}
+
+pub(crate) fn browser_logs_report_headless_shell_wrapper_ready(
+    log_tail: &BrowserLogTail,
+    launch: &BrowserLaunchConfig,
+) -> bool {
+    uses_headless_shell_wrapper(&launch.image, &launch.entrypoint)
+        && browser_logs_report_ready(log_tail, HEADLESS_SHELL_WRAPPER_INTERNAL_DEVTOOLS_PORT)
 }
 
 pub(crate) fn extract_devtools_port(line: &str) -> Option<u16> {

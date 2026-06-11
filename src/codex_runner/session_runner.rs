@@ -1,3 +1,4 @@
+use super::app_server::is_app_server_io_failure;
 use super::{
     AppServerClient, AuthAccount, BrowserMcpConfig, DockerCodexRunner, Duration, Instant,
     PreparedGitLabDiscoveryMcp, RegisteredGitLabDiscoverySession, Result, StartedAppServer, Value,
@@ -73,6 +74,7 @@ pub(crate) struct SessionInitializeRequest<'a> {
 }
 
 pub(crate) struct RunSessionConfig {
+    pub(crate) app_server_container_id: String,
     pub(crate) browser_container_id: Option<String>,
     pub(crate) browser_mcp: Option<BrowserMcpConfig>,
     pub(crate) timeout_duration: Duration,
@@ -305,13 +307,19 @@ impl DockerCodexRunner {
     where
         Fut: Future<Output = Result<T>>,
     {
+        let app_server_container_id = config.app_server_container_id.as_str();
         let browser_container_id = config.browser_container_id.as_deref();
         let browser_mcp = config.browser_mcp.as_ref();
         match timeout(config.timeout_duration, future).await {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(err)) => Err(self
-                .enrich_error_with_browser_diagnostics(err, browser_container_id, browser_mcp)
-                .await),
+            Ok(Err(err)) => {
+                let err = self
+                    .enrich_app_server_io_error_if_needed(err, app_server_container_id)
+                    .await;
+                Err(self
+                    .enrich_error_with_browser_diagnostics(err, browser_container_id, browser_mcp)
+                    .await)
+            }
             Err(_) => Err(self
                 .enrich_error_with_browser_diagnostics(
                     anyhow!(config.timeout_error),
@@ -319,6 +327,19 @@ impl DockerCodexRunner {
                     browser_mcp,
                 )
                 .await),
+        }
+    }
+
+    pub(crate) async fn enrich_app_server_io_error_if_needed(
+        &self,
+        err: anyhow::Error,
+        app_server_container_id: &str,
+    ) -> anyhow::Error {
+        if is_app_server_io_failure(&err) {
+            self.enrich_error_with_app_server_diagnostics(err, app_server_container_id)
+                .await
+        } else {
+            err
         }
     }
 

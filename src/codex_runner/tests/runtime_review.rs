@@ -516,3 +516,230 @@ async fn wait_for_browser_container_ready_with_fake_runtime_reports_exit() {
     assert!(text.contains("browser container exited before reporting readiness on port 9222"));
     assert!(text.contains("browser failed to boot"));
 }
+
+#[tokio::test]
+async fn wait_for_browser_container_ready_accepts_headless_shell_wrapper_internal_devtools_port() {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    let launch = BrowserLaunchConfig::from_browser_mcp(&BrowserMcpConfig::default());
+    harness.set_browser_diagnostics(
+        "browser-1",
+        vec![BrowserContainerDiagnostics {
+            container_id: "browser-1".to_string(),
+            launch: launch.clone(),
+            state: Some(BrowserContainerStateSnapshot {
+                status: Some("running".to_string()),
+                running: Some(true),
+                exit_code: Some(0),
+                oom_killed: Some(false),
+                error: None,
+                started_at: Some("2026-03-18T10:00:00Z".to_string()),
+                finished_at: None,
+            }),
+            state_collection_error: None,
+            log_tail: BrowserLogTail {
+                stdout: Vec::new(),
+                stderr: vec![
+                    "DevTools listening on ws://127.0.0.1:9223/devtools/browser/fake".to_string(),
+                ],
+            },
+            log_collection_error: None,
+        }],
+    );
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runner.wait_for_browser_container_ready("browser-1", &launch),
+    )
+    .await
+    .expect("wrapper internal DevTools port should be accepted without grace-period delay")
+    .expect("browser readiness should pass");
+}
+
+#[tokio::test]
+async fn run_review_with_fake_runtime_enriches_app_server_stdout_close_with_diagnostics() {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "thread-1" } })),
+        ScriptedAppRequest::result(
+            "review/start",
+            json!({
+                "turn": { "id": "turn-1" },
+                "reviewThreadId": "thread-1",
+            }),
+        )
+        .with_after_response(vec![ScriptedAppChunk::Json(json!({
+            "method": "turn/started",
+            "params": { "threadId": "thread-1", "turnId": "turn-1" }
+        }))])
+        .close_output_after(),
+    ]));
+    harness.set_app_server_diagnostics(
+        "app-1",
+        vec![AppServerContainerDiagnostics {
+            container_id: "app-1".to_string(),
+            state: Some(AppServerContainerStateSnapshot {
+                status: Some("exited".to_string()),
+                running: Some(false),
+                exit_code: Some(1),
+                oom_killed: Some(false),
+                error: Some("process exited".to_string()),
+                started_at: Some("2026-06-11T10:19:06Z".to_string()),
+                finished_at: Some("2026-06-11T10:19:33Z".to_string()),
+            }),
+            state_collection_error: None,
+            log_tail: AppServerLogTail {
+                stdout_line_count: 1,
+                stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
+            },
+            log_collection_error: None,
+        }],
+    );
+    harness.set_browser_diagnostics(
+        "browser-1",
+        vec![BrowserContainerDiagnostics {
+            container_id: "browser-1".to_string(),
+            launch: BrowserLaunchConfig::from_browser_mcp(&BrowserMcpConfig::default()),
+            state: Some(BrowserContainerStateSnapshot {
+                status: Some("running".to_string()),
+                running: Some(true),
+                exit_code: Some(0),
+                oom_killed: Some(false),
+                error: None,
+                started_at: Some("2026-06-11T10:19:06Z".to_string()),
+                finished_at: None,
+            }),
+            state_collection_error: None,
+            log_tail: BrowserLogTail {
+                stdout: Vec::new(),
+                stderr: vec![
+                    "DevTools listening on ws://127.0.0.1:9223/devtools/browser/fake".to_string(),
+                ],
+            },
+            log_collection_error: None,
+        }],
+    );
+
+    let mut codex = test_codex_config();
+    codex.browser_mcp.enabled = true;
+    let runner = test_runner_with_fake_runtime(codex, false, Arc::clone(&harness), None).await;
+
+    let err = runner
+        .run_review(review_context_with_target_branch(Some("main")))
+        .await
+        .expect_err("review should fail when app-server closes stdout");
+
+    let text = format!("{err:#}");
+    assert!(text.contains("codex app-server closed stdout"));
+    assert!(text.contains("app-server container diagnostics"));
+    assert!(text.contains("status=exited"));
+    assert!(text.contains("exit_code=1"));
+    assert!(text.contains("stdout tail: <redacted; 1 line(s)>"));
+    assert!(!text.contains("codex app-server stdout before exit"));
+    assert!(text.contains("MCP server chrome-devtools failed to start"));
+    assert!(text.contains("browser container diagnostics"));
+    assert!(text.contains("DevTools listening on ws://127.0.0.1:9223"));
+}
+
+#[tokio::test]
+async fn run_review_with_fake_runtime_enriches_app_server_initialize_write_failure_with_diagnostics()
+ {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::close_input_before_requests());
+    harness.set_app_server_diagnostics(
+        "app-1",
+        vec![AppServerContainerDiagnostics {
+            container_id: "app-1".to_string(),
+            state: Some(AppServerContainerStateSnapshot {
+                status: Some("exited".to_string()),
+                running: Some(false),
+                exit_code: Some(1),
+                oom_killed: Some(false),
+                error: Some("process exited".to_string()),
+                started_at: Some("2026-06-11T10:19:06Z".to_string()),
+                finished_at: Some("2026-06-11T10:19:07Z".to_string()),
+            }),
+            state_collection_error: None,
+            log_tail: AppServerLogTail {
+                stdout_line_count: 1,
+                stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
+            },
+            log_collection_error: None,
+        }],
+    );
+
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
+
+    let err = runner
+        .run_review(review_context_with_target_branch(Some("main")))
+        .await
+        .expect_err("review should fail when app-server stdin closes during initialize");
+
+    let text = format!("{err:#}");
+    assert!(text.contains("write codex app-server input"), "{text}");
+    assert!(text.contains("app-server container diagnostics"), "{text}");
+    assert!(text.contains("status=exited"), "{text}");
+    assert!(text.contains("exit_code=1"), "{text}");
+    assert!(
+        text.contains("stdout tail: <redacted; 1 line(s)>"),
+        "{text}"
+    );
+    assert!(!text.contains("codex app-server stdout before write failed"));
+    assert!(
+        text.contains("MCP server chrome-devtools failed to start"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn read_thread_with_fake_runtime_enriches_app_server_initialize_write_failure_with_diagnostics()
+ {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::close_input_before_requests());
+    harness.set_app_server_diagnostics(
+        "app-1",
+        vec![AppServerContainerDiagnostics {
+            container_id: "app-1".to_string(),
+            state: Some(AppServerContainerStateSnapshot {
+                status: Some("exited".to_string()),
+                running: Some(false),
+                exit_code: Some(1),
+                oom_killed: Some(false),
+                error: Some("process exited".to_string()),
+                started_at: Some("2026-06-11T10:19:06Z".to_string()),
+                finished_at: Some("2026-06-11T10:19:07Z".to_string()),
+            }),
+            state_collection_error: None,
+            log_tail: AppServerLogTail {
+                stdout_line_count: 1,
+                stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
+            },
+            log_collection_error: None,
+        }],
+    );
+
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
+
+    let err = runner
+        .read_thread("primary", "thread-1")
+        .await
+        .expect_err("thread read should fail when app-server stdin closes during initialize");
+
+    let text = format!("{err:#}");
+    assert!(text.contains("write codex app-server input"), "{text}");
+    assert!(text.contains("app-server container diagnostics"), "{text}");
+    assert!(text.contains("status=exited"), "{text}");
+    assert!(text.contains("exit_code=1"), "{text}");
+    assert!(
+        text.contains("stdout tail: <redacted; 1 line(s)>"),
+        "{text}"
+    );
+    assert!(
+        text.contains("MCP server chrome-devtools failed to start"),
+        "{text}"
+    );
+}

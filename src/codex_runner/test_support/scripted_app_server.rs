@@ -16,16 +16,21 @@ pub(super) fn build_scripted_app_client(
 ) -> AppServerClient {
     let (client_input, server_input) = duplex(16 * 1024);
     let (server_output, client_output) = duplex(16 * 1024);
-    tokio::spawn(async move {
-        serve_scripted_app_server(
-            scripted,
-            protocol_requests,
-            operation_log,
-            server_input,
-            server_output,
-        )
-        .await;
-    });
+    if scripted.close_input_before_requests {
+        drop(server_input);
+        drop(server_output);
+    } else {
+        tokio::spawn(async move {
+            serve_scripted_app_server(
+                scripted,
+                protocol_requests,
+                operation_log,
+                server_input,
+                server_output,
+            )
+            .await;
+        });
+    }
     let output = ReaderStream::new(client_output).map(|chunk| match chunk {
         Ok(bytes) => Ok(LogOutput::StdOut { message: bytes }),
         Err(err) => Err(BollardError::IOError { err }),

@@ -41,6 +41,7 @@ use url::Url;
 use uuid::Uuid;
 
 mod app_server;
+mod app_server_diagnostics;
 mod auth;
 mod browser_mcp;
 mod composer;
@@ -619,14 +620,18 @@ impl DockerCodexRunner {
         })
         .await;
 
+        let result = match result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(err)) => Err(self
+                .enrich_app_server_io_error_if_needed(err, &container_id)
+                .await),
+            Err(_) => Err(anyhow!("codex thread/read timed out")),
+        };
+
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
             .await;
 
-        match result {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(err)) => Err(err),
-            Err(_) => Err(anyhow!("codex thread/read timed out")),
-        }
+        result
     }
 }
 

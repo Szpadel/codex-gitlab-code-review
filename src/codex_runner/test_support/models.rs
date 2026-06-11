@@ -86,12 +86,21 @@ impl ScriptedAppRequest {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ScriptedAppServer {
     pub(super) requests: VecDeque<ScriptedAppRequest>,
+    pub(super) close_input_before_requests: bool,
 }
 
 impl ScriptedAppServer {
     pub(crate) fn from_requests(requests: Vec<ScriptedAppRequest>) -> Self {
         Self {
             requests: requests.into(),
+            close_input_before_requests: false,
+        }
+    }
+
+    pub(crate) fn close_input_before_requests() -> Self {
+        Self {
+            requests: VecDeque::new(),
+            close_input_before_requests: true,
         }
     }
 }

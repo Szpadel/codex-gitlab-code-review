@@ -4,6 +4,9 @@ use super::models::{
 };
 use super::scripted_app_server::build_scripted_app_client;
 use super::*;
+use crate::codex_runner::app_server_diagnostics::{
+    AppServerContainerDiagnostics, AppServerContainerStateSnapshot, AppServerLogTail,
+};
 use crate::codex_runner::browser_mcp::{
     BrowserContainerDiagnostics, BrowserContainerStateSnapshot, BrowserLaunchConfig, BrowserLogTail,
 };
@@ -35,6 +38,10 @@ pub(crate) trait RunnerHarness: Send + Sync {
         browser_container_id: &str,
         launch: &BrowserLaunchConfig,
     ) -> BrowserContainerDiagnostics;
+    async fn collect_app_server_container_diagnostics(
+        &self,
+        app_server_container_id: &str,
+    ) -> AppServerContainerDiagnostics;
     async fn collect_container_peer_ips(&self, container_id: &str) -> Result<BTreeSet<String>>;
 }
 
@@ -58,6 +65,7 @@ struct FakeRunnerHarnessState {
     expected_execs: VecDeque<ExpectedExec>,
     managed_containers: Vec<ManagedContainerSummary>,
     browser_diagnostics: HashMap<String, VecDeque<BrowserContainerDiagnostics>>,
+    app_server_diagnostics: HashMap<String, VecDeque<AppServerContainerDiagnostics>>,
     peer_ips: HashMap<String, BTreeSet<String>>,
 }
 
@@ -109,6 +117,18 @@ impl FakeRunnerHarness {
             .lock()
             .unwrap()
             .browser_diagnostics
+            .insert(container_id.to_string(), diagnostics.into());
+    }
+
+    pub(crate) fn set_app_server_diagnostics(
+        &self,
+        container_id: &str,
+        diagnostics: Vec<AppServerContainerDiagnostics>,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .app_server_diagnostics
             .insert(container_id.to_string(), diagnostics.into());
     }
 
@@ -287,6 +307,39 @@ impl RunnerHarness for FakeRunnerHarness {
                     BROWSER_MCP_REMOTE_DEBUGGING_PORT
                 )],
             },
+            log_collection_error: None,
+        }
+    }
+
+    async fn collect_app_server_container_diagnostics(
+        &self,
+        app_server_container_id: &str,
+    ) -> AppServerContainerDiagnostics {
+        let mut state = self.state.lock().unwrap();
+        if let Some(queue) = state
+            .app_server_diagnostics
+            .get_mut(app_server_container_id)
+            && let Some(diagnostics) = queue.pop_front()
+        {
+            if queue.is_empty() {
+                queue.push_back(diagnostics.clone());
+            }
+            return diagnostics;
+        }
+
+        AppServerContainerDiagnostics {
+            container_id: app_server_container_id.to_string(),
+            state: Some(AppServerContainerStateSnapshot {
+                status: Some("running".to_string()),
+                running: Some(true),
+                exit_code: Some(0),
+                oom_killed: Some(false),
+                error: None,
+                started_at: Some("2026-03-18T10:00:00Z".to_string()),
+                finished_at: None,
+            }),
+            state_collection_error: None,
+            log_tail: AppServerLogTail::default(),
             log_collection_error: None,
         }
     }

@@ -26,6 +26,17 @@ fn with_recent_runner_errors_is_noop_when_empty() {
 }
 
 #[test]
+fn app_server_io_failure_marker_survives_anyhow_context() {
+    let err = anyhow!(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "broken pipe"
+    ))
+    .context(AppServerIoFailure::WriteInput);
+
+    assert!(is_app_server_io_failure(&err));
+}
+
+#[test]
 fn validate_container_exec_result_accepts_zero_exit_code() -> Result<()> {
     let command = vec!["git".to_string(), "status".to_string()];
     let output = ContainerExecOutput {
@@ -539,6 +550,38 @@ fn browser_container_diagnostics_context_includes_collection_errors() {
     assert!(formatted.contains("state unavailable: inspect failed"));
     assert!(formatted.contains("log tail unavailable: log fetch failed"));
     assert!(formatted.contains("entrypoint=<image-default>"));
+}
+
+#[test]
+fn app_server_container_diagnostics_context_includes_state_and_logs() {
+    let diagnostics = AppServerContainerDiagnostics {
+        container_id: "app-123".to_string(),
+        state: Some(AppServerContainerStateSnapshot {
+            status: Some("exited".to_string()),
+            running: Some(false),
+            exit_code: Some(1),
+            oom_killed: Some(false),
+            error: Some("process exited".to_string()),
+            started_at: Some("2026-06-11T10:19:06Z".to_string()),
+            finished_at: Some("2026-06-11T10:19:33Z".to_string()),
+        }),
+        state_collection_error: None,
+        log_tail: AppServerLogTail {
+            stdout_line_count: 1,
+            stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
+        },
+        log_collection_error: None,
+    };
+
+    let formatted = diagnostics.format_context();
+
+    assert!(formatted.contains("app-server container diagnostics"));
+    assert!(formatted.contains("app-123"));
+    assert!(formatted.contains("status=exited"));
+    assert!(formatted.contains("exit_code=1"));
+    assert!(formatted.contains("stdout tail: <redacted; 1 line(s)>"));
+    assert!(!formatted.contains("codex stdout line"));
+    assert!(formatted.contains("MCP server chrome-devtools failed to start"));
 }
 
 #[test]
@@ -1125,46 +1168,14 @@ fn browser_mcp_prereq_script_is_empty_when_disabled() {
 }
 
 #[test]
-fn browser_wait_script_probes_endpoint_until_ready() -> Result<()> {
+fn browser_wait_script_accepts_devtools_endpoint() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
-    let server = thread::spawn(move || -> Result<Vec<u8>> {
-        let (mut stream, _) = listener.accept()?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-
-        let mut request = Vec::new();
-        let mut buf = [0_u8; 256];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    request.extend_from_slice(&buf[..n]);
-                    if request.ends_with(b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break;
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        if request == b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
-        {
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
-        }
-
-        Ok(request)
-    });
+    let response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 109\r\n\r\n{\"Browser\":\"HeadlessChrome/126.0.0.0\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:9222/devtools/browser/abc\"}";
+    let server = spawn_browser_wait_server(listener, vec![response, response], 2);
 
     let output = run_bash_script(&render_browser_wait_script_for_port(port))?;
-    let request = server.join().expect("server thread panicked")?;
+    let requests = server.join().expect("server thread panicked")?;
 
     assert!(
         output.status.success(),
@@ -1172,9 +1183,68 @@ fn browser_wait_script_probes_endpoint_until_ready() -> Result<()> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        request,
-        b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    assert_eq!(requests.len(), 1);
+    for request in requests {
+        assert_eq!(
+            request,
+            b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn browser_wait_script_rejects_plain_http_200_before_devtools_response() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let plain_response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+    let devtools_response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 109\r\n\r\n{\"Browser\":\"HeadlessChrome/126.0.0.0\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:9222/devtools/browser/abc\"}";
+    let server = spawn_browser_wait_server(
+        listener,
+        vec![plain_response, devtools_response, devtools_response],
+        3,
     );
+
+    let output = run_bash_script(&render_browser_wait_script_for_port(port))?;
+    let requests = server.join().expect("server thread panicked")?;
+
+    assert_eq!(
+        requests.len(),
+        2,
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success());
+    Ok(())
+}
+
+#[test]
+fn browser_wait_script_continues_after_open_plain_http_200() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let plain_response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+    let devtools_response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 109\r\n\r\n{\"Browser\":\"HeadlessChrome/126.0.0.0\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1:9222/devtools/browser/abc\"}";
+    let server = spawn_browser_wait_server_with_open_plain_response(
+        listener,
+        plain_response,
+        devtools_response,
+    );
+
+    let output = run_bash_script_with_timeout(
+        &render_browser_wait_script_for_port(port),
+        Duration::from_secs(8),
+    )?;
+    let requests = server.join().expect("server thread panicked")?;
+    let output = output.expect("browser wait script timed out");
+
+    assert_eq!(
+        requests.len(),
+        2,
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success());
     Ok(())
 }

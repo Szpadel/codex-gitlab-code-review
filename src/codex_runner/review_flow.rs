@@ -527,6 +527,7 @@ impl DockerCodexRunner {
 
         let run_started_at = Instant::now();
         let extra_security_context_session = ExtraSecurityContextSessionContainer::default();
+        let app_server_container_id = session.container_id.clone();
         let browser_container_id = session.browser_container_id.clone();
         let browser_mcp = prepared.browser_mcp.clone();
         let prepared_for_run = &prepared;
@@ -536,6 +537,7 @@ impl DockerCodexRunner {
             .run_initialized_session(
                 &mut session,
                 RunSessionConfig {
+                    app_server_container_id,
                     browser_container_id,
                     browser_mcp,
                     timeout_duration: run_timeout.saturating_sub(run_started_at.elapsed()),

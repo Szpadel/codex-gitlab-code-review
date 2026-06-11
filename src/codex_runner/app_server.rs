@@ -22,6 +22,20 @@ pub(crate) struct AppServerClient {
     pub(crate) log_all_json: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AppServerIoFailure {
+    #[error("write codex app-server input")]
+    WriteInput,
+    #[error("codex app-server closed stdout")]
+    ClosedStdout,
+    #[error("read codex app-server output")]
+    ReadOutput,
+}
+
+pub(crate) fn is_app_server_io_failure(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<AppServerIoFailure>().is_some()
+}
+
 #[derive(Default)]
 pub(crate) struct ReasoningBuffer {
     summary: String,
@@ -668,9 +682,24 @@ impl AppServerClient {
         if self.log_all_json {
             debug!(json = %line, "codex app-server message");
         }
-        self.input.write_all(line.as_bytes()).await?;
-        self.input.write_all(b"\n").await?;
-        self.input.flush().await?;
+        if let Err(err) = self.input.write_all(line.as_bytes()).await {
+            return Err(with_recent_runner_errors(
+                anyhow!(err).context(AppServerIoFailure::WriteInput),
+                &self.recent_runner_errors,
+            ));
+        }
+        if let Err(err) = self.input.write_all(b"\n").await {
+            return Err(with_recent_runner_errors(
+                anyhow!(err).context(AppServerIoFailure::WriteInput),
+                &self.recent_runner_errors,
+            ));
+        }
+        if let Err(err) = self.input.flush().await {
+            return Err(with_recent_runner_errors(
+                anyhow!(err).context(AppServerIoFailure::WriteInput),
+                &self.recent_runner_errors,
+            ));
+        }
         Ok(())
     }
 
@@ -728,13 +757,13 @@ impl AppServerClient {
                 },
                 Some(Err(err)) => {
                     return Err(with_recent_runner_errors(
-                        anyhow!(err).context("read codex app-server output"),
+                        anyhow!(err).context(AppServerIoFailure::ReadOutput),
                         &self.recent_runner_errors,
                     ));
                 }
                 None => {
                     return Err(with_recent_runner_errors(
-                        anyhow!("codex app-server closed stdout"),
+                        anyhow!(AppServerIoFailure::ClosedStdout),
                         &self.recent_runner_errors,
                     ));
                 }
