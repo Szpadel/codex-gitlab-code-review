@@ -469,7 +469,7 @@ async fn wait_for_shutdown_signal() -> Result<ServiceLifecycleSignal> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootstrap::{BootstrapOptions, bootstrap_runtime};
+    use crate::bootstrap::{BootstrapOptions, bootstrap_runtime_from_config};
     use crate::config::apply_dev_mode_profile;
     use crate::config::{Config, test_builder::ConfigBuilder, validate_config};
     use crate::service_factory::build_review_state_store;
@@ -531,7 +531,7 @@ mod tests {
     async fn run_once_path_can_be_tested_without_waiting_for_os_signals() -> Result<()> {
         let mut config = test_config();
         apply_dev_mode_profile(&mut config);
-        let runtime = bootstrap_runtime(
+        let runtime = bootstrap_runtime_from_config(
             validate_config(config)?,
             BootstrapOptions {
                 run_once: true,

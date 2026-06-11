@@ -2,7 +2,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::auth_cli::{AuthAction as RunnerAuthAction, AuthRunner};
-use crate::bootstrap::{BootstrapOptions, bootstrap_runtime, load_config};
+use crate::bootstrap::{BootstrapOptions, bootstrap_runtime};
+use crate::config::load_validated_config;
 use crate::dev_mode::demo_history::seed_example_history;
 use crate::scheduler;
 
@@ -67,22 +68,19 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.debug);
 
-    let config = load_config(cli.dev_mode)?;
     if let Some(command) = cli.command {
+        let config = load_validated_config(cli.dev_mode)?;
         return run_command(command, config.as_ref(), cli.debug).await;
     }
 
     let run_once = cli.once || env_flag("RUN_ONCE");
     let force_dry_run = cli.dry_run || env_flag("DRY_RUN");
-    let runtime = bootstrap_runtime(
-        config,
-        BootstrapOptions {
-            run_once,
-            force_dry_run,
-            log_all_json: cli.debug,
-            dev_mode: cli.dev_mode,
-        },
-    )
+    let runtime = bootstrap_runtime(BootstrapOptions {
+        run_once,
+        force_dry_run,
+        log_all_json: cli.debug,
+        dev_mode: cli.dev_mode,
+    })
     .await?;
 
     scheduler::run(runtime).await

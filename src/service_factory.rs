@@ -1,16 +1,11 @@
 use anyhow::Result;
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::codex_runner::docker::wait_for_docker_ready;
 use crate::codex_runner::{CodexRunner, DockerCodexRunner, RunnerRuntimeOptions};
-use crate::config::{
-    Config, DockerConfig, ValidatedConfig, load_validated_config, validate_config,
-};
+use crate::config::{Config, ValidatedConfig, validate_config};
 use crate::dev_mode::{DevToolsService, MockCodexRunner};
 use crate::gitlab::bot_user::resolve_and_update_bot_user_config;
 use crate::gitlab::{GitLabApi, GitLabClient};
@@ -18,9 +13,6 @@ use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use crate::http::HttpServices;
 use crate::review::ReviewService;
 use crate::state::ReviewStateStore;
-
-const STARTUP_DOCKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const STARTUP_DOCKER_READY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeMode {
@@ -74,51 +66,9 @@ pub struct ServiceBundle {
     pub dev_tools: Option<Arc<DevToolsService>>,
 }
 
-#[async_trait]
-trait DockerReadinessProbe: Send + Sync {
-    async fn wait_for_startup_docker(&self, docker_cfg: &DockerConfig) -> Result<()>;
-}
-
-struct RealDockerReadinessProbe;
-
-#[async_trait]
-impl DockerReadinessProbe for RealDockerReadinessProbe {
-    async fn wait_for_startup_docker(&self, docker_cfg: &DockerConfig) -> Result<()> {
-        info!(
-            docker_host = docker_cfg.host.as_str(),
-            timeout_secs = STARTUP_DOCKER_READY_TIMEOUT.as_secs(),
-            "waiting for docker daemon readiness"
-        );
-        wait_for_docker_ready(
-            docker_cfg,
-            STARTUP_DOCKER_READY_TIMEOUT,
-            STARTUP_DOCKER_READY_POLL_INTERVAL,
-        )
-        .await?;
-        info!(
-            docker_host = docker_cfg.host.as_str(),
-            "docker daemon is ready"
-        );
-        Ok(())
-    }
-}
-
-pub fn load_config(dev_mode: bool) -> Result<ValidatedConfig> {
-    load_validated_config(dev_mode)
-}
-
 pub async fn build_service_bundle(
     config: ValidatedConfig,
     options: ServiceFactoryOptions,
-) -> Result<ServiceBundle> {
-    let readiness_probe = RealDockerReadinessProbe;
-    build_service_bundle_with_probe(config, options, &readiness_probe).await
-}
-
-async fn build_service_bundle_with_probe(
-    config: ValidatedConfig,
-    options: ServiceFactoryOptions,
-    readiness_probe: &dyn DockerReadinessProbe,
 ) -> Result<ServiceBundle> {
     let mut runtime_config = config.into_inner();
     if options.force_dry_run {
@@ -160,7 +110,6 @@ async fn build_service_bundle_with_probe(
             options.run_once,
             created_after,
             options.log_all_json,
-            readiness_probe,
         )
         .await?
     };
@@ -220,11 +169,7 @@ async fn build_normal_runtime(
     run_once: bool,
     created_after: DateTime<Utc>,
     log_all_json: bool,
-    readiness_probe: &dyn DockerReadinessProbe,
 ) -> Result<RuntimeServices> {
-    readiness_probe
-        .wait_for_startup_docker(&config.docker)
-        .await?;
     let gitlab_client = Arc::new(GitLabClient::new(
         &config.gitlab.base_url,
         &config.gitlab.token,

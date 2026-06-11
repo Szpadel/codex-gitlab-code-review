@@ -1,14 +1,12 @@
 use anyhow::{Result, anyhow};
 use chrono::{Duration, Utc};
+use codex_gitlab_code_review::bootstrap::{BootstrapOptions, bootstrap_runtime_from_config};
 use codex_gitlab_code_review::config::{
     CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
     McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ReviewSecurityConfig,
     ScheduleConfig, ServerConfig, TargetSelector, validate_config,
 };
 use codex_gitlab_code_review::gitlab::GitLabApi;
-use codex_gitlab_code_review::service_factory::{
-    RuntimeMode, ServiceFactoryOptions, build_service_bundle,
-};
 use std::env;
 
 #[tokio::test]
@@ -88,13 +86,13 @@ async fn e2e_live_dry_run() -> Result<()> {
         },
     };
 
-    let runtime = build_service_bundle(
+    let runtime = bootstrap_runtime_from_config(
         validate_config(config)?,
-        ServiceFactoryOptions {
+        BootstrapOptions {
             run_once: true,
             force_dry_run: false,
             log_all_json: false,
-            runtime_mode: RuntimeMode::Normal,
+            dev_mode: false,
         },
     )
     .await?;

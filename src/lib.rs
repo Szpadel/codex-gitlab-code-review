@@ -1,5 +1,5 @@
 pub mod auth_cli;
-mod bootstrap;
+pub mod bootstrap;
 pub mod cli;
 pub mod codex_runner;
 pub mod composer_install;
