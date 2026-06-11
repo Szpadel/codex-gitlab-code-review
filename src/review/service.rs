@@ -10,6 +10,7 @@ use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
 use crate::review::lane_policies::{GeneralLanePolicy, SecurityLanePolicy};
 use crate::review::scan_coordinator::{DefaultScanCoordinator, ScanCoordinator};
+use crate::review::scan_pipeline::{run_pending_rate_limit_pipeline, run_scan_pipeline};
 use crate::review::target_resolver::{DefaultTargetResolver, TargetResolver};
 use crate::state::{ReviewRateLimitPendingEntry, ReviewStateStore};
 use anyhow::Result;
@@ -21,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
-const NO_OPEN_MRS_MARKER: &str = "__no_open_mrs__";
+pub(super) const NO_OPEN_MRS_MARKER: &str = "__no_open_mrs__";
 const MR_NOT_FOUND_ERROR: &str = "mr not found";
 const PENDING_RETRY_LOOKUP_BACKOFF_SECONDS: i64 = 60;
 
@@ -42,42 +43,11 @@ pub trait DynamicRepoSource: Send + Sync {
     async fn list_repos(&self) -> Result<Vec<String>>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RepoScanStatus {
-    Complete,
-    PendingSameMrWork,
-    Interrupted,
-}
-
-#[derive(Default)]
-struct ScanCounters {
-    total_mrs: usize,
-    scheduled: usize,
-    security_scheduled: usize,
-    mention_scheduled: usize,
-    skipped_award: usize,
-    skipped_marker: usize,
-    skipped_completed: usize,
-    skipped_locked: usize,
-    skipped_rate_limit: usize,
-    security_skipped_marker: usize,
-    security_skipped_completed: usize,
-    security_skipped_locked: usize,
-    security_skipped_backoff: usize,
-    security_skipped_rate_limit: usize,
-    mention_skipped_processed: usize,
-    skipped_backoff: usize,
-    missing_sha: usize,
-    skipped_inactive: usize,
-    skipped_draft: usize,
-    skipped_created_before: usize,
-}
-
 pub struct ReviewService {
     config: Config,
-    gitlab: Arc<dyn GitLabApi>,
+    pub(super) gitlab: Arc<dyn GitLabApi>,
     pub(super) state: Arc<ReviewStateStore>,
-    created_after: DateTime<Utc>,
+    pub(super) created_after: DateTime<Utc>,
     award_service: AwardService,
     pub(super) general_review_flow: Arc<ReviewFlow>,
     pub(super) security_review_flow: Arc<ReviewFlow>,
@@ -196,40 +166,7 @@ impl ReviewService {
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn process_due_pending_rate_limit_reviews(&self) -> Result<ScanRunStatus> {
-        if self.shutdown_requested() {
-            info!("pending retry skipped: shutdown requested");
-            return Ok(ScanRunStatus::Interrupted);
-        }
-        self.clear_stale_flow_state().await?;
-        let now = Utc::now().timestamp();
-        let due_pending_rows = self
-            .state
-            .review_rate_limit
-            .list_review_rate_limit_pending()
-            .await?
-            .into_iter()
-            .filter(|entry| entry.next_retry_at <= now)
-            .collect::<Vec<_>>();
-        if due_pending_rows.is_empty() {
-            debug!("no pending review rate-limit retries are due");
-            return Ok(ScanRunStatus::Completed);
-        }
-        for pending in due_pending_rows {
-            if self.shutdown_requested() {
-                info!(
-                    repo = pending.repo.as_str(),
-                    iid = pending.iid,
-                    lane = pending.lane.as_str(),
-                    "stopping pending retry processing: shutdown requested"
-                );
-                return Ok(ScanRunStatus::Interrupted);
-            }
-            let outcome = self.retry_pending_review_rate_limit_row(&pending).await?;
-            if matches!(outcome, ReviewScheduleOutcome::Interrupted) {
-                return Ok(ScanRunStatus::Interrupted);
-            }
-        }
-        Ok(ScanRunStatus::Completed)
+        run_pending_rate_limit_pipeline(self).await
     }
 
     pub fn request_shutdown(&self) {
@@ -255,29 +192,24 @@ impl ReviewService {
         self.scan_coordinator.recover_in_progress().await
     }
 
-    fn shutdown_requested(&self) -> bool {
+    pub(super) fn shutdown_requested(&self) -> bool {
         !self.lifecycle.accepts_new_work()
     }
 
-    async fn clear_stale_flow_state(&self) -> Result<()> {
+    pub(super) async fn clear_stale_flow_state(&self) -> Result<()> {
         self.scan_coordinator.clear_stale_flow_state().await
     }
 
-    async fn schedule_mention_commands_for_mr(
+    pub(super) async fn schedule_mention_commands_for_mr(
         &self,
         repo: &str,
         mr: &MergeRequest,
         head_sha: &str,
-        counters: &mut ScanCounters,
         tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<MentionScheduleOutcome> {
-        let outcome = self
-            .mention_flow
+        self.mention_flow
             .schedule_for_scan(repo, mr, head_sha, tasks)
-            .await?;
-        counters.mention_scheduled += outcome.scheduled;
-        counters.mention_skipped_processed += outcome.skipped_processed;
-        Ok(outcome)
+            .await
     }
 
     fn review_flow_for_lane(&self, lane: ReviewLane) -> &ReviewFlow {
@@ -287,7 +219,27 @@ impl ReviewService {
         }
     }
 
-    async fn retry_pending_review_rate_limit_row(
+    async fn defer_pending_review_rate_limit_retry(
+        &self,
+        pending: &ReviewRateLimitPendingEntry,
+        head_sha: &str,
+        retry_started_at: i64,
+        deferred_until: i64,
+    ) -> Result<()> {
+        self.state
+            .review_rate_limit
+            .upsert_review_rate_limit_pending(
+                pending.lane,
+                &pending.repo,
+                pending.iid,
+                head_sha,
+                retry_started_at,
+                deferred_until,
+            )
+            .await
+    }
+
+    pub(super) async fn retry_pending_review_rate_limit_row(
         &self,
         pending: &ReviewRateLimitPendingEntry,
     ) -> Result<ReviewScheduleOutcome> {
@@ -334,17 +286,13 @@ impl ReviewService {
                 let retry_started_at = Utc::now().timestamp();
                 let deferred_until =
                     retry_started_at.saturating_add(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
-                self.state
-                    .review_rate_limit
-                    .upsert_review_rate_limit_pending(
-                        pending.lane,
-                        &pending.repo,
-                        pending.iid,
-                        &pending.last_seen_head_sha,
-                        retry_started_at,
-                        deferred_until,
-                    )
-                    .await?;
+                self.defer_pending_review_rate_limit_retry(
+                    pending,
+                    &pending.last_seen_head_sha,
+                    retry_started_at,
+                    deferred_until,
+                )
+                .await?;
                 return Ok(ReviewScheduleOutcome::SkippedRateLimit);
             }
         };
@@ -385,17 +333,13 @@ impl ReviewService {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err((err, retry_started_at, deferred_until)) => {
-                self.state
-                    .review_rate_limit
-                    .upsert_review_rate_limit_pending(
-                        pending.lane,
-                        &pending.repo,
-                        pending.iid,
-                        &head_sha,
-                        retry_started_at,
-                        deferred_until,
-                    )
-                    .await?;
+                self.defer_pending_review_rate_limit_retry(
+                    pending,
+                    &head_sha,
+                    retry_started_at,
+                    deferred_until,
+                )
+                .await?;
                 return Err(err);
             }
         };
@@ -442,7 +386,7 @@ impl ReviewService {
         }
     }
 
-    async fn remove_rate_limit_awards_for_closed_pending_mrs(
+    pub(super) async fn remove_rate_limit_awards_for_closed_pending_mrs(
         &self,
         repo: &str,
         open_iids: &[u64],
@@ -474,267 +418,11 @@ impl ReviewService {
         Ok(())
     }
 
-    fn apply_review_outcome(
-        lane: ReviewLane,
-        repo: &str,
-        iid: u64,
-        outcome: ReviewScheduleOutcome,
-        counters: &mut ScanCounters,
-        pending_same_mr_work: &mut bool,
-    ) -> Option<RepoScanStatus> {
-        match (lane, outcome) {
-            (_, ReviewScheduleOutcome::Scheduled) => {
-                if lane.is_security() {
-                    counters.security_scheduled += 1;
-                } else {
-                    counters.scheduled += 1;
-                }
-            }
-            (_, ReviewScheduleOutcome::Disabled) => {}
-            (ReviewLane::General, ReviewScheduleOutcome::SkippedBackoff) => {
-                counters.skipped_backoff += 1;
-                debug!(repo = repo, iid = iid, "skip: review backoff active");
-            }
-            (ReviewLane::Security, ReviewScheduleOutcome::SkippedBackoff) => {
-                counters.security_skipped_backoff += 1;
-                debug!(
-                    repo = repo,
-                    iid = iid,
-                    "skip: security review backoff active"
-                );
-            }
-            (ReviewLane::General, ReviewScheduleOutcome::SkippedRateLimit) => {
-                counters.skipped_rate_limit += 1;
-                debug!(repo = repo, iid = iid, "skip: review rate limit active");
-            }
-            (ReviewLane::Security, ReviewScheduleOutcome::SkippedRateLimit) => {
-                counters.security_skipped_rate_limit += 1;
-                debug!(
-                    repo = repo,
-                    iid = iid,
-                    "skip: security review rate limit active"
-                );
-            }
-            (ReviewLane::General, ReviewScheduleOutcome::SkippedAward) => {
-                counters.skipped_award += 1;
-                debug!(repo = repo, iid = iid, "skip: thumbs up already present");
-            }
-            (ReviewLane::General, ReviewScheduleOutcome::SkippedMarker) => {
-                counters.skipped_marker += 1;
-                debug!(
-                    repo = repo,
-                    iid = iid,
-                    "skip: review marker already present"
-                );
-            }
-            (ReviewLane::Security, ReviewScheduleOutcome::SkippedMarker) => {
-                counters.security_skipped_marker += 1;
-                debug!(
-                    repo = repo,
-                    iid = iid,
-                    "skip: security review marker already present"
-                );
-            }
-            (ReviewLane::General, ReviewScheduleOutcome::SkippedCompleted) => {
-                counters.skipped_completed += 1;
-                debug!(
-                    repo = repo,
-                    iid = iid,
-                    "skip: review already completed for this SHA"
-                );
-            }
-            (ReviewLane::Security, ReviewScheduleOutcome::SkippedCompleted) => {
-                counters.security_skipped_completed += 1;
-                debug!(
-                    repo = repo,
-                    iid = iid,
-                    "skip: security review already completed for this SHA"
-                );
-            }
-            (ReviewLane::General, ReviewScheduleOutcome::SkippedLocked) => {
-                counters.skipped_locked += 1;
-                *pending_same_mr_work = true;
-                debug!(
-                    repo = repo,
-                    iid = iid,
-                    "skip: same-MR work already in progress"
-                );
-            }
-            (ReviewLane::Security, ReviewScheduleOutcome::SkippedLocked) => {
-                counters.security_skipped_locked += 1;
-                *pending_same_mr_work = true;
-                debug!(
-                    repo = repo,
-                    iid = iid,
-                    "skip: same-MR work already in progress for security review"
-                );
-            }
-            (_, ReviewScheduleOutcome::Interrupted) => {
-                return Some(RepoScanStatus::Interrupted);
-            }
-            (ReviewLane::Security, ReviewScheduleOutcome::SkippedAward) => {
-                debug!(
-                    repo = repo,
-                    iid = iid,
-                    "skip: security review returned award outcome"
-                );
-            }
-        }
-        None
-    }
-
     async fn scan(&self, mode: ScanMode) -> Result<ScanRunStatus> {
-        if self.shutdown_requested() {
-            info!("scan skipped: shutdown requested");
-            return Ok(ScanRunStatus::Interrupted);
-        }
-        match mode {
-            ScanMode::Full => info!("starting scan"),
-            ScanMode::Incremental => info!("starting incremental scan"),
-        }
-        self.clear_stale_flow_state().await?;
-        let repos = self.resolve_repos(mode).await?;
-        if repos.is_empty() {
-            info!("no gitlab repositories configured");
-            return Ok(ScanRunStatus::Completed);
-        }
-        let mut tasks = Vec::new();
-        let mut counters = ScanCounters::default();
-        let mut interrupted = false;
-        for repo in &repos {
-            if self.shutdown_requested() {
-                info!("stopping scan early: shutdown requested");
-                interrupted = true;
-                break;
-            }
-            let activity_marker = self.load_latest_mr_activity_marker(repo).await;
-            let now_ts = Utc::now().timestamp();
-            let due_pending_review = matches!(mode, ScanMode::Incremental)
-                && self
-                    .state
-                    .review_rate_limit
-                    .repo_has_due_review_rate_limit_pending(repo, now_ts)
-                    .await?;
-            if matches!(mode, ScanMode::Incremental)
-                && let Some(marker) = activity_marker.as_ref()
-            {
-                let previous = self
-                    .state
-                    .project_catalog
-                    .get_project_last_mr_activity(repo)
-                    .await?;
-                if marker.as_str() == NO_OPEN_MRS_MARKER {
-                    if previous.as_ref() != Some(marker) {
-                        self.state
-                            .project_catalog
-                            .set_project_last_mr_activity(repo, marker)
-                            .await?;
-                    }
-                    if !due_pending_review {
-                        counters.skipped_inactive += 1;
-                        debug!(repo = repo.as_str(), "skip: no open MRs");
-                        continue;
-                    }
-                }
-                if let Some(previous) = previous
-                    && previous == *marker
-                    && !due_pending_review
-                {
-                    counters.skipped_inactive += 1;
-                    debug!(repo = repo.as_str(), "skip: latest MR activity unchanged");
-                    continue;
-                }
-            }
-            let mrs = self.gitlab.list_open_mrs(repo).await?;
-            match self
-                .scan_repo_mrs(repo, mrs, &mut counters, &mut tasks)
-                .await?
-            {
-                RepoScanStatus::Complete => {
-                    if let Some(marker) = activity_marker {
-                        self.state
-                            .project_catalog
-                            .set_project_last_mr_activity(repo, &marker)
-                            .await?;
-                    }
-                }
-                RepoScanStatus::PendingSameMrWork => {
-                    debug!(
-                        repo = repo.as_str(),
-                        "skip: not advancing activity marker because same-MR work is still pending"
-                    );
-                }
-                RepoScanStatus::Interrupted => {
-                    interrupted = true;
-                    debug!(
-                        repo = repo.as_str(),
-                        "skip: not advancing activity marker because scan was interrupted"
-                    );
-                }
-            }
-        }
-        if matches!(mode, ScanMode::Full) {
-            let _ = join_all(tasks).await;
-        }
-        match mode {
-            ScanMode::Full => {
-                info!(
-                    total_mrs = counters.total_mrs,
-                    scheduled = counters.scheduled,
-                    security_scheduled = counters.security_scheduled,
-                    mention_scheduled = counters.mention_scheduled,
-                    skipped_award = counters.skipped_award,
-                    skipped_marker = counters.skipped_marker,
-                    skipped_completed = counters.skipped_completed,
-                    skipped_locked = counters.skipped_locked,
-                    skipped_rate_limit = counters.skipped_rate_limit,
-                    security_skipped_marker = counters.security_skipped_marker,
-                    security_skipped_completed = counters.security_skipped_completed,
-                    security_skipped_locked = counters.security_skipped_locked,
-                    security_skipped_backoff = counters.security_skipped_backoff,
-                    security_skipped_rate_limit = counters.security_skipped_rate_limit,
-                    mention_skipped_processed = counters.mention_skipped_processed,
-                    skipped_backoff = counters.skipped_backoff,
-                    missing_sha = counters.missing_sha,
-                    skipped_draft = counters.skipped_draft,
-                    skipped_created_before = counters.skipped_created_before,
-                    "scan complete"
-                );
-            }
-            ScanMode::Incremental => {
-                info!(
-                    total_mrs = counters.total_mrs,
-                    scheduled = counters.scheduled,
-                    security_scheduled = counters.security_scheduled,
-                    mention_scheduled = counters.mention_scheduled,
-                    skipped_award = counters.skipped_award,
-                    skipped_marker = counters.skipped_marker,
-                    skipped_completed = counters.skipped_completed,
-                    skipped_locked = counters.skipped_locked,
-                    skipped_rate_limit = counters.skipped_rate_limit,
-                    security_skipped_marker = counters.security_skipped_marker,
-                    security_skipped_completed = counters.security_skipped_completed,
-                    security_skipped_locked = counters.security_skipped_locked,
-                    security_skipped_backoff = counters.security_skipped_backoff,
-                    security_skipped_rate_limit = counters.security_skipped_rate_limit,
-                    mention_skipped_processed = counters.mention_skipped_processed,
-                    skipped_backoff = counters.skipped_backoff,
-                    missing_sha = counters.missing_sha,
-                    skipped_inactive = counters.skipped_inactive,
-                    skipped_draft = counters.skipped_draft,
-                    skipped_created_before = counters.skipped_created_before,
-                    "scan complete"
-                );
-            }
-        }
-        Ok(if interrupted {
-            ScanRunStatus::Interrupted
-        } else {
-            ScanRunStatus::Completed
-        })
+        run_scan_pipeline(self, mode).await
     }
 
-    async fn load_latest_mr_activity_marker(&self, repo: &str) -> Option<String> {
+    pub(super) async fn load_latest_mr_activity_marker(&self, repo: &str) -> Option<String> {
         match self.gitlab.get_latest_open_mr_activity(repo).await {
             Ok(Some(mr)) => {
                 if let Some(updated_at) = mr.updated_at {
@@ -764,109 +452,6 @@ impl ReviewService {
         self.target_resolver.resolve_repos(mode).await
     }
 
-    async fn scan_repo_mrs(
-        &self,
-        repo: &str,
-        mrs: Vec<MergeRequest>,
-        counters: &mut ScanCounters,
-        tasks: &mut Vec<tokio::task::JoinHandle<()>>,
-    ) -> Result<RepoScanStatus> {
-        let mut pending_same_mr_work = false;
-        counters.total_mrs += mrs.len();
-        info!(repo = repo, count = mrs.len(), "loaded open MRs");
-        let open_iids = mrs.iter().map(|mr| mr.iid).collect::<Vec<_>>();
-        self.remove_rate_limit_awards_for_closed_pending_mrs(repo, &open_iids)
-            .await?;
-        for mr in mrs {
-            if self.shutdown_requested() {
-                info!(repo = repo, "stopping MR scheduling: shutdown requested");
-                return Ok(RepoScanStatus::Interrupted);
-            }
-            let mut mr = mr;
-            if mr.head_sha().is_none() || mr.created_at.is_none() {
-                mr = self.gitlab.get_mr(repo, mr.iid).await?;
-            }
-            let head_sha = if let Some(value) = mr.head_sha() {
-                value
-            } else {
-                counters.missing_sha += 1;
-                warn!(repo = repo, iid = mr.iid, "missing head sha, skipping");
-                continue;
-            };
-            let mention_outcome = self
-                .schedule_mention_commands_for_mr(repo, &mr, &head_sha, counters, tasks)
-                .await?;
-            if mention_outcome.blocked_pending_work {
-                pending_same_mr_work = true;
-            }
-            if mention_outcome.blocks_review {
-                debug!(
-                    repo = repo,
-                    iid = mr.iid,
-                    "skip review scheduling in this scan: same-MR mention work is active or pending"
-                );
-                continue;
-            }
-            if mr.draft {
-                counters.skipped_draft += 1;
-                debug!(repo = repo, iid = mr.iid, "skip: draft MR");
-                continue;
-            }
-            let created_at = if let Some(value) = mr.created_at.as_ref() {
-                value
-            } else {
-                counters.skipped_created_before += 1;
-                warn!(repo = repo, iid = mr.iid, "missing created_at, skipping");
-                continue;
-            };
-            if created_at <= &self.created_after {
-                counters.skipped_created_before += 1;
-                debug!(
-                    repo = repo,
-                    iid = mr.iid,
-                    created_at = %created_at,
-                    cutoff = %self.created_after,
-                    "skip: MR created before cutoff"
-                );
-                continue;
-            }
-            let mr_iid = mr.iid;
-            let review_outcome = self
-                .general_review_flow
-                .schedule_for_scan(repo, mr.clone(), &head_sha, tasks)
-                .await?;
-            if let Some(status) = Self::apply_review_outcome(
-                ReviewLane::General,
-                repo,
-                mr_iid,
-                review_outcome,
-                counters,
-                &mut pending_same_mr_work,
-            ) {
-                return Ok(status);
-            }
-            let security_review_outcome = self
-                .security_review_flow
-                .schedule_for_scan(repo, mr, &head_sha, tasks)
-                .await?;
-            if let Some(status) = Self::apply_review_outcome(
-                ReviewLane::Security,
-                repo,
-                mr_iid,
-                security_review_outcome,
-                counters,
-                &mut pending_same_mr_work,
-            ) {
-                return Ok(status);
-            }
-        }
-        Ok(if pending_same_mr_work {
-            RepoScanStatus::PendingSameMrWork
-        } else {
-            RepoScanStatus::Complete
-        })
-    }
-
     /// # Errors
     ///
     /// Returns an error if the underlying operation fails.
@@ -884,15 +469,8 @@ impl ReviewService {
             return Ok(());
         };
         let mut mention_tasks = Vec::new();
-        let mut counters = ScanCounters::default();
         let mention_outcome = self
-            .schedule_mention_commands_for_mr(
-                repo,
-                &mr,
-                &head_sha,
-                &mut counters,
-                &mut mention_tasks,
-            )
+            .schedule_mention_commands_for_mr(repo, &mr, &head_sha, &mut mention_tasks)
             .await?;
         let _ = join_all(mention_tasks).await;
         if mention_outcome.blocks_review && mention_outcome.scheduled == 0 {

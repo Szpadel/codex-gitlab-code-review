@@ -1,6 +1,7 @@
 pub mod lane;
 pub(crate) mod lane_policies;
 mod scan_coordinator;
+mod scan_pipeline;
 mod service;
 mod target_resolver;
 
