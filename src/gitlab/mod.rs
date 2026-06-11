@@ -1,4 +1,5 @@
 mod api;
+pub(crate) mod bot_user;
 mod client;
 mod discussions;
 pub(crate) mod links;
