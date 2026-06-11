@@ -1,3 +1,5 @@
+//! Low-level Docker client setup and generic image operations shared by runner bootstrap and auth CLI.
+
 use crate::config::DockerConfig;
 use anyhow::{Context, Result, anyhow};
 use bollard::errors::Error as BollardError;

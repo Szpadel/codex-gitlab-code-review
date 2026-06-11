@@ -1,22 +1,82 @@
+//! Codex-runner container lifecycle and codex-specific image warmup.
+
 use super::{
-    AppServerClient, Arc, AttachContainerOptionsBuilder, BROWSER_CONTAINER_NAME_PREFIX, BoxFuture,
+    AppServerClient, Arc, AttachContainerOptionsBuilder, BROWSER_CONTAINER_NAME_PREFIX,
     BrowserMcpConfig, ContainerCreateBody, Context, CreateContainerOptionsBuilder,
-    DockerCodexRunner, ExecConfig, FutureExt, HashMap, HostConfig, ListContainersOptionsBuilder,
-    LogOutput, Mount, MountTmpfsOptions, MountTypeEnum, Ordering, REVIEW_CONTAINER_NAME_PREFIX,
-    REVIEW_OWNER_LABEL_KEY, RemoveContainerOptionsBuilder, Result, RunnerRuntime, Shared,
-    StartContainerOptionsBuilder, StartExecOptions, StartExecResults, StartedAppServer, StreamExt,
-    Uuid, anyhow, bail, effective_browser_mcp, ensure_image, info, normalize_image_reference,
-    shell_quote, warn,
+    DockerCodexRunner, ExecConfig, HashMap, HostConfig, ListContainersOptionsBuilder, LogOutput,
+    Mount, MountTmpfsOptions, MountTypeEnum, REVIEW_CONTAINER_NAME_PREFIX, REVIEW_OWNER_LABEL_KEY,
+    RemoveContainerOptionsBuilder, Result, RunnerRuntime, StartContainerOptionsBuilder,
+    StartExecOptions, StartExecResults, StartedAppServer, StreamExt, Uuid, anyhow, bail,
+    effective_browser_mcp, ensure_image, info, normalize_image_reference, shell_quote, warn,
 };
 #[cfg(test)]
 use crate::codex_runner::browser_mcp::BrowserLaunchConfig;
 #[cfg(test)]
 use crate::codex_runner::test_support;
+use bollard::Docker;
+use futures::{FutureExt, future::BoxFuture, future::Shared};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone)]
-pub(crate) struct InFlightImagePull {
-    pub(crate) id: u64,
-    pub(crate) future: Shared<BoxFuture<'static, std::result::Result<(), Arc<String>>>>,
+struct InFlightImagePull {
+    id: u64,
+    future: Shared<BoxFuture<'static, std::result::Result<(), Arc<String>>>>,
+}
+
+pub(crate) struct ImagePullManager {
+    in_flight: Mutex<HashMap<String, InFlightImagePull>>,
+    next_id: AtomicU64,
+}
+
+impl ImagePullManager {
+    pub(crate) fn new() -> Self {
+        Self {
+            in_flight: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    async fn pull_with_dedup(&self, docker: &Docker, image: &str) -> Result<()> {
+        let in_flight = {
+            let mut in_flight = self.in_flight.lock().expect("image pull map lock poisoned");
+            if let Some(in_flight) = in_flight.get(image) {
+                in_flight.clone()
+            } else {
+                let pull_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                let docker = docker.clone();
+                let image_for_pull = image.to_string();
+                let future = async move {
+                    ensure_image(&docker, &image_for_pull)
+                        .await
+                        .map_err(|err| Arc::new(format!("{err:#}")))
+                }
+                .boxed()
+                .shared();
+                let pull = InFlightImagePull {
+                    id: pull_id,
+                    future,
+                };
+                in_flight.insert(image.to_string(), pull.clone());
+                pull
+            }
+        };
+
+        let result = in_flight.future.await;
+        {
+            let mut pulls = self.in_flight.lock().expect("image pull map lock poisoned");
+            if pulls
+                .get(image)
+                .is_some_and(|current| current.id == in_flight.id)
+            {
+                pulls.remove(image);
+            }
+        }
+        if let Err(err) = result {
+            return Err(anyhow!(err.as_ref().clone()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,48 +146,8 @@ impl DockerCodexRunner {
         match &self.runtime {
             RunnerRuntime::Docker {
                 docker,
-                image_pulls,
-                next_image_pull_id,
-            } => {
-                let in_flight = {
-                    let mut image_pulls = image_pulls.lock().expect("image pull map lock poisoned");
-                    if let Some(in_flight) = image_pulls.get(&image) {
-                        in_flight.clone()
-                    } else {
-                        let pull_id = next_image_pull_id.fetch_add(1, Ordering::Relaxed);
-                        let docker = docker.clone();
-                        let image_for_pull = image.clone();
-                        let future = async move {
-                            ensure_image(&docker, &image_for_pull)
-                                .await
-                                .map_err(|err| Arc::new(format!("{err:#}")))
-                        }
-                        .boxed()
-                        .shared();
-                        let in_flight = InFlightImagePull {
-                            id: pull_id,
-                            future,
-                        };
-                        image_pulls.insert(image.clone(), in_flight.clone());
-                        in_flight
-                    }
-                };
-
-                let result = in_flight.future.await;
-                {
-                    let mut image_pulls = image_pulls.lock().expect("image pull map lock poisoned");
-                    if image_pulls
-                        .get(&image)
-                        .is_some_and(|current| current.id == in_flight.id)
-                    {
-                        image_pulls.remove(&image);
-                    }
-                }
-                if let Err(err) = result {
-                    return Err(anyhow!(err.as_ref().clone()));
-                }
-                Ok(())
-            }
+                image_pull_manager,
+            } => image_pull_manager.pull_with_dedup(docker, &image).await,
             #[cfg(test)]
             RunnerRuntime::Fake(harness) => harness.ensure_image_available(&image).await,
         }

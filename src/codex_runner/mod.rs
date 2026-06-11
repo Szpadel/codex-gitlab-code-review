@@ -25,13 +25,12 @@ use bollard::query_parameters::{
     LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptionsBuilder,
 };
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
-use futures::{FutureExt, StreamExt, future::BoxFuture, future::Shared};
+use futures::StreamExt;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -66,7 +65,7 @@ use self::app_server::{
 use self::auth::{AuthAccount, AuthFallbackAction};
 #[cfg(test)]
 use self::auth::{AuthFailureKind, classify_auth_failure, classify_auth_failure_for_account};
-use self::container::{InFlightImagePull, format_command_for_log};
+use self::container::{ImagePullManager, format_command_for_log};
 use self::docker::{connect_docker, ensure_image, normalize_image_reference};
 use self::gitlab_discovery::{
     GitLabDiscoveryHandle, GitLabDiscoveryMcpRuntimeConfig, PreparedGitLabDiscoveryMcp,
@@ -285,8 +284,7 @@ pub(crate) struct StartedAppServer {
 enum RunnerRuntime {
     Docker {
         docker: Docker,
-        image_pulls: Mutex<HashMap<String, InFlightImagePull>>,
-        next_image_pull_id: AtomicU64,
+        image_pull_manager: ImagePullManager,
     },
     #[cfg(test)]
     Fake(Arc<dyn test_support::RunnerHarness>),
@@ -476,8 +474,7 @@ impl DockerCodexRunner {
         Ok(Self {
             runtime: RunnerRuntime::Docker {
                 docker,
-                image_pulls: Mutex::new(HashMap::new()),
-                next_image_pull_id: AtomicU64::new(1),
+                image_pull_manager: ImagePullManager::new(),
             },
             security_context_builds: Arc::new(Mutex::new(HashMap::new())),
             codex,

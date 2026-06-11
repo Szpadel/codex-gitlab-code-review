@@ -330,8 +330,7 @@ fn test_runner_with_codex_and_mentions(
                 host: "tcp://127.0.0.1:2375".to_string(),
             })
             .expect("docker client"),
-            image_pulls: Mutex::new(HashMap::new()),
-            next_image_pull_id: AtomicU64::new(1),
+            image_pull_manager: ImagePullManager::new(),
         },
         security_context_builds: Arc::new(Mutex::new(HashMap::new())),
         codex,
