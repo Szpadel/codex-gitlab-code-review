@@ -2,7 +2,7 @@ use crate::codex_runner::{CodexResult, ReviewComment, ReviewContext};
 use crate::config::Config;
 use crate::config::FeatureFlagSnapshot;
 use crate::flow::award_service::AwardService;
-use crate::flow::orchestration::{ActiveTaskKey, spawn_orchestrated_task};
+use crate::flow::orchestration::{ActiveTaskKey, ScheduledTaskContext, spawn_orchestrated_task};
 use crate::flow::review_comments::{PostReviewCommentRequest, post_review_comment};
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
@@ -159,7 +159,7 @@ struct ReviewGateReady {
 }
 
 struct PreparedReviewRun {
-    run_history_id: i64,
+    task: ScheduledTaskContext,
     feature_flags: FeatureFlagSnapshot,
 }
 
@@ -668,7 +668,7 @@ impl ReviewFlow {
             return Err(err);
         }
         Ok(PreparedReviewRun {
-            run_history_id,
+            task: ScheduledTaskContext::new(repo, iid, head_sha, run_history_id),
             feature_flags,
         })
     }
@@ -691,28 +691,23 @@ impl ReviewFlow {
 
     fn spawn_scheduled_review_task(
         &self,
-        repo_name: String,
         mr: MergeRequest,
-        head_sha: String,
         prepared: PreparedReviewRun,
         acquired_rule_ids: Vec<String>,
         tasks: &mut Vec<JoinHandle<()>>,
     ) {
         let review_context = Arc::new(self.run_context(acquired_rule_ids));
-        let review_iid = mr.iid;
-        let run_history_id = prepared.run_history_id;
+        let task = prepared.task.clone();
         let review_key = ActiveReviewKey {
             lane: review_context.lane,
-            repo: repo_name.clone(),
-            iid: review_iid,
-            head_sha: head_sha.clone(),
+            repo: task.repo.clone(),
+            iid: task.iid,
+            head_sha: task.head_sha.clone(),
         };
         let context_for_semaphore_closed = Arc::clone(&review_context);
-        let closed_repo = repo_name.clone();
-        let closed_head_sha = head_sha.clone();
+        let closed_task = task.clone();
         let context_for_start_rejected = Arc::clone(&review_context);
-        let rejected_repo = repo_name.clone();
-        let rejected_head_sha = head_sha.clone();
+        let rejected_task = task.clone();
         spawn_orchestrated_task(
             &self.shared,
             ActiveTaskKey::Review(review_key),
@@ -722,10 +717,10 @@ impl ReviewFlow {
                 let err = Error::msg("review cancelled: semaphore closed");
                 context_for_semaphore_closed
                     .finalize_setup_failure(
-                        &closed_repo,
-                        review_iid,
-                        &closed_head_sha,
-                        run_history_id,
+                        &closed_task.repo,
+                        closed_task.iid,
+                        &closed_task.head_sha,
+                        closed_task.run_history_id,
                         &err,
                     )
                     .await;
@@ -733,22 +728,22 @@ impl ReviewFlow {
             move |()| async move {
                 let retry_key = RetryKey::new(
                     context_for_start_rejected.lane,
-                    &rejected_repo,
-                    review_iid,
-                    &rejected_head_sha,
+                    &rejected_task.repo,
+                    rejected_task.iid,
+                    &rejected_task.head_sha,
                 );
                 if let Err(err) = context_for_start_rejected
                     .finalize_cancelled(
-                        &rejected_repo,
-                        review_iid,
-                        &rejected_head_sha,
+                        &rejected_task.repo,
+                        rejected_task.iid,
+                        &rejected_task.head_sha,
                         &retry_key,
-                        run_history_id,
+                        rejected_task.run_history_id,
                     )
                     .await
                 {
                     warn!(
-                        repo = rejected_repo.as_str(),
+                        repo = rejected_task.repo.as_str(),
                         error = %err,
                         "failed to cancel queued review after shutdown"
                     );
@@ -757,15 +752,15 @@ impl ReviewFlow {
             move |()| async move {
                 if let Err(err) = review_context
                     .run(
-                        &repo_name,
+                        &task.repo,
                         mr,
-                        &head_sha,
+                        &task.head_sha,
                         prepared.feature_flags,
-                        prepared.run_history_id,
+                        task.run_history_id,
                     )
                     .await
                 {
-                    warn!(repo = repo_name.as_str(), error = %err, "review failed");
+                    warn!(repo = task.repo.as_str(), error = %err, "review failed");
                 }
             },
         );
@@ -815,18 +810,11 @@ impl ReviewFlow {
             repo,
             mr.iid,
             head_sha,
-            prepared.run_history_id,
+            prepared.task.run_history_id,
             &acquired_rule_ids,
         )
         .await?;
-        self.spawn_scheduled_review_task(
-            repo.to_string(),
-            mr,
-            head_sha.to_string(),
-            prepared,
-            acquired_rule_ids,
-            tasks,
-        );
+        self.spawn_scheduled_review_task(mr, prepared, acquired_rule_ids, tasks);
         Ok(ReviewScheduleOutcome::Scheduled)
     }
 
@@ -848,7 +836,7 @@ impl ReviewFlow {
                 repo,
                 mr.iid,
                 head_sha,
-                prepared.run_history_id,
+                prepared.task.run_history_id,
                 &acquired_rule_ids,
             )
             .await?;
@@ -856,24 +844,24 @@ impl ReviewFlow {
             repo,
             mr.iid,
             head_sha,
-            prepared.run_history_id,
+            prepared.task.run_history_id,
             &acquired_rule_ids,
         )
         .await?;
         let review_context = self.run_context(acquired_rule_ids.clone());
         let _active_review = self.shared.active_tasks.track_review(ActiveReviewKey {
             lane: self.lane,
-            repo: repo.to_string(),
-            iid: mr.iid,
-            head_sha: head_sha.to_string(),
+            repo: prepared.task.repo.clone(),
+            iid: prepared.task.iid,
+            head_sha: prepared.task.head_sha.clone(),
         });
         review_context
             .run(
-                repo,
+                &prepared.task.repo,
                 mr,
-                head_sha,
+                &prepared.task.head_sha,
                 prepared.feature_flags,
-                prepared.run_history_id,
+                prepared.task.run_history_id,
             )
             .await?;
         Ok(ReviewScheduleOutcome::Scheduled)

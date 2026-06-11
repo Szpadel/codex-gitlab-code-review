@@ -1,7 +1,7 @@
 use crate::codex_runner::{MentionCommandContext, MentionCommandResult, MentionCommandStatus};
 use crate::config::FeatureFlagSnapshot;
 use crate::flow::mention_assets::collect_note_image_uploads;
-use crate::flow::orchestration::{ActiveTaskKey, spawn_orchestrated_task};
+use crate::flow::orchestration::{ActiveTaskKey, ScheduledTaskContext, spawn_orchestrated_task};
 use crate::flow::{ActiveMentionKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::links::{extract_root_relative_markdown_urls, gitlab_web_base};
 use crate::gitlab::{DiscussionNote, GitLabUser, MergeRequest, MergeRequestDiscussion};
@@ -45,6 +45,13 @@ struct MentionSetupFailureContext<'a> {
     trigger_note_id: u64,
     head_sha: &'a str,
     run_history_id: i64,
+}
+
+struct PreparedMentionRun {
+    task: ScheduledTaskContext,
+    source_branch_key: String,
+    requester: RequesterIdentity,
+    feature_flags: FeatureFlagSnapshot,
 }
 
 pub(crate) struct MentionFlow {
@@ -380,6 +387,108 @@ impl MentionFlow {
         )
     }
 
+    async fn prepare_mention_run(
+        &self,
+        repo: &str,
+        mr: &MergeRequest,
+        head_sha: &str,
+        command_repo: &str,
+        trigger: &MentionTrigger,
+    ) -> Result<PreparedMentionRun> {
+        let trigger_note_id = trigger.trigger_note.id;
+        let trigger_author_name = trigger
+            .trigger_note
+            .author
+            .name
+            .clone()
+            .or_else(|| trigger.trigger_note.author.username.clone());
+        let run_history_id = match self
+            .shared
+            .state
+            .run_history
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Mention,
+                repo: repo.to_string(),
+                iid: mr.iid,
+                head_sha: head_sha.to_string(),
+                discussion_id: Some(trigger.discussion_id.clone()),
+                trigger_note_id: Some(trigger_note_id),
+                trigger_note_author_name: trigger_author_name,
+                trigger_note_body: Some(trigger.trigger_note.body.clone()),
+                command_repo: Some(command_repo.to_string()),
+            })
+            .await
+        {
+            Ok(run_history_id) => run_history_id,
+            Err(err) => {
+                self.release_mention_lock_after_history_failure(
+                    repo,
+                    mr.iid,
+                    &trigger.discussion_id,
+                    trigger_note_id,
+                    head_sha,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        let task = ScheduledTaskContext::new(repo, mr.iid, head_sha, run_history_id);
+        let source_branch_key = mr
+            .source_branch
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("(unknown-source-branch)")
+            .to_string();
+        let feature_flags = match self.resolve_feature_flags().await {
+            Ok(feature_flags) => feature_flags,
+            Err(err) => {
+                self.abort_mention_after_setup_failure(
+                    MentionSetupFailureContext {
+                        repo,
+                        iid: task.iid,
+                        discussion_id: &trigger.discussion_id,
+                        trigger_note_id,
+                        head_sha,
+                        run_history_id: task.run_history_id,
+                    },
+                    &err,
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        if let Err(err) = self
+            .shared
+            .state
+            .run_history
+            .set_run_history_feature_flags(task.run_history_id, &feature_flags)
+            .await
+        {
+            self.abort_mention_after_setup_failure(
+                MentionSetupFailureContext {
+                    repo,
+                    iid: task.iid,
+                    discussion_id: &trigger.discussion_id,
+                    trigger_note_id,
+                    head_sha,
+                    run_history_id: task.run_history_id,
+                },
+                &err,
+            )
+            .await;
+            return Err(err);
+        }
+        let requester = self
+            .resolve_requester_identity(&trigger.trigger_note.author)
+            .await;
+        Ok(PreparedMentionRun {
+            task,
+            source_branch_key,
+            requester,
+            feature_flags,
+        })
+    }
+
     pub(crate) async fn schedule_for_scan(
         &self,
         repo: &str,
@@ -499,107 +608,30 @@ impl MentionFlow {
                 outcome.skipped_processed += 1;
                 continue;
             }
-            let trigger_author_name = trigger
-                .trigger_note
-                .author
-                .name
-                .clone()
-                .or_else(|| trigger.trigger_note.author.username.clone());
-            let run_history_id = match self
-                .shared
-                .state
-                .run_history
-                .start_run_history(NewRunHistory {
-                    kind: RunHistoryKind::Mention,
-                    repo: repo.to_string(),
-                    iid: mr.iid,
-                    head_sha: head_sha.to_string(),
-                    discussion_id: Some(trigger.discussion_id.clone()),
-                    trigger_note_id: Some(trigger_note_id),
-                    trigger_note_author_name: trigger_author_name,
-                    trigger_note_body: Some(trigger.trigger_note.body.clone()),
-                    command_repo: Some(command_repo.clone()),
-                })
-                .await
-            {
-                Ok(run_history_id) => run_history_id,
-                Err(err) => {
-                    self.release_mention_lock_after_history_failure(
-                        repo,
-                        mr.iid,
-                        &trigger.discussion_id,
-                        trigger_note_id,
-                        head_sha,
-                    )
-                    .await;
-                    return Err(err);
-                }
-            };
-            let source_branch_key = mr
-                .source_branch
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .unwrap_or("(unknown-source-branch)")
-                .to_string();
-            let feature_flags = match self.resolve_feature_flags().await {
-                Ok(feature_flags) => feature_flags,
-                Err(err) => {
-                    self.abort_mention_after_setup_failure(
-                        MentionSetupFailureContext {
-                            repo,
-                            iid: mr.iid,
-                            discussion_id: &trigger.discussion_id,
-                            trigger_note_id,
-                            head_sha,
-                            run_history_id,
-                        },
-                        &err,
-                    )
-                    .await;
-                    return Err(err);
-                }
-            };
-            if let Err(err) = self
-                .shared
-                .state
-                .run_history
-                .set_run_history_feature_flags(run_history_id, &feature_flags)
-                .await
-            {
-                self.abort_mention_after_setup_failure(
-                    MentionSetupFailureContext {
-                        repo,
-                        iid: mr.iid,
-                        discussion_id: &trigger.discussion_id,
-                        trigger_note_id,
-                        head_sha,
-                        run_history_id,
-                    },
-                    &err,
-                )
-                .await;
-                return Err(err);
-            }
-            let branch_lock = self.mention_branch_lock(&command_repo, &source_branch_key);
+            let prepared = self
+                .prepare_mention_run(repo, mr, head_sha, &command_repo, &trigger)
+                .await?;
+            let task = prepared.task.clone();
+            let branch_lock = self.mention_branch_lock(&command_repo, &prepared.source_branch_key);
             let gitlab = Arc::clone(&self.shared.gitlab);
             let codex = Arc::clone(&self.shared.codex);
             let state = Arc::clone(&self.shared.state);
             let lifecycle = Arc::clone(&self.shared.lifecycle);
             let award_service = self.shared.award_service.clone();
-            let repo_name = repo.to_string();
+            let repo_name = task.repo.clone();
             let command_repo_name = command_repo.clone();
             let mr_copy = mr.clone();
-            let head_sha_copy = head_sha.to_string();
+            let head_sha_copy = task.head_sha.clone();
             let eyes_emoji = mention_eyes_emoji.clone();
             let additional_developer_instructions = additional_developer_instructions.clone();
             let gitlab_base_url = gitlab_base_url.clone();
-            let requester = self
-                .resolve_requester_identity(&trigger.trigger_note.author)
-                .await;
+            let requester = prepared.requester;
+            let feature_flags = prepared.feature_flags;
+            let run_history_id = task.run_history_id;
             outcome.scheduled += 1;
             outcome.blocks_review = true;
             outcome.blocked_pending_work = true;
-            let mention_iid = mr_copy.iid;
+            let mention_iid = task.iid;
             let trigger_discussion_id = trigger.discussion_id.clone();
             let trigger_note_id = trigger.trigger_note.id;
             let mention_key = ActiveMentionKey {

@@ -6,6 +6,25 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
+#[derive(Clone, Debug)]
+pub(crate) struct ScheduledTaskContext {
+    pub(crate) repo: String,
+    pub(crate) iid: u64,
+    pub(crate) head_sha: String,
+    pub(crate) run_history_id: i64,
+}
+
+impl ScheduledTaskContext {
+    pub(crate) fn new(repo: &str, iid: u64, head_sha: &str, run_history_id: i64) -> Self {
+        Self {
+            repo: repo.to_string(),
+            iid,
+            head_sha: head_sha.to_string(),
+            run_history_id,
+        }
+    }
+}
+
 pub(crate) enum ActiveTaskKey {
     Review(ActiveReviewKey),
     Mention(ActiveMentionKey),
