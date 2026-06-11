@@ -2,8 +2,9 @@ use crate::codex_runner::CodexRunner;
 use crate::config::Config;
 use crate::flow::ActiveTaskRegistry;
 use crate::flow::FlowShared;
+use crate::flow::award_service::AwardService;
 use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
-use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome, remove_bot_award};
+use crate::flow::review::{RetryBackoff, ReviewFlow, ReviewScheduleOutcome};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
@@ -76,7 +77,7 @@ pub struct ReviewService {
     gitlab: Arc<dyn GitLabApi>,
     pub(super) state: Arc<ReviewStateStore>,
     created_after: DateTime<Utc>,
-    bot_user_id: u64,
+    award_service: AwardService,
     pub(super) general_review_flow: Arc<ReviewFlow>,
     pub(super) security_review_flow: Arc<ReviewFlow>,
     mention_flow: Arc<MentionFlow>,
@@ -100,9 +101,11 @@ impl ReviewService {
         let retry_backoff = Arc::new(RetryBackoff::new(Duration::hours(1)));
         let lifecycle = Arc::new(ServiceLifecycle::default());
         let active_tasks = Arc::new(ActiveTaskRegistry::default());
+        let award_service = AwardService::new(Arc::clone(&gitlab), bot_user_id);
         let flow_shared = FlowShared {
             config: config.clone(),
             gitlab: Arc::clone(&gitlab),
+            award_service: award_service.clone(),
             state: Arc::clone(&state),
             codex: Arc::clone(&codex),
             bot_user_id,
@@ -139,7 +142,7 @@ impl ReviewService {
             gitlab,
             state,
             created_after,
-            bot_user_id,
+            award_service,
             general_review_flow,
             security_review_flow,
             mention_flow,
@@ -422,14 +425,10 @@ impl ReviewService {
         if lane.is_security() || self.config.review.dry_run {
             return;
         }
-        if let Err(err) = remove_bot_award(
-            self.gitlab.as_ref(),
-            repo,
-            iid,
-            self.bot_user_id,
-            &self.config.review.rate_limit_emoji,
-        )
-        .await
+        if let Err(err) = self
+            .award_service
+            .remove_award(repo, iid, &self.config.review.rate_limit_emoji)
+            .await
         {
             warn!(
                 repo = repo,

@@ -1,9 +1,10 @@
 use crate::codex_runner::{CodexResult, ReviewComment, ReviewContext};
 use crate::config::Config;
 use crate::config::FeatureFlagSnapshot;
+use crate::flow::award_service::AwardService;
 use crate::flow::review_comments::{PostReviewCommentRequest, post_review_comment};
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
-use crate::gitlab::{AwardEmoji, GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
+use crate::gitlab::{GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
 use crate::state::{
@@ -242,14 +243,15 @@ impl ReviewFlow {
                         iid = review.iid,
                         "dry run: skipping eyes removal during recovery"
                     );
-                } else if let Err(err) = remove_bot_award(
-                    self.shared.gitlab.as_ref(),
-                    review.repo.as_str(),
-                    review.iid,
-                    self.shared.bot_user_id,
-                    &self.shared.config.review.eyes_emoji,
-                )
-                .await
+                } else if let Err(err) = self
+                    .shared
+                    .award_service
+                    .remove_award(
+                        review.repo.as_str(),
+                        review.iid,
+                        &self.shared.config.review.eyes_emoji,
+                    )
+                    .await
                 {
                     warn!(
                         repo = review.repo.as_str(),
@@ -344,12 +346,10 @@ impl ReviewFlow {
         if !self.uses_awards() {
             return Ok(false);
         }
-        let awards = self.shared.gitlab.list_awards(repo, iid).await?;
-        Ok(has_bot_award(
-            &awards,
-            self.shared.bot_user_id,
-            &self.shared.config.review.thumbs_emoji,
-        ))
+        self.shared
+            .award_service
+            .has_award(repo, iid, &self.shared.config.review.thumbs_emoji)
+            .await
     }
 
     async fn skipped_by_review_marker(&self, repo: &str, iid: u64, head_sha: &str) -> Result<bool> {
@@ -688,6 +688,7 @@ impl ReviewFlow {
             lane: self.lane,
             config: self.shared.config.clone(),
             gitlab: Arc::clone(&self.shared.gitlab),
+            award_service: self.shared.award_service.clone(),
             codex: Arc::clone(&self.shared.codex),
             state: Arc::clone(&self.shared.state),
             retry_backoff: Arc::clone(&self.retry_backoff),
@@ -906,14 +907,11 @@ impl ReviewFlow {
         if self.shared.config.review.dry_run || !self.uses_awards() {
             return;
         }
-        if let Err(err) = ensure_bot_award(
-            self.shared.gitlab.as_ref(),
-            repo,
-            iid,
-            self.shared.bot_user_id,
-            &self.shared.config.review.rate_limit_emoji,
-        )
-        .await
+        if let Err(err) = self
+            .shared
+            .award_service
+            .ensure_award(repo, iid, &self.shared.config.review.rate_limit_emoji)
+            .await
         {
             warn!(
                 repo = repo,
@@ -928,14 +926,11 @@ impl ReviewFlow {
         if self.shared.config.review.dry_run || !self.uses_awards() {
             return;
         }
-        if let Err(err) = remove_bot_award(
-            self.shared.gitlab.as_ref(),
-            repo,
-            iid,
-            self.shared.bot_user_id,
-            &self.shared.config.review.rate_limit_emoji,
-        )
-        .await
+        if let Err(err) = self
+            .shared
+            .award_service
+            .remove_award(repo, iid, &self.shared.config.review.rate_limit_emoji)
+            .await
         {
             warn!(
                 repo = repo,
@@ -1084,6 +1079,7 @@ pub(crate) struct ReviewRunContext {
     pub(crate) lane: ReviewLane,
     pub(crate) config: Config,
     pub(crate) gitlab: Arc<dyn GitLabApi>,
+    pub(crate) award_service: AwardService,
     pub(crate) codex: Arc<dyn crate::codex_runner::CodexRunner>,
     pub(crate) state: Arc<ReviewStateStore>,
     pub(crate) retry_backoff: Arc<RetryBackoff>,
@@ -1166,14 +1162,10 @@ impl ReviewRunContext {
             info!(repo = repo, iid = iid, "dry run: skipping eyes removal");
             return;
         }
-        if let Err(err) = remove_bot_award(
-            self.gitlab.as_ref(),
-            repo,
-            iid,
-            self.bot_user_id,
-            &self.config.review.eyes_emoji,
-        )
-        .await
+        if let Err(err) = self
+            .award_service
+            .remove_award(repo, iid, &self.config.review.eyes_emoji)
+            .await
         {
             warn!(
                 repo = repo,
@@ -1189,14 +1181,10 @@ impl ReviewRunContext {
             info!(repo = repo, iid = iid, "dry run: skipping eyes award");
             return;
         }
-        if let Err(err) = ensure_bot_award(
-            self.gitlab.as_ref(),
-            repo,
-            iid,
-            self.bot_user_id,
-            &self.config.review.eyes_emoji,
-        )
-        .await
+        if let Err(err) = self
+            .award_service
+            .ensure_award(repo, iid, &self.config.review.eyes_emoji)
+            .await
         {
             warn!(
                 repo = repo,
@@ -1443,8 +1431,8 @@ impl ReviewRunContext {
                 "dry run: skipping thumbs up"
             );
         } else {
-            self.gitlab
-                .add_award(run.repo, run.iid, &self.config.review.thumbs_emoji)
+            self.award_service
+                .create_award(run.repo, run.iid, &self.config.review.thumbs_emoji)
                 .await?;
         }
         let result = if self.config.review.dry_run {
@@ -1617,15 +1605,6 @@ impl ReviewRunContext {
     }
 }
 
-pub(crate) fn has_bot_award(awards: &[AwardEmoji], bot_user_id: u64, name: &str) -> bool {
-    if bot_user_id == 0 {
-        return false;
-    }
-    awards
-        .iter()
-        .any(|award| award.user.id == bot_user_id && award.name == name)
-}
-
 pub(crate) fn has_review_marker(notes: &[Note], bot_user_id: u64, prefix: &str, sha: &str) -> bool {
     if bot_user_id == 0 {
         return false;
@@ -1652,206 +1631,9 @@ pub(crate) fn has_inline_review_marker(
         .any(|note| note.author.id == bot_user_id && note.body.contains(&marker_prefix))
 }
 
-pub(crate) async fn ensure_bot_award(
-    gitlab: &dyn GitLabApi,
-    repo: &str,
-    iid: u64,
-    bot_user_id: u64,
-    award_name: &str,
-) -> Result<()> {
-    if bot_user_id == 0 {
-        return Ok(());
-    }
-    let awards = gitlab.list_awards(repo, iid).await?;
-    if awards
-        .iter()
-        .any(|award| award.user.id == bot_user_id && award.name == award_name)
-    {
-        return Ok(());
-    }
-    gitlab.add_award(repo, iid, award_name).await?;
-    Ok(())
-}
-
-pub(crate) async fn remove_bot_award(
-    gitlab: &dyn GitLabApi,
-    repo: &str,
-    iid: u64,
-    bot_user_id: u64,
-    award_name: &str,
-) -> Result<()> {
-    if bot_user_id == 0 {
-        return Ok(());
-    }
-    let awards = gitlab.list_awards(repo, iid).await?;
-    for award in awards {
-        if award.user.id == bot_user_id && award.name == award_name {
-            gitlab.delete_award(repo, iid, award.id).await?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ReviewRunContext, ReviewRunResult};
-    use crate::codex_runner::{
-        CodexResult, CodexRunner, MentionCommandContext, MentionCommandResult, ReviewContext,
-    };
-    use crate::config::{Config, test_builder::ConfigBuilder};
-    use crate::gitlab::{
-        AwardEmoji, GitLabApi, GitLabProject, GitLabProjectSummary, GitLabUser, MergeRequest, Note,
-    };
-    use crate::lifecycle::ServiceLifecycle;
-    use crate::review::ReviewLane;
-    use crate::state::ReviewStateStore;
-    use anyhow::{Result, anyhow, bail};
-    use async_trait::async_trait;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    struct AwardRecordingGitLab {
-        bot_user: GitLabUser,
-        awards: Mutex<HashMap<(String, u64), Vec<AwardEmoji>>>,
-        add_award_calls: Mutex<Vec<String>>,
-    }
-
-    impl AwardRecordingGitLab {
-        fn new(bot_user_id: u64) -> Self {
-            Self {
-                bot_user: GitLabUser {
-                    id: bot_user_id,
-                    username: Some("bot".to_string()),
-                    name: Some("Bot".to_string()),
-                },
-                awards: Mutex::new(HashMap::new()),
-                add_award_calls: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn add_award_call_count(&self, repo: &str, iid: u64, award_name: &str) -> usize {
-            let expected = format!("add_award:{repo}:{iid}:{award_name}");
-            self.add_award_calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|call| *call == &expected)
-                .count()
-        }
-    }
-
-    #[async_trait]
-    impl GitLabApi for AwardRecordingGitLab {
-        async fn current_user(&self) -> Result<GitLabUser> {
-            Ok(self.bot_user.clone())
-        }
-
-        async fn list_projects(&self) -> Result<Vec<GitLabProjectSummary>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_group_projects(&self, _group: &str) -> Result<Vec<GitLabProjectSummary>> {
-            Ok(Vec::new())
-        }
-
-        async fn list_open_mrs(&self, _project: &str) -> Result<Vec<MergeRequest>> {
-            Ok(Vec::new())
-        }
-
-        async fn get_latest_open_mr_activity(
-            &self,
-            _project: &str,
-        ) -> Result<Option<MergeRequest>> {
-            Ok(None)
-        }
-
-        async fn get_mr(&self, _project: &str, _iid: u64) -> Result<MergeRequest> {
-            Err(anyhow!("get_mr is not used by this test"))
-        }
-
-        async fn get_project(&self, project: &str) -> Result<GitLabProject> {
-            Ok(GitLabProject {
-                path_with_namespace: Some(project.to_string()),
-                web_url: None,
-                default_branch: None,
-                last_activity_at: None,
-            })
-        }
-
-        async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>> {
-            Ok(self
-                .awards
-                .lock()
-                .unwrap()
-                .get(&(project.to_string(), iid))
-                .cloned()
-                .unwrap_or_default())
-        }
-
-        async fn add_award(&self, project: &str, iid: u64, name: &str) -> Result<()> {
-            self.add_award_calls
-                .lock()
-                .unwrap()
-                .push(format!("add_award:{project}:{iid}:{name}"));
-            let mut awards = self.awards.lock().unwrap();
-            let entry = awards.entry((project.to_string(), iid)).or_default();
-            entry.push(AwardEmoji {
-                id: entry.len() as u64 + 1,
-                name: name.to_string(),
-                user: self.bot_user.clone(),
-            });
-            Ok(())
-        }
-
-        async fn delete_award(&self, _project: &str, _iid: u64, _award_id: u64) -> Result<()> {
-            bail!("delete_award is not used by this test")
-        }
-
-        async fn list_notes(&self, _project: &str, _iid: u64) -> Result<Vec<Note>> {
-            Ok(Vec::new())
-        }
-
-        async fn create_note(&self, _project: &str, _iid: u64, _body: &str) -> Result<()> {
-            bail!("create_note is not used by this test")
-        }
-    }
-
-    struct UnusedCodexRunner;
-
-    #[async_trait]
-    impl CodexRunner for UnusedCodexRunner {
-        async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
-            bail!("run_review is not used by this test")
-        }
-
-        async fn run_mention_command(
-            &self,
-            _ctx: MentionCommandContext,
-        ) -> Result<MentionCommandResult> {
-            bail!("run_mention_command is not used by this test")
-        }
-    }
-
-    fn test_config() -> Config {
-        ConfigBuilder::for_review_tests().build()
-    }
-
-    async fn review_run_context(
-        gitlab: Arc<dyn GitLabApi>,
-        bot_user_id: u64,
-    ) -> Result<ReviewRunContext> {
-        Ok(ReviewRunContext {
-            lane: ReviewLane::General,
-            config: test_config(),
-            gitlab,
-            codex: Arc::new(UnusedCodexRunner),
-            state: Arc::new(ReviewStateStore::new(":memory:").await?),
-            retry_backoff: Arc::new(super::RetryBackoff::new(chrono::Duration::seconds(60))),
-            bot_user_id,
-            lifecycle: Arc::new(ServiceLifecycle::default()),
-            acquired_rate_limit_rule_ids: Vec::new(),
-        })
-    }
+    use super::ReviewRunResult;
 
     #[test]
     fn review_run_result_roundtrips_persisted_strings() {
@@ -1865,17 +1647,5 @@ mod tests {
         ] {
             assert_eq!(ReviewRunResult::parse(result.as_str()), Some(result));
         }
-    }
-
-    #[tokio::test]
-    async fn add_eyes_best_effort_does_not_duplicate_existing_bot_award() -> Result<()> {
-        let gitlab = Arc::new(AwardRecordingGitLab::new(1));
-        let context = review_run_context(gitlab.clone(), 1).await?;
-
-        context.add_eyes_best_effort("group/repo", 42).await;
-        context.add_eyes_best_effort("group/repo", 42).await;
-
-        assert_eq!(gitlab.add_award_call_count("group/repo", 42, "eyes"), 1);
-        Ok(())
     }
 }

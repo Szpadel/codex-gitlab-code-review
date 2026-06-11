@@ -5,6 +5,7 @@ use crate::codex_runner::{
 };
 use crate::config::TargetSelector;
 use crate::dev_mode::{DevToolsService, MockCodexRunner};
+use crate::flow::award_service::AwardService;
 use crate::flow::mention::{contains_mention, extract_parent_chain};
 use crate::flow::review::{RetryBackoff, RetryKey, ReviewRunContext};
 use crate::gitlab::{

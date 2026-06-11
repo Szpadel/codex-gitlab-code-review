@@ -3,7 +3,7 @@ use crate::config::FeatureFlagSnapshot;
 use crate::flow::mention_assets::collect_note_image_uploads;
 use crate::flow::{ActiveMentionKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::links::{extract_root_relative_markdown_urls, gitlab_web_base};
-use crate::gitlab::{DiscussionNote, GitLabApi, GitLabUser, MergeRequest, MergeRequestDiscussion};
+use crate::gitlab::{DiscussionNote, GitLabUser, MergeRequest, MergeRequestDiscussion};
 use crate::state::{MentionCommandScanState, NewRunHistory, RunHistoryFinish, RunHistoryKind};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -93,16 +93,17 @@ impl MentionFlow {
                     trigger_note_id = mention.key.trigger_note_id,
                     "dry run: skipping stale mention-command eyes-reaction cleanup during recovery"
                 );
-            } else if let Err(err) = remove_eyes_from_discussion_note(
-                self.shared.gitlab.as_ref(),
-                mention.key.repo.as_str(),
-                mention.key.iid,
-                mention.key.discussion_id.as_str(),
-                mention.key.trigger_note_id,
-                self.shared.bot_user_id,
-                &mention_eyes_emoji,
-            )
-            .await
+            } else if let Err(err) = self
+                .shared
+                .award_service
+                .remove_discussion_note_award(
+                    mention.key.repo.as_str(),
+                    mention.key.iid,
+                    mention.key.discussion_id.as_str(),
+                    mention.key.trigger_note_id,
+                    &mention_eyes_emoji,
+                )
+                .await
             {
                 let error_chain = format!("{err:#}");
                 warn!(
@@ -585,12 +586,12 @@ impl MentionFlow {
             let codex = Arc::clone(&self.shared.codex);
             let state = Arc::clone(&self.shared.state);
             let lifecycle = Arc::clone(&self.shared.lifecycle);
+            let award_service = self.shared.award_service.clone();
             let repo_name = repo.to_string();
             let command_repo_name = command_repo.clone();
             let mr_copy = mr.clone();
             let head_sha_copy = head_sha.to_string();
             let eyes_emoji = mention_eyes_emoji.clone();
-            let bot_user_id = self.shared.bot_user_id;
             let additional_developer_instructions = additional_developer_instructions.clone();
             let gitlab_base_url = gitlab_base_url.clone();
             let requester = self
@@ -686,16 +687,15 @@ impl MentionFlow {
                 );
                 let image_uploads =
                     collect_note_image_uploads(&trigger.parent_chain, &gitlab_base_url);
-                if let Err(err) = add_eyes_to_discussion_note(
-                    gitlab.as_ref(),
-                    &repo_name,
-                    mr_copy.iid,
-                    &discussion_id,
-                    trigger_note_id,
-                    bot_user_id,
-                    &eyes_emoji,
-                )
-                .await
+                if let Err(err) = award_service
+                    .ensure_discussion_note_award(
+                        &repo_name,
+                        mr_copy.iid,
+                        &discussion_id,
+                        trigger_note_id,
+                        &eyes_emoji,
+                    )
+                    .await
                 {
                     let error_chain = format!("{err:#}");
                     warn!(
@@ -922,16 +922,15 @@ impl MentionFlow {
                         )
                         .await;
                 }
-                if let Err(err) = remove_eyes_from_discussion_note(
-                    gitlab.as_ref(),
-                    &repo_name,
-                    mr_copy.iid,
-                    &discussion_id,
-                    trigger_note_id,
-                    bot_user_id,
-                    &eyes_emoji,
-                )
-                .await
+                if let Err(err) = award_service
+                    .remove_discussion_note_award(
+                        &repo_name,
+                        mr_copy.iid,
+                        &discussion_id,
+                        trigger_note_id,
+                        &eyes_emoji,
+                    )
+                    .await
                 {
                     let error_chain = format!("{err:#}");
                     warn!(
@@ -1136,58 +1135,6 @@ pub(crate) fn sanitize_email_local_part(input: &str) -> String {
     } else {
         output
     }
-}
-
-pub(crate) async fn add_eyes_to_discussion_note(
-    gitlab: &dyn GitLabApi,
-    repo: &str,
-    iid: u64,
-    discussion_id: &str,
-    note_id: u64,
-    bot_user_id: u64,
-    eyes: &str,
-) -> Result<()> {
-    if bot_user_id == 0 {
-        return Ok(());
-    }
-    let awards = gitlab
-        .list_discussion_note_awards(repo, iid, discussion_id, note_id)
-        .await?;
-    if awards
-        .iter()
-        .any(|award| award.user.id == bot_user_id && award.name == eyes)
-    {
-        return Ok(());
-    }
-    gitlab
-        .add_discussion_note_award(repo, iid, discussion_id, note_id, eyes)
-        .await?;
-    Ok(())
-}
-
-pub(crate) async fn remove_eyes_from_discussion_note(
-    gitlab: &dyn GitLabApi,
-    repo: &str,
-    iid: u64,
-    discussion_id: &str,
-    note_id: u64,
-    bot_user_id: u64,
-    eyes: &str,
-) -> Result<()> {
-    if bot_user_id == 0 {
-        return Ok(());
-    }
-    let awards = gitlab
-        .list_discussion_note_awards(repo, iid, discussion_id, note_id)
-        .await?;
-    for award in awards {
-        if award.user.id == bot_user_id && award.name == eyes {
-            gitlab
-                .delete_discussion_note_award(repo, iid, discussion_id, note_id, award.id)
-                .await?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
+use crate::flow::award_service::AwardService;
 use crate::gitlab::GitLabApi;
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
@@ -12,6 +13,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Notify, Semaphore};
 
+pub(crate) mod award_service;
 pub(crate) mod mention;
 pub(crate) mod mention_assets;
 pub(crate) mod review;
@@ -130,6 +132,7 @@ impl Drop for ActiveMentionGuard {
 pub(crate) struct FlowShared {
     pub(crate) config: Config,
     pub(crate) gitlab: Arc<dyn GitLabApi>,
+    pub(crate) award_service: AwardService,
     pub(crate) state: Arc<ReviewStateStore>,
     pub(crate) codex: Arc<dyn CodexRunner>,
     pub(crate) bot_user_id: u64,
