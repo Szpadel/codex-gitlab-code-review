@@ -1,7 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::codex_runner::{CodexRunner, DockerCodexRunner, RunnerRuntimeOptions};
@@ -210,7 +209,6 @@ async fn build_normal_runtime(
                 .clone(),
         },
     )?) as Arc<dyn CodexRunner>;
-    spawn_startup_warmup(Arc::clone(&runner));
 
     let service = Arc::new(ReviewService::new(
         config.clone(),
@@ -290,81 +288,11 @@ fn mention_commands_active(config: &Config) -> bool {
             .is_some_and(|value| !value.is_empty())
 }
 
-fn spawn_startup_warmup(runner: Arc<dyn CodexRunner>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(err) = runner.warm_up_images().await {
-            warn!(error = %err, "startup docker image warm-up failed");
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex_runner::{
-        CodexResult, MentionCommandContext, MentionCommandResult, ReviewContext,
-    };
     use crate::config::test_builder::ConfigBuilder;
-    use anyhow::anyhow;
-    use async_trait::async_trait;
     use chrono::TimeZone;
-    use std::sync::Mutex;
-
-    struct WarmupRunner {
-        calls: Mutex<u32>,
-        fail: bool,
-    }
-
-    #[async_trait]
-    impl CodexRunner for WarmupRunner {
-        async fn warm_up_images(&self) -> Result<()> {
-            *self.calls.lock().expect("warmup calls lock") += 1;
-            if self.fail {
-                Err(anyhow!("warmup failed"))
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
-            unreachable!("run_review should not be called")
-        }
-
-        async fn run_mention_command(
-            &self,
-            _ctx: MentionCommandContext,
-        ) -> Result<MentionCommandResult> {
-            unreachable!("run_mention_command should not be called")
-        }
-    }
-
-    #[tokio::test]
-    async fn startup_warmup_runs_runner_once() {
-        let runner = Arc::new(WarmupRunner {
-            calls: Mutex::new(0),
-            fail: false,
-        });
-
-        spawn_startup_warmup(runner.clone())
-            .await
-            .expect("warmup task finished");
-
-        assert_eq!(*runner.calls.lock().expect("warmup calls lock"), 1);
-    }
-
-    #[tokio::test]
-    async fn startup_warmup_is_best_effort_on_failure() {
-        let runner = Arc::new(WarmupRunner {
-            calls: Mutex::new(0),
-            fail: true,
-        });
-
-        spawn_startup_warmup(runner.clone())
-            .await
-            .expect("warmup task finished");
-
-        assert_eq!(*runner.calls.lock().expect("warmup calls lock"), 1);
-    }
 
     #[test]
     fn mention_commands_active_requires_runtime_usable_state() {

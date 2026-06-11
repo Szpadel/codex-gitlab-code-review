@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::bootstrap::BootstrappedRuntime;
+use crate::codex_runner::CodexRunner;
 use crate::dev_mode::DevToolsService;
 use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use crate::http::{AdminService, HttpServices, run_http_server_with_dev_tools};
@@ -90,6 +91,7 @@ pub(crate) async fn run_with_hooks(
         http_services,
         gitlab_discovery_mcp,
         dev_tools,
+        runner,
         ..
     } = runtime;
 
@@ -105,6 +107,7 @@ pub(crate) async fn run_with_hooks(
         Arc::clone(&http_services),
         dev_tools.clone(),
     );
+    let _startup_warmup = spawn_startup_warmup(runner);
 
     if run_once {
         info!("running single scan");
@@ -210,6 +213,14 @@ pub(crate) async fn run_with_hooks(
             }
         }
     }
+}
+
+fn spawn_startup_warmup(runner: Arc<dyn CodexRunner>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(err) = runner.warm_up_images().await {
+            warn!(error = %err, "startup docker image warm-up failed");
+        }
+    })
 }
 
 fn parse_timezone(value: Option<&str>) -> Result<chrono_tz::Tz> {
@@ -470,11 +481,20 @@ async fn wait_for_shutdown_signal() -> Result<ServiceLifecycleSignal> {
 mod tests {
     use super::*;
     use crate::bootstrap::{BootstrapOptions, bootstrap_runtime_from_config};
+    use crate::codex_runner::{
+        CodexResult, CodexRunner, MentionCommandContext, MentionCommandResult, ReviewContext,
+    };
     use crate::config::apply_dev_mode_profile;
     use crate::config::{Config, test_builder::ConfigBuilder, validate_config};
+    use crate::review::DynamicRepoSource;
     use crate::service_factory::build_review_state_store;
+    use anyhow::anyhow;
+    use async_trait::async_trait;
     use sqlx::Executor;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    type EventLog = Arc<std::sync::Mutex<Vec<&'static str>>>;
 
     struct PanicSignalSource;
 
@@ -553,6 +573,39 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn run_once_starts_image_warmup_before_scanning_without_waiting_for_it() -> Result<()> {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warmup_started = Arc::new(Notify::new());
+        let release_warmup = Arc::new(Notify::new());
+        let runner = Arc::new(BlockingWarmupRunner {
+            events: Arc::clone(&events),
+            warmup_started: Arc::clone(&warmup_started),
+            release_warmup: Arc::clone(&release_warmup),
+        });
+        let runtime =
+            runtime_with_recording_sources(Arc::clone(&events), warmup_started, runner).await?;
+        let launch_count = Arc::new(AtomicUsize::new(0));
+        let launcher = RecordingHttpServerLauncher {
+            launches: Arc::clone(&launch_count),
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            run_with_hooks(runtime, &PanicSignalSource, &launcher),
+        )
+        .await;
+        release_warmup.notify_waiters();
+        result.context("run_once scan should not wait for warmup to finish")??;
+
+        assert_eq!(
+            *events.lock().expect("event log lock"),
+            vec!["warmup", "resolve_repos"]
+        );
+        assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
     #[test]
     fn select_next_wake_prefers_pending_retry_before_cron() {
         use chrono::TimeZone;
@@ -597,5 +650,100 @@ mod tests {
 
     fn test_config() -> Config {
         ConfigBuilder::for_scheduler_tests().build()
+    }
+
+    async fn runtime_with_recording_sources(
+        events: EventLog,
+        warmup_started: Arc<Notify>,
+        runner: Arc<BlockingWarmupRunner>,
+    ) -> Result<BootstrappedRuntime> {
+        let config = test_config();
+        let validated_config = validate_config(config.clone())?;
+        let state = build_review_state_store(&config).await?;
+        let dev_tools = DevToolsService::new(&config.database.path);
+        let runner = runner as Arc<dyn CodexRunner>;
+        let dynamic_repo_source: Arc<dyn DynamicRepoSource> = Arc::new(RecordingRepoSource {
+            events,
+            warmup_started,
+        });
+        let service = Arc::new(
+            ReviewService::new(
+                config.clone(),
+                dev_tools.gitlab_api(),
+                Arc::clone(&state),
+                Arc::clone(&runner),
+                1,
+                Utc::now(),
+            )
+            .with_dynamic_repo_source(dynamic_repo_source),
+        );
+        let http_services = Arc::new(HttpServices::new(
+            config,
+            Arc::clone(&state),
+            true,
+            Some(Arc::clone(&runner)),
+        ));
+
+        Ok(BootstrappedRuntime {
+            config: validated_config,
+            run_once: true,
+            state,
+            runner,
+            gitlab_client: None,
+            service,
+            http_services,
+            gitlab_discovery_mcp: None,
+            dev_tools: None,
+        })
+    }
+
+    struct BlockingWarmupRunner {
+        events: EventLog,
+        warmup_started: Arc<Notify>,
+        release_warmup: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl CodexRunner for BlockingWarmupRunner {
+        async fn warm_up_images(&self) -> Result<()> {
+            self.events.lock().expect("event log lock").push("warmup");
+            self.warmup_started.notify_one();
+            self.release_warmup.notified().await;
+            Err(anyhow!("warmup failed after scan started"))
+        }
+
+        async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+            Err(anyhow!(
+                "run_review should not be called in warmup ordering test"
+            ))
+        }
+
+        async fn run_mention_command(
+            &self,
+            _ctx: MentionCommandContext,
+        ) -> Result<MentionCommandResult> {
+            Err(anyhow!(
+                "run_mention_command should not be called in warmup ordering test"
+            ))
+        }
+    }
+
+    struct RecordingRepoSource {
+        events: EventLog,
+        warmup_started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl DynamicRepoSource for RecordingRepoSource {
+        async fn list_repos(&self) -> Result<Vec<String>> {
+            tokio::time::timeout(Duration::from_millis(100), self.warmup_started.notified())
+                .await
+                .context("warmup should be started before repository discovery completes")?;
+            self.events
+                .lock()
+                .expect("event log lock")
+                .push("resolve_repos");
+            Ok(vec!["demo/group/service-a".to_string()])
+        }
     }
 }
