@@ -16,6 +16,7 @@ use tokio::sync::{Notify, Semaphore};
 pub(crate) mod award_service;
 pub(crate) mod mention;
 pub(crate) mod mention_assets;
+pub(crate) mod orchestration;
 pub(crate) mod review;
 pub(crate) mod review_comments;
 

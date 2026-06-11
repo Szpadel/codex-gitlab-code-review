@@ -2,6 +2,7 @@ use crate::codex_runner::{CodexResult, ReviewComment, ReviewContext};
 use crate::config::Config;
 use crate::config::FeatureFlagSnapshot;
 use crate::flow::award_service::AwardService;
+use crate::flow::orchestration::{ActiveTaskKey, spawn_orchestrated_task};
 use crate::flow::review_comments::{PostReviewCommentRequest, post_review_comment};
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
@@ -697,43 +698,77 @@ impl ReviewFlow {
         acquired_rule_ids: Vec<String>,
         tasks: &mut Vec<JoinHandle<()>>,
     ) {
-        let semaphore = Arc::clone(&self.shared.semaphore);
-        let active_tasks = Arc::clone(&self.shared.active_tasks);
-        let review_context = self.run_context(acquired_rule_ids);
-        let active_review = active_tasks.track_review(ActiveReviewKey {
+        let review_context = Arc::new(self.run_context(acquired_rule_ids));
+        let review_iid = mr.iid;
+        let run_history_id = prepared.run_history_id;
+        let review_key = ActiveReviewKey {
             lane: review_context.lane,
             repo: repo_name.clone(),
-            iid: mr.iid,
+            iid: review_iid,
             head_sha: head_sha.clone(),
-        });
-        tasks.push(tokio::spawn(async move {
-            let _active_review = active_review;
-            let Ok(_permit) = semaphore.acquire_owned().await else {
+        };
+        let context_for_semaphore_closed = Arc::clone(&review_context);
+        let closed_repo = repo_name.clone();
+        let closed_head_sha = head_sha.clone();
+        let context_for_start_rejected = Arc::clone(&review_context);
+        let rejected_repo = repo_name.clone();
+        let rejected_head_sha = head_sha.clone();
+        spawn_orchestrated_task(
+            &self.shared,
+            ActiveTaskKey::Review(review_key),
+            tasks,
+            async {},
+            move |()| async move {
                 let err = Error::msg("review cancelled: semaphore closed");
-                review_context
+                context_for_semaphore_closed
                     .finalize_setup_failure(
-                        &repo_name,
-                        mr.iid,
-                        &head_sha,
-                        prepared.run_history_id,
+                        &closed_repo,
+                        review_iid,
+                        &closed_head_sha,
+                        run_history_id,
                         &err,
                     )
                     .await;
-                return;
-            };
-            if let Err(err) = review_context
-                .run(
-                    &repo_name,
-                    mr,
-                    &head_sha,
-                    prepared.feature_flags,
-                    prepared.run_history_id,
-                )
-                .await
-            {
-                warn!(repo = repo_name.as_str(), error = %err, "review failed");
-            }
-        }));
+            },
+            move |()| async move {
+                let retry_key = RetryKey::new(
+                    context_for_start_rejected.lane,
+                    &rejected_repo,
+                    review_iid,
+                    &rejected_head_sha,
+                );
+                if let Err(err) = context_for_start_rejected
+                    .finalize_cancelled(
+                        &rejected_repo,
+                        review_iid,
+                        &rejected_head_sha,
+                        &retry_key,
+                        run_history_id,
+                    )
+                    .await
+                {
+                    warn!(
+                        repo = rejected_repo.as_str(),
+                        error = %err,
+                        "failed to cancel queued review after shutdown"
+                    );
+                }
+            },
+            move |()| async move {
+                if let Err(err) = review_context
+                    .run(
+                        &repo_name,
+                        mr,
+                        &head_sha,
+                        prepared.feature_flags,
+                        prepared.run_history_id,
+                    )
+                    .await
+                {
+                    warn!(repo = repo_name.as_str(), error = %err, "review failed");
+                }
+            },
+        );
     }
 
     async fn acquire_review_permit_or_abort(
