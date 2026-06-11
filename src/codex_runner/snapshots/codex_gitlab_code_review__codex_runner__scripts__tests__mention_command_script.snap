@@ -5,9 +5,9 @@ expression: mention
 set -eu
 GITLAB_TOKEN='token-value'
 repo_dir='/work/repo/group/repo'
-log_file="/tmp/codex-mention-git.log"
 mkdir -p /work
 mkdir -p "$(dirname "$repo_dir")"
+log_file="/tmp/codex-mention-git.log"
 run_git() {
   action="$1"
   shift
@@ -30,7 +30,7 @@ export GIT_CONFIG_VALUE_1='ssh://git@gitlab.example.com/'
 export GIT_CONFIG_KEY_2='url.https://oauth2:token-value@gitlab.example.com/.insteadOf'
 export GIT_CONFIG_VALUE_2='https://gitlab.example.com/'
 
-run_git clone git clone --depth 1 --recurse-submodules "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git" "$repo_dir"
+run_git clone git clone --depth 1 --recurse-submodules 'https://oauth2:'"${GITLAB_TOKEN}"'@gitlab.example.com/group/repo.git' "$repo_dir"
 cd "$repo_dir"
 run_git fetch git fetch --depth 1 origin 'abc123'
 run_git checkout git checkout 'abc123'
@@ -52,8 +52,10 @@ if [ -n "$origin_url" ]; then
   run_git set_url git remote set-url origin "$sanitized_origin"
 fi
 run_git set_pushurl git remote set-url --push origin "no_push://disabled"
+# Use the mounted auth directory directly so token refresh persists.
 mkdir -p '/root/.codex'
 export CODEX_HOME='/root/.codex'
+# Ensure Codex CLI is available for app-server mode
 if ! command -v codex >/dev/null 2>&1; then
   echo "codex-runner: codex not found, installing"
   if command -v npm >/dev/null 2>&1; then

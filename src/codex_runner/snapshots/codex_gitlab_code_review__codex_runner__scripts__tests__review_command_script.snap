@@ -30,10 +30,10 @@ export GIT_CONFIG_VALUE_1='ssh://git@gitlab.example.com/'
 export GIT_CONFIG_KEY_2='url.https://oauth2:token-value@gitlab.example.com/.insteadOf'
 export GIT_CONFIG_VALUE_2='https://gitlab.example.com/'
 
-run_git clone git clone --depth 1 --recurse-submodules "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git" "$repo_dir"
+run_git clone git clone --depth 1 --recurse-submodules 'https://oauth2:'"${GITLAB_TOKEN}"'@gitlab.example.com/group/repo.git' "$repo_dir"
 cd "$repo_dir"
-run_git fetch git fetch --depth 1 origin "abc123"
-run_git checkout git checkout "abc123"
+run_git fetch git fetch --depth 1 origin 'abc123'
+run_git checkout git checkout 'abc123'
 run_git submodule_update git submodule update --init --recursive
 run_git fetch git fetch --depth 1 origin "main"
 git branch --force "main" FETCH_HEAD
@@ -142,8 +142,8 @@ export GOMODCACHE="$repo_dir/.codex_deps/go/mod"
 export GOCACHE="$repo_dir/.codex_deps/go/cache"
 export MAVEN_USER_HOME="$repo_dir/.codex_deps/m2"
 # Use the mounted auth directory directly so token refresh persists.
-mkdir -p "/root/.codex"
-export CODEX_HOME="/root/.codex"
+mkdir -p '/root/.codex'
+export CODEX_HOME='/root/.codex'
 # Ensure Codex CLI is available for app-server mode
 if ! command -v codex >/dev/null 2>&1; then
   echo "codex-runner: codex not found, installing"

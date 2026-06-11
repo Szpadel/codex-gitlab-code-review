@@ -44,7 +44,7 @@ fn mention_command_script_clones_repo_and_starts_app_server() {
         },
     );
     assert!(
-        script.contains("run_git clone git clone --depth 1 --recurse-submodules \"https://oauth2:${GITLAB_TOKEN}@example.com/repo.git\"")
+        script.contains("run_git clone git clone --depth 1 --recurse-submodules 'https://oauth2:'\"${GITLAB_TOKEN}\"'@example.com/repo.git' \"$repo_dir\"")
     );
     assert!(script.contains("repo_dir='/work/repo/group/repo'"));
     assert!(script.contains("export GITLAB_TOKEN='token'"));

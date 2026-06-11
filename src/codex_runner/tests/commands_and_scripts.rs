@@ -561,8 +561,8 @@ fn build_command_script_sets_writable_codex_home() {
             session_override: ConfiguredSessionOverride::default(),
         },
     );
-    assert!(script.contains("export CODEX_HOME=\"/root/.codex\""));
-    assert!(script.contains("mkdir -p \"/root/.codex\""));
+    assert!(script.contains("export CODEX_HOME='/root/.codex'"));
+    assert!(script.contains("mkdir -p '/root/.codex'"));
     assert!(script.contains("repo_dir='/work/repo/repo'"));
 }
 

@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 
 const MENTION_COMMAND_TEMPLATE: &str = include_str!("assets/mention_command.sh");
 const REVIEW_COMMAND_TEMPLATE: &str = include_str!("assets/review_command.sh");
+const BASE_BOOTSTRAP_TEMPLATE: &str = include_str!("assets/base_bootstrap.sh");
 const DEPS_PREFETCH_TEMPLATE: &str = include_str!("assets/deps_prefetch.sh");
 const HISTORY_READER_TEMPLATE: &str = include_str!("assets/history_reader.sh");
 const GIT_BOOTSTRAP_AUTH_CLEANUP_TEMPLATE: &str =
@@ -40,6 +41,20 @@ pub(crate) struct BuildCommandScriptInput<'a> {
     pub(crate) auth_mount_path: &'a str,
     pub(crate) target_branch: Option<&'a str>,
     pub(crate) deps_enabled: bool,
+}
+
+struct BuildCommandScriptRequest<'a> {
+    clone_url: &'a str,
+    gitlab_token: &'a str,
+    repo: &'a str,
+    project_path: &'a str,
+    head_sha: &'a str,
+    auth_mount_path: &'a str,
+    git_log_file: &'a str,
+    target_branch: Option<&'a str>,
+    deps_enabled: bool,
+    disable_push_url: bool,
+    app_server: AppServerCommandOptions<'a>,
 }
 
 fn render_script_template(template: &str, replacements: &[(&str, &str)]) -> String {
@@ -228,36 +243,21 @@ impl DockerCodexRunner {
         auth_mount_path: &str,
         app_server: AppServerCommandOptions<'_>,
     ) -> String {
-        let clone_url_dq = clone_url.replace('\\', "\\\\").replace('"', "\\\"");
-        let head_sha_q = shell_quote(&ctx.head_sha);
-        let gitlab_token_q = shell_quote(gitlab_token);
-        let auth_mount_path_q = shell_quote(auth_mount_path);
-        let repo_dir_q = shell_quote(&repo_checkout_root(&ctx.project_path));
-        let git_auth_setup_script =
-            git_bootstrap_auth_setup_script(clone_url, &ctx.repo, gitlab_token);
-        let git_auth_cleanup_script = git_bootstrap_auth_cleanup_script();
-        let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
-        let browser_wait_script = browser_wait_script(app_server.browser_mcp);
-        let app_server_exec_cmd = codex_app_server_exec_command(
-            app_server.browser_mcp,
-            app_server.gitlab_discovery_mcp,
-            app_server.mcp_server_overrides,
-            app_server.session_override,
-        );
-        render_script_template(
+        Self::render_command_template(
             MENTION_COMMAND_TEMPLATE,
-            &[
-                ("CLONE_URL_DQ", &clone_url_dq),
-                ("GITLAB_TOKEN_Q", &gitlab_token_q),
-                ("HEAD_SHA_Q", &head_sha_q),
-                ("AUTH_MOUNT_PATH_Q", &auth_mount_path_q),
-                ("REPO_DIR_Q", &repo_dir_q),
-                ("GIT_AUTH_SETUP_SCRIPT", &git_auth_setup_script),
-                ("GIT_AUTH_CLEANUP_SCRIPT", git_auth_cleanup_script),
-                ("BROWSER_PREREQ_SCRIPT", &browser_prereq_script),
-                ("BROWSER_WAIT_SCRIPT", &browser_wait_script),
-                ("APP_SERVER_EXEC_CMD", &app_server_exec_cmd),
-            ],
+            BuildCommandScriptRequest {
+                clone_url,
+                gitlab_token,
+                repo: &ctx.repo,
+                project_path: &ctx.project_path,
+                head_sha: &ctx.head_sha,
+                auth_mount_path,
+                git_log_file: "/tmp/codex-mention-git.log",
+                target_branch: None,
+                deps_enabled: false,
+                disable_push_url: true,
+                app_server,
+            },
         )
     }
 
@@ -265,52 +265,27 @@ impl DockerCodexRunner {
         input: BuildCommandScriptInput<'_>,
         app_server: AppServerCommandOptions<'_>,
     ) -> String {
-        let target_branch_script = input
-            .target_branch
-            .map(|branch| {
-                format!(
-                    "run_git fetch git fetch --depth 1 origin \"{branch}\"\n\
-git branch --force \"{branch}\" FETCH_HEAD\n\
-# Ensure merge-base works for PR review by unshallowing history.\n\
-run_git fetch git fetch --unshallow\n"
-                )
-            })
-            .unwrap_or_default();
-        let deps_prefetch_script = if input.deps_enabled {
-            DEPS_PREFETCH_TEMPLATE
-        } else {
-            ""
-        };
-        let git_auth_setup_script =
-            git_bootstrap_auth_setup_script(input.clone_url, input.repo, input.gitlab_token);
-        let git_auth_cleanup_script = git_bootstrap_auth_cleanup_script();
-        let gitlab_token_q = shell_quote(input.gitlab_token);
-        let repo_dir_q = shell_quote(&repo_checkout_root(input.project_path));
-        let browser_prereq_script = browser_mcp_prereq_script(app_server.browser_mcp);
-        let browser_wait_script = browser_wait_script(app_server.browser_mcp);
-        let app_server_exec_cmd = codex_app_server_exec_command(
-            app_server.browser_mcp,
-            app_server.gitlab_discovery_mcp,
-            app_server.mcp_server_overrides,
-            app_server.session_override,
-        );
-        render_script_template(
+        Self::render_command_template(
             REVIEW_COMMAND_TEMPLATE,
-            &[
-                ("CLONE_URL", input.clone_url),
-                ("GITLAB_TOKEN_Q", &gitlab_token_q),
-                ("REPO_DIR_Q", &repo_dir_q),
-                ("HEAD_SHA", input.head_sha),
-                ("AUTH_MOUNT_PATH", input.auth_mount_path),
-                ("TARGET_BRANCH_SCRIPT", &target_branch_script),
-                ("DEPS_PREFETCH_SCRIPT", deps_prefetch_script),
-                ("GIT_AUTH_SETUP_SCRIPT", &git_auth_setup_script),
-                ("GIT_AUTH_CLEANUP_SCRIPT", git_auth_cleanup_script),
-                ("BROWSER_PREREQ_SCRIPT", &browser_prereq_script),
-                ("BROWSER_WAIT_SCRIPT", &browser_wait_script),
-                ("APP_SERVER_EXEC_CMD", &app_server_exec_cmd),
-            ],
+            BuildCommandScriptRequest {
+                clone_url: input.clone_url,
+                gitlab_token: input.gitlab_token,
+                repo: input.repo,
+                project_path: input.project_path,
+                head_sha: input.head_sha,
+                auth_mount_path: input.auth_mount_path,
+                git_log_file: "/tmp/codex-git.log",
+                target_branch: input.target_branch,
+                deps_enabled: input.deps_enabled,
+                disable_push_url: false,
+                app_server,
+            },
         )
+    }
+
+    fn render_command_template(template: &str, request: BuildCommandScriptRequest<'_>) -> String {
+        let base_bootstrap = render_base_bootstrap_script(request);
+        render_script_template(template, &[("BASE_BOOTSTRAP", &base_bootstrap)])
     }
 
     pub(crate) fn app_server_cmd(script: String) -> Vec<String> {
@@ -326,6 +301,65 @@ run_git fetch git fetch --unshallow\n"
     }
 }
 
+fn render_base_bootstrap_script(request: BuildCommandScriptRequest<'_>) -> String {
+    let target_branch_script = request
+        .target_branch
+        .map(|branch| {
+            format!(
+                "run_git fetch git fetch --depth 1 origin \"{branch}\"\n\
+git branch --force \"{branch}\" FETCH_HEAD\n\
+# Ensure merge-base works for PR review by unshallowing history.\n\
+run_git fetch git fetch --unshallow\n"
+            )
+        })
+        .unwrap_or_default();
+    let deps_prefetch_script = if request.deps_enabled {
+        DEPS_PREFETCH_TEMPLATE
+    } else {
+        ""
+    };
+    let disable_push_url_script = if request.disable_push_url {
+        "run_git set_pushurl git remote set-url --push origin \"no_push://disabled\"\n"
+    } else {
+        ""
+    };
+    let git_auth_setup_script =
+        git_bootstrap_auth_setup_script(request.clone_url, request.repo, request.gitlab_token);
+    let git_auth_cleanup_script = git_bootstrap_auth_cleanup_script();
+    let clone_url_q = shell_quote_preserving_gitlab_token(request.clone_url);
+    let head_sha_q = shell_quote(request.head_sha);
+    let gitlab_token_q = shell_quote(request.gitlab_token);
+    let auth_mount_path_q = shell_quote(request.auth_mount_path);
+    let repo_dir_q = shell_quote(&repo_checkout_root(request.project_path));
+    let browser_prereq_script = browser_mcp_prereq_script(request.app_server.browser_mcp);
+    let browser_wait_script = browser_wait_script(request.app_server.browser_mcp);
+    let app_server_exec_cmd = codex_app_server_exec_command(
+        request.app_server.browser_mcp,
+        request.app_server.gitlab_discovery_mcp,
+        request.app_server.mcp_server_overrides,
+        request.app_server.session_override,
+    );
+    render_script_template(
+        BASE_BOOTSTRAP_TEMPLATE,
+        &[
+            ("CLONE_URL_Q", &clone_url_q),
+            ("GITLAB_TOKEN_Q", &gitlab_token_q),
+            ("REPO_DIR_Q", &repo_dir_q),
+            ("HEAD_SHA_Q", &head_sha_q),
+            ("AUTH_MOUNT_PATH_Q", &auth_mount_path_q),
+            ("GIT_LOG_FILE", request.git_log_file),
+            ("AFTER_SUBMODULE_SCRIPT", &target_branch_script),
+            ("AFTER_REMOTE_SANITIZE_SCRIPT", disable_push_url_script),
+            ("DEPS_PREFETCH_SCRIPT", deps_prefetch_script),
+            ("GIT_AUTH_SETUP_SCRIPT", &git_auth_setup_script),
+            ("GIT_AUTH_CLEANUP_SCRIPT", git_auth_cleanup_script),
+            ("BROWSER_PREREQ_SCRIPT", &browser_prereq_script),
+            ("BROWSER_WAIT_SCRIPT", &browser_wait_script),
+            ("APP_SERVER_EXEC_CMD", &app_server_exec_cmd),
+        ],
+    )
+}
+
 pub(crate) fn restore_push_remote_url_exec_command(push_url: &str) -> Vec<String> {
     let push_url_dq = push_url.replace('\\', "\\\\").replace('"', "\\\"");
     vec![
@@ -337,6 +371,30 @@ pub(crate) fn restore_push_remote_url_exec_command(push_url: &str) -> Vec<String
 
 pub(crate) fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn shell_quote_preserving_gitlab_token(input: &str) -> String {
+    const TOKEN: &str = "${GITLAB_TOKEN}";
+    let mut quoted = String::new();
+    let mut remainder = input;
+    while let Some(index) = remainder.find(TOKEN) {
+        let (prefix, suffix) = remainder.split_at(index);
+        if !prefix.is_empty() {
+            quoted.push_str(&shell_quote(prefix));
+        }
+        quoted.push('"');
+        quoted.push_str(TOKEN);
+        quoted.push('"');
+        remainder = &suffix[TOKEN.len()..];
+    }
+    if !remainder.is_empty() {
+        quoted.push_str(&shell_quote(remainder));
+    }
+    if quoted.is_empty() {
+        shell_quote(input)
+    } else {
+        quoted
+    }
 }
 
 fn git_url_rewrites(clone_url: &str, repo: &str) -> Vec<(String, String)> {
@@ -674,6 +732,53 @@ mod tests {
         );
         assert_no_placeholders(&mention);
         assert_snapshot!("mention_command_script", mention);
+    }
+
+    #[test]
+    fn command_scripts_quote_special_clone_urls_consistently() {
+        let mcp_overrides = BTreeMap::new();
+        let app_server = AppServerCommandOptions {
+            browser_mcp: None,
+            gitlab_discovery_mcp: None,
+            mcp_server_overrides: &mcp_overrides,
+            session_override: ConfiguredSessionOverride::default(),
+        };
+        let clone_url =
+            "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group repo/weird 'quote\".git";
+        let head_sha = "abc 'sha\" value";
+        let review = DockerCodexRunner::build_command_script(
+            BuildCommandScriptInput {
+                clone_url,
+                gitlab_token: "token-value",
+                repo: "group repo/weird 'quote\"",
+                project_path: "group repo/weird 'quote\"",
+                head_sha,
+                auth_mount_path: "/root/.codex",
+                target_branch: None,
+                deps_enabled: false,
+            },
+            app_server,
+        );
+        let mut mention_ctx = mention_context();
+        mention_ctx.head_sha = head_sha.to_string();
+        mention_ctx.repo = "group repo/weird 'quote\"".to_string();
+        mention_ctx.project_path = "group repo/weird 'quote\"".to_string();
+        let mention = DockerCodexRunner::build_mention_command_script(
+            &mention_ctx,
+            clone_url,
+            "token-value",
+            "/root/.codex",
+            app_server,
+        );
+        let expected_clone = r#"run_git clone git clone --depth 1 --recurse-submodules 'https://oauth2:'"${GITLAB_TOKEN}"'@gitlab.example.com/group repo/weird '"'"'quote".git' "$repo_dir""#;
+        let expected_fetch = r#"run_git fetch git fetch --depth 1 origin 'abc '"'"'sha" value'"#;
+        let expected_checkout = r#"run_git checkout git checkout 'abc '"'"'sha" value'"#;
+
+        for script in [&review, &mention] {
+            assert!(script.contains(expected_clone), "{script}");
+            assert!(script.contains(expected_fetch), "{script}");
+            assert!(script.contains(expected_checkout), "{script}");
+        }
     }
 
     #[test]
