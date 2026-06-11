@@ -5,6 +5,7 @@ use super::{
 };
 use crate::composer_install::composer_install_timeout_seconds;
 use crate::config::FeatureFlagSnapshot;
+use futures::future::BoxFuture;
 use std::collections::BTreeMap;
 use std::future::Future;
 
@@ -71,6 +72,13 @@ pub(crate) struct SessionInitializeRequest<'a> {
     pub(crate) timeout_error: &'static str,
 }
 
+pub(crate) struct RunSessionConfig {
+    pub(crate) browser_container_id: Option<String>,
+    pub(crate) browser_mcp: Option<BrowserMcpConfig>,
+    pub(crate) timeout_duration: Duration,
+    pub(crate) timeout_error: &'static str,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StartedReviewTurn {
     pub(crate) turn_id: String,
@@ -82,6 +90,26 @@ impl RunnerSession {
         self.gitlab_discovery_mcp
             .as_ref()
             .map(|prepared| prepared.runtime_config.server_name.as_str())
+    }
+}
+
+pub(crate) fn standard_session_launch_request<'a, F>(
+    run_history_id: Option<i64>,
+    feature_flags: &'a FeatureFlagSnapshot,
+    project_path: &'a str,
+    mcp_server_overrides: &'a BTreeMap<String, bool>,
+    allow_gitlab_discovery: bool,
+    auth_account: &'a AuthAccount,
+    build_script: F,
+) -> SessionLaunchRequest<'a, F> {
+    SessionLaunchRequest {
+        run_history_id,
+        feature_flags,
+        project_path,
+        mcp_server_overrides,
+        allow_gitlab_discovery,
+        auth_account,
+        build_script,
     }
 }
 
@@ -271,28 +299,45 @@ impl DockerCodexRunner {
 
     pub(crate) async fn run_session_with_timeout<T, Fut>(
         &self,
-        browser_container_id: Option<&str>,
-        browser_mcp: Option<&BrowserMcpConfig>,
-        timeout_duration: Duration,
-        timeout_error: &'static str,
+        config: RunSessionConfig,
         future: Fut,
     ) -> Result<T>
     where
         Fut: Future<Output = Result<T>>,
     {
-        match timeout(timeout_duration, future).await {
+        let browser_container_id = config.browser_container_id.as_deref();
+        let browser_mcp = config.browser_mcp.as_ref();
+        match timeout(config.timeout_duration, future).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(err)) => Err(self
                 .enrich_error_with_browser_diagnostics(err, browser_container_id, browser_mcp)
                 .await),
             Err(_) => Err(self
                 .enrich_error_with_browser_diagnostics(
-                    anyhow!(timeout_error),
+                    anyhow!(config.timeout_error),
                     browser_container_id,
                     browser_mcp,
                 )
                 .await),
         }
+    }
+
+    pub(crate) async fn run_initialized_session<'a, T, Work>(
+        &'a self,
+        session: &'a mut RunnerSession,
+        config: RunSessionConfig,
+        initialize: SessionInitializeRequest<'a>,
+        work: Work,
+    ) -> Result<T>
+    where
+        Work: FnOnce(&'a mut RunnerSession) -> BoxFuture<'a, Result<T>>,
+    {
+        self.run_session_with_timeout(config, async {
+            self.initialize_session_and_install_deps(session, initialize)
+                .await?;
+            work(session).await
+        })
+        .await
     }
 
     pub(crate) async fn session_start_thread(

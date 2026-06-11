@@ -1,5 +1,6 @@
 use super::session_runner::{
-    PreparedRunnerSessionComponents, SessionInitializeRequest, SessionLaunchRequest,
+    PreparedRunnerSessionComponents, RunSessionConfig, SessionInitializeRequest,
+    standard_session_launch_request,
 };
 use super::{
     AppServerCommandOptions, AuthAccount, AuthFallbackAction, Context, DockerCodexRunner,
@@ -7,6 +8,7 @@ use super::{
     RunHistorySessionUpdate, anyhow, bail, debug, info, json, repo_checkout_root,
     restore_push_remote_url_exec_command, warn,
 };
+use futures::FutureExt;
 use std::collections::BTreeSet;
 
 fn git_status_paths(status_output: &str) -> BTreeSet<String> {
@@ -84,14 +86,14 @@ impl DockerCodexRunner {
         let clone_url = self.clone_url(&ctx.repo)?;
         let repo_dir = repo_checkout_root(&ctx.project_path);
         let launch = self
-            .launch_runner_session(SessionLaunchRequest {
-                run_history_id: ctx.run_history_id,
-                feature_flags: &ctx.feature_flags,
-                project_path: &ctx.project_path,
-                mcp_server_overrides: &self.codex.mcp_server_overrides.mention,
-                allow_gitlab_discovery: true,
-                auth_account: account,
-                build_script: |prepared: &PreparedRunnerSessionComponents| {
+            .launch_runner_session(standard_session_launch_request(
+                ctx.run_history_id,
+                &ctx.feature_flags,
+                &ctx.project_path,
+                &self.codex.mcp_server_overrides.mention,
+                true,
+                account,
+                |prepared: &PreparedRunnerSessionComponents| {
                     Ok(Self::build_mention_command_script(
                         ctx,
                         &clone_url,
@@ -108,7 +110,7 @@ impl DockerCodexRunner {
                         },
                     ))
                 },
-            })
+            ))
             .await?;
         let prepared = launch.prepared;
         let mut session = launch.session;
@@ -122,42 +124,44 @@ impl DockerCodexRunner {
             browser_container_id = session.browser_container_id.as_deref().unwrap_or("none"),
             "launched mention command runner session"
         );
+        self.update_run_history_session(
+            ctx.run_history_id,
+            RunHistorySessionUpdate {
+                auth_account_name: Some(session.auth_account_name.clone()),
+                ..RunHistorySessionUpdate::default()
+            },
+        )
+        .await;
+        debug!(
+            repo = ctx.repo.as_str(),
+            iid = ctx.mr.iid,
+            run_history_id = ctx.run_history_id,
+            "initializing mention command session and dependency step"
+        );
 
         let browser_container_id = session.browser_container_id.clone();
         let browser_mcp = prepared.browser_mcp.clone();
+        let prepared_for_run = &prepared;
+        let repo_dir_for_run = repo_dir.as_str();
         let mention_result = self
-            .run_session_with_timeout(
-                browser_container_id.as_deref(),
-                browser_mcp.as_ref(),
-                run_timeout.saturating_sub(run_started_at.elapsed()),
-                "codex mention command timed out",
-                async {
-                    self.update_run_history_session(
-                        ctx.run_history_id,
-                        RunHistorySessionUpdate {
-                            auth_account_name: Some(session.auth_account_name.clone()),
-                            ..RunHistorySessionUpdate::default()
-                        },
-                    )
-                    .await;
-                    debug!(
-                        repo = ctx.repo.as_str(),
-                        iid = ctx.mr.iid,
-                        run_history_id = ctx.run_history_id,
-                        "initializing mention command session and dependency step"
-                    );
-                    self.initialize_session_and_install_deps(
-                        &mut session,
-                        SessionInitializeRequest {
-                            repo_dir: repo_dir.as_str(),
-                            project_path: &ctx.project_path,
-                            feature_flags: &ctx.feature_flags,
-                            run_timeout,
-                            run_started_at,
-                            timeout_error: "codex mention command timed out",
-                        },
-                    )
-                    .await?;
+            .run_initialized_session(
+                &mut session,
+                RunSessionConfig {
+                    browser_container_id,
+                    browser_mcp,
+                    timeout_duration: run_timeout.saturating_sub(run_started_at.elapsed()),
+                    timeout_error: "codex mention command timed out",
+                },
+                SessionInitializeRequest {
+                    repo_dir: repo_dir_for_run,
+                    project_path: &ctx.project_path,
+                    feature_flags: &ctx.feature_flags,
+                    run_timeout,
+                    run_started_at,
+                    timeout_error: "codex mention command timed out",
+                },
+                |session| {
+                    async move {
                     debug!(
                         repo = ctx.repo.as_str(),
                         iid = ctx.mr.iid,
@@ -168,7 +172,7 @@ impl DockerCodexRunner {
                         .exec_container_git_command(
                             &session.container_id,
                             &["status".to_string(), "--porcelain".to_string()],
-                            Some(repo_dir.as_str()),
+                            Some(repo_dir_for_run),
                         )
                         .await
                         .inspect_err(|_| {
@@ -176,15 +180,15 @@ impl DockerCodexRunner {
                         })?
                         .stdout;
                     let baseline_worktree_paths = git_status_paths(&baseline_worktree_state);
-                    let extra_writable_roots = prepared.extra_writable_roots();
+                    let extra_writable_roots = prepared_for_run.extra_writable_roots();
                     let prepared_inputs = self
-                        .prepare_mention_inputs(&session.container_id, repo_dir.as_str(), ctx)
+                        .prepare_mention_inputs(&session.container_id, repo_dir_for_run, ctx)
                         .await;
                     let thread_id = self
                         .session_start_thread(
-                            &mut session,
+                            session,
                             self.thread_start_params(
-                                repo_dir.as_str(),
+                                repo_dir_for_run,
                                 Some(Self::mention_developer_instructions(ctx)),
                                 &extra_writable_roots,
                             ),
@@ -215,7 +219,7 @@ impl DockerCodexRunner {
                             "user.name".to_string(),
                             ctx.requester_name.clone(),
                         ],
-                        Some(repo_dir.as_str()),
+                        Some(repo_dir_for_run),
                     )
                     .await
                     .inspect_err(|_| {
@@ -228,7 +232,7 @@ impl DockerCodexRunner {
                             "user.email".to_string(),
                             ctx.requester_email.clone(),
                         ],
-                        Some(repo_dir.as_str()),
+                        Some(repo_dir_for_run),
                     )
                     .await
                     .inspect_err(|_| {
@@ -243,7 +247,7 @@ impl DockerCodexRunner {
                             "origin".to_string(),
                             "no_push://disabled".to_string(),
                         ],
-                        Some(repo_dir.as_str()),
+                        Some(repo_dir_for_run),
                     )
                     .await
                     .inspect_err(|_| {
@@ -256,7 +260,7 @@ impl DockerCodexRunner {
                         .exec_container_git_command(
                             &session.container_id,
                             &["rev-parse".to_string(), "HEAD".to_string()],
-                            Some(repo_dir.as_str()),
+                            Some(repo_dir_for_run),
                         )
                         .await
                         .inspect_err(|_| {
@@ -268,10 +272,10 @@ impl DockerCodexRunner {
 
                     let turn_id = self
                         .session_start_turn(
-                            &mut session,
+                            session,
                             json!({
                                 "threadId": thread_id.as_str(),
-                                "cwd": repo_dir.as_str(),
+                                "cwd": repo_dir_for_run,
                                 "input": prepared_inputs.turn_input,
                             }),
                             "turn/start missing turn id",
@@ -296,7 +300,7 @@ impl DockerCodexRunner {
                     )
                     .await;
                     let mut reply_message = self
-                        .session_stream_turn_message(&mut session, &thread_id, &turn_id)
+                        .session_stream_turn_message(session, &thread_id, &turn_id)
                         .await?;
                     if reply_message.trim().is_empty() {
                         reply_message = "Mention command completed.".to_string();
@@ -306,7 +310,7 @@ impl DockerCodexRunner {
                         .exec_container_git_command(
                             &session.container_id,
                             &["rev-parse".to_string(), "HEAD".to_string()],
-                            Some(repo_dir.as_str()),
+                            Some(repo_dir_for_run),
                         )
                         .await
                         .inspect_err(|_| {
@@ -320,7 +324,7 @@ impl DockerCodexRunner {
                             .exec_container_git_command(
                                 &session.container_id,
                                 &["status".to_string(), "--porcelain".to_string()],
-                                Some(repo_dir.as_str()),
+                                Some(repo_dir_for_run),
                             )
                             .await
                             .inspect_err(|_| {
@@ -360,7 +364,7 @@ impl DockerCodexRunner {
                                     before_sha.clone(),
                                     after_sha.clone(),
                                 ],
-                                Some(repo_dir.as_str()),
+                                Some(repo_dir_for_run),
                             )
                             .await
                         {
@@ -380,7 +384,7 @@ impl DockerCodexRunner {
                                     "--count".to_string(),
                                     format!("{before_sha}..{after_sha}"),
                                 ],
-                                Some(repo_dir.as_str()),
+                                Some(repo_dir_for_run),
                             )
                             .await
                             .inspect_err(|_| {
@@ -413,7 +417,7 @@ impl DockerCodexRunner {
                                         "--name-only".to_string(),
                                         format!("{before_sha}..{after_sha}"),
                                     ],
-                                    Some(repo_dir.as_str()),
+                                    Some(repo_dir_for_run),
                                 )
                                 .await
                                 .inspect_err(|_| {
@@ -446,7 +450,7 @@ impl DockerCodexRunner {
                         self.exec_container_command_with_env(
                             &session.container_id,
                             restore_push_remote_url_exec_command(&clone_url),
-                            Some(repo_dir.as_str()),
+                            Some(repo_dir_for_run),
                             Some(vec![format!("GITLAB_TOKEN={}", self.gitlab_token)]),
                         )
                         .await
@@ -460,7 +464,7 @@ impl DockerCodexRunner {
                                 "origin".to_string(),
                                 format!("HEAD:{source_branch}"),
                             ],
-                            Some(repo_dir.as_str()),
+                            Some(repo_dir_for_run),
                         )
                         .await
                         .inspect_err(|_| {
@@ -480,7 +484,9 @@ impl DockerCodexRunner {
                         commit_sha,
                         reply_message,
                     })
-                }
+                    }
+                    .boxed()
+                },
             )
             .await;
 

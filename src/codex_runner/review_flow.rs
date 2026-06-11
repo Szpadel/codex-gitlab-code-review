@@ -4,7 +4,8 @@ use super::security_context::{
     SecurityContextPayloadResolution, SeparateSecurityContextSessionRequest,
 };
 use super::session_runner::{
-    PreparedRunnerSessionComponents, RunnerSession, SessionInitializeRequest, SessionLaunchRequest,
+    PreparedRunnerSessionComponents, RunSessionConfig, RunnerSession, SessionInitializeRequest,
+    standard_session_launch_request,
 };
 use super::{
     AppServerCommandOptions, Arc, AuthAccount, AuthFallbackAction, DockerCodexRunner, Instant,
@@ -13,6 +14,7 @@ use super::{
     build_commit_review_prompt, json, repo_checkout_root, upstream_review_prompt_source_commit,
     upstream_review_prompt_source_path, warn,
 };
+use futures::FutureExt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewTargetRequest {
@@ -483,14 +485,14 @@ impl DockerCodexRunner {
         account: &AuthAccount,
     ) -> Result<String> {
         let launch = self
-            .launch_runner_session(SessionLaunchRequest {
-                run_history_id: ctx.run_history_id,
-                feature_flags: &ctx.feature_flags,
-                project_path: &ctx.project_path,
-                mcp_server_overrides: &self.codex.mcp_server_overrides.review,
-                allow_gitlab_discovery: !ctx.lane.is_security(),
-                auth_account: account,
-                build_script: |prepared: &PreparedRunnerSessionComponents| {
+            .launch_runner_session(standard_session_launch_request(
+                ctx.run_history_id,
+                &ctx.feature_flags,
+                &ctx.project_path,
+                &self.codex.mcp_server_overrides.review,
+                !ctx.lane.is_security(),
+                account,
+                |prepared: &PreparedRunnerSessionComponents| {
                     self.command(
                         ctx,
                         AppServerCommandOptions {
@@ -508,7 +510,7 @@ impl DockerCodexRunner {
                         },
                     )
                 },
-            })
+            ))
             .await?;
         let prepared = launch.prepared;
         let mut session = launch.session;
@@ -527,98 +529,102 @@ impl DockerCodexRunner {
         let extra_security_context_session = ExtraSecurityContextSessionContainer::default();
         let browser_container_id = session.browser_container_id.clone();
         let browser_mcp = prepared.browser_mcp.clone();
+        let prepared_for_run = &prepared;
+        let extra_security_context_session_for_run = &extra_security_context_session;
+        let repo_path_for_run = repo_path.as_str();
         let review_result = self
-            .run_session_with_timeout(
-                browser_container_id.as_deref(),
-                browser_mcp.as_ref(),
-                run_timeout.saturating_sub(run_started_at.elapsed()),
-                "codex review timed out",
-                async {
-                    self.initialize_session_and_install_deps(
-                        &mut session,
-                        SessionInitializeRequest {
-                            repo_dir: repo_path.as_str(),
-                            project_path: &ctx.project_path,
-                            feature_flags: &ctx.feature_flags,
-                            run_timeout,
-                            run_started_at,
-                            timeout_error: "codex review timed out",
-                        },
-                    )
-                    .await?;
-
-                    let extra_writable_roots = prepared.extra_writable_roots();
-                    let mut security_plan = if ctx.lane.is_security() {
-                        Some(
-                            self.prepare_security_review_plan(
-                                ctx,
-                                &session.container_id,
-                                repo_path.as_str(),
+            .run_initialized_session(
+                &mut session,
+                RunSessionConfig {
+                    browser_container_id,
+                    browser_mcp,
+                    timeout_duration: run_timeout.saturating_sub(run_started_at.elapsed()),
+                    timeout_error: "codex review timed out",
+                },
+                SessionInitializeRequest {
+                    repo_dir: repo_path_for_run,
+                    project_path: &ctx.project_path,
+                    feature_flags: &ctx.feature_flags,
+                    run_timeout,
+                    run_started_at,
+                    timeout_error: "codex review timed out",
+                },
+                |session| {
+                    async move {
+                        let extra_writable_roots = prepared_for_run.extra_writable_roots();
+                        let mut security_plan = if ctx.lane.is_security() {
+                            Some(
+                                self.prepare_security_review_plan(
+                                    ctx,
+                                    &session.container_id,
+                                    repo_path_for_run,
+                                )
+                                .await?,
                             )
-                            .await?,
-                        )
-                    } else {
-                        None
-                    };
-                    let thread_id = self
-                        .session_start_thread(
-                            &mut session,
-                            self.thread_start_params(
-                                repo_path.as_str(),
-                                None,
-                                &extra_writable_roots,
-                            ),
-                            "thread/start missing thread id",
-                        )
-                        .await?;
-                    let default_security_context_resolution =
-                        SecurityContextPayloadResolution::default();
-                    let security_context_resolution = security_plan
-                        .as_ref()
-                        .map(|plan| &plan.context_resolution)
-                        .unwrap_or(&default_security_context_resolution);
-                    let security_context_base_branch = security_plan
-                        .as_ref()
-                        .and_then(|plan| plan.base_branch.as_deref());
-                    let mut session_update = Self::security_context_session_update(
-                        security_context_base_branch,
-                        security_context_resolution,
-                    );
-                    session_update.thread_id = Some(thread_id.clone());
-                    session_update.auth_account_name = Some(session.auth_account_name.clone());
-                    self.update_run_history_session(ctx.run_history_id, session_update)
-                        .await;
+                        } else {
+                            None
+                        };
+                        let thread_id = self
+                            .session_start_thread(
+                                session,
+                                self.thread_start_params(
+                                    repo_path_for_run,
+                                    None,
+                                    &extra_writable_roots,
+                                ),
+                                "thread/start missing thread id",
+                            )
+                            .await?;
+                        let default_security_context_resolution =
+                            SecurityContextPayloadResolution::default();
+                        let security_context_resolution = security_plan
+                            .as_ref()
+                            .map(|plan| &plan.context_resolution)
+                            .unwrap_or(&default_security_context_resolution);
+                        let security_context_base_branch = security_plan
+                            .as_ref()
+                            .and_then(|plan| plan.base_branch.as_deref());
+                        let mut session_update = Self::security_context_session_update(
+                            security_context_base_branch,
+                            security_context_resolution,
+                        );
+                        session_update.thread_id = Some(thread_id.clone());
+                        session_update.auth_account_name = Some(session.auth_account_name.clone());
+                        self.update_run_history_session(ctx.run_history_id, session_update)
+                            .await;
 
-                    if ctx.lane.is_security() {
-                        let plan = security_plan
-                            .as_mut()
-                            .expect("security review plan built for security lane");
-                        self.refresh_security_context_if_pending(
-                            ctx,
-                            account,
-                            &prepared,
-                            repo_path.as_str(),
-                            plan,
-                            &extra_security_context_session,
-                        )
-                        .await;
-                        self.run_security_review_turn(
-                            ctx,
-                            &mut session,
-                            &thread_id,
-                            repo_path.as_str(),
-                            plan,
-                        )
-                        .await
-                    } else {
-                        self.run_general_review_turn(
-                            ctx,
-                            &mut session,
-                            &thread_id,
-                            repo_path.as_str(),
-                        )
-                        .await
+                        if ctx.lane.is_security() {
+                            let plan = security_plan
+                                .as_mut()
+                                .expect("security review plan built for security lane");
+                            self.refresh_security_context_if_pending(
+                                ctx,
+                                account,
+                                prepared_for_run,
+                                repo_path_for_run,
+                                plan,
+                                extra_security_context_session_for_run,
+                            )
+                            .await;
+                            self.run_security_review_turn(
+                                ctx,
+                                session,
+                                &thread_id,
+                                repo_path_for_run,
+                                plan,
+                            )
+                            .await
+                        } else {
+                            self.run_general_review_turn(
+                                ctx,
+                                session,
+                                &thread_id,
+                                repo_path_for_run,
+                            )
+                            .await
+                        }
                     }
+                    .boxed()
                 },
             )
             .await;

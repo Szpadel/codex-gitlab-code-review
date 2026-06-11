@@ -1,6 +1,6 @@
 //! Security-review context cache lifecycle and separate-session context building.
 
-use super::session_runner::{PreparedRunnerSessionComponents, SessionLaunchRequest};
+use super::session_runner::{PreparedRunnerSessionComponents, standard_session_launch_request};
 use super::{
     AppServerClient, AppServerCommandOptions, Arc, AuthAccount, BrowserMcpConfig, Context,
     DockerCodexRunner, Mutex, Result, ReviewContext, RunHistorySessionUpdate,
@@ -624,14 +624,14 @@ impl DockerCodexRunner {
         request: SeparateSecurityContextSessionRequest<'_>,
     ) -> Result<String> {
         let launch = self
-            .launch_runner_session(SessionLaunchRequest {
-                run_history_id: ctx.run_history_id,
-                feature_flags: &ctx.feature_flags,
-                project_path: &ctx.project_path,
-                mcp_server_overrides: &self.codex.mcp_server_overrides.review,
-                allow_gitlab_discovery: false,
-                auth_account: request.account,
-                build_script: |_prepared: &PreparedRunnerSessionComponents| {
+            .launch_runner_session(standard_session_launch_request(
+                ctx.run_history_id,
+                &ctx.feature_flags,
+                &ctx.project_path,
+                &self.codex.mcp_server_overrides.review,
+                false,
+                request.account,
+                |_prepared: &PreparedRunnerSessionComponents| {
                     self.command(
                         ctx,
                         AppServerCommandOptions {
@@ -642,7 +642,7 @@ impl DockerCodexRunner {
                         },
                     )
                 },
-            })
+            ))
             .await?;
         let mut session = launch.session;
         {
