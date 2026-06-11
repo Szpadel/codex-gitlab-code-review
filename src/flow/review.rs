@@ -2,7 +2,10 @@ use crate::codex_runner::{CodexResult, ReviewComment, ReviewContext};
 use crate::config::Config;
 use crate::config::FeatureFlagSnapshot;
 use crate::flow::award_service::AwardService;
-use crate::flow::orchestration::{ActiveTaskKey, ScheduledTaskContext, spawn_orchestrated_task};
+use crate::flow::orchestration::{
+    ActiveTaskKey, ScheduledTaskContext, finish_task_run_history, refund_review_rate_limits,
+    spawn_orchestrated_task, task_cancelled_finish, task_error_finish,
+};
 use crate::flow::review_comments::{PostReviewCommentRequest, post_review_comment};
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
@@ -993,13 +996,8 @@ impl ReviewFlow {
         head_sha: &str,
         acquired_rule_ids: &[String],
     ) {
-        if !acquired_rule_ids.is_empty()
-            && let Err(recovery_err) = self
-                .shared
-                .state
-                .review_rate_limit
-                .refund_review_rate_limit_buckets(acquired_rule_ids, Utc::now().timestamp())
-                .await
+        if let Err(recovery_err) =
+            refund_review_rate_limits(&self.shared.state, acquired_rule_ids).await
         {
             warn!(
                 repo = repo,
@@ -1043,20 +1041,17 @@ impl ReviewFlow {
     ) {
         self.release_review_lock_after_history_failure(repo, iid, head_sha, acquired_rule_ids)
             .await;
-        if let Err(recovery_err) = self
-            .shared
-            .state
-            .run_history
-            .finish_run_history(
-                run_history_id,
-                RunHistoryFinish {
-                    result: ReviewRunResult::Error.as_str().to_string(),
-                    preview: Some(format!("{} {repo} !{iid}", self.lane.review_label())),
-                    error: Some(format!("{err:#}")),
-                    ..RunHistoryFinish::default()
-                },
-            )
-            .await
+        let task = ScheduledTaskContext::new(repo, iid, head_sha, run_history_id);
+        if let Err(recovery_err) = finish_task_run_history(
+            &self.shared.state,
+            &task,
+            task_error_finish(
+                ReviewRunResult::Error.as_str(),
+                format!("{} {repo} !{iid}", self.lane.review_label()),
+                err,
+            ),
+        )
+        .await
         {
             warn!(
                 repo = repo,
@@ -1214,15 +1209,7 @@ impl ReviewRunContext {
         run_history_id: i64,
     ) -> Result<()> {
         self.remove_eyes_best_effort(repo, iid).await;
-        if !self.acquired_rate_limit_rule_ids.is_empty() {
-            self.state
-                .review_rate_limit
-                .refund_review_rate_limit_buckets(
-                    &self.acquired_rate_limit_rule_ids,
-                    Utc::now().timestamp(),
-                )
-                .await?;
-        }
+        refund_review_rate_limits(&self.state, &self.acquired_rate_limit_rule_ids).await?;
         self.retry_backoff.clear(retry_key);
         self.state
             .review_state
@@ -1234,17 +1221,16 @@ impl ReviewRunContext {
                 ReviewRunResult::Cancelled.as_str(),
             )
             .await?;
-        self.state
-            .run_history
-            .finish_run_history(
-                run_history_id,
-                RunHistoryFinish {
-                    result: ReviewRunResult::Cancelled.as_str().to_string(),
-                    preview: Some(self.review_preview(repo, iid)),
-                    ..RunHistoryFinish::default()
-                },
-            )
-            .await?;
+        let task = ScheduledTaskContext::new(repo, iid, head_sha, run_history_id);
+        finish_task_run_history(
+            &self.state,
+            &task,
+            task_cancelled_finish(
+                ReviewRunResult::Cancelled.as_str(),
+                self.review_preview(repo, iid),
+            ),
+        )
+        .await?;
         info!(repo = repo, iid = iid, "review cancelled due to shutdown");
         Ok(())
     }
@@ -1257,15 +1243,8 @@ impl ReviewRunContext {
         run_history_id: i64,
         err: &anyhow::Error,
     ) {
-        if !self.acquired_rate_limit_rule_ids.is_empty()
-            && let Err(recovery_err) = self
-                .state
-                .review_rate_limit
-                .refund_review_rate_limit_buckets(
-                    &self.acquired_rate_limit_rule_ids,
-                    Utc::now().timestamp(),
-                )
-                .await
+        if let Err(recovery_err) =
+            refund_review_rate_limits(&self.state, &self.acquired_rate_limit_rule_ids).await
         {
             warn!(
                 repo = repo,
@@ -1295,19 +1274,17 @@ impl ReviewRunContext {
                 "failed to release review lock after queued review setup error"
             );
         }
-        if let Err(recovery_err) = self
-            .state
-            .run_history
-            .finish_run_history(
-                run_history_id,
-                RunHistoryFinish {
-                    result: ReviewRunResult::Error.as_str().to_string(),
-                    preview: Some(self.review_preview(repo, iid)),
-                    error: Some(format!("{err:#}")),
-                    ..RunHistoryFinish::default()
-                },
-            )
-            .await
+        let task = ScheduledTaskContext::new(repo, iid, head_sha, run_history_id);
+        if let Err(recovery_err) = finish_task_run_history(
+            &self.state,
+            &task,
+            task_error_finish(
+                ReviewRunResult::Error.as_str(),
+                self.review_preview(repo, iid),
+                err,
+            ),
+        )
+        .await
         {
             warn!(
                 repo = repo,
@@ -1412,10 +1389,8 @@ impl ReviewRunContext {
             .finish_review_for_lane(run.repo, run.iid, run.head_sha, self.lane, result.as_str())
             .await?;
         finish.result = result.as_str().to_string();
-        self.state
-            .run_history
-            .finish_run_history(run.run_history_id, finish)
-            .await
+        let task = ScheduledTaskContext::new(run.repo, run.iid, run.head_sha, run.run_history_id);
+        finish_task_run_history(&self.state, &task, finish).await
     }
 
     async fn handle_pass(&self, run: &ReviewRunIdentity<'_>, summary: String) -> Result<()> {
@@ -1530,11 +1505,11 @@ impl ReviewRunContext {
             run,
             false,
             ReviewRunResult::Error,
-            RunHistoryFinish {
-                preview: Some(self.review_preview(run.repo, run.iid)),
-                error: Some(format!("{err:#}")),
-                ..RunHistoryFinish::default()
-            },
+            task_error_finish(
+                ReviewRunResult::Error.as_str(),
+                self.review_preview(run.repo, run.iid),
+                &err,
+            ),
         )
         .await
     }

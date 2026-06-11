@@ -1,7 +1,10 @@
 use crate::codex_runner::{MentionCommandContext, MentionCommandResult, MentionCommandStatus};
 use crate::config::FeatureFlagSnapshot;
 use crate::flow::mention_assets::collect_note_image_uploads;
-use crate::flow::orchestration::{ActiveTaskKey, ScheduledTaskContext, spawn_orchestrated_task};
+use crate::flow::orchestration::{
+    ActiveTaskKey, ScheduledTaskContext, finish_task_run_history, spawn_orchestrated_task,
+    task_cancelled_finish, task_error_finish,
+};
 use crate::flow::{ActiveMentionKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::links::{extract_root_relative_markdown_urls, gitlab_web_base};
 use crate::gitlab::{DiscussionNote, GitLabUser, MergeRequest, MergeRequestDiscussion};
@@ -39,12 +42,9 @@ pub(crate) struct MentionScheduleOutcome {
 
 #[derive(Clone, Copy, Debug)]
 struct MentionSetupFailureContext<'a> {
-    repo: &'a str,
-    iid: u64,
+    task: &'a ScheduledTaskContext,
     discussion_id: &'a str,
     trigger_note_id: u64,
-    head_sha: &'a str,
-    run_history_id: i64,
 }
 
 struct PreparedMentionRun {
@@ -444,12 +444,9 @@ impl MentionFlow {
             Err(err) => {
                 self.abort_mention_after_setup_failure(
                     MentionSetupFailureContext {
-                        repo,
-                        iid: task.iid,
+                        task: &task,
                         discussion_id: &trigger.discussion_id,
                         trigger_note_id,
-                        head_sha,
-                        run_history_id: task.run_history_id,
                     },
                     &err,
                 )
@@ -466,12 +463,9 @@ impl MentionFlow {
         {
             self.abort_mention_after_setup_failure(
                 MentionSetupFailureContext {
-                    repo,
-                    iid: task.iid,
+                    task: &task,
                     discussion_id: &trigger.discussion_id,
                     trigger_note_id,
-                    head_sha,
-                    run_history_id: task.run_history_id,
                 },
                 &err,
             )
@@ -642,10 +636,10 @@ impl MentionFlow {
                 head_sha: head_sha_copy.clone(),
             };
             let closed_repo = repo_name.clone();
-            let rejected_repo = repo_name.clone();
-            let rejected_head_sha = head_sha_copy.clone();
+            let rejected_task = task.clone();
             let rejected_discussion_id = trigger_discussion_id.clone();
             let state_for_rejection = Arc::clone(&state);
+            let task_for_run_history = task.clone();
             spawn_orchestrated_task(
                 &self.shared,
                 ActiveTaskKey::Mention(mention_key),
@@ -662,28 +656,26 @@ impl MentionFlow {
                     let _ = state_for_rejection
                         .mention_commands
                         .finish_mention_command(
-                            &rejected_repo,
-                            mention_iid,
+                            &rejected_task.repo,
+                            rejected_task.iid,
                             &rejected_discussion_id,
                             trigger_note_id,
-                            &rejected_head_sha,
+                            &rejected_task.head_sha,
                             "cancelled",
                         )
                         .await;
-                    let _ = state_for_rejection
-                        .run_history
-                        .finish_run_history(
-                            run_history_id,
-                            RunHistoryFinish {
-                                result: "cancelled".to_string(),
-                                preview: Some(format!(
-                                    "Mention {} !{} note {}",
-                                    rejected_repo, mention_iid, trigger_note_id
-                                )),
-                                ..RunHistoryFinish::default()
-                            },
-                        )
-                        .await;
+                    let _ = finish_task_run_history(
+                        &state_for_rejection,
+                        &rejected_task,
+                        task_cancelled_finish(
+                            "cancelled",
+                            format!(
+                                "Mention {} !{} note {}",
+                                rejected_task.repo, rejected_task.iid, trigger_note_id
+                            ),
+                        ),
+                    )
+                    .await;
                 },
                 move |branch_guard| async move {
                     let _branch_guard = branch_guard;
@@ -845,22 +837,20 @@ impl MentionFlow {
                                 "error",
                                 "Mention command failed. Check service logs for details."
                                     .to_string(),
-                                RunHistoryFinish {
-                                    result: "error".to_string(),
-                                    preview: Some(format!(
+                                task_error_finish(
+                                    "error",
+                                    format!(
                                         "Mention {} !{} note {}",
                                         repo_name, mr_copy.iid, trigger_note_id
-                                    )),
-                                    error: Some(format!("{err:#}")),
-                                    ..RunHistoryFinish::default()
-                                },
+                                    ),
+                                    &err,
+                                ),
                             )
                         }
                     };
-                    if let Err(err) = state
-                        .run_history
-                        .finish_run_history(run_history_id, run_history_finish)
-                        .await
+                    if let Err(err) =
+                        finish_task_run_history(&state, &task_for_run_history, run_history_finish)
+                            .await
                     {
                         warn!(
                             repo = repo_name.as_str(),
@@ -1041,34 +1031,30 @@ impl MentionFlow {
         err: &anyhow::Error,
     ) {
         self.release_mention_lock_after_history_failure(
-            ctx.repo,
-            ctx.iid,
+            &ctx.task.repo,
+            ctx.task.iid,
             ctx.discussion_id,
             ctx.trigger_note_id,
-            ctx.head_sha,
+            &ctx.task.head_sha,
         )
         .await;
-        if let Err(finish_err) = self
-            .shared
-            .state
-            .run_history
-            .finish_run_history(
-                ctx.run_history_id,
-                RunHistoryFinish {
-                    result: "error".to_string(),
-                    preview: Some(format!(
-                        "Mention {} !{} note {}",
-                        ctx.repo, ctx.iid, ctx.trigger_note_id
-                    )),
-                    error: Some(format!("{err:#}")),
-                    ..RunHistoryFinish::default()
-                },
-            )
-            .await
+        if let Err(finish_err) = finish_task_run_history(
+            &self.shared.state,
+            ctx.task,
+            task_error_finish(
+                "error",
+                format!(
+                    "Mention {} !{} note {}",
+                    ctx.task.repo, ctx.task.iid, ctx.trigger_note_id
+                ),
+                err,
+            ),
+        )
+        .await
         {
             warn!(
-                repo = ctx.repo,
-                iid = ctx.iid,
+                repo = ctx.task.repo.as_str(),
+                iid = ctx.task.iid,
                 discussion_id = ctx.discussion_id,
                 trigger_note_id = ctx.trigger_note_id,
                 error = %finish_err,

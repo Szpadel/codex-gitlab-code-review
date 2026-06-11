@@ -2,6 +2,9 @@ use super::{
     ActiveMentionGuard, ActiveMentionKey, ActiveReviewGuard, ActiveReviewKey, ActiveTaskRegistry,
     FlowShared,
 };
+use crate::state::{ReviewStateStore, RunHistoryFinish};
+use anyhow::Result;
+use chrono::Utc;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -23,6 +26,51 @@ impl ScheduledTaskContext {
             run_history_id,
         }
     }
+}
+
+pub(crate) fn task_cancelled_finish(result: &str, preview: String) -> RunHistoryFinish {
+    RunHistoryFinish {
+        result: result.to_string(),
+        preview: Some(preview),
+        ..RunHistoryFinish::default()
+    }
+}
+
+pub(crate) fn task_error_finish(
+    result: &str,
+    preview: String,
+    err: &anyhow::Error,
+) -> RunHistoryFinish {
+    RunHistoryFinish {
+        result: result.to_string(),
+        preview: Some(preview),
+        error: Some(format!("{err:#}")),
+        ..RunHistoryFinish::default()
+    }
+}
+
+pub(crate) async fn finish_task_run_history(
+    state: &ReviewStateStore,
+    task: &ScheduledTaskContext,
+    finish: RunHistoryFinish,
+) -> Result<()> {
+    state
+        .run_history
+        .finish_run_history(task.run_history_id, finish)
+        .await
+}
+
+pub(crate) async fn refund_review_rate_limits(
+    state: &ReviewStateStore,
+    acquired_rule_ids: &[String],
+) -> Result<()> {
+    if acquired_rule_ids.is_empty() {
+        return Ok(());
+    }
+    state
+        .review_rate_limit
+        .refund_review_rate_limit_buckets(acquired_rule_ids, Utc::now().timestamp())
+        .await
 }
 
 pub(crate) enum ActiveTaskKey {
