@@ -2,7 +2,10 @@ use super::app_server::{
     TurnHistoryCapture, TurnNotificationContext, item_is_successful_gitlab_discovery_call,
     with_recent_runner_errors,
 };
-use super::auth::{auth_account_state_key, parse_usage_limit_reset_at, should_clear_limit_reset};
+use super::auth::{
+    CodexQuotaExhausted, QUOTA_LAST_PROBE_AT_KEY, auth_account_state_key,
+    parse_usage_limit_reset_at, should_clear_limit_reset,
+};
 use super::browser_mcp::{
     BrowserContainerDiagnostics, BrowserContainerStateSnapshot, BrowserLaunchConfig,
     BrowserLogTail, browser_container_cmd, browser_container_has_exited, browser_logs_report_ready,
@@ -283,6 +286,7 @@ fn test_codex_config() -> CodexConfig {
         exec_sandbox: "danger-full-access".to_string(),
         fallback_auth_accounts: Vec::new(),
         usage_limit_fallback_cooldown_seconds: 3600,
+        usage_limit_recheck_seconds: 900,
         deps: DepsConfig { enabled: false },
         browser_mcp: BrowserMcpConfig::default(),
         work_tmpfs: WorkTmpfsConfig::default(),

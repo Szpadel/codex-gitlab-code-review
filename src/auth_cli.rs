@@ -218,6 +218,7 @@ mod tests {
             exec_sandbox: "danger-full-access".to_string(),
             fallback_auth_accounts: Vec::new(),
             usage_limit_fallback_cooldown_seconds: 3600,
+            usage_limit_recheck_seconds: 900,
             deps: DepsConfig { enabled: false },
             browser_mcp: BrowserMcpConfig::default(),
             work_tmpfs: crate::config::WorkTmpfsConfig::default(),

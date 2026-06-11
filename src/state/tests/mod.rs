@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use uuid::Uuid;
 
+mod mention_quota_pending;
 mod mention_review_state;
 mod rate_limits;
 mod run_history;

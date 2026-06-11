@@ -1,7 +1,7 @@
 use super::*;
 use crate::codex_runner::{
-    CodexResult, CodexRunner, MentionCommandContext, MentionCommandResult, MentionCommandStatus,
-    ReviewContext,
+    CodexQuotaExhausted, CodexResult, CodexRunner, MentionCommandContext, MentionCommandResult,
+    MentionCommandStatus, QuotaBlock, ReviewContext,
 };
 use crate::config::{Config, test_builder::ConfigBuilder};
 use crate::gitlab::{
@@ -519,6 +519,38 @@ impl CodexRunner for FailingRunner {
     }
 }
 
+pub(super) struct QuotaBlockRunner {
+    pub(super) block: QuotaBlock,
+    pub(super) review_calls: Mutex<u32>,
+}
+
+#[async_trait]
+impl CodexRunner for QuotaBlockRunner {
+    async fn quota_block(&self, _now: chrono::DateTime<Utc>) -> Result<Option<QuotaBlock>> {
+        Ok(Some(self.block.clone()))
+    }
+
+    async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+        *self.review_calls.lock().unwrap() += 1;
+        Ok(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })
+    }
+}
+
+pub(super) struct QuotaErrorRunner {
+    pub(super) quota: CodexQuotaExhausted,
+    pub(super) review_calls: Mutex<u32>,
+}
+
+#[async_trait]
+impl CodexRunner for QuotaErrorRunner {
+    async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+        *self.review_calls.lock().unwrap() += 1;
+        Err(anyhow::Error::new(self.quota.clone()))
+    }
+}
+
 pub(super) struct BlockingReviewRunner {
     pub(super) first_started: Arc<tokio::sync::Notify>,
     pub(super) release_first: Arc<tokio::sync::Notify>,
@@ -565,6 +597,28 @@ impl CodexRunner for MentionRunner {
             commit_sha: Some("deadbeef".to_string()),
             reply_message: "Implemented and committed deadbeef".to_string(),
         })
+    }
+}
+
+pub(super) struct QuotaMentionErrorRunner {
+    pub(super) quota: CodexQuotaExhausted,
+    pub(super) mention_calls: Mutex<u32>,
+}
+
+#[async_trait]
+impl CodexRunner for QuotaMentionErrorRunner {
+    async fn run_review(&self, _ctx: ReviewContext) -> Result<CodexResult> {
+        Ok(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })
+    }
+
+    async fn run_mention_command(
+        &self,
+        _ctx: MentionCommandContext,
+    ) -> Result<MentionCommandResult> {
+        *self.mention_calls.lock().unwrap() += 1;
+        Err(anyhow::Error::new(self.quota.clone()))
     }
 }
 

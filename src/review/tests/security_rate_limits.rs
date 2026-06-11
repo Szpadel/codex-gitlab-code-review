@@ -414,6 +414,127 @@ async fn runtime_rate_limit_block_adds_configured_mr_award() -> Result<()> {
 }
 
 #[tokio::test]
+async fn codex_quota_block_adds_fuelpump_award_and_pending_row() -> Result<()> {
+    let mut config = test_config();
+    config.review.quota_emoji = "fuelpump".to_string();
+    let gitlab = fake_gitlab(Vec::new());
+    let retry_at = Utc::now() + Duration::minutes(10);
+    let runner = Arc::new(QuotaBlockRunner {
+        block: crate::codex_runner::QuotaBlock {
+            reset_at: Utc::now() + Duration::hours(1),
+            retry_at,
+        },
+        review_calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state.clone(),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    let outcome = service
+        .general_review_flow
+        .run_for_mr("group/repo", mr(30, "sha30"), "sha30")
+        .await?;
+
+    assert_eq!(
+        outcome,
+        crate::flow::review::ReviewScheduleOutcome::SkippedQuota
+    );
+    assert_eq!(*runner.review_calls.lock().unwrap(), 0);
+    let pending = state
+        .review_rate_limit
+        .list_review_rate_limit_pending()
+        .await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].lane, ReviewLane::General);
+    assert_eq!(pending[0].repo, "group/repo");
+    assert_eq!(pending[0].iid, 30);
+    assert_eq!(pending[0].last_seen_head_sha, "sha30");
+    assert_eq!(pending[0].next_retry_at, retry_at.timestamp());
+    assert!(
+        gitlab
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "add_award:group/repo:30:fuelpump")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn codex_quota_error_cancels_review_and_requeues_without_failure_backoff() -> Result<()> {
+    let mut config = test_config();
+    config.review.quota_emoji = "fuelpump".to_string();
+    let gitlab = fake_gitlab(Vec::new());
+    let retry_at = Utc::now() + Duration::minutes(5);
+    let quota = crate::codex_runner::CodexQuotaExhausted {
+        reset_at: Utc::now() + Duration::hours(1),
+        retry_at,
+    };
+    let runner = Arc::new(QuotaErrorRunner {
+        quota,
+        review_calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state.clone(),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    let outcome = service
+        .general_review_flow
+        .run_for_mr("group/repo", mr(31, "sha31"), "sha31")
+        .await?;
+
+    assert_eq!(
+        outcome,
+        crate::flow::review::ReviewScheduleOutcome::SkippedQuota
+    );
+    assert_eq!(*runner.review_calls.lock().unwrap(), 1);
+    assert_eq!(
+        state
+            .review_state
+            .review_result_for_lane("group/repo", 31, "sha31", ReviewLane::General)
+            .await?,
+        Some("cancelled".to_string())
+    );
+    let pending = state
+        .review_rate_limit
+        .list_review_rate_limit_pending()
+        .await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].iid, 31);
+    assert_eq!(pending[0].next_retry_at, retry_at.timestamp());
+    let run_result: Option<String> = sqlx::query_scalar(
+        "SELECT result FROM run_history WHERE kind = 'review' AND repo = ? AND iid = ?",
+    )
+    .bind("group/repo")
+    .bind(31_i64)
+    .fetch_one(state.pool())
+    .await?;
+    assert_eq!(run_result, Some("cancelled".to_string()));
+    assert!(
+        gitlab
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "add_award:group/repo:31:fuelpump")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_rate_limit_block_skips_duplicate_mr_award_when_bot_already_has_it() -> Result<()> {
     let mut config = test_config();
     config.review.rate_limit_emoji = "hourglass_flowing_sand".to_string();
@@ -510,6 +631,7 @@ async fn runtime_rate_limit_clear_removes_configured_mr_award_before_review_resu
 {
     let mut config = test_config();
     config.review.rate_limit_emoji = "hourglass_flowing_sand".to_string();
+    config.review.quota_emoji = "fuelpump".to_string();
     let gitlab = Arc::new(FakeGitLab {
         bot_user: GitLabUser {
             id: 1,
@@ -519,15 +641,26 @@ async fn runtime_rate_limit_clear_removes_configured_mr_award_before_review_resu
         mrs: Mutex::new(Vec::new()),
         awards: Mutex::new(HashMap::from([(
             ("group/repo".to_string(), 29),
-            vec![AwardEmoji {
-                id: 290,
-                name: "hourglass_flowing_sand".to_string(),
-                user: GitLabUser {
-                    id: 1,
-                    username: Some("bot".to_string()),
-                    name: Some("Bot".to_string()),
+            vec![
+                AwardEmoji {
+                    id: 290,
+                    name: "hourglass_flowing_sand".to_string(),
+                    user: GitLabUser {
+                        id: 1,
+                        username: Some("bot".to_string()),
+                        name: Some("Bot".to_string()),
+                    },
                 },
-            }],
+                AwardEmoji {
+                    id: 291,
+                    name: "fuelpump".to_string(),
+                    user: GitLabUser {
+                        id: 1,
+                        username: Some("bot".to_string()),
+                        name: Some("Bot".to_string()),
+                    },
+                },
+            ],
         )])),
         notes: Mutex::new(HashMap::new()),
         discussions: Mutex::new(HashMap::new()),
@@ -607,6 +740,14 @@ async fn runtime_rate_limit_clear_removes_configured_mr_award_before_review_resu
             .unwrap()
             .iter()
             .any(|call| call == "delete_award:group/repo:29:290")
+    );
+    assert!(
+        gitlab
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "delete_award:group/repo:29:291")
     );
     assert!(
         state

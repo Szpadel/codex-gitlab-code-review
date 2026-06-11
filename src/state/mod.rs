@@ -14,6 +14,7 @@ use std::str::FromStr;
 
 mod feature_flags_repository;
 mod mention_commands_repository;
+mod mention_quota_pending_repository;
 mod project_catalog_repository;
 mod review_rate_limits;
 mod review_state_repository;
@@ -24,6 +25,9 @@ mod service_state_repository;
 
 pub use feature_flags_repository::FeatureFlagsRepository;
 pub use mention_commands_repository::MentionCommandsRepository;
+pub use mention_quota_pending_repository::{
+    MentionQuotaPendingEntry, MentionQuotaPendingRepository, MentionQuotaPendingUpsert,
+};
 pub use project_catalog_repository::ProjectCatalogRepository;
 pub use review_rate_limits::{
     ReviewRateLimitAcquireOutcome, ReviewRateLimitBucketMode, ReviewRateLimitBucketSnapshot,
@@ -70,6 +74,7 @@ pub struct ReviewStateStore {
     pub project_catalog: ProjectCatalogRepository,
     pub feature_flags: FeatureFlagsRepository,
     pub mention_commands: MentionCommandsRepository,
+    pub mention_quota_pending: MentionQuotaPendingRepository,
     pub service_state: ServiceStateRepository,
     pub security_context_cache: SecurityContextCacheRepository,
     pub security_review_debounce: SecurityReviewDebounceRepository,
@@ -436,6 +441,7 @@ impl ReviewStateStore {
             project_catalog: ProjectCatalogRepository::new(pool.clone()),
             feature_flags: FeatureFlagsRepository::new(pool.clone()),
             mention_commands: MentionCommandsRepository::new(pool.clone()),
+            mention_quota_pending: MentionQuotaPendingRepository::new(pool.clone()),
             service_state: ServiceStateRepository::new(pool.clone()),
             security_context_cache: SecurityContextCacheRepository::new(pool.clone()),
             security_review_debounce: SecurityReviewDebounceRepository::new(pool.clone()),

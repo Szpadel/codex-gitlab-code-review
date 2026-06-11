@@ -1,4 +1,6 @@
-use crate::codex_runner::{MentionCommandContext, MentionCommandResult, MentionCommandStatus};
+use crate::codex_runner::{
+    CodexQuotaExhausted, MentionCommandContext, MentionCommandResult, MentionCommandStatus,
+};
 use crate::config::FeatureFlagSnapshot;
 use crate::flow::mention_assets::collect_note_image_uploads;
 use crate::flow::orchestration::{
@@ -8,9 +10,13 @@ use crate::flow::orchestration::{
 use crate::flow::{ActiveMentionKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::links::{extract_root_relative_markdown_urls, gitlab_web_base};
 use crate::gitlab::{DiscussionNote, GitLabUser, MergeRequest, MergeRequestDiscussion};
-use crate::state::{MentionCommandScanState, NewRunHistory, RunHistoryFinish, RunHistoryKind};
+use crate::state::{
+    MentionCommandScanState, MentionQuotaPendingUpsert, NewRunHistory, RunHistoryFinish,
+    RunHistoryKind,
+};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
@@ -36,6 +42,7 @@ pub(crate) struct RequesterIdentity {
 pub(crate) struct MentionScheduleOutcome {
     pub(crate) scheduled: usize,
     pub(crate) skipped_processed: usize,
+    pub(crate) quota_blocked: usize,
     pub(crate) blocks_review: bool,
     pub(crate) blocked_pending_work: bool,
 }
@@ -183,6 +190,72 @@ impl MentionFlow {
             .filter(|value| !value.is_empty())
             .unwrap_or(self.shared.config.review.eyes_emoji.as_str())
             .to_string()
+    }
+
+    async fn ensure_quota_award_best_effort(
+        &self,
+        repo: &str,
+        iid: u64,
+        discussion_id: &str,
+        trigger_note_id: u64,
+    ) {
+        if self.shared.config.review.dry_run {
+            return;
+        }
+        if let Err(err) = self
+            .shared
+            .award_service
+            .ensure_discussion_note_award(
+                repo,
+                iid,
+                discussion_id,
+                trigger_note_id,
+                &self.shared.config.review.quota_emoji,
+            )
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                discussion_id = discussion_id,
+                trigger_note_id,
+                error = %err,
+                "failed to add mention quota award"
+            );
+        }
+    }
+
+    async fn remove_quota_award_best_effort(
+        &self,
+        repo: &str,
+        iid: u64,
+        discussion_id: &str,
+        trigger_note_id: u64,
+    ) {
+        if self.shared.config.review.dry_run {
+            return;
+        }
+        if let Err(err) = self
+            .shared
+            .award_service
+            .remove_discussion_note_award(
+                repo,
+                iid,
+                discussion_id,
+                trigger_note_id,
+                &self.shared.config.review.quota_emoji,
+            )
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                discussion_id = discussion_id,
+                trigger_note_id,
+                error = %err,
+                "failed to remove mention quota award"
+            );
+        }
     }
 
     fn gitlab_host(&self) -> String {
@@ -586,6 +659,33 @@ impl MentionFlow {
                 outcome.blocked_pending_work = true;
                 continue;
             }
+            let now = Utc::now();
+            if let Some(block) = self.shared.codex.quota_block(now).await? {
+                self.shared
+                    .state
+                    .mention_quota_pending
+                    .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+                        repo,
+                        iid: mr.iid,
+                        discussion_id: &trigger.discussion_id,
+                        trigger_note_id,
+                        head_sha,
+                        blocked_at: now.timestamp(),
+                        next_retry_at: block.retry_at.timestamp(),
+                    })
+                    .await?;
+                self.ensure_quota_award_best_effort(
+                    repo,
+                    mr.iid,
+                    &trigger.discussion_id,
+                    trigger_note_id,
+                )
+                .await;
+                outcome.quota_blocked += 1;
+                outcome.blocks_review = true;
+                outcome.blocked_pending_work = true;
+                continue;
+            }
             if !self
                 .shared
                 .state
@@ -602,6 +702,34 @@ impl MentionFlow {
                 outcome.skipped_processed += 1;
                 continue;
             }
+            match self
+                .shared
+                .state
+                .mention_quota_pending
+                .clear_mention_quota_pending(repo, mr.iid, &trigger.discussion_id, trigger_note_id)
+                .await
+            {
+                Ok(true) => {
+                    self.remove_quota_award_best_effort(
+                        repo,
+                        mr.iid,
+                        &trigger.discussion_id,
+                        trigger_note_id,
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    warn!(
+                        repo = repo,
+                        iid = mr.iid,
+                        discussion_id = trigger.discussion_id.as_str(),
+                        trigger_note_id,
+                        error = %err,
+                        "failed to clear mention quota pending row at run start"
+                    );
+                }
+            }
             let prepared = self
                 .prepare_mention_run(repo, mr, head_sha, &command_repo, &trigger)
                 .await?;
@@ -617,6 +745,7 @@ impl MentionFlow {
             let mr_copy = mr.clone();
             let head_sha_copy = task.head_sha.clone();
             let eyes_emoji = mention_eyes_emoji.clone();
+            let quota_emoji = self.shared.config.review.quota_emoji.clone();
             let additional_developer_instructions = additional_developer_instructions.clone();
             let gitlab_base_url = gitlab_base_url.clone();
             let requester = prepared.requester;
@@ -763,91 +892,162 @@ impl MentionFlow {
                     };
                     let _started_run = lifecycle.track_started_run();
                     let outcome = codex.run_mention_command(command_context).await;
-                    let (state_result, status_message, run_history_finish) = match outcome {
-                        Ok(MentionCommandResult {
-                            status: MentionCommandStatus::Committed,
-                            commit_sha,
-                            reply_message,
-                        }) => {
-                            let mut message = if reply_message.trim().is_empty() {
-                                "Mention command completed.".to_string()
-                            } else {
-                                reply_message
-                            };
-                            if let Some(ref commit_sha) = commit_sha {
-                                let short_sha: String = commit_sha.chars().take(7).collect();
-                                let has_sha = message.contains(commit_sha.as_str())
-                                    || (!short_sha.is_empty()
-                                        && message.contains(short_sha.as_str()));
-                                if !has_sha {
-                                    let _ = write!(message, "\n\nCommit SHA: `{commit_sha}`");
+                    let (state_result, status_message, run_history_finish, post_status_note) =
+                        match outcome {
+                            Ok(MentionCommandResult {
+                                status: MentionCommandStatus::Committed,
+                                commit_sha,
+                                reply_message,
+                            }) => {
+                                let mut message = if reply_message.trim().is_empty() {
+                                    "Mention command completed.".to_string()
+                                } else {
+                                    reply_message
+                                };
+                                if let Some(ref commit_sha) = commit_sha {
+                                    let short_sha: String = commit_sha.chars().take(7).collect();
+                                    let has_sha = message.contains(commit_sha.as_str())
+                                        || (!short_sha.is_empty()
+                                            && message.contains(short_sha.as_str()));
+                                    if !has_sha {
+                                        let _ = write!(message, "\n\nCommit SHA: `{commit_sha}`");
+                                    }
+                                }
+                                (
+                                    "committed",
+                                    message.clone(),
+                                    RunHistoryFinish {
+                                        result: "committed".to_string(),
+                                        preview: Some(format!(
+                                            "Mention {} !{} note {}",
+                                            repo_name, mr_copy.iid, trigger_note_id
+                                        )),
+                                        summary: Some(message),
+                                        commit_sha,
+                                        ..RunHistoryFinish::default()
+                                    },
+                                    true,
+                                )
+                            }
+                            Ok(MentionCommandResult {
+                                status: MentionCommandStatus::NoChanges,
+                                reply_message,
+                                ..
+                            }) => {
+                                let message = if reply_message.trim().is_empty() {
+                                    "Mention command completed with no code changes.".to_string()
+                                } else {
+                                    reply_message
+                                };
+                                (
+                                    "no_changes",
+                                    message.clone(),
+                                    RunHistoryFinish {
+                                        result: "no_changes".to_string(),
+                                        preview: Some(format!(
+                                            "Mention {} !{} note {}",
+                                            repo_name, mr_copy.iid, trigger_note_id
+                                        )),
+                                        summary: Some(message),
+                                        ..RunHistoryFinish::default()
+                                    },
+                                    true,
+                                )
+                            }
+                            Err(err) => {
+                                if let Some(quota) = err.downcast_ref::<CodexQuotaExhausted>() {
+                                    let quota = quota.clone();
+                                    warn!(
+                                        repo = repo_name.as_str(),
+                                        iid = mr_copy.iid,
+                                        discussion_id = discussion_id.as_str(),
+                                        trigger_note_id,
+                                        reset_at = %quota.reset_at,
+                                        retry_at = %quota.retry_at,
+                                        "mention command deferred because codex quota is exhausted"
+                                    );
+                                    let now = Utc::now();
+                                    if let Err(err) = state
+                                        .mention_quota_pending
+                                        .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+                                            repo: &repo_name,
+                                            iid: mr_copy.iid,
+                                            discussion_id: &discussion_id,
+                                            trigger_note_id,
+                                            head_sha: &head_sha_copy,
+                                            blocked_at: now.timestamp(),
+                                            next_retry_at: quota.retry_at.timestamp(),
+                                        })
+                                        .await
+                                    {
+                                        warn!(
+                                            repo = repo_name.as_str(),
+                                            iid = mr_copy.iid,
+                                            discussion_id = discussion_id.as_str(),
+                                            trigger_note_id,
+                                            error = %err,
+                                            "failed to persist mention quota pending row"
+                                        );
+                                    }
+                                    if let Err(err) = award_service
+                                        .ensure_discussion_note_award(
+                                            &repo_name,
+                                            mr_copy.iid,
+                                            &discussion_id,
+                                            trigger_note_id,
+                                            &quota_emoji,
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            repo = repo_name.as_str(),
+                                            iid = mr_copy.iid,
+                                            discussion_id = discussion_id.as_str(),
+                                            trigger_note_id,
+                                            error = %err,
+                                            "failed to add mention quota award"
+                                        );
+                                    }
+                                    let mut finish = task_cancelled_finish(
+                                        "cancelled",
+                                        format!(
+                                            "Mention {} !{} note {}",
+                                            repo_name, mr_copy.iid, trigger_note_id
+                                        ),
+                                    );
+                                    finish.summary = Some(format!(
+                                        "deferred: codex quota exhausted until {}",
+                                        quota.reset_at
+                                    ));
+                                    ("cancelled", String::new(), finish, false)
+                                } else {
+                                    let error_chain = format!("{err:#}");
+                                    warn!(
+                                        repo = repo_name.as_str(),
+                                        iid = mr_copy.iid,
+                                        discussion_id = discussion_id.as_str(),
+                                        trigger_note_id,
+                                        error = %err,
+                                        error_chain = error_chain.as_str(),
+                                        "mention command execution failed"
+                                    );
+                                    (
+                                        "error",
+                                        "Mention command failed. Check service logs for details."
+                                            .to_string(),
+                                        task_error_finish(
+                                            "error",
+                                            format!(
+                                                "Mention {} !{} note {}",
+                                                repo_name, mr_copy.iid, trigger_note_id
+                                            ),
+                                            &err,
+                                        ),
+                                        true,
+                                    )
                                 }
                             }
-                            (
-                                "committed",
-                                message.clone(),
-                                RunHistoryFinish {
-                                    result: "committed".to_string(),
-                                    preview: Some(format!(
-                                        "Mention {} !{} note {}",
-                                        repo_name, mr_copy.iid, trigger_note_id
-                                    )),
-                                    summary: Some(message),
-                                    commit_sha,
-                                    ..RunHistoryFinish::default()
-                                },
-                            )
-                        }
-                        Ok(MentionCommandResult {
-                            status: MentionCommandStatus::NoChanges,
-                            reply_message,
-                            ..
-                        }) => {
-                            let message = if reply_message.trim().is_empty() {
-                                "Mention command completed with no code changes.".to_string()
-                            } else {
-                                reply_message
-                            };
-                            (
-                                "no_changes",
-                                message.clone(),
-                                RunHistoryFinish {
-                                    result: "no_changes".to_string(),
-                                    preview: Some(format!(
-                                        "Mention {} !{} note {}",
-                                        repo_name, mr_copy.iid, trigger_note_id
-                                    )),
-                                    summary: Some(message),
-                                    ..RunHistoryFinish::default()
-                                },
-                            )
-                        }
-                        Err(err) => {
-                            let error_chain = format!("{err:#}");
-                            warn!(
-                                repo = repo_name.as_str(),
-                                iid = mr_copy.iid,
-                                discussion_id = discussion_id.as_str(),
-                                trigger_note_id,
-                                error = %err,
-                                error_chain = error_chain.as_str(),
-                                "mention command execution failed"
-                            );
-                            (
-                                "error",
-                                "Mention command failed. Check service logs for details."
-                                    .to_string(),
-                                task_error_finish(
-                                    "error",
-                                    format!(
-                                        "Mention {} !{} note {}",
-                                        repo_name, mr_copy.iid, trigger_note_id
-                                    ),
-                                    &err,
-                                ),
-                            )
-                        }
-                    };
+                        };
                     if let Err(err) =
                         finish_task_run_history(&state, &task_for_run_history, run_history_finish)
                             .await
@@ -861,29 +1061,33 @@ impl MentionFlow {
                             "failed to persist mention run history"
                         );
                     }
-                    let completion_note_posted = match gitlab
-                        .create_discussion_note(
-                            &repo_name,
-                            mr_copy.iid,
-                            &discussion_id,
-                            &status_message,
-                        )
-                        .await
-                    {
-                        Ok(()) => true,
-                        Err(err) => {
-                            warn!(
-                                repo = repo_name.as_str(),
-                                iid = mr_copy.iid,
-                                discussion_id = discussion_id.as_str(),
-                                trigger_note_id,
-                                error = %err,
-                                "failed to post mention-command completion status"
-                            );
-                            false
+                    let completion_note_posted = if post_status_note {
+                        match gitlab
+                            .create_discussion_note(
+                                &repo_name,
+                                mr_copy.iid,
+                                &discussion_id,
+                                &status_message,
+                            )
+                            .await
+                        {
+                            Ok(()) => true,
+                            Err(err) => {
+                                warn!(
+                                    repo = repo_name.as_str(),
+                                    iid = mr_copy.iid,
+                                    discussion_id = discussion_id.as_str(),
+                                    trigger_note_id,
+                                    error = %err,
+                                    "failed to post mention-command completion status"
+                                );
+                                false
+                            }
                         }
+                    } else {
+                        true
                     };
-                    if !completion_note_posted {
+                    if post_status_note && !completion_note_posted {
                         let fallback_message = format!(
                             "Mention command result for discussion `{discussion_id}`:\n\n{status_message}"
                         );

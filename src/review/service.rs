@@ -12,7 +12,10 @@ use crate::review::lane_policies::{GeneralLanePolicy, SecurityLanePolicy};
 use crate::review::scan_coordinator::{DefaultScanCoordinator, ScanCoordinator};
 use crate::review::scan_pipeline::{run_pending_rate_limit_pipeline, run_scan_pipeline};
 use crate::review::target_resolver::{DefaultTargetResolver, TargetResolver};
-use crate::state::{ReviewRateLimitPendingEntry, ReviewStateStore};
+use crate::state::{
+    MentionQuotaPendingEntry, MentionQuotaPendingUpsert, ReviewRateLimitPendingEntry,
+    ReviewStateStore,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -154,12 +157,24 @@ impl ReviewService {
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn next_pending_rate_limit_retry_at(&self) -> Result<Option<DateTime<Utc>>> {
-        Ok(self
+        let review_retry = self
             .state
             .review_rate_limit
             .earliest_review_rate_limit_pending_retry_at()
             .await?
-            .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single()))
+            .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single());
+        let mention_retry = self
+            .state
+            .mention_quota_pending
+            .earliest_mention_quota_pending_retry_at()
+            .await?
+            .and_then(|timestamp| Utc.timestamp_opt(timestamp, 0).single());
+        Ok(match (review_retry, mention_retry) {
+            (Some(review), Some(mention)) => Some(review.min(mention)),
+            (Some(review), None) => Some(review),
+            (None, Some(mention)) => Some(mention),
+            (None, None) => None,
+        })
     }
 
     /// # Errors
@@ -239,6 +254,178 @@ impl ReviewService {
             .await
     }
 
+    async fn defer_pending_mention_quota_retry(
+        &self,
+        pending: &MentionQuotaPendingEntry,
+        retry_started_at: i64,
+        deferred_until: i64,
+    ) -> Result<()> {
+        self.state
+            .mention_quota_pending
+            .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+                repo: &pending.repo,
+                iid: pending.iid,
+                discussion_id: &pending.discussion_id,
+                trigger_note_id: pending.trigger_note_id,
+                head_sha: &pending.last_seen_head_sha,
+                blocked_at: retry_started_at,
+                next_retry_at: deferred_until,
+            })
+            .await
+    }
+
+    pub(super) async fn retry_pending_mention_quota_row(
+        &self,
+        pending: &MentionQuotaPendingEntry,
+    ) -> Result<()> {
+        debug!(
+            repo = pending.repo.as_str(),
+            iid = pending.iid,
+            discussion_id = pending.discussion_id.as_str(),
+            trigger_note_id = pending.trigger_note_id,
+            next_retry_at = pending.next_retry_at,
+            "retrying due pending mention quota row"
+        );
+        let mr = match self.gitlab.get_mr(&pending.repo, pending.iid).await {
+            Ok(mr) => mr,
+            Err(err) if should_clear_pending_retry_after_mr_lookup_error(&err) => {
+                warn!(
+                    repo = pending.repo.as_str(),
+                    iid = pending.iid,
+                    discussion_id = pending.discussion_id.as_str(),
+                    trigger_note_id = pending.trigger_note_id,
+                    error = %err,
+                    "merge request lookup failed while retrying pending mention; clearing pending row"
+                );
+                if self
+                    .state
+                    .mention_quota_pending
+                    .clear_mention_quota_pending(
+                        &pending.repo,
+                        pending.iid,
+                        &pending.discussion_id,
+                        pending.trigger_note_id,
+                    )
+                    .await?
+                {
+                    self.remove_mention_quota_award_after_pending_clear(pending)
+                        .await;
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                warn!(
+                    repo = pending.repo.as_str(),
+                    iid = pending.iid,
+                    discussion_id = pending.discussion_id.as_str(),
+                    trigger_note_id = pending.trigger_note_id,
+                    error = %err,
+                    "merge request lookup failed while retrying pending mention; deferring retry"
+                );
+                let retry_started_at = Utc::now().timestamp();
+                let deferred_until =
+                    retry_started_at.saturating_add(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
+                self.defer_pending_mention_quota_retry(pending, retry_started_at, deferred_until)
+                    .await?;
+                return Ok(());
+            }
+        };
+        let Some(head_sha) = mr.head_sha() else {
+            warn!(
+                repo = pending.repo.as_str(),
+                iid = pending.iid,
+                discussion_id = pending.discussion_id.as_str(),
+                trigger_note_id = pending.trigger_note_id,
+                "missing head sha while retrying pending mention; clearing pending row"
+            );
+            if self
+                .state
+                .mention_quota_pending
+                .clear_mention_quota_pending(
+                    &pending.repo,
+                    pending.iid,
+                    &pending.discussion_id,
+                    pending.trigger_note_id,
+                )
+                .await?
+            {
+                self.remove_mention_quota_award_after_pending_clear(pending)
+                    .await;
+            }
+            return Ok(());
+        };
+
+        let mut tasks = Vec::new();
+        let outcome = self
+            .mention_flow
+            .schedule_for_scan(&pending.repo, &mr, &head_sha, &mut tasks)
+            .await?;
+        let _ = join_all(tasks).await;
+
+        match self
+            .state
+            .mention_commands
+            .mention_command_scan_state(
+                &pending.repo,
+                pending.iid,
+                &pending.discussion_id,
+                pending.trigger_note_id,
+            )
+            .await?
+        {
+            crate::state::MentionCommandScanState::Completed => {
+                if self
+                    .state
+                    .mention_quota_pending
+                    .clear_mention_quota_pending(
+                        &pending.repo,
+                        pending.iid,
+                        &pending.discussion_id,
+                        pending.trigger_note_id,
+                    )
+                    .await?
+                {
+                    self.remove_mention_quota_award_after_pending_clear(pending)
+                        .await;
+                }
+            }
+            crate::state::MentionCommandScanState::Ready => {
+                let now = Utc::now().timestamp();
+                let still_due = self
+                    .state
+                    .mention_quota_pending
+                    .list_mention_quota_pending()
+                    .await?
+                    .into_iter()
+                    .any(|entry| {
+                        entry.repo == pending.repo
+                            && entry.iid == pending.iid
+                            && entry.discussion_id == pending.discussion_id
+                            && entry.trigger_note_id == pending.trigger_note_id
+                            && entry.next_retry_at <= now
+                    });
+                if still_due
+                    && !outcome.blocked_pending_work
+                    && self
+                        .state
+                        .mention_quota_pending
+                        .clear_mention_quota_pending(
+                            &pending.repo,
+                            pending.iid,
+                            &pending.discussion_id,
+                            pending.trigger_note_id,
+                        )
+                        .await?
+                {
+                    self.remove_mention_quota_award_after_pending_clear(pending)
+                        .await;
+                }
+            }
+            crate::state::MentionCommandScanState::InProgress => {}
+        }
+        Ok(())
+    }
+
     pub(super) async fn retry_pending_review_rate_limit_row(
         &self,
         pending: &ReviewRateLimitPendingEntry,
@@ -266,7 +453,7 @@ impl ReviewService {
                     .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
                     .await?
                 {
-                    self.remove_rate_limit_award_after_pending_clear(
+                    self.remove_pending_awards_after_clear(
                         pending.lane,
                         &pending.repo,
                         pending.iid,
@@ -311,12 +498,8 @@ impl ReviewService {
                 .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
                 .await?
             {
-                self.remove_rate_limit_award_after_pending_clear(
-                    pending.lane,
-                    &pending.repo,
-                    pending.iid,
-                )
-                .await;
+                self.remove_pending_awards_after_clear(pending.lane, &pending.repo, pending.iid)
+                    .await;
             }
             return Ok(ReviewScheduleOutcome::SkippedCompleted);
         };
@@ -345,29 +528,22 @@ impl ReviewService {
         };
         if !matches!(
             outcome,
-            ReviewScheduleOutcome::SkippedRateLimit | ReviewScheduleOutcome::Interrupted
+            ReviewScheduleOutcome::SkippedRateLimit
+                | ReviewScheduleOutcome::Interrupted
+                | ReviewScheduleOutcome::SkippedQuota
         ) && self
             .state
             .review_rate_limit
             .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
             .await?
         {
-            self.remove_rate_limit_award_after_pending_clear(
-                pending.lane,
-                &pending.repo,
-                pending.iid,
-            )
-            .await;
+            self.remove_pending_awards_after_clear(pending.lane, &pending.repo, pending.iid)
+                .await;
         }
         Ok(outcome)
     }
 
-    async fn remove_rate_limit_award_after_pending_clear(
-        &self,
-        lane: ReviewLane,
-        repo: &str,
-        iid: u64,
-    ) {
+    async fn remove_pending_awards_after_clear(&self, lane: ReviewLane, repo: &str, iid: u64) {
         if !self.review_flow_for_lane(lane).uses_awards() || self.config.review.dry_run {
             return;
         }
@@ -382,6 +558,48 @@ impl ReviewService {
                 lane = lane.as_str(),
                 error = %err,
                 "failed to remove rate-limit award after pending state cleared"
+            );
+        }
+        if let Err(err) = self
+            .award_service
+            .remove_award(repo, iid, &self.config.review.quota_emoji)
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                lane = lane.as_str(),
+                error = %err,
+                "failed to remove quota award after pending state cleared"
+            );
+        }
+    }
+
+    async fn remove_mention_quota_award_after_pending_clear(
+        &self,
+        pending: &MentionQuotaPendingEntry,
+    ) {
+        if self.config.review.dry_run {
+            return;
+        }
+        if let Err(err) = self
+            .award_service
+            .remove_discussion_note_award(
+                &pending.repo,
+                pending.iid,
+                &pending.discussion_id,
+                pending.trigger_note_id,
+                &self.config.review.quota_emoji,
+            )
+            .await
+        {
+            warn!(
+                repo = pending.repo.as_str(),
+                iid = pending.iid,
+                discussion_id = pending.discussion_id.as_str(),
+                trigger_note_id = pending.trigger_note_id,
+                error = %err,
+                "failed to remove mention quota award after pending state cleared"
             );
         }
     }
@@ -408,12 +626,29 @@ impl ReviewService {
             .sync_review_rate_limit_pending_rows(repo, open_iids)
             .await?;
         for pending in pending_to_clear {
-            self.remove_rate_limit_award_after_pending_clear(
+            self.remove_pending_awards_after_clear(
                 pending.lane,
                 pending.repo.as_str(),
                 pending.iid,
             )
             .await;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn clear_mention_quota_pending_for_closed_mrs(
+        &self,
+        repo: &str,
+        open_iids: &[u64],
+    ) -> Result<()> {
+        let deleted = self
+            .state
+            .mention_quota_pending
+            .sync_mention_quota_pending_rows(repo, open_iids)
+            .await?;
+        for pending in &deleted {
+            self.remove_mention_quota_award_after_pending_clear(pending)
+                .await;
         }
         Ok(())
     }
@@ -529,7 +764,10 @@ fn should_clear_pending_retry_after_mr_lookup_error(err: &anyhow::Error) -> bool
 #[cfg(test)]
 mod pending_rate_limit_tests {
     use super::*;
-    use crate::codex_runner::{CodexResult, ReviewContext};
+    use crate::codex_runner::{
+        CodexResult, MentionCommandContext, MentionCommandResult, MentionCommandStatus,
+        ReviewContext,
+    };
     use crate::config::test_builder::ConfigBuilder;
     use crate::gitlab::GitLabUser;
     use anyhow::{Result, anyhow};
@@ -538,11 +776,17 @@ mod pending_rate_limit_tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    type DiscussionNoteAwardKey = (String, u64, String, u64);
+    type DiscussionNoteAwardMap = HashMap<DiscussionNoteAwardKey, Vec<crate::gitlab::AwardEmoji>>;
+
     struct TestGitLab {
         bot_user: GitLabUser,
         open_mrs: Mutex<Vec<MergeRequest>>,
         mrs_by_iid: Mutex<HashMap<u64, MergeRequest>>,
+        discussions: Mutex<HashMap<(String, u64), Vec<crate::gitlab::MergeRequestDiscussion>>>,
+        users: Mutex<HashMap<u64, crate::gitlab::GitLabUserDetail>>,
         awards: Mutex<HashMap<(String, u64), Vec<crate::gitlab::AwardEmoji>>>,
+        discussion_note_awards: Mutex<DiscussionNoteAwardMap>,
         calls: Mutex<Vec<String>>,
         mr_lookup_error: Mutex<Option<String>>,
         list_open_calls: Mutex<u32>,
@@ -559,7 +803,10 @@ mod pending_rate_limit_tests {
                 },
                 open_mrs: Mutex::new(open_mrs),
                 mrs_by_iid: Mutex::new(mrs_by_iid),
+                discussions: Mutex::new(HashMap::new()),
+                users: Mutex::new(HashMap::new()),
                 awards: Mutex::new(HashMap::new()),
+                discussion_note_awards: Mutex::new(HashMap::new()),
                 calls: Mutex::new(Vec::new()),
                 mr_lookup_error: Mutex::new(None),
                 list_open_calls: Mutex::new(0),
@@ -568,6 +815,22 @@ mod pending_rate_limit_tests {
 
         fn insert_mr(&self, mr: MergeRequest) {
             self.mrs_by_iid.lock().unwrap().insert(mr.iid, mr);
+        }
+
+        fn insert_discussions(
+            &self,
+            repo: &str,
+            iid: u64,
+            discussions: Vec<crate::gitlab::MergeRequestDiscussion>,
+        ) {
+            self.discussions
+                .lock()
+                .unwrap()
+                .insert((repo.to_string(), iid), discussions);
+        }
+
+        fn insert_user(&self, user: crate::gitlab::GitLabUserDetail) {
+            self.users.lock().unwrap().insert(user.id, user);
         }
 
         fn fail_mr_lookup(&self, message: &str) {
@@ -668,11 +931,92 @@ mod pending_rate_limit_tests {
         async fn create_note(&self, _project: &str, _iid: u64, _body: &str) -> Result<()> {
             Ok(())
         }
+
+        async fn list_discussions(
+            &self,
+            project: &str,
+            iid: u64,
+        ) -> Result<Vec<crate::gitlab::MergeRequestDiscussion>> {
+            Ok(self
+                .discussions
+                .lock()
+                .unwrap()
+                .get(&(project.to_string(), iid))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn create_discussion_note(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            _body: &str,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "create_discussion_note:{project}:{iid}:{discussion_id}"
+            ));
+            Ok(())
+        }
+
+        async fn list_discussion_note_awards(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            note_id: u64,
+        ) -> Result<Vec<crate::gitlab::AwardEmoji>> {
+            Ok(self
+                .discussion_note_awards
+                .lock()
+                .unwrap()
+                .get(&(project.to_string(), iid, discussion_id.to_string(), note_id))
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn add_discussion_note_award(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            note_id: u64,
+            name: &str,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "add_discussion_note_award:{project}:{iid}:{discussion_id}:{note_id}:{name}"
+            ));
+            Ok(())
+        }
+
+        async fn delete_discussion_note_award(
+            &self,
+            project: &str,
+            iid: u64,
+            discussion_id: &str,
+            note_id: u64,
+            award_id: u64,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push(format!(
+                "delete_discussion_note_award:{project}:{iid}:{discussion_id}:{note_id}:{award_id}"
+            ));
+            Ok(())
+        }
+
+        async fn get_user(&self, user_id: u64) -> Result<crate::gitlab::GitLabUserDetail> {
+            self.users
+                .lock()
+                .unwrap()
+                .get(&user_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("user not found"))
+        }
     }
 
     #[derive(Default)]
     struct CapturingRunner {
         review_contexts: Mutex<Vec<ReviewContext>>,
+        mention_contexts: Mutex<Vec<MentionCommandContext>>,
     }
 
     #[async_trait]
@@ -683,10 +1027,30 @@ mod pending_rate_limit_tests {
                 summary: "ok".to_string(),
             })
         }
+
+        async fn run_mention_command(
+            &self,
+            ctx: MentionCommandContext,
+        ) -> Result<MentionCommandResult> {
+            self.mention_contexts.lock().unwrap().push(ctx);
+            Ok(MentionCommandResult {
+                status: MentionCommandStatus::NoChanges,
+                commit_sha: None,
+                reply_message: "No changes needed.".to_string(),
+            })
+        }
     }
 
     fn test_config() -> crate::config::Config {
         ConfigBuilder::for_review_service_tests().build()
+    }
+
+    fn mention_test_config() -> crate::config::Config {
+        let mut config = test_config();
+        config.review.mention_commands.enabled = true;
+        config.review.mention_commands.bot_username = Some("botuser".to_string());
+        config.review.quota_emoji = "fuelpump".to_string();
+        config
     }
 
     fn test_mr(iid: u64, sha: &str, updated_at: chrono::DateTime<Utc>) -> MergeRequest {
@@ -704,6 +1068,43 @@ mod pending_rate_limit_tests {
             source_project_id: Some(1),
             target_project_id: Some(1),
             diff_refs: None,
+        }
+    }
+
+    fn mention_discussion(
+        discussion_id: &str,
+        trigger_note_id: u64,
+    ) -> crate::gitlab::MergeRequestDiscussion {
+        let bot_user = GitLabUser {
+            id: 1,
+            username: Some("botuser".to_string()),
+            name: Some("Bot".to_string()),
+        };
+        let requester = GitLabUser {
+            id: 7,
+            username: Some("alice".to_string()),
+            name: Some("Alice".to_string()),
+        };
+        crate::gitlab::MergeRequestDiscussion {
+            id: discussion_id.to_string(),
+            notes: vec![
+                crate::gitlab::DiscussionNote {
+                    id: trigger_note_id - 1,
+                    body: "parent".to_string(),
+                    author: bot_user,
+                    system: false,
+                    in_reply_to_id: None,
+                    created_at: None,
+                },
+                crate::gitlab::DiscussionNote {
+                    id: trigger_note_id,
+                    body: "@botuser please fix".to_string(),
+                    author: requester,
+                    system: false,
+                    in_reply_to_id: Some(trigger_note_id - 1),
+                    created_at: None,
+                },
+            ],
         }
     }
 
@@ -746,6 +1147,215 @@ mod pending_rate_limit_tests {
                 .await?
                 .is_empty()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_scan_wakes_for_due_mention_quota_pending_rows() -> Result<()> {
+        let gitlab = Arc::new(TestGitLab::new(Vec::new()));
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state
+            .project_catalog
+            .set_project_last_mr_activity("group/repo", "2025-01-02T00:00:00Z|77")
+            .await?;
+        state
+            .mention_quota_pending
+            .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+                repo: "group/repo",
+                iid: 77,
+                discussion_id: "discussion-77",
+                trigger_note_id: 977,
+                head_sha: "sha77",
+                blocked_at: 0,
+                next_retry_at: 0,
+            })
+            .await?;
+        let service = ReviewService::new(
+            mention_test_config(),
+            gitlab.clone(),
+            state,
+            Arc::new(CapturingRunner::default()),
+            1,
+            Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
+        );
+
+        service.scan_once_incremental().await?;
+
+        assert_eq!(*gitlab.list_open_calls.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_pending_retry_at_includes_mention_quota_rows() -> Result<()> {
+        let gitlab = Arc::new(TestGitLab::new(Vec::new()));
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state
+            .review_rate_limit
+            .upsert_review_rate_limit_pending(
+                ReviewLane::General,
+                "group/repo",
+                78,
+                "sha78",
+                0,
+                500,
+            )
+            .await?;
+        state
+            .mention_quota_pending
+            .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+                repo: "group/repo",
+                iid: 79,
+                discussion_id: "discussion-79",
+                trigger_note_id: 979,
+                head_sha: "sha79",
+                blocked_at: 0,
+                next_retry_at: 300,
+            })
+            .await?;
+        let service = ReviewService::new(
+            mention_test_config(),
+            gitlab,
+            state,
+            Arc::new(CapturingRunner::default()),
+            1,
+            Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
+        );
+
+        assert_eq!(
+            service.next_pending_rate_limit_retry_at().await?,
+            Utc.timestamp_opt(300, 0).single()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_rate_limit_pipeline_retries_due_mention_quota_rows() -> Result<()> {
+        let gitlab = Arc::new(TestGitLab::new(Vec::new()));
+        gitlab.insert_mr(test_mr(
+            80,
+            "sha80-new",
+            Utc.with_ymd_and_hms(2025, 1, 2, 0, 5, 0).unwrap(),
+        ));
+        gitlab.insert_discussions(
+            "group/repo",
+            80,
+            vec![mention_discussion("discussion-80", 980)],
+        );
+        gitlab.insert_user(crate::gitlab::GitLabUserDetail {
+            id: 7,
+            username: Some("alice".to_string()),
+            name: Some("Alice".to_string()),
+            public_email: Some("alice@example.com".to_string()),
+        });
+        gitlab.discussion_note_awards.lock().unwrap().insert(
+            (
+                "group/repo".to_string(),
+                80,
+                "discussion-80".to_string(),
+                980,
+            ),
+            vec![crate::gitlab::AwardEmoji {
+                id: 9800,
+                name: "fuelpump".to_string(),
+                user: gitlab.bot_user.clone(),
+            }],
+        );
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state
+            .mention_quota_pending
+            .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+                repo: "group/repo",
+                iid: 80,
+                discussion_id: "discussion-80",
+                trigger_note_id: 980,
+                head_sha: "sha80-old",
+                blocked_at: 100,
+                next_retry_at: 0,
+            })
+            .await?;
+        let runner = Arc::new(CapturingRunner::default());
+        let service = ReviewService::new(
+            mention_test_config(),
+            gitlab.clone(),
+            state.clone(),
+            runner.clone(),
+            1,
+            Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
+        );
+
+        service.process_due_pending_rate_limit_reviews().await?;
+
+        {
+            let mention_contexts = runner.mention_contexts.lock().unwrap();
+            assert_eq!(mention_contexts.len(), 1);
+            assert_eq!(mention_contexts[0].head_sha, "sha80-new");
+            assert_eq!(mention_contexts[0].discussion_id, "discussion-80");
+            assert_eq!(mention_contexts[0].trigger_note_id, 980);
+        }
+        assert!(
+            state
+                .mention_quota_pending
+                .list_mention_quota_pending()
+                .await?
+                .is_empty()
+        );
+        assert!(gitlab.calls.lock().unwrap().iter().any(|call| {
+            call == "delete_discussion_note_award:group/repo:80:discussion-80:980:9800"
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_mention_quota_retry_preserves_row_when_same_mr_work_is_active() -> Result<()> {
+        let gitlab = Arc::new(TestGitLab::new(Vec::new()));
+        gitlab.insert_mr(test_mr(
+            81,
+            "sha81-new",
+            Utc.with_ymd_and_hms(2025, 1, 2, 0, 5, 0).unwrap(),
+        ));
+        gitlab.insert_discussions(
+            "group/repo",
+            81,
+            vec![mention_discussion("discussion-81", 981)],
+        );
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state
+            .mention_commands
+            .begin_mention_command("group/repo", 81, "other-discussion", 1981, "sha81-new")
+            .await?;
+        state
+            .mention_quota_pending
+            .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+                repo: "group/repo",
+                iid: 81,
+                discussion_id: "discussion-81",
+                trigger_note_id: 981,
+                head_sha: "sha81-old",
+                blocked_at: 100,
+                next_retry_at: 0,
+            })
+            .await?;
+        let runner = Arc::new(CapturingRunner::default());
+        let service = ReviewService::new(
+            mention_test_config(),
+            gitlab,
+            state.clone(),
+            runner.clone(),
+            1,
+            Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
+        );
+
+        service.process_due_pending_rate_limit_reviews().await?;
+
+        assert!(runner.mention_contexts.lock().unwrap().is_empty());
+        let pending = state
+            .mention_quota_pending
+            .list_mention_quota_pending()
+            .await?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].iid, 81);
+        assert_eq!(pending[0].discussion_id, "discussion-81");
+        assert_eq!(pending[0].trigger_note_id, 981);
         Ok(())
     }
 

@@ -62,6 +62,7 @@ pub(crate) mod test_support;
 use self::app_server::{
     AppServerClient, GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID, annotate_event_payload,
 };
+pub use self::auth::CodexQuotaExhausted;
 use self::auth::{AuthAccount, AuthFallbackAction};
 #[cfg(test)]
 use self::auth::{AuthFailureKind, classify_auth_failure, classify_auth_failure_for_account};
@@ -296,6 +297,10 @@ pub trait CodexRunner: Send + Sync {
         Ok(())
     }
 
+    async fn quota_block(&self, _now: DateTime<Utc>) -> Result<Option<QuotaBlock>> {
+        Ok(None)
+    }
+
     async fn run_review(&self, ctx: ReviewContext) -> Result<CodexResult>;
 
     async fn run_mention_command(
@@ -312,6 +317,12 @@ pub trait CodexRunner: Send + Sync {
     async fn read_thread(&self, _account_name: &str, _thread_id: &str) -> Result<Value> {
         bail!("thread history is not implemented by this runner")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaBlock {
+    pub reset_at: DateTime<Utc>,
+    pub retry_at: DateTime<Utc>,
 }
 
 pub struct DockerCodexRunner {
@@ -629,6 +640,10 @@ impl CodexRunner for DockerCodexRunner {
             info!(image = image.as_str(), "docker image warm-up complete");
         }
         Ok(())
+    }
+
+    async fn quota_block(&self, now: DateTime<Utc>) -> Result<Option<QuotaBlock>> {
+        self.quota_block_at(now).await
     }
 
     async fn run_review(&self, ctx: ReviewContext) -> Result<CodexResult> {

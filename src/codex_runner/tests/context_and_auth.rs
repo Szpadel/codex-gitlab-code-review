@@ -433,6 +433,289 @@ fn classify_auth_failure_for_account_marks_mount_path_errors_as_unavailable() {
     assert_eq!(kind, AuthFailureKind::AuthUnavailable);
 }
 
+#[tokio::test]
+async fn all_usage_limited_accounts_return_downcastable_quota_error() {
+    let mut codex = test_codex_config();
+    codex.usage_limit_recheck_seconds = 120;
+    codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
+        name: "backup".to_string(),
+        auth_host_path: "/root/.codex-backup".to_string(),
+    }];
+    let runner =
+        test_runner_with_fake_runtime(codex, false, Arc::new(FakeRunnerHarness::default()), None)
+            .await;
+    let reset_at = Utc
+        .with_ymd_and_hms(2099, 3, 2, 10, 0, 0)
+        .single()
+        .expect("valid");
+
+    let before = Utc::now();
+    let err = runner
+        .run_with_auth_fallback(AuthFallbackAction::Review, |_account| async move {
+            Err::<(), anyhow::Error>(anyhow!(
+                "codex turn failed: usage limit exceeded; resets at {}",
+                reset_at.to_rfc3339()
+            ))
+        })
+        .await
+        .expect_err("all usage-limited accounts should defer");
+    let after = Utc::now();
+
+    let quota = err
+        .downcast_ref::<CodexQuotaExhausted>()
+        .expect("quota error should be downcastable");
+    assert_eq!(quota.reset_at, reset_at);
+    assert!(quota.retry_at >= before + ChronoDuration::seconds(120));
+    assert!(quota.retry_at <= after + ChronoDuration::seconds(120));
+}
+
+#[tokio::test]
+async fn mixed_usage_limit_and_auth_unavailable_keeps_combined_auth_error() {
+    let mut codex = test_codex_config();
+    codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
+        name: "backup".to_string(),
+        auth_host_path: "/root/.codex-backup".to_string(),
+    }];
+    let runner =
+        test_runner_with_fake_runtime(codex, false, Arc::new(FakeRunnerHarness::default()), None)
+            .await;
+
+    let err = runner
+        .run_with_auth_fallback(AuthFallbackAction::Review, |account| async move {
+            if account.name == PRIMARY_AUTH_ACCOUNT_NAME {
+                Err::<(), anyhow::Error>(anyhow!(
+                    "codex turn failed: usage limit exceeded; resets at 2099-03-02T10:00:00Z"
+                ))
+            } else {
+                Err::<(), anyhow::Error>(anyhow!("codex app-server error: not authenticated"))
+            }
+        })
+        .await
+        .expect_err("mixed account failures should still fail");
+
+    assert!(err.downcast_ref::<CodexQuotaExhausted>().is_none());
+    let message = err.to_string();
+    assert!(message.contains("all codex auth accounts failed with usage-limit/auth errors"));
+    assert!(message.contains("account 'primary' usage-limited until"));
+    assert!(message.contains("account 'backup' unavailable"));
+}
+
+#[tokio::test]
+async fn available_accounts_quota_exhaustion_records_probe_marker() {
+    let mut codex = test_codex_config();
+    codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
+        name: "backup".to_string(),
+        auth_host_path: "/root/.codex-backup".to_string(),
+    }];
+    let runner =
+        test_runner_with_fake_runtime(codex, false, Arc::new(FakeRunnerHarness::default()), None)
+            .await;
+
+    let err = runner
+        .run_with_auth_fallback(AuthFallbackAction::Review, |_account| async move {
+            Err::<(), anyhow::Error>(anyhow!(
+                "codex turn failed: usage limit exceeded; resets at 2099-03-02T10:00:00Z"
+            ))
+        })
+        .await
+        .expect_err("all usage-limited accounts should defer");
+
+    assert!(err.downcast_ref::<CodexQuotaExhausted>().is_some());
+    assert!(
+        runner
+            .state
+            .service_state
+            .get_service_state_value(QUOTA_LAST_PROBE_AT_KEY)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn all_preblocked_accounts_enter_probe_mode_and_clear_successful_marker() {
+    let mut codex = test_codex_config();
+    codex.usage_limit_recheck_seconds = 900;
+    codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
+        name: "backup".to_string(),
+        auth_host_path: "/root/.codex-backup".to_string(),
+    }];
+    let runner =
+        test_runner_with_fake_runtime(codex, false, Arc::new(FakeRunnerHarness::default()), None)
+            .await;
+    let now = Utc::now();
+    let primary = runner
+        .auth_account_by_name(PRIMARY_AUTH_ACCOUNT_NAME)
+        .expect("primary account")
+        .clone();
+    let backup = runner
+        .auth_account_by_name("backup")
+        .expect("backup account")
+        .clone();
+    let primary_reset = now + ChronoDuration::hours(2);
+    let backup_reset = now + ChronoDuration::hours(1);
+    runner
+        .mark_limit_reset_at(&primary, primary_reset)
+        .await
+        .unwrap();
+    runner
+        .mark_limit_reset_at(&backup, backup_reset)
+        .await
+        .unwrap();
+
+    let attempted = Arc::new(Mutex::new(Vec::new()));
+    let attempted_for_run = Arc::clone(&attempted);
+    let account_name = runner
+        .run_with_auth_fallback(AuthFallbackAction::Review, move |account| {
+            let attempted = Arc::clone(&attempted_for_run);
+            async move {
+                attempted
+                    .lock()
+                    .expect("attempts")
+                    .push(account.name.clone());
+                Ok::<_, anyhow::Error>(account.name)
+            }
+        })
+        .await
+        .expect("probe should run a blocked account");
+
+    assert_eq!(account_name, "backup");
+    assert_eq!(
+        *attempted.lock().expect("attempts"),
+        vec!["backup".to_string()]
+    );
+    assert_eq!(
+        runner
+            .state
+            .service_state
+            .get_auth_limit_reset_at(&primary.state_key)
+            .await
+            .unwrap(),
+        Some(primary_reset.to_rfc3339())
+    );
+    assert_eq!(
+        runner
+            .state
+            .service_state
+            .get_auth_limit_reset_at(&backup.state_key)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(
+        runner
+            .state
+            .service_state
+            .get_service_state_value(QUOTA_LAST_PROBE_AT_KEY)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn preblocked_probe_auth_unavailable_clears_probe_marker() {
+    let mut codex = test_codex_config();
+    codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
+        name: "backup".to_string(),
+        auth_host_path: "/root/.codex-backup".to_string(),
+    }];
+    let runner =
+        test_runner_with_fake_runtime(codex, false, Arc::new(FakeRunnerHarness::default()), None)
+            .await;
+    let now = Utc::now();
+    for account in runner.auth_accounts.clone() {
+        runner
+            .mark_limit_reset_at(&account, now + ChronoDuration::hours(1))
+            .await
+            .unwrap();
+    }
+
+    let err = runner
+        .run_with_auth_fallback(AuthFallbackAction::Review, |_account| async move {
+            Err::<(), anyhow::Error>(anyhow!("codex app-server error: not authenticated"))
+        })
+        .await
+        .expect_err("auth-unavailable probe should keep combined auth error");
+
+    assert!(err.downcast_ref::<CodexQuotaExhausted>().is_none());
+    assert_eq!(
+        runner
+            .state
+            .service_state
+            .get_service_state_value(QUOTA_LAST_PROBE_AT_KEY)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn quota_block_at_requires_all_accounts_blocked_and_recent_probe() {
+    let mut codex = test_codex_config();
+    codex.usage_limit_recheck_seconds = 300;
+    codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
+        name: "backup".to_string(),
+        auth_host_path: "/root/.codex-backup".to_string(),
+    }];
+    let runner =
+        test_runner_with_fake_runtime(codex, false, Arc::new(FakeRunnerHarness::default()), None)
+            .await;
+    let now = Utc
+        .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+        .single()
+        .expect("valid");
+    assert!(runner.quota_block_at(now).await.unwrap().is_none());
+
+    let primary = runner
+        .auth_account_by_name(PRIMARY_AUTH_ACCOUNT_NAME)
+        .expect("primary account")
+        .clone();
+    let backup = runner
+        .auth_account_by_name("backup")
+        .expect("backup account")
+        .clone();
+    let primary_reset = now + ChronoDuration::minutes(20);
+    let backup_reset = now + ChronoDuration::minutes(30);
+    runner
+        .mark_limit_reset_at(&primary, primary_reset)
+        .await
+        .unwrap();
+    runner
+        .mark_limit_reset_at(&backup, backup_reset)
+        .await
+        .unwrap();
+    assert!(runner.quota_block_at(now).await.unwrap().is_none());
+
+    runner
+        .state
+        .service_state
+        .set_service_state_value(
+            QUOTA_LAST_PROBE_AT_KEY,
+            &(now - ChronoDuration::seconds(60)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+    let block = runner
+        .quota_block_at(now)
+        .await
+        .unwrap()
+        .expect("recent probe should block");
+    assert_eq!(block.reset_at, primary_reset);
+    assert_eq!(block.retry_at, now + ChronoDuration::seconds(240));
+
+    runner
+        .state
+        .service_state
+        .set_service_state_value(
+            QUOTA_LAST_PROBE_AT_KEY,
+            &(now - ChronoDuration::seconds(300)).to_rfc3339(),
+        )
+        .await
+        .unwrap();
+    assert!(runner.quota_block_at(now).await.unwrap().is_none());
+}
+
 #[test]
 fn should_clear_limit_reset_only_when_marker_is_not_newer_than_attempt() {
     let attempt_started_at = Utc
@@ -476,6 +759,7 @@ fn build_auth_accounts_keeps_primary_first_then_fallback_order() {
             },
         ],
         usage_limit_fallback_cooldown_seconds: 3600,
+        usage_limit_recheck_seconds: 900,
         deps: DepsConfig { enabled: false },
         browser_mcp: BrowserMcpConfig::default(),
         work_tmpfs: crate::config::WorkTmpfsConfig::default(),
@@ -529,6 +813,7 @@ fn runner_env_vars_do_not_include_proxy_settings() {
             exec_sandbox: "danger-full-access".to_string(),
             fallback_auth_accounts: Vec::new(),
             usage_limit_fallback_cooldown_seconds: 3600,
+            usage_limit_recheck_seconds: 900,
             deps: DepsConfig { enabled: false },
             browser_mcp: BrowserMcpConfig::default(),
             work_tmpfs: crate::config::WorkTmpfsConfig::default(),

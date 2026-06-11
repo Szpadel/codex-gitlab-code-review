@@ -231,6 +231,15 @@ impl ServiceStateRepository {
         .with_context(|| format!("upsert service_state value for key {key}"))?;
         Ok(())
     }
+
+    pub(crate) async fn clear_service_state_value(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM service_state WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("delete service_state value for key {key}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

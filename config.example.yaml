@@ -64,6 +64,8 @@ review:
   thumbs_emoji: "thumbsup"
   # Optional. GitLab award emoji for "review queued by runtime rate limiting".
   rate_limit_emoji: "hourglass_flowing_sand"
+  # Optional. GitLab award emoji for work deferred because all Codex auth accounts are quota-limited.
+  quota_emoji: "fuelpump"
   # Required. Prefix used to mark review comments to avoid duplicate processing.
   comment_marker_prefix: "<!-- codex-review:sha="
   # Required. Minutes after which in-progress reviews are treated as stale.
@@ -117,6 +119,10 @@ codex:
       auth_host_path: "/root/.codex-backup-2"
   # Optional. Cooldown in seconds when usage-limit reset time cannot be parsed from error output.
   usage_limit_fallback_cooldown_seconds: 3600
+  # Optional. Probe interval in seconds while all auth accounts are usage-limited.
+  # The service retries at the earliest of the reported reset time or this interval,
+  # so earlier unscheduled quota resets are discovered without waiting for the full reset window.
+  usage_limit_recheck_seconds: 900
   # Required. Sandbox mode passed to Codex: "read-only", "workspace-write", or "danger-full-access".
   exec_sandbox: "danger-full-access"
   work_tmpfs:

@@ -16,8 +16,16 @@ pub(super) fn default_usage_limit_fallback_cooldown_seconds() -> u64 {
     3600
 }
 
+pub(super) fn default_usage_limit_recheck_seconds() -> u64 {
+    900
+}
+
 pub(super) fn default_review_rate_limit_emoji() -> String {
     "hourglass_flowing_sand".to_string()
+}
+
+pub(super) fn default_review_quota_emoji() -> String {
+    "fuelpump".to_string()
 }
 
 pub(super) fn default_browser_mcp_server_name() -> String {

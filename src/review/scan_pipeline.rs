@@ -26,12 +26,15 @@ pub(super) struct ScanCounters {
     skipped_completed: usize,
     skipped_locked: usize,
     skipped_rate_limit: usize,
+    skipped_quota: usize,
     security_skipped_marker: usize,
     security_skipped_completed: usize,
     security_skipped_locked: usize,
     security_skipped_backoff: usize,
     security_skipped_rate_limit: usize,
+    security_skipped_quota: usize,
     mention_skipped_processed: usize,
+    mention_quota_blocked: usize,
     skipped_backoff: usize,
     missing_sha: usize,
     skipped_inactive: usize,
@@ -50,6 +53,7 @@ impl ScanContext {
     fn record_mention_outcome(&mut self, outcome: MentionScheduleOutcome) {
         self.counters.mention_scheduled += outcome.scheduled;
         self.counters.mention_skipped_processed += outcome.skipped_processed;
+        self.counters.mention_quota_blocked += outcome.quota_blocked;
     }
 
     fn apply_review_outcome(
@@ -91,6 +95,18 @@ impl ScanContext {
                     repo = repo,
                     iid = iid,
                     "skip: security review rate limit active"
+                );
+            }
+            (ReviewLane::General, ReviewScheduleOutcome::SkippedQuota) => {
+                self.counters.skipped_quota += 1;
+                debug!(repo = repo, iid = iid, "skip: codex quota exhausted");
+            }
+            (ReviewLane::Security, ReviewScheduleOutcome::SkippedQuota) => {
+                self.counters.security_skipped_quota += 1;
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: codex quota exhausted for security review"
                 );
             }
             (ReviewLane::General, ReviewScheduleOutcome::SkippedAward) => {
@@ -186,12 +202,15 @@ impl ScanContext {
                     skipped_completed = self.counters.skipped_completed,
                     skipped_locked = self.counters.skipped_locked,
                     skipped_rate_limit = self.counters.skipped_rate_limit,
+                    skipped_quota = self.counters.skipped_quota,
                     security_skipped_marker = self.counters.security_skipped_marker,
                     security_skipped_completed = self.counters.security_skipped_completed,
                     security_skipped_locked = self.counters.security_skipped_locked,
                     security_skipped_backoff = self.counters.security_skipped_backoff,
                     security_skipped_rate_limit = self.counters.security_skipped_rate_limit,
+                    security_skipped_quota = self.counters.security_skipped_quota,
                     mention_skipped_processed = self.counters.mention_skipped_processed,
+                    mention_quota_blocked = self.counters.mention_quota_blocked,
                     skipped_backoff = self.counters.skipped_backoff,
                     missing_sha = self.counters.missing_sha,
                     skipped_draft = self.counters.skipped_draft,
@@ -210,12 +229,15 @@ impl ScanContext {
                     skipped_completed = self.counters.skipped_completed,
                     skipped_locked = self.counters.skipped_locked,
                     skipped_rate_limit = self.counters.skipped_rate_limit,
+                    skipped_quota = self.counters.skipped_quota,
                     security_skipped_marker = self.counters.security_skipped_marker,
                     security_skipped_completed = self.counters.security_skipped_completed,
                     security_skipped_locked = self.counters.security_skipped_locked,
                     security_skipped_backoff = self.counters.security_skipped_backoff,
                     security_skipped_rate_limit = self.counters.security_skipped_rate_limit,
+                    security_skipped_quota = self.counters.security_skipped_quota,
                     mention_skipped_processed = self.counters.mention_skipped_processed,
+                    mention_quota_blocked = self.counters.mention_quota_blocked,
                     skipped_backoff = self.counters.skipped_backoff,
                     missing_sha = self.counters.missing_sha,
                     skipped_inactive = self.counters.skipped_inactive,
@@ -283,6 +305,14 @@ impl<'a> ScanPipeline<'a> {
                 .review_rate_limit
                 .repo_has_due_review_rate_limit_pending(repo, now_ts)
                 .await?;
+        let due_pending_mention = matches!(self.mode, ScanMode::Incremental)
+            && self
+                .service
+                .state
+                .mention_quota_pending
+                .repo_has_due_mention_quota_pending(repo, now_ts)
+                .await?;
+        let due_pending_work = due_pending_review || due_pending_mention;
         if matches!(self.mode, ScanMode::Incremental)
             && let Some(marker) = activity_marker.as_ref()
         {
@@ -300,7 +330,7 @@ impl<'a> ScanPipeline<'a> {
                         .set_project_last_mr_activity(repo, marker)
                         .await?;
                 }
-                if !due_pending_review {
+                if !due_pending_work {
                     self.context.counters.skipped_inactive += 1;
                     debug!(repo = repo, "skip: no open MRs");
                     return Ok(());
@@ -308,7 +338,7 @@ impl<'a> ScanPipeline<'a> {
             }
             if let Some(previous) = previous
                 && previous == *marker
-                && !due_pending_review
+                && !due_pending_work
             {
                 self.context.counters.skipped_inactive += 1;
                 debug!(repo = repo, "skip: latest MR activity unchanged");
@@ -354,6 +384,9 @@ impl<'a> ScanPipeline<'a> {
         let open_iids = mrs.iter().map(|mr| mr.iid).collect::<Vec<_>>();
         self.service
             .remove_rate_limit_awards_for_closed_pending_mrs(repo, &open_iids)
+            .await?;
+        self.service
+            .clear_mention_quota_pending_for_closed_mrs(repo, &open_iids)
             .await?;
         for mr in mrs {
             if self.service.shutdown_requested() {
@@ -464,6 +497,14 @@ pub(super) async fn run_pending_rate_limit_pipeline(
     }
     service.clear_stale_flow_state().await?;
     let now = Utc::now().timestamp();
+    let due_pending_mentions = service
+        .state
+        .mention_quota_pending
+        .list_mention_quota_pending()
+        .await?
+        .into_iter()
+        .filter(|entry| entry.next_retry_at <= now)
+        .collect::<Vec<_>>();
     let due_pending_rows = service
         .state
         .review_rate_limit
@@ -472,9 +513,22 @@ pub(super) async fn run_pending_rate_limit_pipeline(
         .into_iter()
         .filter(|entry| entry.next_retry_at <= now)
         .collect::<Vec<_>>();
-    if due_pending_rows.is_empty() {
+    if due_pending_mentions.is_empty() && due_pending_rows.is_empty() {
         debug!("no pending review rate-limit retries are due");
         return Ok(ScanRunStatus::Completed);
+    }
+    for pending in due_pending_mentions {
+        if service.shutdown_requested() {
+            info!(
+                repo = pending.repo.as_str(),
+                iid = pending.iid,
+                discussion_id = pending.discussion_id.as_str(),
+                trigger_note_id = pending.trigger_note_id,
+                "stopping pending mention quota retry processing: shutdown requested"
+            );
+            return Ok(ScanRunStatus::Interrupted);
+        }
+        service.retry_pending_mention_quota_row(&pending).await?;
     }
     for pending in due_pending_rows {
         if service.shutdown_requested() {
@@ -507,6 +561,7 @@ mod tests {
         context.record_mention_outcome(MentionScheduleOutcome {
             scheduled: 2,
             skipped_processed: 3,
+            quota_blocked: 0,
             blocks_review: true,
             blocked_pending_work: true,
         });

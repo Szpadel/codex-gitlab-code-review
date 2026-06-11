@@ -1,4 +1,4 @@
-use crate::codex_runner::{CodexResult, ReviewComment, ReviewContext};
+use crate::codex_runner::{CodexQuotaExhausted, CodexResult, ReviewComment, ReviewContext};
 use crate::config::Config;
 use crate::config::FeatureFlagSnapshot;
 use crate::flow::award_service::AwardService;
@@ -106,6 +106,7 @@ pub(crate) enum ReviewScheduleOutcome {
     Disabled,
     SkippedBackoff,
     SkippedRateLimit,
+    SkippedQuota,
     SkippedAward,
     SkippedMarker,
     SkippedCompleted,
@@ -121,6 +122,11 @@ pub(crate) enum ReviewRunResult {
     DryRunComment,
     Error,
     Cancelled,
+}
+
+pub(crate) enum ReviewRunStatus {
+    Completed,
+    QuotaDeferred,
 }
 
 impl ReviewRunResult {
@@ -331,6 +337,9 @@ impl ReviewFlow {
         if self.skipped_by_mention_lock(repo, mr.iid).await? {
             return Ok(Some(ReviewScheduleOutcome::SkippedLocked));
         }
+        if self.skipped_by_codex_quota(repo, mr.iid, head_sha).await? {
+            return Ok(Some(ReviewScheduleOutcome::SkippedQuota));
+        }
         Ok(None)
     }
 
@@ -347,6 +356,27 @@ impl ReviewFlow {
             .award_service
             .has_award(repo, iid, &self.shared.config.review.thumbs_emoji)
             .await
+    }
+
+    async fn skipped_by_codex_quota(&self, repo: &str, iid: u64, head_sha: &str) -> Result<bool> {
+        let now = Utc::now();
+        let Some(block) = self.shared.codex.quota_block(now).await? else {
+            return Ok(false);
+        };
+        self.shared
+            .state
+            .review_rate_limit
+            .upsert_review_rate_limit_pending(
+                self.lane,
+                repo,
+                iid,
+                head_sha,
+                now.timestamp(),
+                block.retry_at.timestamp(),
+            )
+            .await?;
+        self.ensure_quota_award_best_effort(repo, iid).await;
+        Ok(true)
     }
 
     async fn skipped_by_review_marker(&self, repo: &str, iid: u64, head_sha: &str) -> Result<bool> {
@@ -866,8 +896,11 @@ impl ReviewFlow {
                 prepared.feature_flags,
                 prepared.task.run_history_id,
             )
-            .await?;
-        Ok(ReviewScheduleOutcome::Scheduled)
+            .await
+            .map(|status| match status {
+                ReviewRunStatus::Completed => ReviewScheduleOutcome::Scheduled,
+                ReviewRunStatus::QuotaDeferred => ReviewScheduleOutcome::SkippedQuota,
+            })
     }
 
     async fn resolve_feature_flags(&self) -> Result<FeatureFlagSnapshot> {
@@ -889,6 +922,7 @@ impl ReviewFlow {
             .await?;
         if cleared {
             self.remove_rate_limit_award_best_effort(repo, iid).await;
+            self.remove_quota_award_best_effort(repo, iid).await;
         }
         Ok(())
     }
@@ -938,6 +972,25 @@ impl ReviewFlow {
         }
     }
 
+    async fn ensure_quota_award_best_effort(&self, repo: &str, iid: u64) {
+        if self.shared.config.review.dry_run || !self.uses_awards() {
+            return;
+        }
+        if let Err(err) = self
+            .shared
+            .award_service
+            .ensure_award(repo, iid, &self.shared.config.review.quota_emoji)
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                error = %err,
+                "failed to add quota award"
+            );
+        }
+    }
+
     async fn remove_rate_limit_award_best_effort(&self, repo: &str, iid: u64) {
         if self.shared.config.review.dry_run || !self.uses_awards() {
             return;
@@ -953,6 +1006,25 @@ impl ReviewFlow {
                 iid = iid,
                 error = %err,
                 "failed to remove rate-limit award"
+            );
+        }
+    }
+
+    async fn remove_quota_award_best_effort(&self, repo: &str, iid: u64) {
+        if self.shared.config.review.dry_run || !self.uses_awards() {
+            return;
+        }
+        if let Err(err) = self
+            .shared
+            .award_service
+            .remove_award(repo, iid, &self.shared.config.review.quota_emoji)
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                error = %err,
+                "failed to remove quota award"
             );
         }
     }
@@ -1232,6 +1304,73 @@ impl ReviewRunContext {
         )
         .await?;
         info!(repo = repo, iid = iid, "review cancelled due to shutdown");
+        Ok(())
+    }
+
+    async fn ensure_quota_award_best_effort(&self, repo: &str, iid: u64) {
+        if self.config.review.dry_run || !self.uses_awards() {
+            return;
+        }
+        if let Err(err) = self
+            .award_service
+            .ensure_award(repo, iid, &self.config.review.quota_emoji)
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                error = %err,
+                "failed to add quota award"
+            );
+        }
+    }
+
+    async fn handle_quota_exhausted(
+        &self,
+        run: &ReviewRunIdentity<'_>,
+        quota: &CodexQuotaExhausted,
+    ) -> Result<()> {
+        refund_review_rate_limits(&self.state, &self.acquired_rate_limit_rule_ids).await?;
+        self.retry_backoff.clear(run.retry_key);
+        self.state
+            .review_state
+            .finish_review_for_lane(
+                run.repo,
+                run.iid,
+                run.head_sha,
+                self.lane,
+                ReviewRunResult::Cancelled.as_str(),
+            )
+            .await?;
+        let task = ScheduledTaskContext::new(run.repo, run.iid, run.head_sha, run.run_history_id);
+        let mut finish = task_cancelled_finish(
+            ReviewRunResult::Cancelled.as_str(),
+            self.review_preview(run.repo, run.iid),
+        );
+        finish.summary = Some(format!(
+            "deferred: codex quota exhausted until {}",
+            quota.reset_at
+        ));
+        finish_task_run_history(&self.state, &task, finish).await?;
+        self.state
+            .review_rate_limit
+            .upsert_review_rate_limit_pending(
+                self.lane,
+                run.repo,
+                run.iid,
+                run.head_sha,
+                Utc::now().timestamp(),
+                quota.retry_at.timestamp(),
+            )
+            .await?;
+        self.ensure_quota_award_best_effort(run.repo, run.iid).await;
+        info!(
+            repo = run.repo,
+            iid = run.iid,
+            reset_at = %quota.reset_at,
+            retry_at = %quota.retry_at,
+            "review deferred because codex quota is exhausted"
+        );
         Ok(())
     }
 
@@ -1521,7 +1660,7 @@ impl ReviewRunContext {
         head_sha: &str,
         feature_flags: FeatureFlagSnapshot,
         run_history_id: i64,
-    ) -> Result<()> {
+    ) -> Result<ReviewRunStatus> {
         let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
         let run_identity = ReviewRunIdentity {
             repo,
@@ -1532,7 +1671,7 @@ impl ReviewRunContext {
         };
         let inline_review_comments_enabled = feature_flags.gitlab_inline_review_comments;
         if self.bail_if_start_rejected(&run_identity).await? {
-            return Ok(());
+            return Ok(ReviewRunStatus::Completed);
         }
 
         self.add_eyes_best_effort(repo, mr.iid).await;
@@ -1542,22 +1681,23 @@ impl ReviewRunContext {
         let review_project_path = review_ctx.project_path.clone();
 
         if self.bail_if_start_rejected(&run_identity).await? {
-            return Ok(());
+            return Ok(ReviewRunStatus::Completed);
         }
 
         let _started_run = self.lifecycle.track_started_run();
         let result = self.codex.run_review(review_ctx).await;
         if self.bail_if_cancelled(&run_identity).await? {
-            return Ok(());
+            return Ok(ReviewRunStatus::Completed);
         }
         self.remove_eyes_best_effort(repo, mr.iid).await;
         if self.bail_if_cancelled(&run_identity).await? {
-            return Ok(());
+            return Ok(ReviewRunStatus::Completed);
         }
 
-        match result {
+        let status = match result {
             Ok(CodexResult::Pass { summary }) => {
                 self.handle_pass(&run_identity, summary).await?;
+                ReviewRunStatus::Completed
             }
             Ok(CodexResult::Comment(comment)) => {
                 self.handle_comment(
@@ -1568,13 +1708,21 @@ impl ReviewRunContext {
                     comment,
                 )
                 .await?;
+                ReviewRunStatus::Completed
             }
             Err(err) => {
-                self.handle_error(&run_identity, err).await?;
+                if let Some(quota) = err.downcast_ref::<CodexQuotaExhausted>() {
+                    let quota = quota.clone();
+                    self.handle_quota_exhausted(&run_identity, &quota).await?;
+                    ReviewRunStatus::QuotaDeferred
+                } else {
+                    self.handle_error(&run_identity, err).await?;
+                    ReviewRunStatus::Completed
+                }
             }
-        }
+        };
 
-        Ok(())
+        Ok(status)
     }
 }
 

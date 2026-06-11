@@ -179,6 +179,7 @@ fn defaults_mention_commands_when_missing() {
     let config = load_from_yaml(&yaml);
     assert_eq!(config.review.additional_developer_instructions, None);
     assert_eq!(config.review.rate_limit_emoji, "hourglass_flowing_sand");
+    assert_eq!(config.review.quota_emoji, "fuelpump");
     assert!(!config.review.mention_commands.enabled);
     assert_eq!(config.review.mention_commands.bot_username, None);
     assert_eq!(config.review.mention_commands.eyes_emoji, None);
@@ -191,6 +192,7 @@ fn defaults_mention_commands_when_missing() {
     );
     assert!(config.codex.fallback_auth_accounts.is_empty());
     assert_eq!(config.codex.usage_limit_fallback_cooldown_seconds, 3600);
+    assert_eq!(config.codex.usage_limit_recheck_seconds, 900);
     assert!(config.codex.mcp_server_overrides.review.is_empty());
     assert!(config.codex.mcp_server_overrides.mention.is_empty());
     assert_eq!(config.codex.session_overrides.review.model, None);
@@ -242,6 +244,19 @@ fn preserves_rate_limit_emoji_override() {
     );
     let config = load_from_yaml(&yaml);
     assert_eq!(config.review.rate_limit_emoji, "alarm_clock");
+}
+
+#[test]
+fn preserves_quota_emoji_override() {
+    let yaml = base_config_yaml_with(
+        r#"
+  quota_emoji: "fuelpump"
+"#,
+        "",
+        "",
+    );
+    let config = load_from_yaml(&yaml);
+    assert_eq!(config.review.quota_emoji, "fuelpump");
 }
 
 #[test]
@@ -992,6 +1007,7 @@ fn loads_fallback_auth_accounts_in_declared_order() {
         "",
         r#"
   usage_limit_fallback_cooldown_seconds: 120
+  usage_limit_recheck_seconds: 45
   fallback_auth_accounts:
     - name: "backup-high"
       auth_host_path: "/root/.codex-backup-high"
@@ -1002,6 +1018,7 @@ fn loads_fallback_auth_accounts_in_declared_order() {
     );
     let config = load_from_yaml(&yaml);
     assert_eq!(config.codex.usage_limit_fallback_cooldown_seconds, 120);
+    assert_eq!(config.codex.usage_limit_recheck_seconds, 45);
     assert_eq!(config.codex.fallback_auth_accounts.len(), 2);
     assert_eq!(config.codex.fallback_auth_accounts[0].name, "backup-high");
     assert_eq!(

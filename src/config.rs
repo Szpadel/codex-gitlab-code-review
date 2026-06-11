@@ -17,11 +17,12 @@ use self::defaults::{
     default_browser_mcp_remote_debugging_port, default_browser_mcp_server_name,
     default_docker_host, default_gitlab_discovery_mcp_bind_addr,
     default_gitlab_discovery_mcp_clone_root, default_gitlab_discovery_mcp_server_name,
-    default_reasoning_summary_override, default_refresh_seconds, default_review_rate_limit_emoji,
-    default_security_context_session_override, default_security_review_comment_marker_prefix,
-    default_security_review_context_ttl_seconds, default_security_review_finding_marker_prefix,
-    default_security_review_min_confidence_score, default_security_review_session_override,
-    default_usage_limit_fallback_cooldown_seconds,
+    default_reasoning_summary_override, default_refresh_seconds, default_review_quota_emoji,
+    default_review_rate_limit_emoji, default_security_context_session_override,
+    default_security_review_comment_marker_prefix, default_security_review_context_ttl_seconds,
+    default_security_review_finding_marker_prefix, default_security_review_min_confidence_score,
+    default_security_review_session_override, default_usage_limit_fallback_cooldown_seconds,
+    default_usage_limit_recheck_seconds,
 };
 pub use self::feature_flags::{
     FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
@@ -158,6 +159,8 @@ pub struct ReviewConfig {
     pub thumbs_emoji: String,
     #[serde(default = "default_review_rate_limit_emoji")]
     pub rate_limit_emoji: String,
+    #[serde(default = "default_review_quota_emoji")]
+    pub quota_emoji: String,
     pub comment_marker_prefix: String,
     pub stale_in_progress_minutes: u64,
     #[serde(default)]
@@ -210,6 +213,8 @@ pub struct CodexConfig {
     pub fallback_auth_accounts: Vec<FallbackAuthAccountConfig>,
     #[serde(default = "default_usage_limit_fallback_cooldown_seconds")]
     pub usage_limit_fallback_cooldown_seconds: u64,
+    #[serde(default = "default_usage_limit_recheck_seconds")]
+    pub usage_limit_recheck_seconds: u64,
     #[serde(default)]
     pub deps: DepsConfig,
     #[serde(default)]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::Config;
 #[test]
 fn mention_detection_honors_boundaries() {
     assert!(contains_mention("@botuser please fix", "botuser"));
@@ -57,6 +58,196 @@ fn extract_parent_chain_uses_reply_chain_when_available() {
         chain.iter().map(|note| note.id).collect::<Vec<_>>(),
         vec![1, 2, 3]
     );
+}
+
+fn mention_quota_config() -> Config {
+    let mut config = test_config();
+    config.review.mention_commands.enabled = true;
+    config.review.mention_commands.bot_username = Some("botuser".to_string());
+    config.review.quota_emoji = "fuelpump".to_string();
+    config
+}
+
+fn gitlab_with_mention_trigger(
+    iid: u64,
+    sha: &str,
+    discussion_id: &str,
+    trigger_note_id: u64,
+) -> Arc<FakeGitLab> {
+    let bot_user = GitLabUser {
+        id: 1,
+        username: Some("botuser".to_string()),
+        name: Some("Bot User".to_string()),
+    };
+    let requester = GitLabUser {
+        id: 7,
+        username: Some("alice".to_string()),
+        name: Some("Alice".to_string()),
+    };
+    Arc::new(FakeGitLab {
+        bot_user: bot_user.clone(),
+        mrs: Mutex::new(vec![mr(iid, sha)]),
+        awards: Mutex::new(HashMap::new()),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::from([(
+            ("group/repo".to_string(), iid),
+            vec![MergeRequestDiscussion {
+                id: discussion_id.to_string(),
+                notes: vec![
+                    DiscussionNote {
+                        id: trigger_note_id - 1,
+                        body: "initial review comment".to_string(),
+                        author: bot_user,
+                        system: false,
+                        in_reply_to_id: None,
+                        created_at: None,
+                    },
+                    DiscussionNote {
+                        id: trigger_note_id,
+                        body: "@botuser please implement change".to_string(),
+                        author: requester,
+                        system: false,
+                        in_reply_to_id: Some(trigger_note_id - 1),
+                        created_at: None,
+                    },
+                ],
+            }],
+        )])),
+        users: Mutex::new(HashMap::from([(
+            7,
+            GitLabUserDetail {
+                id: 7,
+                username: Some("alice".to_string()),
+                name: Some("Alice".to_string()),
+                public_email: Some("alice@example.com".to_string()),
+            },
+        )])),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    })
+}
+
+#[tokio::test]
+async fn quota_gate_defers_mention_trigger_with_fuelpump_award() -> Result<()> {
+    let config = mention_quota_config();
+    let gitlab = gitlab_with_mention_trigger(35, "sha35", "discussion-quota", 935);
+    let retry_at = Utc::now() + Duration::minutes(10);
+    let runner = Arc::new(QuotaBlockRunner {
+        block: crate::codex_runner::QuotaBlock {
+            reset_at: Utc::now() + Duration::hours(1),
+            retry_at,
+        },
+        review_calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state.clone(),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    let status = service.scan_once().await?;
+
+    assert_eq!(status, ScanRunStatus::Completed);
+    assert_eq!(*runner.review_calls.lock().unwrap(), 0);
+    assert_eq!(
+        state
+            .mention_commands
+            .mention_command_scan_state("group/repo", 35, "discussion-quota", 935)
+            .await?,
+        crate::state::MentionCommandScanState::Ready
+    );
+    let pending = state
+        .mention_quota_pending
+        .list_mention_quota_pending()
+        .await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].repo, "group/repo");
+    assert_eq!(pending[0].iid, 35);
+    assert_eq!(pending[0].discussion_id, "discussion-quota");
+    assert_eq!(pending[0].trigger_note_id, 935);
+    assert_eq!(pending[0].last_seen_head_sha, "sha35");
+    assert_eq!(pending[0].next_retry_at, retry_at.timestamp());
+    assert!(gitlab.calls.lock().unwrap().iter().any(|call| {
+        call == "add_discussion_note_award:group/repo:35:discussion-quota:935:fuelpump"
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn quota_error_during_mention_keeps_trigger_retryable_without_failure_note() -> Result<()> {
+    let config = mention_quota_config();
+    let gitlab = gitlab_with_mention_trigger(36, "sha36", "discussion-mid-quota", 936);
+    let retry_at = Utc::now() + Duration::minutes(5);
+    let runner = Arc::new(QuotaMentionErrorRunner {
+        quota: crate::codex_runner::CodexQuotaExhausted {
+            reset_at: Utc::now() + Duration::hours(1),
+            retry_at,
+        },
+        mention_calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state.clone(),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    let status = service.scan_once().await?;
+
+    assert_eq!(status, ScanRunStatus::Completed);
+    assert_eq!(*runner.mention_calls.lock().unwrap(), 1);
+    assert_eq!(
+        state
+            .mention_commands
+            .mention_command_scan_state("group/repo", 36, "discussion-mid-quota", 936)
+            .await?,
+        crate::state::MentionCommandScanState::Ready
+    );
+    let pending = state
+        .mention_quota_pending
+        .list_mention_quota_pending()
+        .await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].iid, 36);
+    assert_eq!(pending[0].discussion_id, "discussion-mid-quota");
+    assert_eq!(pending[0].trigger_note_id, 936);
+    assert_eq!(pending[0].next_retry_at, retry_at.timestamp());
+    let run_result: Option<String> = sqlx::query_scalar(
+        "SELECT result FROM run_history WHERE kind = 'mention' AND repo = ? AND iid = ?",
+    )
+    .bind("group/repo")
+    .bind(36_i64)
+    .fetch_one(state.pool())
+    .await?;
+    assert_eq!(run_result, Some("cancelled".to_string()));
+    let calls = gitlab.calls.lock().unwrap();
+    assert!(calls.iter().any(|call| {
+        call == "add_discussion_note_award:group/repo:36:discussion-mid-quota:936:fuelpump"
+    }));
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.starts_with("create_discussion_note:group/repo:36"))
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.starts_with("create_note:group/repo:36"))
+    );
+    Ok(())
 }
 
 #[tokio::test]
