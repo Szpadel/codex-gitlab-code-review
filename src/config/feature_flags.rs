@@ -1,115 +1,67 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FeatureFlagSnapshot {
-    #[serde(default)]
-    pub gitlab_discovery_mcp: bool,
-    #[serde(default)]
-    pub gitlab_inline_review_comments: bool,
-    #[serde(default)]
-    pub security_review: bool,
-    #[serde(default)]
-    pub security_context_ignore_base_head: bool,
-    #[serde(default)]
-    pub composer_install: bool,
-    #[serde(default)]
-    pub composer_auto_repositories: bool,
-    #[serde(default)]
-    pub composer_safe_install: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeFeatureFlagOverrides {
-    #[serde(default)]
-    pub gitlab_discovery_mcp: Option<bool>,
-    #[serde(default)]
-    pub gitlab_inline_review_comments: Option<bool>,
-    #[serde(default)]
-    pub security_review: Option<bool>,
-    #[serde(default)]
-    pub security_context_ignore_base_head: Option<bool>,
-    #[serde(default)]
-    pub composer_install: Option<bool>,
-    #[serde(default)]
-    pub composer_auto_repositories: Option<bool>,
-    #[serde(default)]
-    pub composer_safe_install: Option<bool>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FeatureFlagDefaults {
-    #[serde(default)]
-    pub gitlab_discovery_mcp: bool,
-    #[serde(default)]
-    pub gitlab_inline_review_comments: bool,
-    #[serde(default)]
-    pub security_review: bool,
-    #[serde(default)]
-    pub security_context_ignore_base_head: bool,
-    #[serde(default)]
-    pub composer_install: bool,
-    #[serde(default)]
-    pub composer_auto_repositories: bool,
-    #[serde(default)]
-    pub composer_safe_install: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FeatureFlagAvailability {
-    pub gitlab_discovery_mcp: bool,
-    pub gitlab_inline_review_comments: bool,
-    pub security_review: bool,
-    pub security_context_ignore_base_head: bool,
-    pub composer_install: bool,
-    pub composer_auto_repositories: bool,
-    pub composer_safe_install: bool,
-}
-
-impl FeatureFlagSnapshot {
-    #[must_use]
-    pub fn resolve(
-        defaults: &FeatureFlagDefaults,
-        availability: &FeatureFlagAvailability,
-        overrides: &RuntimeFeatureFlagOverrides,
-    ) -> Self {
-        Self {
-            gitlab_discovery_mcp: resolve_flag(
-                defaults.gitlab_discovery_mcp,
-                availability.gitlab_discovery_mcp,
-                overrides.gitlab_discovery_mcp,
-            ),
-            gitlab_inline_review_comments: resolve_flag(
-                defaults.gitlab_inline_review_comments,
-                availability.gitlab_inline_review_comments,
-                overrides.gitlab_inline_review_comments,
-            ),
-            security_review: resolve_flag(
-                defaults.security_review,
-                availability.security_review,
-                overrides.security_review,
-            ),
-            security_context_ignore_base_head: resolve_flag(
-                defaults.security_context_ignore_base_head,
-                availability.security_context_ignore_base_head,
-                overrides.security_context_ignore_base_head,
-            ),
-            composer_install: resolve_flag(
-                defaults.composer_install,
-                availability.composer_install,
-                overrides.composer_install,
-            ),
-            composer_auto_repositories: resolve_flag(
-                defaults.composer_auto_repositories,
-                availability.composer_auto_repositories,
-                overrides.composer_auto_repositories,
-            ),
-            composer_safe_install: resolve_flag(
-                defaults.composer_safe_install,
-                availability.composer_safe_install,
-                overrides.composer_safe_install,
-            ),
+macro_rules! define_feature_flags {
+    ($($flag:ident),+ $(,)?) => {
+        #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+        pub struct FeatureFlagSnapshot {
+            $(
+                #[serde(default)]
+                pub $flag: bool,
+            )+
         }
-    }
+
+        #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+        pub struct RuntimeFeatureFlagOverrides {
+            $(
+                #[serde(default)]
+                pub $flag: Option<bool>,
+            )+
+        }
+
+        #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+        pub struct FeatureFlagDefaults {
+            $(
+                #[serde(default)]
+                pub $flag: bool,
+            )+
+        }
+
+        #[derive(Clone, Debug, Default, PartialEq, Eq)]
+        pub struct FeatureFlagAvailability {
+            $(
+                pub $flag: bool,
+            )+
+        }
+
+        impl FeatureFlagSnapshot {
+            #[must_use]
+            pub fn resolve(
+                defaults: &FeatureFlagDefaults,
+                availability: &FeatureFlagAvailability,
+                overrides: &RuntimeFeatureFlagOverrides,
+            ) -> Self {
+                Self {
+                    $(
+                        $flag: resolve_flag(
+                            defaults.$flag,
+                            availability.$flag,
+                            overrides.$flag,
+                        ),
+                    )+
+                }
+            }
+        }
+    };
+}
+
+define_feature_flags! {
+    gitlab_discovery_mcp,
+    gitlab_inline_review_comments,
+    security_review,
+    security_context_ignore_base_head,
+    composer_install,
+    composer_auto_repositories,
+    composer_safe_install,
 }
 
 fn resolve_flag(default_enabled: bool, available: bool, runtime_override: Option<bool>) -> bool {
@@ -235,5 +187,25 @@ mod tests {
         assert!(snapshot.composer_install);
         assert!(snapshot.composer_auto_repositories);
         assert!(snapshot.composer_safe_install);
+    }
+
+    #[test]
+    fn flag_struct_literals_keep_update_syntax_available() {
+        let _snapshot = FeatureFlagSnapshot {
+            composer_safe_install: true,
+            ..Default::default()
+        };
+        let _overrides = RuntimeFeatureFlagOverrides {
+            composer_auto_repositories: Some(true),
+            ..Default::default()
+        };
+        let _defaults = FeatureFlagDefaults {
+            gitlab_inline_review_comments: true,
+            ..Default::default()
+        };
+        let _availability = FeatureFlagAvailability {
+            security_context_ignore_base_head: true,
+            ..Default::default()
+        };
     }
 }
