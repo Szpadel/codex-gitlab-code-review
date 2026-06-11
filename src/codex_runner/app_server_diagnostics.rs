@@ -3,12 +3,22 @@ use super::{
     RunnerRuntime, StreamExt, anyhow, warn,
 };
 use crate::codex_runner::browser_mcp::tail_log_lines;
+use crate::composer_install::redact_composer_related_output;
 #[cfg(test)]
 use anyhow::bail;
 
+const SAFE_APP_SERVER_STDOUT_PREFIXES: &[&str] = &[
+    "codex-runner:",
+    "codex-runner-warn:",
+    "codex-runner-error:",
+    "codex-install:",
+    "codex-install-error:",
+];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AppServerLogTail {
-    pub(crate) stdout_line_count: usize,
+    pub(crate) stdout: Vec<String>,
+    pub(crate) stdout_redacted_line_count: usize,
     pub(crate) stderr: Vec<String>,
 }
 
@@ -63,13 +73,24 @@ impl AppServerContainerDiagnostics {
         if let Some(err) = &self.log_collection_error {
             lines.push(format!("  log tail unavailable: {err}"));
         } else {
-            if self.log_tail.stdout_line_count == 0 {
+            if self.log_tail.stdout.is_empty() && self.log_tail.stdout_redacted_line_count == 0 {
                 lines.push("  stdout tail: <empty>".to_string());
-            } else {
+            } else if self.log_tail.stdout.is_empty() {
                 lines.push(format!(
-                    "  stdout tail: <redacted; {} line(s)>",
-                    self.log_tail.stdout_line_count
+                    "  stdout tail: {}",
+                    redacted_stdout_marker(self.log_tail.stdout_redacted_line_count)
                 ));
+            } else {
+                lines.push("  stdout tail:".to_string());
+                for line in &self.log_tail.stdout {
+                    lines.push(format!("    {line}"));
+                }
+                if self.log_tail.stdout_redacted_line_count > 0 {
+                    lines.push(format!(
+                        "    {}",
+                        redacted_stdout_marker(self.log_tail.stdout_redacted_line_count)
+                    ));
+                }
             }
             if self.log_tail.stderr.is_empty() {
                 lines.push("  stderr tail: <empty>".to_string());
@@ -181,10 +202,11 @@ impl DockerCodexRunner {
             }
         }
 
-        Ok(AppServerLogTail {
-            stdout_line_count: tail_log_lines(&stdout).len(),
-            stderr: tail_log_lines(&stderr),
-        })
+        Ok(app_server_log_tail_from_raw(
+            &stdout,
+            &stderr,
+            Some(&self.gitlab_token),
+        ))
     }
 
     pub(crate) async fn enrich_error_with_app_server_diagnostics(
@@ -220,4 +242,39 @@ pub(crate) fn app_server_container_state_snapshot(
         started_at: state.started_at.filter(|value| !value.trim().is_empty()),
         finished_at: state.finished_at.filter(|value| !value.trim().is_empty()),
     })
+}
+
+pub(crate) fn app_server_log_tail_from_raw(
+    stdout: &str,
+    stderr: &str,
+    gitlab_token: Option<&str>,
+) -> AppServerLogTail {
+    let redacted_stdout = redact_composer_related_output(stdout, gitlab_token, None);
+    let mut safe_stdout = Vec::new();
+    let mut redacted_stdout_count = 0;
+    for line in tail_log_lines(&redacted_stdout) {
+        if is_safe_app_server_stdout_line(&line) {
+            safe_stdout.push(line);
+        } else {
+            redacted_stdout_count += 1;
+        }
+    }
+
+    let redacted_stderr = redact_composer_related_output(stderr, gitlab_token, None);
+
+    AppServerLogTail {
+        stdout: safe_stdout,
+        stdout_redacted_line_count: redacted_stdout_count,
+        stderr: tail_log_lines(&redacted_stderr),
+    }
+}
+
+fn is_safe_app_server_stdout_line(line: &str) -> bool {
+    SAFE_APP_SERVER_STDOUT_PREFIXES
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+}
+
+fn redacted_stdout_marker(line_count: usize) -> String {
+    format!("<redacted; {line_count} protocol/unclassified line(s)>")
 }

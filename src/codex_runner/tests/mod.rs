@@ -4,6 +4,7 @@ use super::app_server::{
 };
 use super::app_server_diagnostics::{
     AppServerContainerDiagnostics, AppServerContainerStateSnapshot, AppServerLogTail,
+    app_server_log_tail_from_raw,
 };
 use super::auth::{
     CodexQuotaExhausted, QUOTA_LAST_PROBE_AT_KEY, auth_account_state_key,

@@ -567,7 +567,8 @@ fn app_server_container_diagnostics_context_includes_state_and_logs() {
         }),
         state_collection_error: None,
         log_tail: AppServerLogTail {
-            stdout_line_count: 1,
+            stdout: vec!["codex-runner-error: git clone failed".to_string()],
+            stdout_redacted_line_count: 1,
             stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
         },
         log_collection_error: None,
@@ -579,9 +580,39 @@ fn app_server_container_diagnostics_context_includes_state_and_logs() {
     assert!(formatted.contains("app-123"));
     assert!(formatted.contains("status=exited"));
     assert!(formatted.contains("exit_code=1"));
-    assert!(formatted.contains("stdout tail: <redacted; 1 line(s)>"));
-    assert!(!formatted.contains("codex stdout line"));
+    assert!(formatted.contains("codex-runner-error: git clone failed"));
+    assert!(formatted.contains("<redacted; 1 protocol/unclassified line(s)>"));
     assert!(formatted.contains("MCP server chrome-devtools failed to start"));
+}
+
+#[test]
+fn app_server_log_tail_keeps_only_sanitized_prefixed_stdout() {
+    let tail = app_server_log_tail_from_raw(
+        concat!(
+            "{\"method\":\"turn/started\",\"params\":{\"secret\":\"token\"}}\n",
+            "codex-runner-error: clone https://oauth2:token@example.com/repo.git failed\n",
+            "plain crash line token\n",
+            "codex-install-error: npm failed token\n",
+        ),
+        "stderr token https://oauth2:token@example.com/repo.git\n",
+        Some("token"),
+    );
+
+    assert_eq!(
+        tail.stdout,
+        vec![
+            "codex-runner-error: clone https://oauth2:[REDACTED]@example.com/repo.git failed",
+            "codex-install-error: npm failed [REDACTED_GITLAB_TOKEN]",
+        ]
+    );
+    assert_eq!(tail.stdout_redacted_line_count, 2);
+    assert_eq!(
+        tail.stderr,
+        vec![
+            "stderr [REDACTED_GITLAB_TOKEN] https://oauth2:[REDACTED]@example.com/repo.git"
+                .to_string()
+        ]
+    );
 }
 
 #[test]
