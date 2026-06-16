@@ -593,8 +593,8 @@ async fn run_review_with_fake_runtime_enriches_app_server_stdout_close_with_diag
             log_tail: AppServerLogTail {
                 stdout: vec![
                     "codex-runner-error: browser MCP endpoint did not become ready".to_string(),
+                    "npm ERR! 429 Too Many Requests".to_string(),
                 ],
-                stdout_redacted_line_count: 1,
                 stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
             },
             log_collection_error: None,
@@ -640,7 +640,7 @@ async fn run_review_with_fake_runtime_enriches_app_server_stdout_close_with_diag
     assert!(text.contains("status=exited"));
     assert!(text.contains("exit_code=1"));
     assert!(text.contains("codex-runner-error: browser MCP endpoint did not become ready"));
-    assert!(text.contains("<redacted; 1 protocol/unclassified line(s)>"));
+    assert!(text.contains("npm ERR! 429 Too Many Requests"));
     assert!(text.contains("MCP server chrome-devtools failed to start"));
     assert!(text.contains("browser container diagnostics"));
     assert!(text.contains("DevTools listening on ws://127.0.0.1:9223"));
@@ -666,8 +666,7 @@ async fn run_review_with_fake_runtime_enriches_app_server_initialize_write_failu
             }),
             state_collection_error: None,
             log_tail: AppServerLogTail {
-                stdout: Vec::new(),
-                stdout_redacted_line_count: 1,
+                stdout: vec!["npm ERR! 429 Too Many Requests".to_string()],
                 stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
             },
             log_collection_error: None,
@@ -687,10 +686,7 @@ async fn run_review_with_fake_runtime_enriches_app_server_initialize_write_failu
     assert!(text.contains("app-server container diagnostics"), "{text}");
     assert!(text.contains("status=exited"), "{text}");
     assert!(text.contains("exit_code=1"), "{text}");
-    assert!(
-        text.contains("stdout tail: <redacted; 1 protocol/unclassified line(s)>"),
-        "{text}"
-    );
+    assert!(text.contains("npm ERR! 429 Too Many Requests"), "{text}");
     assert!(!text.contains("codex app-server stdout before write failed"));
     assert!(
         text.contains("MCP server chrome-devtools failed to start"),
@@ -718,8 +714,7 @@ async fn read_thread_with_fake_runtime_enriches_app_server_initialize_write_fail
             }),
             state_collection_error: None,
             log_tail: AppServerLogTail {
-                stdout: Vec::new(),
-                stdout_redacted_line_count: 1,
+                stdout: vec!["npm ERR! 429 Too Many Requests".to_string()],
                 stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
             },
             log_collection_error: None,
@@ -739,10 +734,7 @@ async fn read_thread_with_fake_runtime_enriches_app_server_initialize_write_fail
     assert!(text.contains("app-server container diagnostics"), "{text}");
     assert!(text.contains("status=exited"), "{text}");
     assert!(text.contains("exit_code=1"), "{text}");
-    assert!(
-        text.contains("stdout tail: <redacted; 1 protocol/unclassified line(s)>"),
-        "{text}"
-    );
+    assert!(text.contains("npm ERR! 429 Too Many Requests"), "{text}");
     assert!(
         text.contains("MCP server chrome-devtools failed to start"),
         "{text}"
