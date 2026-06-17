@@ -88,6 +88,7 @@ pub(crate) async fn run_with_hooks(
         config,
         run_once,
         service,
+        state,
         http_services,
         gitlab_discovery_mcp,
         dev_tools,
@@ -114,12 +115,28 @@ pub(crate) async fn run_with_hooks(
         if let Err(err) = http_services.admin.clear_next_scan_at().await {
             warn!(error = %err, "failed to clear next scheduled scan status");
         }
-        run_tracked_scan(
+        let scan_result = run_tracked_scan(
             http_services.admin.as_ref(),
             ScanMode::Full,
             service.scan_once(),
         )
-        .await?;
+        .await;
+        let flush_result = state
+            .flush_background_writes()
+            .await
+            .context("flush sqlite background writes after single scan");
+        match (scan_result, flush_result) {
+            (Ok(()), Ok(())) => {}
+            (Err(scan_err), Ok(())) => return Err(scan_err),
+            (Ok(()), Err(flush_err)) => return Err(flush_err),
+            (Err(scan_err), Err(flush_err)) => {
+                warn!(
+                    error = %format!("{flush_err:#}"),
+                    "failed to flush sqlite background writes after failed single scan"
+                );
+                return Err(scan_err);
+            }
+        }
         info!("single scan complete");
         return Ok(());
     }
@@ -152,7 +169,12 @@ pub(crate) async fn run_with_hooks(
             .await;
             log_task_result("initial scan", initial_scan.await);
             if matches!(signal, ServiceLifecycleSignal::GracefulDrain) {
-                finalize_graceful_drain(service.as_ref(), gitlab_discovery_mcp.as_ref()).await;
+                finalize_graceful_drain(
+                    service.as_ref(),
+                    state.as_ref(),
+                    gitlab_discovery_mcp.as_ref(),
+                )
+                .await;
             }
             return Ok(());
         }
@@ -199,7 +221,12 @@ pub(crate) async fn run_with_hooks(
             .await;
             log_task_result("schedule loop", scheduled_loop.await);
             if matches!(signal, ServiceLifecycleSignal::GracefulDrain) {
-                finalize_graceful_drain(service.as_ref(), gitlab_discovery_mcp.as_ref()).await;
+                finalize_graceful_drain(
+                    service.as_ref(),
+                    state.as_ref(),
+                    gitlab_discovery_mcp.as_ref(),
+                )
+                .await;
             }
             Ok(())
         }
@@ -439,10 +466,17 @@ async fn handle_service_signal(
 
 async fn finalize_graceful_drain(
     service: &ReviewService,
+    state: &crate::state::ReviewStateStore,
     gitlab_discovery_mcp: Option<&Arc<GitLabDiscoveryMcpService>>,
 ) {
     service.wait_for_started_runs().await;
     service.wait_for_active_tasks().await;
+    if let Err(err) = state.flush_background_writes().await {
+        warn!(
+            error = %format!("{err:#}"),
+            "failed to flush sqlite background writes during graceful drain"
+        );
+    }
     if let Some(service) = gitlab_discovery_mcp {
         service.shutdown();
     }

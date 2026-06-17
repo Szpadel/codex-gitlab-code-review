@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
-use sqlx::SqlitePool;
 use std::collections::BTreeSet;
+
+use super::sqlite::SqliteCoordinator;
 
 mod bucket_rows;
 mod buckets;
@@ -26,11 +27,11 @@ pub struct ReviewRateLimitRepository {
 }
 
 impl ReviewRateLimitRepository {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
         Self {
-            rules: RuleRepository::new(pool.clone()),
-            buckets: BucketRepository::new(pool.clone()),
-            pending: PendingRepository::new(pool),
+            rules: RuleRepository::new(sqlite.clone()),
+            buckets: BucketRepository::new(sqlite.clone()),
+            pending: PendingRepository::new(sqlite),
         }
     }
 

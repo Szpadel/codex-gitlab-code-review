@@ -845,6 +845,100 @@ async fn run_history_events_offset_sequence_across_append_batches() -> Result<()
 }
 
 #[tokio::test]
+async fn background_run_history_append_persists_after_flush() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let run_id = store
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 109,
+            head_sha: "sha-bg".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+
+    store
+        .run_history
+        .append_run_history_events_bg(
+            run_id,
+            vec![NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("turn-bg".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: serde_json::json!({}),
+            }],
+        )
+        .await?;
+    store.flush_background_writes().await?;
+
+    let events = store.run_history.list_run_history_events(run_id).await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].turn_id.as_deref(), Some("turn-bg"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn queued_background_append_does_not_block_foreground_run_creation() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let run_id = store
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 110,
+            head_sha: "sha-bg-blocked".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    let background_pause = store.pause_background_writes_for_test().await;
+    store
+        .run_history
+        .append_run_history_events_bg(
+            run_id,
+            vec![NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("turn-paused".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: serde_json::json!({}),
+            }],
+        )
+        .await?;
+
+    let foreground = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        store.run_history.start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 111,
+            head_sha: "sha-foreground".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        }),
+    )
+    .await
+    .context("foreground write waited behind paused background queue")??;
+    assert!(foreground > run_id);
+
+    drop(background_pause);
+    store.flush_background_writes().await?;
+    let events = store.run_history.list_run_history_events(run_id).await?;
+    assert_eq!(events.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn mark_run_history_events_incomplete_updates_flag() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
@@ -1025,6 +1119,83 @@ async fn transcript_backfill_state_and_event_rewrite_roundtrip() -> Result<()> {
     assert_eq!(
         events[1].payload["content"][0]["text"],
         serde_json::json!("Recovered detail")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transcript_backfill_completion_can_run_in_background() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let run_id = store
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 112,
+            head_sha: "sha-bg-backfill".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    store
+        .run_history
+        .update_run_history_transcript_backfill(run_id, TranscriptBackfillState::InProgress, None)
+        .await?;
+    let background_pause = store.pause_background_writes_for_test().await;
+
+    store
+        .run_history
+        .complete_run_history_transcript_backfill_bg(
+            run_id,
+            vec![NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("turn-recovered".to_string()),
+                event_type: "turn_completed".to_string(),
+                payload: serde_json::json!({"status": "completed"}),
+            }],
+        )
+        .await?;
+
+    let foreground = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        store.run_history.start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 113,
+            head_sha: "sha-after-backfill".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        }),
+    )
+    .await
+    .context("foreground write waited behind queued backfill rewrite")??;
+    assert!(foreground > run_id);
+
+    drop(background_pause);
+    store.flush_background_writes().await?;
+    let run = store
+        .run_history
+        .get_run_history(run_id)
+        .await?
+        .context("backfilled run history row")?;
+    assert_eq!(
+        run.transcript_backfill_state,
+        TranscriptBackfillState::Complete
+    );
+    assert!(run.events_persisted_cleanly);
+    assert_eq!(
+        store
+            .run_history
+            .list_run_history_events(run_id)
+            .await?
+            .len(),
+        1
     );
     Ok(())
 }

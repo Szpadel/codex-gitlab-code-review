@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
-use sqlx::SqlitePool;
 
 use crate::config::RuntimeFeatureFlagOverrides;
 
-use super::{FEATURE_FLAG_OVERRIDES_KEY, ServiceStateRepository};
+use super::{FEATURE_FLAG_OVERRIDES_KEY, ServiceStateRepository, sqlite::SqliteCoordinator};
 
 #[derive(Clone)]
 pub struct FeatureFlagsRepository {
@@ -11,9 +10,9 @@ pub struct FeatureFlagsRepository {
 }
 
 impl FeatureFlagsRepository {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
         Self {
-            service_state: ServiceStateRepository::new(pool),
+            service_state: ServiceStateRepository::new(sqlite),
         }
     }
 

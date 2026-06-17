@@ -7,25 +7,27 @@ use super::{
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use sqlx::{Row, Sqlite, SqlitePool};
+use sqlx::{Row, Sqlite};
 use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use uuid::Uuid;
 
+use crate::state::sqlite::SqliteCoordinator;
+
 #[derive(Clone)]
 pub(super) struct RuleRepository {
-    pool: SqlitePool,
+    sqlite: SqliteCoordinator,
 }
 
 impl RuleRepository {
-    pub(super) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(super) fn new(sqlite: SqliteCoordinator) -> Self {
+        Self { sqlite }
     }
 
     async fn load_review_rate_limit_targets_by_rule_id(
         &self,
     ) -> Result<Vec<(String, ReviewRateLimitTarget)>> {
-        load_review_rate_limit_targets_by_rule_id_from_executor(&self.pool).await
+        load_review_rate_limit_targets_by_rule_id_from_executor(self.sqlite.read_pool()).await
     }
 
     /// # Errors
@@ -40,7 +42,7 @@ impl RuleRepository {
             ORDER BY created_at ASC, id ASC
             ",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.sqlite.read_pool())
         .await
         .context("list runtime review rate limit rules")?;
 
@@ -64,60 +66,70 @@ impl RuleRepository {
             .id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let now = Utc::now().timestamp();
-        let primary_target = rule_primary_target(rule)?;
-        let bucket_mode = effective_review_rate_limit_bucket_mode(
-            rule.scope,
-            !rule.targets.is_empty(),
-            rule.bucket_mode,
-        );
-        let scope_repo = if is_global_review_rate_limit_target(&primary_target) {
-            ""
-        } else {
-            primary_target.path.as_str()
-        };
-        let mut tx = self
-            .pool
-            .begin()
+        let rule = rule.clone();
+        self.sqlite
+            .write_foreground("create review rate limit rule", move |pool| {
+                let rule = rule.clone();
+                let id = id.clone();
+                async move {
+                    validate_review_rate_limit_rule_upsert(&rule)?;
+                    let now = Utc::now().timestamp();
+                    let primary_target = rule_primary_target(&rule)?;
+                    let bucket_mode = effective_review_rate_limit_bucket_mode(
+                        rule.scope,
+                        !rule.targets.is_empty(),
+                        rule.bucket_mode,
+                    );
+                    let scope_repo = if is_global_review_rate_limit_target(&primary_target) {
+                        String::new()
+                    } else {
+                        primary_target.path
+                    };
+                    let mut tx = pool.begin().await.context("start sqlite transaction")?;
+                    sqlx::query(
+                        r"
+                        INSERT INTO runtime_review_rate_limit_rule (
+                            id,
+                            label,
+                            scope_repo,
+                            scope_subject_iid,
+                            applies_to_review,
+                            applies_to_security,
+                            scope,
+                            capacity,
+                            window_seconds,
+                            bucket_mode,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ",
+                    )
+                    .bind(&id)
+                    .bind(&rule.label)
+                    .bind(scope_repo)
+                    .bind(rule.scope.subject_iid(rule.scope_iid))
+                    .bind(rule.applies_to_review)
+                    .bind(rule.applies_to_security)
+                    .bind(rule.scope.as_str())
+                    .bind(i64::from(rule.capacity))
+                    .bind(
+                        i64::try_from(rule.window_seconds)
+                            .context("convert rule window seconds to i64")?,
+                    )
+                    .bind(bucket_mode.as_str())
+                    .bind(now)
+                    .bind(now)
+                    .execute(tx.as_mut())
+                    .await
+                    .context("insert runtime review rate limit rule")?;
+                    insert_review_rate_limit_rule_targets(tx.as_mut(), &id, &rule.targets, now)
+                        .await?;
+                    tx.commit().await.context("commit sqlite transaction")?;
+                    Ok(id)
+                }
+            })
             .await
-            .context("start sqlite transaction")?;
-        sqlx::query(
-            r"
-            INSERT INTO runtime_review_rate_limit_rule (
-                id,
-                label,
-                scope_repo,
-                scope_subject_iid,
-                applies_to_review,
-                applies_to_security,
-                scope,
-                capacity,
-                window_seconds,
-                bucket_mode,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ",
-        )
-        .bind(&id)
-        .bind(&rule.label)
-        .bind(scope_repo)
-        .bind(rule.scope.subject_iid(rule.scope_iid))
-        .bind(rule.applies_to_review)
-        .bind(rule.applies_to_security)
-        .bind(rule.scope.as_str())
-        .bind(i64::from(rule.capacity))
-        .bind(i64::try_from(rule.window_seconds).context("convert rule window seconds to i64")?)
-        .bind(bucket_mode.as_str())
-        .bind(now)
-        .bind(now)
-        .execute(tx.as_mut())
-        .await
-        .context("insert runtime review rate limit rule")?;
-        insert_review_rate_limit_rule_targets(tx.as_mut(), &id, &rule.targets, now).await?;
-        tx.commit().await.context("commit sqlite transaction")?;
-        Ok(id)
     }
 
     /// # Errors
@@ -128,133 +140,143 @@ impl RuleRepository {
         rule: &ReviewRateLimitRuleUpsert,
     ) -> Result<()> {
         validate_review_rate_limit_rule_upsert(rule)?;
-        let Some(id) = rule.id.as_deref() else {
+        let Some(id) = rule.id.clone() else {
             bail!("runtime review rate limit rule id is required for update");
         };
-        let now = Utc::now().timestamp();
-        let primary_target = rule_primary_target(rule)?;
-        let bucket_mode = effective_review_rate_limit_bucket_mode(
-            rule.scope,
-            !rule.targets.is_empty(),
-            rule.bucket_mode,
-        );
-        let scope_repo = if is_global_review_rate_limit_target(&primary_target) {
-            ""
-        } else {
-            primary_target.path.as_str()
-        };
-        let mut tx = self
-            .pool
-            .begin()
+        let rule = rule.clone();
+        self.sqlite
+            .write_foreground("update review rate limit rule", move |pool| {
+                let rule = rule.clone();
+                let id = id.clone();
+                async move {
+                    validate_review_rate_limit_rule_upsert(&rule)?;
+                    let now = Utc::now().timestamp();
+                    let primary_target = rule_primary_target(&rule)?;
+                    let bucket_mode = effective_review_rate_limit_bucket_mode(
+                        rule.scope,
+                        !rule.targets.is_empty(),
+                        rule.bucket_mode,
+                    );
+                    let scope_repo = if is_global_review_rate_limit_target(&primary_target) {
+                        String::new()
+                    } else {
+                        primary_target.path
+                    };
+                    let mut tx = pool.begin().await.context("start sqlite transaction")?;
+                    let existing_row = sqlx::query(
+                        r"
+                        SELECT id, label, scope_repo, scope_subject_iid, applies_to_review, applies_to_security,
+                               scope, capacity, window_seconds, created_at, updated_at, bucket_mode
+                        FROM runtime_review_rate_limit_rule
+                        WHERE id = ?
+                        ",
+                    )
+                    .bind(&id)
+                    .fetch_optional(tx.as_mut())
+                    .await
+                    .context("load runtime review rate limit rule before update")?;
+                    let Some(existing_row) = existing_row else {
+                        tx.rollback().await.context("rollback sqlite transaction")?;
+                        bail!("runtime review rate limit rule not found: {id}");
+                    };
+                    let existing_targets_by_rule_id = review_rate_limit_targets_by_rule_id(
+                        load_review_rate_limit_targets_by_rule_id_from_executor(tx.as_mut())
+                            .await
+                            .context("load runtime review rate limit rule targets before update")?,
+                    );
+                    let existing_rule =
+                        map_review_rate_limit_rule_row(&existing_row, &existing_targets_by_rule_id)
+                            .context("map runtime review rate limit rule before update")?;
+                    let invalidate_buckets =
+                        review_rate_limit_rule_update_invalidates_buckets(&existing_rule, &rule)?;
+                    let result = sqlx::query(
+                        r"
+                        UPDATE runtime_review_rate_limit_rule
+                        SET label = ?,
+                            scope_repo = ?,
+                            scope_subject_iid = ?,
+                            applies_to_review = ?,
+                            applies_to_security = ?,
+                            scope = ?,
+                            capacity = ?,
+                            window_seconds = ?,
+                            bucket_mode = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        ",
+                    )
+                    .bind(&rule.label)
+                    .bind(scope_repo)
+                    .bind(rule.scope.subject_iid(rule.scope_iid))
+                    .bind(rule.applies_to_review)
+                    .bind(rule.applies_to_security)
+                    .bind(rule.scope.as_str())
+                    .bind(i64::from(rule.capacity))
+                    .bind(
+                        i64::try_from(rule.window_seconds)
+                            .context("convert rule window seconds to i64")?,
+                    )
+                    .bind(bucket_mode.as_str())
+                    .bind(now)
+                    .bind(&id)
+                    .execute(tx.as_mut())
+                    .await
+                    .context("update runtime review rate limit rule")?;
+                    if result.rows_affected() == 0 {
+                        tx.rollback().await.context("rollback sqlite transaction")?;
+                        bail!("runtime review rate limit rule not found: {id}");
+                    }
+                    sqlx::query("DELETE FROM runtime_review_rate_limit_rule_target WHERE rule_id = ?")
+                        .bind(&id)
+                        .execute(tx.as_mut())
+                        .await
+                        .context("delete runtime review rate limit rule targets")?;
+                    insert_review_rate_limit_rule_targets(tx.as_mut(), &id, &rule.targets, now)
+                        .await?;
+                    if invalidate_buckets {
+                        sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE rule_id = ?")
+                            .bind(&id)
+                            .execute(tx.as_mut())
+                            .await
+                            .context("delete invalidated runtime review rate limit buckets")?;
+                    }
+                    tx.commit().await.context("commit sqlite transaction")?;
+                    Ok(())
+                }
+            })
             .await
-            .context("start sqlite transaction")?;
-        let existing_row = sqlx::query(
-            r"
-            SELECT id, label, scope_repo, scope_subject_iid, applies_to_review, applies_to_security,
-                   scope, capacity, window_seconds, created_at, updated_at, bucket_mode
-            FROM runtime_review_rate_limit_rule
-            WHERE id = ?
-            ",
-        )
-        .bind(id)
-        .fetch_optional(tx.as_mut())
-        .await
-        .context("load runtime review rate limit rule before update")?;
-        let Some(existing_row) = existing_row else {
-            tx.rollback().await.context("rollback sqlite transaction")?;
-            bail!("runtime review rate limit rule not found: {id}");
-        };
-        let existing_targets_by_rule_id = review_rate_limit_targets_by_rule_id(
-            load_review_rate_limit_targets_by_rule_id_from_executor(tx.as_mut())
-                .await
-                .context("load runtime review rate limit rule targets before update")?,
-        );
-        let existing_rule =
-            map_review_rate_limit_rule_row(&existing_row, &existing_targets_by_rule_id)
-                .context("map runtime review rate limit rule before update")?;
-        let invalidate_buckets =
-            review_rate_limit_rule_update_invalidates_buckets(&existing_rule, rule)?;
-        let result = sqlx::query(
-            r"
-            UPDATE runtime_review_rate_limit_rule
-            SET label = ?,
-                scope_repo = ?,
-                scope_subject_iid = ?,
-                applies_to_review = ?,
-                applies_to_security = ?,
-                scope = ?,
-                capacity = ?,
-                window_seconds = ?,
-                bucket_mode = ?,
-                updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(&rule.label)
-        .bind(scope_repo)
-        .bind(rule.scope.subject_iid(rule.scope_iid))
-        .bind(rule.applies_to_review)
-        .bind(rule.applies_to_security)
-        .bind(rule.scope.as_str())
-        .bind(i64::from(rule.capacity))
-        .bind(i64::try_from(rule.window_seconds).context("convert rule window seconds to i64")?)
-        .bind(bucket_mode.as_str())
-        .bind(now)
-        .bind(id)
-        .execute(tx.as_mut())
-        .await
-        .context("update runtime review rate limit rule")?;
-        if result.rows_affected() == 0 {
-            tx.rollback().await.context("rollback sqlite transaction")?;
-            bail!("runtime review rate limit rule not found: {id}");
-        }
-        sqlx::query("DELETE FROM runtime_review_rate_limit_rule_target WHERE rule_id = ?")
-            .bind(id)
-            .execute(tx.as_mut())
-            .await
-            .context("delete runtime review rate limit rule targets")?;
-        insert_review_rate_limit_rule_targets(tx.as_mut(), id, &rule.targets, now).await?;
-        if invalidate_buckets {
-            sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE rule_id = ?")
-                .bind(id)
-                .execute(tx.as_mut())
-                .await
-                .context("delete invalidated runtime review rate limit buckets")?;
-        }
-        tx.commit().await.context("commit sqlite transaction")?;
-        Ok(())
     }
 
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
     pub(super) async fn delete_review_rate_limit_rule(&self, id: &str) -> Result<()> {
-        let mut tx = self
-            .pool
-            .begin()
+        self.sqlite
+            .write_foreground("delete review rate limit rule", |pool| async move {
+                let mut tx = pool.begin().await.context("start sqlite transaction")?;
+                sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE rule_id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("delete runtime review rate limit buckets")?;
+                sqlx::query("DELETE FROM runtime_review_rate_limit_rule_target WHERE rule_id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("delete runtime review rate limit targets")?;
+                let result = sqlx::query("DELETE FROM runtime_review_rate_limit_rule WHERE id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("delete runtime review rate limit rule")?;
+                if result.rows_affected() == 0 {
+                    tx.rollback().await.context("rollback sqlite transaction")?;
+                    bail!("runtime review rate limit rule not found: {id}");
+                }
+                tx.commit().await.context("commit sqlite transaction")?;
+                Ok(())
+            })
             .await
-            .context("start sqlite transaction")?;
-        sqlx::query("DELETE FROM runtime_review_rate_limit_bucket WHERE rule_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .context("delete runtime review rate limit buckets")?;
-        sqlx::query("DELETE FROM runtime_review_rate_limit_rule_target WHERE rule_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .context("delete runtime review rate limit targets")?;
-        let result = sqlx::query("DELETE FROM runtime_review_rate_limit_rule WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .context("delete runtime review rate limit rule")?;
-        if result.rows_affected() == 0 {
-            tx.rollback().await.context("rollback sqlite transaction")?;
-            bail!("runtime review rate limit rule not found: {id}");
-        }
-        tx.commit().await.context("commit sqlite transaction")?;
-        Ok(())
     }
 }
 

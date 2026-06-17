@@ -46,6 +46,12 @@ pub(crate) async fn run_transcript_backfill(
         return Ok(());
     };
 
+    if flushed_incomplete_persisted_events(state, run)
+        .await?
+        .is_none()
+    {
+        return Ok(());
+    }
     let allow_missing_review_child_history = !retry_window_open_at_attempt_start;
     let turn_scoped_events = match load_validated_transcript_backfill_events(
         source,
@@ -69,7 +75,10 @@ pub(crate) async fn run_transcript_backfill(
         .as_ref()
         .filter(|events| turn_events_include_review_wrapper_items(events))
         .cloned();
-    let original_persisted_events = state.run_history.list_run_history_events(run.id).await?;
+    let Some(original_persisted_events) = flushed_incomplete_persisted_events(state, run).await?
+    else {
+        return Ok(());
+    };
     let target_turn_missing_in_persisted = run.turn_id.as_deref().is_some_and(|turn_id| {
         !original_persisted_events
             .iter()
@@ -265,13 +274,39 @@ pub(crate) async fn run_transcript_backfill(
     }
     state
         .run_history
-        .replace_run_history_events(run.id, &candidate_events)
+        .complete_run_history_transcript_backfill_bg(run.id, candidate_events)
         .await?;
-    state
-        .run_history
-        .mark_run_history_transcript_backfill_complete(run.id)
-        .await?;
+    state.flush_background_writes().await?;
     Ok(())
+}
+
+async fn flushed_incomplete_persisted_events(
+    state: &ReviewStateStore,
+    run: &RunHistoryRecord,
+) -> Result<Option<Vec<RunHistoryEventRecord>>> {
+    state.flush_background_writes().await?;
+    let events = state.run_history.list_run_history_events(run.id).await?;
+    let preserve_all_thread_turns =
+        run.kind == RunHistoryKind::Security && run.review_thread_id.is_none();
+    let target_turn_is_present = run.turn_id.as_deref().is_none_or(|turn_id| {
+        events
+            .iter()
+            .any(|event| event.turn_id.as_deref() == Some(turn_id))
+    });
+    if !preserve_all_thread_turns
+        && target_turn_is_present
+        && thread_snapshot_from_events(run, &events)
+            .as_ref()
+            .is_some_and(thread_snapshot_is_complete)
+    {
+        state
+            .run_history
+            .mark_run_history_transcript_backfill_complete_bg(run.id)
+            .await?;
+        state.flush_background_writes().await?;
+        return Ok(None);
+    }
+    Ok(Some(events))
 }
 
 pub(crate) fn initial_backfill_candidate_events(

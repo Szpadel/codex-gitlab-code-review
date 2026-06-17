@@ -1,21 +1,21 @@
 use anyhow::{Context, Result};
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
 use tracing::warn;
 use uuid::Uuid;
 
 use super::{
     AUTH_LIMIT_RESET_KEY_PREFIX, AuthLimitResetEntry, PersistedScanStatus, SCAN_STATUS_KEY,
-    auth_limit_reset_key,
+    auth_limit_reset_key, sqlite::SqliteCoordinator,
 };
 
 #[derive(Clone)]
 pub struct ServiceStateRepository {
-    pool: SqlitePool,
+    sqlite: SqliteCoordinator,
 }
 
 impl ServiceStateRepository {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
+        Self { sqlite }
     }
 
     /// # Errors
@@ -24,7 +24,7 @@ impl ServiceStateRepository {
     pub async fn get_created_after(&self) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
             .bind("created_after")
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.sqlite.read_pool())
             .await
             .context("load created_after state")?;
         match row {
@@ -40,44 +40,53 @@ impl ServiceStateRepository {
     ///
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn set_created_after(&self, value: &str) -> Result<()> {
-        sqlx::query(
-            r"
-            INSERT INTO service_state (key, value)
-            VALUES ('created_after', ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value
-            ",
-        )
-        .bind(value)
-        .execute(&self.pool)
-        .await
-        .context("upsert created_after state")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("set created_after state", |pool| async move {
+                sqlx::query(
+                    r"
+                    INSERT INTO service_state (key, value)
+                    VALUES ('created_after', ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value
+                    ",
+                )
+                .bind(value)
+                .execute(&pool)
+                .await
+                .context("upsert created_after state")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn get_or_create_review_owner_id(&self) -> Result<String> {
-        let candidate = Uuid::new_v4().to_string();
-        sqlx::query(
-            r"
-            INSERT OR IGNORE INTO service_state (key, value)
-            VALUES ('review_owner_id', ?)
-            ",
-        )
-        .bind(candidate)
-        .execute(&self.pool)
-        .await
-        .context("insert review_owner_id state")?;
+        self.sqlite
+            .write_foreground("get or create review owner id", |pool| async move {
+                let candidate = Uuid::new_v4().to_string();
+                sqlx::query(
+                    r"
+                    INSERT OR IGNORE INTO service_state (key, value)
+                    VALUES ('review_owner_id', ?)
+                    ",
+                )
+                .bind(candidate)
+                .execute(&pool)
+                .await
+                .context("insert review_owner_id state")?;
 
-        let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
-            .bind("review_owner_id")
-            .fetch_one(&self.pool)
+                let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
+                    .bind("review_owner_id")
+                    .fetch_one(&pool)
+                    .await
+                    .context("load review_owner_id state")?;
+                let owner_id: String =
+                    row.try_get("value").context("read review_owner_id state")?;
+                Ok(owner_id)
+            })
             .await
-            .context("load review_owner_id state")?;
-        let owner_id: String = row.try_get("value").context("read review_owner_id state")?;
-        Ok(owner_id)
     }
 
     /// # Errors
@@ -86,7 +95,7 @@ impl ServiceStateRepository {
     pub async fn get_auth_limit_reset_at(&self, account_name: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
             .bind(auth_limit_reset_key(account_name))
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.sqlite.read_pool())
             .await
             .with_context(|| {
                 format!("load codex auth limit reset state for account {account_name}")
@@ -106,41 +115,49 @@ impl ServiceStateRepository {
     ///
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn set_auth_limit_reset_at(&self, account_name: &str, value: &str) -> Result<()> {
-        sqlx::query(
-            r"
-            INSERT INTO service_state (key, value)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = CASE
-                    WHEN julianday(service_state.value) IS NULL THEN excluded.value
-                    WHEN julianday(excluded.value) IS NULL THEN service_state.value
-                    WHEN julianday(excluded.value) > julianday(service_state.value) THEN excluded.value
-                    ELSE service_state.value
-                END
-            ",
-        )
-        .bind(auth_limit_reset_key(account_name))
-        .bind(value)
-        .execute(&self.pool)
-        .await
-        .with_context(|| {
-            format!("upsert codex auth limit reset state for account {account_name}")
-        })?;
-        Ok(())
+        self.sqlite
+            .write_foreground("set auth limit reset", |pool| async move {
+                sqlx::query(
+                    r"
+                    INSERT INTO service_state (key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = CASE
+                            WHEN julianday(service_state.value) IS NULL THEN excluded.value
+                            WHEN julianday(excluded.value) IS NULL THEN service_state.value
+                            WHEN julianday(excluded.value) > julianday(service_state.value) THEN excluded.value
+                            ELSE service_state.value
+                        END
+                    ",
+                )
+                .bind(auth_limit_reset_key(account_name))
+                .bind(value)
+                .execute(&pool)
+                .await
+                .with_context(|| {
+                    format!("upsert codex auth limit reset state for account {account_name}")
+                })?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn clear_auth_limit_reset_at(&self, account_name: &str) -> Result<()> {
-        sqlx::query("DELETE FROM service_state WHERE key = ?")
-            .bind(auth_limit_reset_key(account_name))
-            .execute(&self.pool)
+        self.sqlite
+            .write_foreground("clear auth limit reset", |pool| async move {
+                sqlx::query("DELETE FROM service_state WHERE key = ?")
+                    .bind(auth_limit_reset_key(account_name))
+                    .execute(&pool)
+                    .await
+                    .with_context(|| {
+                        format!("delete codex auth limit reset state for account {account_name}")
+                    })?;
+                Ok(())
+            })
             .await
-            .with_context(|| {
-                format!("delete codex auth limit reset state for account {account_name}")
-            })?;
-        Ok(())
     }
 
     /// # Errors
@@ -184,7 +201,7 @@ impl ServiceStateRepository {
         let rows =
             sqlx::query("SELECT key, value FROM service_state WHERE key LIKE ? ORDER BY key ASC")
                 .bind(format!("{AUTH_LIMIT_RESET_KEY_PREFIX}%"))
-                .fetch_all(&self.pool)
+                .fetch_all(self.sqlite.read_pool())
                 .await
                 .context("list auth limit reset entries")?;
 
@@ -208,7 +225,7 @@ impl ServiceStateRepository {
     pub(crate) async fn get_service_state_value(&self, key: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM service_state WHERE key = ?")
             .bind(key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.sqlite.read_pool())
             .await
             .with_context(|| format!("load service_state value for key {key}"))?;
         row.map(|row| row.try_get("value").context("read service_state value"))
@@ -216,29 +233,37 @@ impl ServiceStateRepository {
     }
 
     pub(crate) async fn set_service_state_value(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(
-            r"
-            INSERT INTO service_state (key, value)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value
-            ",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await
-        .with_context(|| format!("upsert service_state value for key {key}"))?;
-        Ok(())
+        self.sqlite
+            .write_foreground("set service state value", |pool| async move {
+                sqlx::query(
+                    r"
+                    INSERT INTO service_state (key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value
+                    ",
+                )
+                .bind(key)
+                .bind(value)
+                .execute(&pool)
+                .await
+                .with_context(|| format!("upsert service_state value for key {key}"))?;
+                Ok(())
+            })
+            .await
     }
 
     pub(crate) async fn clear_service_state_value(&self, key: &str) -> Result<()> {
-        sqlx::query("DELETE FROM service_state WHERE key = ?")
-            .bind(key)
-            .execute(&self.pool)
+        self.sqlite
+            .write_foreground("clear service state value", |pool| async move {
+                sqlx::query("DELETE FROM service_state WHERE key = ?")
+                    .bind(key)
+                    .execute(&pool)
+                    .await
+                    .with_context(|| format!("delete service_state value for key {key}"))?;
+                Ok(())
+            })
             .await
-            .with_context(|| format!("delete service_state value for key {key}"))?;
-        Ok(())
     }
 }
 

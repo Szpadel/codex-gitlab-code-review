@@ -1,16 +1,16 @@
 use anyhow::{Context, Result};
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite};
 
-use super::{SecurityReviewDebounceEntry, sqlite_i64_from_u64};
+use super::{SecurityReviewDebounceEntry, sqlite::SqliteCoordinator, sqlite_i64_from_u64};
 
 #[derive(Clone)]
 pub struct SecurityReviewDebounceRepository {
-    pool: SqlitePool,
+    sqlite: SqliteCoordinator,
 }
 
 impl SecurityReviewDebounceRepository {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
+        Self { sqlite }
     }
 
     /// # Errors
@@ -23,23 +23,27 @@ impl SecurityReviewDebounceRepository {
         last_started_at: i64,
         next_eligible_at: i64,
     ) -> Result<()> {
-        sqlx::query(
-            r"
-            INSERT INTO security_review_debounce_state (repo, iid, last_started_at, next_eligible_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(repo, iid) DO UPDATE SET
-                last_started_at = excluded.last_started_at,
-                next_eligible_at = excluded.next_eligible_at
-            ",
-        )
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .bind(last_started_at)
-        .bind(next_eligible_at)
-        .execute(&self.pool)
-        .await
-        .context("upsert security review debounce state")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("upsert security review debounce", |pool| async move {
+                sqlx::query(
+                    r"
+                    INSERT INTO security_review_debounce_state (repo, iid, last_started_at, next_eligible_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(repo, iid) DO UPDATE SET
+                        last_started_at = excluded.last_started_at,
+                        next_eligible_at = excluded.next_eligible_at
+                    ",
+                )
+                .bind(repo)
+                .bind(sqlite_i64_from_u64(iid, "iid")?)
+                .bind(last_started_at)
+                .bind(next_eligible_at)
+                .execute(&pool)
+                .await
+                .context("upsert security review debounce state")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
@@ -60,7 +64,7 @@ impl SecurityReviewDebounceRepository {
         )
         .bind(repo)
         .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.sqlite.read_pool())
         .await
         .context("load security review debounce state")?;
         row.map(|row| map_security_review_debounce_entry(&row))
@@ -92,7 +96,7 @@ impl SecurityReviewDebounceRepository {
         )
         .bind(repo)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(self.sqlite.read_pool())
         .await
         .context("check due security review debounce state")?;
         Ok(exists != 0)
@@ -107,29 +111,39 @@ impl SecurityReviewDebounceRepository {
         open_iids: &[u64],
     ) -> Result<()> {
         if open_iids.is_empty() {
-            sqlx::query("DELETE FROM security_review_debounce_state WHERE repo = ?")
-                .bind(repo)
-                .execute(&self.pool)
-                .await
-                .context("clear security review debounce state for closed repo")?;
-            return Ok(());
+            return self
+                .sqlite
+                .write_foreground("clear security review debounce rows", |pool| async move {
+                    sqlx::query("DELETE FROM security_review_debounce_state WHERE repo = ?")
+                        .bind(repo)
+                        .execute(&pool)
+                        .await
+                        .context("clear security review debounce state for closed repo")?;
+                    Ok(())
+                })
+                .await;
         }
 
-        let mut builder =
-            QueryBuilder::<Sqlite>::new("DELETE FROM security_review_debounce_state WHERE repo = ");
-        builder.push_bind(repo);
-        builder.push(" AND iid NOT IN (");
-        let mut separated = builder.separated(", ");
-        for iid in open_iids {
-            separated.push_bind(sqlite_i64_from_u64(*iid, "iid")?);
-        }
-        separated.push_unseparated(")");
-        builder
-            .build()
-            .execute(&self.pool)
+        self.sqlite
+            .write_foreground("sync security review debounce rows", |pool| async move {
+                let mut builder = QueryBuilder::<Sqlite>::new(
+                    "DELETE FROM security_review_debounce_state WHERE repo = ",
+                );
+                builder.push_bind(repo);
+                builder.push(" AND iid NOT IN (");
+                let mut separated = builder.separated(", ");
+                for iid in open_iids {
+                    separated.push_bind(sqlite_i64_from_u64(*iid, "iid")?);
+                }
+                separated.push_unseparated(")");
+                builder
+                    .build()
+                    .execute(&pool)
+                    .await
+                    .context("prune closed merge requests from security review debounce state")?;
+                Ok(())
+            })
             .await
-            .context("prune closed merge requests from security review debounce state")?;
-        Ok(())
     }
 }
 

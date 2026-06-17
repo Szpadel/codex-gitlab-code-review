@@ -38,6 +38,7 @@ This service scans configured GitLab projects/groups for open merge requests, ru
 - Default config path is `config.yaml`; override with `CONFIG_PATH`.
 - Environment overrides use `CODEX_REVIEW__...` (double underscores map to nested keys).
 - Runtime state is stored in SQLite at `database.path`.
+- Production SQLite access goes through repository methods and `src/state/sqlite.rs`; raw `SqlitePool` access is reserved for state test setup.
 - When upgrading the Codex image/version, run `just sync-prompts <upstream-commit>` and commit the regenerated prompt template file with the version bump.
 
 ## Commit & Pull Request Guidelines

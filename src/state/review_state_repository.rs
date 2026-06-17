@@ -1,18 +1,18 @@
 use crate::review::ReviewLane;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
 
-use super::{InProgressReview, sqlite_i64_from_u64};
+use super::{InProgressReview, sqlite::SqliteCoordinator, sqlite_i64_from_u64};
 
 #[derive(Clone)]
 pub struct ReviewStateRepository {
-    pool: SqlitePool,
+    sqlite: SqliteCoordinator,
 }
 
 impl ReviewStateRepository {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
+        Self { sqlite }
     }
 
     /// # Errors
@@ -34,49 +34,50 @@ impl ReviewStateRepository {
         lane: ReviewLane,
     ) -> Result<bool> {
         let now = Utc::now().timestamp();
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("start sqlite transaction")?;
-        let row =
-            sqlx::query("SELECT status FROM review_state WHERE repo = ? AND iid = ? AND lane = ?")
+        self.sqlite
+            .write_foreground("begin review state", |pool| async move {
+                let mut tx = pool.begin().await.context("start sqlite transaction")?;
+                let row = sqlx::query(
+                    "SELECT status FROM review_state WHERE repo = ? AND iid = ? AND lane = ?",
+                )
                 .bind(repo)
                 .bind(i64::try_from(iid).context("convert review iid to i64")?)
                 .bind(lane.as_str())
                 .fetch_optional(&mut *tx)
                 .await
                 .context("load existing review state")?;
-        if let Some(existing) = row {
-            let status: String = existing.try_get("status").context("read review status")?;
-            if status == "in_progress" {
+                if let Some(existing) = row {
+                    let status: String = existing.try_get("status").context("read review status")?;
+                    if status == "in_progress" {
+                        tx.commit().await.context("commit sqlite transaction")?;
+                        return Ok(false);
+                    }
+                }
+                sqlx::query(
+                    r"
+                    INSERT INTO review_state (repo, iid, lane, head_sha, status, started_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'in_progress', ?, ?)
+                    ON CONFLICT(repo, iid, lane) DO UPDATE SET
+                        head_sha = excluded.head_sha,
+                        status = 'in_progress',
+                        started_at = excluded.started_at,
+                        updated_at = excluded.updated_at,
+                        result = NULL
+                    ",
+                )
+                .bind(repo)
+                .bind(sqlite_i64_from_u64(iid, "iid")?)
+                .bind(lane.as_str())
+                .bind(sha)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .context("insert review state")?;
                 tx.commit().await.context("commit sqlite transaction")?;
-                return Ok(false);
-            }
-        }
-        sqlx::query(
-            r"
-            INSERT INTO review_state (repo, iid, lane, head_sha, status, started_at, updated_at)
-            VALUES (?, ?, ?, ?, 'in_progress', ?, ?)
-            ON CONFLICT(repo, iid, lane) DO UPDATE SET
-                head_sha = excluded.head_sha,
-                status = 'in_progress',
-                started_at = excluded.started_at,
-                updated_at = excluded.updated_at,
-                result = NULL
-            ",
-        )
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .bind(lane.as_str())
-        .bind(sha)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .context("insert review state")?;
-        tx.commit().await.context("commit sqlite transaction")?;
-        Ok(true)
+                Ok(true)
+            })
+            .await
     }
 
     /// # Errors
@@ -99,24 +100,28 @@ impl ReviewStateRepository {
         result: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            r"
-            UPDATE review_state
-            SET status = 'done', head_sha = ?, result = ?, updated_at = ?
-            WHERE repo = ? AND iid = ? AND lane = ? AND head_sha = ? AND status = 'in_progress'
-            ",
-        )
-        .bind(sha)
-        .bind(result)
-        .bind(now)
-        .bind(repo)
-        .bind(i64::try_from(iid).context("convert review iid to i64")?)
-        .bind(lane.as_str())
-        .bind(sha)
-        .execute(&self.pool)
-        .await
-        .context("update review state")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("finish review state", |pool| async move {
+                sqlx::query(
+                    r"
+                    UPDATE review_state
+                    SET status = 'done', head_sha = ?, result = ?, updated_at = ?
+                    WHERE repo = ? AND iid = ? AND lane = ? AND head_sha = ? AND status = 'in_progress'
+                    ",
+                )
+                .bind(sha)
+                .bind(result)
+                .bind(now)
+                .bind(repo)
+                .bind(i64::try_from(iid).context("convert review iid to i64")?)
+                .bind(lane.as_str())
+                .bind(sha)
+                .execute(&pool)
+                .await
+                .context("update review state")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
@@ -153,7 +158,7 @@ impl ReviewStateRepository {
         .bind(i64::try_from(iid).context("convert review iid to i64")?)
         .bind(lane.as_str())
         .bind(sha)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.sqlite.read_pool())
         .await
         .context("load review result")?;
         Ok(row.map(|row| row.get::<String, _>(0)))
@@ -171,7 +176,7 @@ impl ReviewStateRepository {
             ORDER BY repo, iid, lane
             ",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.sqlite.read_pool())
         .await
         .context("list in-progress reviews")?;
 
@@ -208,7 +213,7 @@ impl ReviewStateRepository {
         )
         .bind(repo)
         .bind(i64::try_from(iid).context("convert review iid to i64")?)
-        .fetch_one(&self.pool)
+        .fetch_one(self.sqlite.read_pool())
         .await
         .context("check in-progress review")?;
         Ok(exists != 0)
@@ -221,19 +226,23 @@ impl ReviewStateRepository {
         let cutoff = Utc::now().timestamp()
             - (super::sqlite_i64_from_u64(max_age_minutes, "max_age_minutes")? * 60);
         let now = Utc::now().timestamp();
-        sqlx::query(
-            r"
-            UPDATE review_state
-            SET status = 'stale', updated_at = ?
-            WHERE status = 'in_progress' AND updated_at < ?
-            ",
-        )
-        .bind(now)
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await
-        .context("mark stale reviews")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("clear stale review state", |pool| async move {
+                sqlx::query(
+                    r"
+                    UPDATE review_state
+                    SET status = 'stale', updated_at = ?
+                    WHERE status = 'in_progress' AND updated_at < ?
+                    ",
+                )
+                .bind(now)
+                .bind(cutoff)
+                .execute(&pool)
+                .await
+                .context("mark stale reviews")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
@@ -255,22 +264,26 @@ impl ReviewStateRepository {
         lane: ReviewLane,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            r"
-            UPDATE review_state
-            SET updated_at = ?
-            WHERE repo = ? AND iid = ? AND lane = ? AND head_sha = ? AND status = 'in_progress'
-            ",
-        )
-        .bind(now)
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .bind(lane.as_str())
-        .bind(sha)
-        .execute(&self.pool)
-        .await
-        .context("touch in-progress review")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("touch review state", |pool| async move {
+                sqlx::query(
+                    r"
+                    UPDATE review_state
+                    SET updated_at = ?
+                    WHERE repo = ? AND iid = ? AND lane = ? AND head_sha = ? AND status = 'in_progress'
+                    ",
+                )
+                .bind(now)
+                .bind(repo)
+                .bind(sqlite_i64_from_u64(iid, "iid")?)
+                .bind(lane.as_str())
+                .bind(sha)
+                .execute(&pool)
+                .await
+                .context("touch in-progress review")?;
+                Ok(())
+            })
+            .await
     }
 }
 

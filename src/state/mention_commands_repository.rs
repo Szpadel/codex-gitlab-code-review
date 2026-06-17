@@ -1,19 +1,20 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
 
 use super::{
-    InProgressMentionCommand, MentionCommandScanState, MentionCommandStateKey, sqlite_i64_from_u64,
+    InProgressMentionCommand, MentionCommandScanState, MentionCommandStateKey,
+    sqlite::SqliteCoordinator, sqlite_i64_from_u64,
 };
 
 #[derive(Clone)]
 pub struct MentionCommandsRepository {
-    pool: SqlitePool,
+    sqlite: SqliteCoordinator,
 }
 
 impl MentionCommandsRepository {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
+        Self { sqlite }
     }
 
     /// # Errors
@@ -23,19 +24,23 @@ impl MentionCommandsRepository {
         let cutoff = Utc::now().timestamp()
             - (sqlite_i64_from_u64(max_age_minutes, "max_age_minutes")? * 60);
         let now = Utc::now().timestamp();
-        sqlx::query(
-            r"
-            UPDATE mention_command_state
-            SET status = 'done', result = 'error', updated_at = ?
-            WHERE status = 'in_progress' AND updated_at < ?
-            ",
-        )
-        .bind(now)
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await
-        .context("mark stale mention commands")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("clear stale mention commands", |pool| async move {
+                sqlx::query(
+                    r"
+                    UPDATE mention_command_state
+                    SET status = 'done', result = 'error', updated_at = ?
+                    WHERE status = 'in_progress' AND updated_at < ?
+                    ",
+                )
+                .bind(now)
+                .bind(cutoff)
+                .execute(&pool)
+                .await
+                .context("mark stale mention commands")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
@@ -50,28 +55,32 @@ impl MentionCommandsRepository {
         head_sha: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            r"
-            UPDATE mention_command_state
-            SET updated_at = ?
-            WHERE repo = ?
-              AND iid = ?
-              AND discussion_id = ?
-              AND trigger_note_id = ?
-              AND head_sha = ?
-              AND status = 'in_progress'
-            ",
-        )
-        .bind(now)
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .bind(discussion_id)
-        .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
-        .bind(head_sha)
-        .execute(&self.pool)
-        .await
-        .context("touch in-progress mention command")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("touch mention command", |pool| async move {
+                sqlx::query(
+                    r"
+                    UPDATE mention_command_state
+                    SET updated_at = ?
+                    WHERE repo = ?
+                      AND iid = ?
+                      AND discussion_id = ?
+                      AND trigger_note_id = ?
+                      AND head_sha = ?
+                      AND status = 'in_progress'
+                    ",
+                )
+                .bind(now)
+                .bind(repo)
+                .bind(sqlite_i64_from_u64(iid, "iid")?)
+                .bind(discussion_id)
+                .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
+                .bind(head_sha)
+                .execute(&pool)
+                .await
+                .context("touch in-progress mention command")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
@@ -86,43 +95,47 @@ impl MentionCommandsRepository {
         head_sha: &str,
     ) -> Result<bool> {
         let now = Utc::now().timestamp();
-        let result = sqlx::query(
-            r"
-            INSERT INTO mention_command_state (
-                repo,
-                iid,
-                discussion_id,
-                trigger_note_id,
-                head_sha,
-                status,
-                started_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?)
-            ON CONFLICT(repo, iid, discussion_id, trigger_note_id) DO UPDATE
-            SET head_sha = excluded.head_sha,
-                status = 'in_progress',
-                started_at = excluded.started_at,
-                updated_at = excluded.updated_at,
-                result = NULL
-            WHERE mention_command_state.status != 'in_progress'
-              AND (
-                  mention_command_state.result = 'cancelled'
-                  OR mention_command_state.result IS NULL
-              )
-            ",
-        )
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .bind(discussion_id)
-        .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
-        .bind(head_sha)
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .context("insert mention command state")?;
-        Ok(result.rows_affected() > 0)
+        self.sqlite
+            .write_foreground("begin mention command", |pool| async move {
+                let result = sqlx::query(
+                    r"
+                    INSERT INTO mention_command_state (
+                        repo,
+                        iid,
+                        discussion_id,
+                        trigger_note_id,
+                        head_sha,
+                        status,
+                        started_at,
+                        updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?)
+                    ON CONFLICT(repo, iid, discussion_id, trigger_note_id) DO UPDATE
+                    SET head_sha = excluded.head_sha,
+                        status = 'in_progress',
+                        started_at = excluded.started_at,
+                        updated_at = excluded.updated_at,
+                        result = NULL
+                    WHERE mention_command_state.status != 'in_progress'
+                      AND (
+                          mention_command_state.result = 'cancelled'
+                          OR mention_command_state.result IS NULL
+                      )
+                    ",
+                )
+                .bind(repo)
+                .bind(sqlite_i64_from_u64(iid, "iid")?)
+                .bind(discussion_id)
+                .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
+                .bind(head_sha)
+                .bind(now)
+                .bind(now)
+                .execute(&pool)
+                .await
+                .context("insert mention command state")?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
     }
 
     /// # Errors
@@ -138,29 +151,33 @@ impl MentionCommandsRepository {
         result: &str,
     ) -> Result<()> {
         let now = Utc::now().timestamp();
-        sqlx::query(
-            r"
-            UPDATE mention_command_state
-            SET status = 'done', result = ?, updated_at = ?
-            WHERE repo = ?
-              AND iid = ?
-              AND discussion_id = ?
-              AND trigger_note_id = ?
-              AND head_sha = ?
-              AND status = 'in_progress'
-            ",
-        )
-        .bind(result)
-        .bind(now)
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .bind(discussion_id)
-        .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
-        .bind(head_sha)
-        .execute(&self.pool)
-        .await
-        .context("update mention command state")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("finish mention command", |pool| async move {
+                sqlx::query(
+                    r"
+                    UPDATE mention_command_state
+                    SET status = 'done', result = ?, updated_at = ?
+                    WHERE repo = ?
+                      AND iid = ?
+                      AND discussion_id = ?
+                      AND trigger_note_id = ?
+                      AND head_sha = ?
+                      AND status = 'in_progress'
+                    ",
+                )
+                .bind(result)
+                .bind(now)
+                .bind(repo)
+                .bind(sqlite_i64_from_u64(iid, "iid")?)
+                .bind(discussion_id)
+                .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
+                .bind(head_sha)
+                .execute(&pool)
+                .await
+                .context("update mention command state")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
@@ -175,7 +192,7 @@ impl MentionCommandsRepository {
             ORDER BY repo, iid, discussion_id, trigger_note_id
             ",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.sqlite.read_pool())
         .await
         .context("list in-progress mention commands")?;
 
@@ -224,7 +241,7 @@ impl MentionCommandsRepository {
         )
         .bind(repo)
         .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .fetch_one(&self.pool)
+        .fetch_one(self.sqlite.read_pool())
         .await
         .context("check in-progress mention command")?;
         Ok(exists != 0)
@@ -248,7 +265,7 @@ impl MentionCommandsRepository {
         .bind(sqlite_i64_from_u64(iid, "iid")?)
         .bind(discussion_id)
         .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.sqlite.read_pool())
         .await
         .context("load mention command scan state")?;
 

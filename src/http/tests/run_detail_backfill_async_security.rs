@@ -77,6 +77,7 @@ async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread(
 
     crate::http::status::run_transcript_backfill(&state, &source, &run, false).await?;
 
+    state.flush_background_writes().await?;
     let persisted_events = state.run_history.list_run_history_events(run_id).await?;
     let persisted_turn_ids = persisted_events
         .iter()
@@ -86,6 +87,73 @@ async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread(
         persisted_turn_ids,
         std::collections::HashSet::from(["turn-threat", "turn-review"])
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_transcript_backfill_flushes_queued_events_before_loading_source() -> Result<()> {
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let state = Arc::clone(&srv.state);
+    let run_id = RunFixture::review("group/repo", 29, "feedqueued")
+        .thread("thread-queued")
+        .turn("turn-queued")
+        .auth_account("primary")
+        .result("commented")
+        .preview("Review group/repo !29")
+        .summary("Queued history completes transcript")
+        .insert(&state)
+        .await?;
+    state
+        .run_history
+        .mark_run_history_events_incomplete(run_id)
+        .await?;
+    let run = state
+        .run_history
+        .get_run_history(run_id)
+        .await?
+        .expect("run history should exist");
+    let background_pause = state.pause_background_writes_for_test().await;
+    state
+        .run_history
+        .append_run_history_events_bg(
+            run_id,
+            vec![
+                turn_started_event(1, "turn-queued"),
+                agent_message_event(2, "turn-queued", "Queued transcript is complete."),
+                turn_completed_event(3, "turn-queued"),
+            ],
+        )
+        .await?;
+    let backfill_calls = Arc::new(AtomicUsize::new(0));
+    let source = ErroringTranscriptBackfillSource {
+        error: "source should not be used",
+        calls: Arc::clone(&backfill_calls),
+    };
+
+    let backfill = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { crate::http::status::run_transcript_backfill(&state, &source, &run, false).await }
+    });
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(backfill_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !backfill.is_finished(),
+        "backfill should wait for queued history before loading from source"
+    );
+
+    drop(background_pause);
+    backfill.await.context("join transcript backfill")??;
+    assert_eq!(backfill_calls.load(Ordering::SeqCst), 0);
+    let run = state
+        .run_history
+        .get_run_history(run_id)
+        .await?
+        .expect("run history should exist");
+    assert_eq!(
+        run.transcript_backfill_state,
+        TranscriptBackfillState::Complete
+    );
+    assert!(run.events_persisted_cleanly);
     Ok(())
 }
 

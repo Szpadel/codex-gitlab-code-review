@@ -3,14 +3,7 @@ use crate::review::ReviewLane;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
-};
 use std::fmt::Write as _;
-use std::fs::{self, OpenOptions};
-use std::path::Path;
-use std::str::FromStr;
 
 mod feature_flags_repository;
 mod mention_commands_repository;
@@ -22,6 +15,7 @@ mod run_history_repository;
 mod security_context_cache_repository;
 mod security_review_debounce_repository;
 mod service_state_repository;
+mod sqlite;
 
 pub use feature_flags_repository::FeatureFlagsRepository;
 pub use mention_commands_repository::MentionCommandsRepository;
@@ -41,6 +35,7 @@ pub(crate) use run_history_repository::merge_rewritten_turn_events;
 pub use security_context_cache_repository::SecurityContextCacheRepository;
 pub use security_review_debounce_repository::SecurityReviewDebounceRepository;
 pub use service_state_repository::ServiceStateRepository;
+use sqlite::{SqliteCoordinator, ensure_sqlite_file};
 
 pub(crate) const AUTH_LIMIT_RESET_KEY_PREFIX: &str = "codex_auth_limit_reset_at::";
 pub(crate) const FEATURE_FLAG_OVERRIDES_KEY: &str = "feature_flag_overrides";
@@ -68,7 +63,7 @@ pub(crate) fn parse_review_lane(value: &str) -> Result<ReviewLane> {
 }
 
 pub struct ReviewStateStore {
-    pool: SqlitePool,
+    sqlite: SqliteCoordinator,
     pub review_state: ReviewStateRepository,
     pub run_history: RunHistoryRepository,
     pub project_catalog: ProjectCatalogRepository,
@@ -402,79 +397,45 @@ impl ReviewStateStore {
     /// Returns an error if the `SQLite` database cannot be created, opened,
     /// migrated, or connected.
     pub async fn new(path: &str) -> Result<Self> {
-        if path != ":memory:" {
-            let path_obj = Path::new(path);
-            if path_obj.is_dir() {
-                bail!("database path is a directory: {}", path_obj.display());
-            }
-            if let Some(parent) = path_obj.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("create database directory {}", parent.display()))?;
-            }
-            if !path_obj.exists() {
-                OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(path_obj)
-                    .with_context(|| format!("create database file {}", path_obj.display()))?;
-            }
-        }
-        let url = sqlite_url(path);
-        let max_connections = if path == ":memory:" { 1 } else { 5 };
-        let connect_options = sqlite_connect_options(path, &url)?;
-        let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
-            .connect_with(connect_options)
-            .await
-            .with_context(|| format!("connect sqlite database at {path}"))?;
+        ensure_sqlite_file(path)?;
+        let sqlite = SqliteCoordinator::connect(path).await?;
         sqlx::migrate!()
-            .run(&pool)
+            .run(sqlite.read_pool())
             .await
             .context("run sqlite migrations")?;
 
         Ok(Self {
-            review_state: ReviewStateRepository::new(pool.clone()),
-            run_history: RunHistoryRepository::new(pool.clone()),
-            project_catalog: ProjectCatalogRepository::new(pool.clone()),
-            feature_flags: FeatureFlagsRepository::new(pool.clone()),
-            mention_commands: MentionCommandsRepository::new(pool.clone()),
-            mention_quota_pending: MentionQuotaPendingRepository::new(pool.clone()),
-            service_state: ServiceStateRepository::new(pool.clone()),
-            security_context_cache: SecurityContextCacheRepository::new(pool.clone()),
-            security_review_debounce: SecurityReviewDebounceRepository::new(pool.clone()),
-            review_rate_limit: ReviewRateLimitRepository::new(pool.clone()),
-            pool,
+            review_state: ReviewStateRepository::new(sqlite.clone()),
+            run_history: RunHistoryRepository::new(sqlite.clone()),
+            project_catalog: ProjectCatalogRepository::new(sqlite.clone()),
+            feature_flags: FeatureFlagsRepository::new(sqlite.clone()),
+            mention_commands: MentionCommandsRepository::new(sqlite.clone()),
+            mention_quota_pending: MentionQuotaPendingRepository::new(sqlite.clone()),
+            service_state: ServiceStateRepository::new(sqlite.clone()),
+            security_context_cache: SecurityContextCacheRepository::new(sqlite.clone()),
+            security_review_debounce: SecurityReviewDebounceRepository::new(sqlite.clone()),
+            review_rate_limit: ReviewRateLimitRepository::new(sqlite.clone()),
+            sqlite,
         })
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if an accepted background write failed.
+    pub async fn flush_background_writes(&self) -> Result<()> {
+        self.sqlite.flush_background_writes().await
+    }
+
+    #[cfg(test)]
     #[must_use]
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+    pub fn pool(&self) -> &sqlx::SqlitePool {
+        self.sqlite.read_pool()
     }
-}
 
-fn sqlite_url(path: &str) -> String {
-    if path == ":memory:" {
-        "sqlite::memory:".to_string()
-    } else if path.starts_with('/') {
-        format!("sqlite:///{}", path.trim_start_matches('/'))
-    } else {
-        format!("sqlite://{path}")
+    #[cfg(test)]
+    pub async fn pause_background_writes_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.sqlite.pause_background_writes_for_test().await
     }
-}
-
-fn sqlite_connect_options(path: &str, url: &str) -> Result<SqliteConnectOptions> {
-    let mut options =
-        SqliteConnectOptions::from_str(url).with_context(|| format!("parse sqlite url {url}"))?;
-    if path != ":memory:" {
-        options = options
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal);
-    }
-    Ok(options)
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

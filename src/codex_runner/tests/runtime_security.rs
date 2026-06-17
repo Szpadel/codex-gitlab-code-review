@@ -199,6 +199,7 @@ async fn run_review_with_fake_runtime_security_lane_uses_split_sessions_on_cache
     assert!(run.security_context_generated_at.is_some());
     assert!(run.security_context_expires_at.is_some());
 
+    runner.state.flush_background_writes().await?;
     let events = runner
         .state
         .run_history
@@ -472,6 +473,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
         .await?
         .expect("follower run history");
     assert_eq!(follower_run.thread_id.as_deref(), Some("thread-review-2"));
+    runner.state.flush_background_writes().await?;
     let follower_events = runner
         .state
         .run_history

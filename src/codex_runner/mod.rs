@@ -409,7 +409,7 @@ impl DockerCodexRunner {
         if let Err(err) = self
             .state
             .run_history
-            .append_run_history_events(run_history_id, events)
+            .append_run_history_events_bg(run_history_id, events.to_vec())
             .await
         {
             warn!(
@@ -446,7 +446,11 @@ impl DockerCodexRunner {
         if let Err(err) = self
             .state
             .run_history
-            .replace_run_history_events_for_turn(run_history_id, turn_id, events)
+            .replace_run_history_events_for_turn_bg(
+                run_history_id,
+                turn_id.to_string(),
+                events.to_vec(),
+            )
             .await
         {
             warn!(

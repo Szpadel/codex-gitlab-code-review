@@ -1,17 +1,17 @@
 use super::ReviewRateLimitPendingEntry;
 use crate::review::ReviewLane;
-use crate::state::{parse_review_lane, sqlite_i64_from_u64};
+use crate::state::{parse_review_lane, sqlite::SqliteCoordinator, sqlite_i64_from_u64};
 use anyhow::{Context, Result};
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite};
 
 #[derive(Clone)]
 pub(super) struct PendingRepository {
-    pool: SqlitePool,
+    sqlite: SqliteCoordinator,
 }
 
 impl PendingRepository {
-    pub(super) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(super) fn new(sqlite: SqliteCoordinator) -> Self {
+        Self { sqlite }
     }
 
     /// # Errors
@@ -26,36 +26,40 @@ impl PendingRepository {
         blocked_at: i64,
         next_retry_at: i64,
     ) -> Result<()> {
-        sqlx::query(
-            r"
-            INSERT INTO runtime_review_rate_limit_pending (
-                lane,
-                repo,
-                iid,
-                first_blocked_at,
-                last_blocked_at,
-                last_seen_head_sha,
-                next_retry_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(lane, repo, iid) DO UPDATE SET
-                first_blocked_at = MIN(runtime_review_rate_limit_pending.first_blocked_at, excluded.first_blocked_at),
-                last_blocked_at = MAX(runtime_review_rate_limit_pending.last_blocked_at, excluded.last_blocked_at),
-                last_seen_head_sha = excluded.last_seen_head_sha,
-                next_retry_at = excluded.next_retry_at
-            ",
-        )
-        .bind(lane.as_str())
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .bind(blocked_at)
-        .bind(blocked_at)
-        .bind(head_sha)
-        .bind(next_retry_at)
-        .execute(&self.pool)
-        .await
-        .context("upsert runtime review rate limit pending row")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("upsert review rate limit pending", |pool| async move {
+                sqlx::query(
+                    r"
+                    INSERT INTO runtime_review_rate_limit_pending (
+                        lane,
+                        repo,
+                        iid,
+                        first_blocked_at,
+                        last_blocked_at,
+                        last_seen_head_sha,
+                        next_retry_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(lane, repo, iid) DO UPDATE SET
+                        first_blocked_at = MIN(runtime_review_rate_limit_pending.first_blocked_at, excluded.first_blocked_at),
+                        last_blocked_at = MAX(runtime_review_rate_limit_pending.last_blocked_at, excluded.last_blocked_at),
+                        last_seen_head_sha = excluded.last_seen_head_sha,
+                        next_retry_at = excluded.next_retry_at
+                    ",
+                )
+                .bind(lane.as_str())
+                .bind(repo)
+                .bind(sqlite_i64_from_u64(iid, "iid")?)
+                .bind(blocked_at)
+                .bind(blocked_at)
+                .bind(head_sha)
+                .bind(next_retry_at)
+                .execute(&pool)
+                .await
+                .context("upsert runtime review rate limit pending row")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
@@ -67,19 +71,23 @@ impl PendingRepository {
         repo: &str,
         iid: u64,
     ) -> Result<bool> {
-        let result = sqlx::query(
-            r"
-            DELETE FROM runtime_review_rate_limit_pending
-            WHERE lane = ? AND repo = ? AND iid = ?
-            ",
-        )
-        .bind(lane.as_str())
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .execute(&self.pool)
-        .await
-        .context("clear runtime review rate limit pending row")?;
-        Ok(result.rows_affected() > 0)
+        self.sqlite
+            .write_foreground("clear review rate limit pending", |pool| async move {
+                let result = sqlx::query(
+                    r"
+                    DELETE FROM runtime_review_rate_limit_pending
+                    WHERE lane = ? AND repo = ? AND iid = ?
+                    ",
+                )
+                .bind(lane.as_str())
+                .bind(repo)
+                .bind(sqlite_i64_from_u64(iid, "iid")?)
+                .execute(&pool)
+                .await
+                .context("clear runtime review rate limit pending row")?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
     }
 
     /// # Errors
@@ -95,7 +103,7 @@ impl PendingRepository {
             ORDER BY first_blocked_at ASC, lane ASC, repo ASC, iid ASC
             ",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.sqlite.read_pool())
         .await
         .context("list runtime review rate limit pending rows")?;
 
@@ -114,7 +122,7 @@ impl PendingRepository {
             FROM runtime_review_rate_limit_pending
             ",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(self.sqlite.read_pool())
         .await
         .context("load earliest runtime review rate limit pending retry time")?;
         Ok(next_retry_at)
@@ -140,7 +148,7 @@ impl PendingRepository {
         )
         .bind(repo)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(self.sqlite.read_pool())
         .await
         .context("check due runtime review rate limit pending rows")?;
         Ok(exists != 0)
@@ -155,30 +163,37 @@ impl PendingRepository {
         open_iids: &[u64],
     ) -> Result<()> {
         if open_iids.is_empty() {
-            sqlx::query("DELETE FROM runtime_review_rate_limit_pending WHERE repo = ?")
-                .bind(repo)
-                .execute(&self.pool)
-                .await
-                .context("clear runtime review rate limit pending rows for closed repo")?;
-            return Ok(());
+            return self
+                .sqlite
+                .write_foreground("clear review rate limit pending rows", |pool| async move {
+                    sqlx::query("DELETE FROM runtime_review_rate_limit_pending WHERE repo = ?")
+                        .bind(repo)
+                        .execute(&pool)
+                        .await
+                        .context("clear runtime review rate limit pending rows for closed repo")?;
+                    Ok(())
+                })
+                .await;
         }
 
-        let mut builder = QueryBuilder::<Sqlite>::new(
-            "DELETE FROM runtime_review_rate_limit_pending WHERE repo = ",
-        );
-        builder.push_bind(repo);
-        builder.push(" AND iid NOT IN (");
-        let mut separated = builder.separated(", ");
-        for iid in open_iids {
-            separated.push_bind(sqlite_i64_from_u64(*iid, "iid")?);
-        }
-        separated.push_unseparated(")");
-        builder
-            .build()
-            .execute(&self.pool)
+        self.sqlite
+            .write_foreground("sync review rate limit pending rows", |pool| async move {
+                let mut builder = QueryBuilder::<Sqlite>::new(
+                    "DELETE FROM runtime_review_rate_limit_pending WHERE repo = ",
+                );
+                builder.push_bind(repo);
+                builder.push(" AND iid NOT IN (");
+                let mut separated = builder.separated(", ");
+                for iid in open_iids {
+                    separated.push_bind(sqlite_i64_from_u64(*iid, "iid")?);
+                }
+                separated.push_unseparated(")");
+                builder.build().execute(&pool).await.context(
+                    "prune closed merge requests from runtime review rate limit pending rows",
+                )?;
+                Ok(())
+            })
             .await
-            .context("prune closed merge requests from runtime review rate limit pending rows")?;
-        Ok(())
     }
 }
 

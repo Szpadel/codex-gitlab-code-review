@@ -160,6 +160,7 @@ async fn run_review_with_fake_runtime_persists_failed_turn_error() -> Result<()>
         .expect_err("review should fail when the Codex turn fails");
     assert!(format!("{err:#}").contains("model stream closed before final response"));
 
+    runner.state.flush_background_writes().await?;
     let events = runner
         .state
         .run_history

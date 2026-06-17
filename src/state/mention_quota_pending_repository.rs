@@ -2,6 +2,8 @@ use crate::state::sqlite_i64_from_u64;
 use anyhow::{Context, Result};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
+use super::sqlite::SqliteCoordinator;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MentionQuotaPendingEntry {
     pub repo: String,
@@ -27,12 +29,12 @@ pub struct MentionQuotaPendingUpsert<'a> {
 
 #[derive(Clone)]
 pub struct MentionQuotaPendingRepository {
-    pool: SqlitePool,
+    sqlite: SqliteCoordinator,
 }
 
 impl MentionQuotaPendingRepository {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
+        Self { sqlite }
     }
 
     /// # Errors
@@ -42,41 +44,45 @@ impl MentionQuotaPendingRepository {
         &self,
         pending: MentionQuotaPendingUpsert<'_>,
     ) -> Result<()> {
-        sqlx::query(
-            r"
-            INSERT INTO runtime_mention_quota_pending (
-                repo,
-                iid,
-                discussion_id,
-                trigger_note_id,
-                first_blocked_at,
-                last_blocked_at,
-                last_seen_head_sha,
-                next_retry_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(repo, iid, discussion_id, trigger_note_id) DO UPDATE SET
-                first_blocked_at = MIN(runtime_mention_quota_pending.first_blocked_at, excluded.first_blocked_at),
-                last_blocked_at = MAX(runtime_mention_quota_pending.last_blocked_at, excluded.last_blocked_at),
-                last_seen_head_sha = excluded.last_seen_head_sha,
-                next_retry_at = excluded.next_retry_at
-            ",
-        )
-        .bind(pending.repo)
-        .bind(sqlite_i64_from_u64(pending.iid, "iid")?)
-        .bind(pending.discussion_id)
-        .bind(sqlite_i64_from_u64(
-            pending.trigger_note_id,
-            "trigger_note_id",
-        )?)
-        .bind(pending.blocked_at)
-        .bind(pending.blocked_at)
-        .bind(pending.head_sha)
-        .bind(pending.next_retry_at)
-        .execute(&self.pool)
-        .await
-        .context("upsert runtime mention quota pending row")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("upsert mention quota pending", |pool| async move {
+                sqlx::query(
+                    r"
+                    INSERT INTO runtime_mention_quota_pending (
+                        repo,
+                        iid,
+                        discussion_id,
+                        trigger_note_id,
+                        first_blocked_at,
+                        last_blocked_at,
+                        last_seen_head_sha,
+                        next_retry_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(repo, iid, discussion_id, trigger_note_id) DO UPDATE SET
+                        first_blocked_at = MIN(runtime_mention_quota_pending.first_blocked_at, excluded.first_blocked_at),
+                        last_blocked_at = MAX(runtime_mention_quota_pending.last_blocked_at, excluded.last_blocked_at),
+                        last_seen_head_sha = excluded.last_seen_head_sha,
+                        next_retry_at = excluded.next_retry_at
+                    ",
+                )
+                .bind(pending.repo)
+                .bind(sqlite_i64_from_u64(pending.iid, "iid")?)
+                .bind(pending.discussion_id)
+                .bind(sqlite_i64_from_u64(
+                    pending.trigger_note_id,
+                    "trigger_note_id",
+                )?)
+                .bind(pending.blocked_at)
+                .bind(pending.blocked_at)
+                .bind(pending.head_sha)
+                .bind(pending.next_retry_at)
+                .execute(&pool)
+                .await
+                .context("upsert runtime mention quota pending row")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
@@ -89,20 +95,24 @@ impl MentionQuotaPendingRepository {
         discussion_id: &str,
         trigger_note_id: u64,
     ) -> Result<bool> {
-        let result = sqlx::query(
-            r"
-            DELETE FROM runtime_mention_quota_pending
-            WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
-            ",
-        )
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .bind(discussion_id)
-        .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
-        .execute(&self.pool)
-        .await
-        .context("clear runtime mention quota pending row")?;
-        Ok(result.rows_affected() > 0)
+        self.sqlite
+            .write_foreground("clear mention quota pending", |pool| async move {
+                let result = sqlx::query(
+                    r"
+                    DELETE FROM runtime_mention_quota_pending
+                    WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
+                    ",
+                )
+                .bind(repo)
+                .bind(sqlite_i64_from_u64(iid, "iid")?)
+                .bind(discussion_id)
+                .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
+                .execute(&pool)
+                .await
+                .context("clear runtime mention quota pending row")?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
     }
 
     /// # Errors
@@ -116,7 +126,7 @@ impl MentionQuotaPendingRepository {
             ORDER BY first_blocked_at ASC, repo ASC, iid ASC, discussion_id ASC, trigger_note_id ASC
             ",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(self.sqlite.read_pool())
         .await
         .context("list runtime mention quota pending rows")?;
 
@@ -135,7 +145,7 @@ impl MentionQuotaPendingRepository {
             FROM runtime_mention_quota_pending
             ",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(self.sqlite.read_pool())
         .await
         .context("load earliest runtime mention quota pending retry time")?;
         Ok(next_retry_at)
@@ -157,7 +167,7 @@ impl MentionQuotaPendingRepository {
         )
         .bind(repo)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(self.sqlite.read_pool())
         .await
         .context("check due runtime mention quota pending rows")?;
         Ok(exists != 0)
@@ -171,86 +181,94 @@ impl MentionQuotaPendingRepository {
         repo: &str,
         open_iids: &[u64],
     ) -> Result<Vec<MentionQuotaPendingEntry>> {
-        let deleted = self
-            .list_mention_quota_pending_rows_for_prune(repo, open_iids)
-            .await?;
-        if deleted.is_empty() {
-            return Ok(deleted);
-        }
+        self.sqlite
+            .write_foreground("sync mention quota pending rows", |pool| async move {
+                let deleted = list_mention_quota_pending_rows_for_prune_on_pool(
+                    pool.clone(),
+                    repo,
+                    open_iids,
+                )
+                .await?;
+                if deleted.is_empty() {
+                    return Ok(deleted);
+                }
 
-        if open_iids.is_empty() {
-            sqlx::query("DELETE FROM runtime_mention_quota_pending WHERE repo = ?")
-                .bind(repo)
-                .execute(&self.pool)
-                .await
-                .context("clear runtime mention quota pending rows for closed repo")?;
-            return Ok(deleted);
-        }
+                if open_iids.is_empty() {
+                    sqlx::query("DELETE FROM runtime_mention_quota_pending WHERE repo = ?")
+                        .bind(repo)
+                        .execute(&pool)
+                        .await
+                        .context("clear runtime mention quota pending rows for closed repo")?;
+                    return Ok(deleted);
+                }
 
-        let mut builder =
-            QueryBuilder::<Sqlite>::new("DELETE FROM runtime_mention_quota_pending WHERE repo = ");
-        builder.push_bind(repo);
-        builder.push(" AND iid NOT IN (");
-        let mut separated = builder.separated(", ");
-        for iid in open_iids {
-            separated.push_bind(sqlite_i64_from_u64(*iid, "iid")?);
-        }
-        separated.push_unseparated(")");
-        builder
-            .build()
-            .execute(&self.pool)
+                let mut builder = QueryBuilder::<Sqlite>::new(
+                    "DELETE FROM runtime_mention_quota_pending WHERE repo = ",
+                );
+                builder.push_bind(repo);
+                builder.push(" AND iid NOT IN (");
+                let mut separated = builder.separated(", ");
+                for iid in open_iids {
+                    separated.push_bind(sqlite_i64_from_u64(*iid, "iid")?);
+                }
+                separated.push_unseparated(")");
+                builder.build().execute(&pool).await.context(
+                    "prune closed merge requests from runtime mention quota pending rows",
+                )?;
+                Ok(deleted)
+            })
             .await
-            .context("prune closed merge requests from runtime mention quota pending rows")?;
-        Ok(deleted)
     }
+}
 
-    async fn list_mention_quota_pending_rows_for_prune(
-        &self,
-        repo: &str,
-        open_iids: &[u64],
-    ) -> Result<Vec<MentionQuotaPendingEntry>> {
-        if open_iids.is_empty() {
-            let rows = sqlx::query(
-                r"
-                SELECT repo, iid, discussion_id, trigger_note_id, first_blocked_at, last_blocked_at, last_seen_head_sha, next_retry_at
-                FROM runtime_mention_quota_pending
-                WHERE repo = ?
-                ORDER BY first_blocked_at ASC, repo ASC, iid ASC, discussion_id ASC, trigger_note_id ASC
-                ",
-            )
-            .bind(repo)
-            .fetch_all(&self.pool)
-            .await
-            .context("list runtime mention quota pending rows for closed repo")?;
-            return rows
-                .into_iter()
-                .map(|row| map_mention_quota_pending_row(&row))
-                .collect();
-        }
-
-        let mut builder = QueryBuilder::<Sqlite>::new(
+async fn list_mention_quota_pending_rows_for_prune_on_pool(
+    pool: SqlitePool,
+    repo: &str,
+    open_iids: &[u64],
+) -> Result<Vec<MentionQuotaPendingEntry>> {
+    if open_iids.is_empty() {
+        let rows = sqlx::query(
             r"
             SELECT repo, iid, discussion_id, trigger_note_id, first_blocked_at, last_blocked_at, last_seen_head_sha, next_retry_at
             FROM runtime_mention_quota_pending
-            WHERE repo = ",
-        );
-        builder.push_bind(repo);
-        builder.push(" AND iid NOT IN (");
-        let mut separated = builder.separated(", ");
-        for iid in open_iids {
-            separated.push_bind(sqlite_i64_from_u64(*iid, "iid")?);
-        }
-        separated.push_unseparated(")");
-        builder.push(" ORDER BY first_blocked_at ASC, repo ASC, iid ASC, discussion_id ASC, trigger_note_id ASC");
-        let rows = builder
-            .build()
-            .fetch_all(&self.pool)
-            .await
-            .context("list runtime mention quota pending rows to prune")?;
-        rows.into_iter()
+            WHERE repo = ?
+            ORDER BY first_blocked_at ASC, repo ASC, iid ASC, discussion_id ASC, trigger_note_id ASC
+            ",
+        )
+        .bind(repo)
+        .fetch_all(&pool)
+        .await
+        .context("list runtime mention quota pending rows for closed repo")?;
+        return rows
+            .into_iter()
             .map(|row| map_mention_quota_pending_row(&row))
-            .collect()
+            .collect();
     }
+
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        r"
+        SELECT repo, iid, discussion_id, trigger_note_id, first_blocked_at, last_blocked_at, last_seen_head_sha, next_retry_at
+        FROM runtime_mention_quota_pending
+        WHERE repo = ",
+    );
+    builder.push_bind(repo);
+    builder.push(" AND iid NOT IN (");
+    let mut separated = builder.separated(", ");
+    for iid in open_iids {
+        separated.push_bind(sqlite_i64_from_u64(*iid, "iid")?);
+    }
+    separated.push_unseparated(")");
+    builder.push(
+        " ORDER BY first_blocked_at ASC, repo ASC, iid ASC, discussion_id ASC, trigger_note_id ASC",
+    );
+    let rows = builder
+        .build()
+        .fetch_all(&pool)
+        .await
+        .context("list runtime mention quota pending rows to prune")?;
+    rows.into_iter()
+        .map(|row| map_mention_quota_pending_row(&row))
+        .collect()
 }
 
 fn map_mention_quota_pending_row(

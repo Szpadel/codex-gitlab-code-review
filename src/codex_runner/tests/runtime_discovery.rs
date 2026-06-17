@@ -117,6 +117,7 @@ async fn run_review_with_fake_runtime_persists_gitlab_discovery_startup_warning(
         "mcp_servers.gitlab-discovery.url=\"http://gitlab-discovery.internal:8091/mcp\""
     ));
 
+    runner.state.flush_background_writes().await?;
     let events = runner
         .state
         .run_history

@@ -7,7 +7,8 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use super::{
     NewRunHistory, NewRunHistoryEvent, RunHistoryCursor, RunHistoryEventRecord, RunHistoryFinish,
     RunHistoryKind, RunHistoryListItem, RunHistoryListPage, RunHistoryListQuery, RunHistoryRecord,
-    RunHistorySessionUpdate, TranscriptBackfillState, sqlite_i64_from_u64,
+    RunHistorySessionUpdate, TranscriptBackfillState, sqlite::SqliteCoordinator,
+    sqlite_i64_from_u64,
 };
 
 const MISSING_ERROR_DETAILS: &str =
@@ -23,7 +24,7 @@ const RUN_HISTORY_COLUMNS: &str = "id, kind, repo, iid, head_sha, status, result
 
 #[derive(Clone)]
 pub struct RunHistoryRepository {
-    pool: SqlitePool,
+    sqlite: SqliteCoordinator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,8 +34,8 @@ enum CursorDirection {
 }
 
 impl RunHistoryRepository {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
+        Self { sqlite }
     }
 
     /// # Errors
@@ -85,7 +86,7 @@ impl RunHistoryRepository {
         .bind(repo)
         .bind(i64::try_from(iid).context("convert review iid to i64")?)
         .bind(sha)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.sqlite.read_pool())
         .await;
         let row = match row {
             Ok(row) => row,
@@ -100,24 +101,28 @@ impl RunHistoryRepository {
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn reconcile_interrupted_run_history(&self, reason: &str) -> Result<u64> {
         let now = Utc::now().timestamp();
-        let result = sqlx::query(
-            r"
-            UPDATE run_history
-            SET status = 'done',
-                result = 'cancelled',
-                finished_at = COALESCE(finished_at, ?),
-                updated_at = ?,
-                error = COALESCE(error, ?)
-            WHERE status = 'in_progress'
-            ",
-        )
-        .bind(now)
-        .bind(now)
-        .bind(reason)
-        .execute(&self.pool)
-        .await
-        .context("reconcile interrupted run history")?;
-        Ok(result.rows_affected())
+        self.sqlite
+            .write_foreground("reconcile interrupted run history", |pool| async move {
+                let result = sqlx::query(
+                    r"
+                    UPDATE run_history
+                    SET status = 'done',
+                        result = 'cancelled',
+                        finished_at = COALESCE(finished_at, ?),
+                        updated_at = ?,
+                        error = COALESCE(error, ?)
+                    WHERE status = 'in_progress'
+                    ",
+                )
+                .bind(now)
+                .bind(now)
+                .bind(reason)
+                .execute(&pool)
+                .await
+                .context("reconcile interrupted run history")?;
+                Ok(result.rows_affected())
+            })
+            .await
     }
 
     /// # Errors
@@ -141,47 +146,54 @@ impl RunHistoryRepository {
         review_lane: Option<ReviewLane>,
     ) -> Result<i64> {
         let now = Utc::now().timestamp();
-        let result = sqlx::query(
-            r"
-            INSERT INTO run_history (
-                kind,
-                review_lane,
-                repo,
-                iid,
-                head_sha,
-                status,
-                started_at,
-                updated_at,
-                discussion_id,
-                trigger_note_id,
-                trigger_note_author_name,
-                trigger_note_body,
-                command_repo
-            )
-            VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?)
-            ",
-        )
-        .bind(run_history_kind_label(new_run.kind))
-        .bind(review_lane.map(ReviewLane::as_str))
-        .bind(new_run.repo)
-        .bind(sqlite_i64_from_u64(new_run.iid, "iid")?)
-        .bind(new_run.head_sha)
-        .bind(now)
-        .bind(now)
-        .bind(new_run.discussion_id)
-        .bind(
-            new_run
-                .trigger_note_id
-                .map(|value| sqlite_i64_from_u64(value, "trigger_note_id"))
-                .transpose()?,
-        )
-        .bind(new_run.trigger_note_author_name)
-        .bind(new_run.trigger_note_body)
-        .bind(new_run.command_repo)
-        .execute(&self.pool)
-        .await
-        .context("insert run history")?;
-        Ok(result.last_insert_rowid())
+        self.sqlite
+            .write_foreground("start run history", move |pool| {
+                let new_run = new_run.clone();
+                async move {
+                    let result = sqlx::query(
+                        r"
+                        INSERT INTO run_history (
+                            kind,
+                            review_lane,
+                            repo,
+                            iid,
+                            head_sha,
+                            status,
+                            started_at,
+                            updated_at,
+                            discussion_id,
+                            trigger_note_id,
+                            trigger_note_author_name,
+                            trigger_note_body,
+                            command_repo
+                        )
+                        VALUES (?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?, ?, ?, ?)
+                        ",
+                    )
+                    .bind(run_history_kind_label(new_run.kind))
+                    .bind(review_lane.map(ReviewLane::as_str))
+                    .bind(new_run.repo)
+                    .bind(sqlite_i64_from_u64(new_run.iid, "iid")?)
+                    .bind(new_run.head_sha)
+                    .bind(now)
+                    .bind(now)
+                    .bind(new_run.discussion_id)
+                    .bind(
+                        new_run
+                            .trigger_note_id
+                            .map(|value| sqlite_i64_from_u64(value, "trigger_note_id"))
+                            .transpose()?,
+                    )
+                    .bind(new_run.trigger_note_author_name)
+                    .bind(new_run.trigger_note_body)
+                    .bind(new_run.command_repo)
+                    .execute(&pool)
+                    .await
+                    .context("insert run history")?;
+                    Ok(result.last_insert_rowid())
+                }
+            })
+            .await
     }
 
     /// # Errors
@@ -192,41 +204,48 @@ impl RunHistoryRepository {
         run_id: i64,
         update: RunHistorySessionUpdate,
     ) -> Result<()> {
-        sqlx::query(
-            r"
-            UPDATE run_history
-            SET thread_id = COALESCE(?, thread_id),
-                turn_id = COALESCE(?, turn_id),
-                review_thread_id = COALESCE(?, review_thread_id),
-                auth_account_name = COALESCE(?, auth_account_name),
-                security_context_source_run_id = COALESCE(?, security_context_source_run_id),
-                security_context_base_branch = COALESCE(?, security_context_base_branch),
-                security_context_base_head_sha = COALESCE(?, security_context_base_head_sha),
-                security_context_prompt_version = COALESCE(?, security_context_prompt_version),
-                security_context_payload_json = COALESCE(?, security_context_payload_json),
-                security_context_generated_at = COALESCE(?, security_context_generated_at),
-                security_context_expires_at = COALESCE(?, security_context_expires_at),
-                updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(update.thread_id)
-        .bind(update.turn_id)
-        .bind(update.review_thread_id)
-        .bind(update.auth_account_name)
-        .bind(update.security_context_source_run_id)
-        .bind(update.security_context_base_branch)
-        .bind(update.security_context_base_head_sha)
-        .bind(update.security_context_prompt_version)
-        .bind(update.security_context_payload_json)
-        .bind(update.security_context_generated_at)
-        .bind(update.security_context_expires_at)
-        .bind(Utc::now().timestamp())
-        .bind(run_id)
-        .execute(&self.pool)
-        .await
-        .context("update run history session metadata")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("update run history session", move |pool| {
+                let update = update.clone();
+                async move {
+                    sqlx::query(
+                        r"
+                        UPDATE run_history
+                        SET thread_id = COALESCE(?, thread_id),
+                            turn_id = COALESCE(?, turn_id),
+                            review_thread_id = COALESCE(?, review_thread_id),
+                            auth_account_name = COALESCE(?, auth_account_name),
+                            security_context_source_run_id = COALESCE(?, security_context_source_run_id),
+                            security_context_base_branch = COALESCE(?, security_context_base_branch),
+                            security_context_base_head_sha = COALESCE(?, security_context_base_head_sha),
+                            security_context_prompt_version = COALESCE(?, security_context_prompt_version),
+                            security_context_payload_json = COALESCE(?, security_context_payload_json),
+                            security_context_generated_at = COALESCE(?, security_context_generated_at),
+                            security_context_expires_at = COALESCE(?, security_context_expires_at),
+                            updated_at = ?
+                        WHERE id = ?
+                        ",
+                    )
+                    .bind(update.thread_id)
+                    .bind(update.turn_id)
+                    .bind(update.review_thread_id)
+                    .bind(update.auth_account_name)
+                    .bind(update.security_context_source_run_id)
+                    .bind(update.security_context_base_branch)
+                    .bind(update.security_context_base_head_sha)
+                    .bind(update.security_context_prompt_version)
+                    .bind(update.security_context_payload_json)
+                    .bind(update.security_context_generated_at)
+                    .bind(update.security_context_expires_at)
+                    .bind(Utc::now().timestamp())
+                    .bind(run_id)
+                    .execute(&pool)
+                    .await
+                    .context("update run history session metadata")?;
+                    Ok(())
+                }
+            })
+            .await
     }
 
     /// # Errors
@@ -237,43 +256,51 @@ impl RunHistoryRepository {
         run_id: i64,
         feature_flags: &FeatureFlagSnapshot,
     ) -> Result<()> {
-        let feature_flags_json =
-            serde_json::to_string(feature_flags).context("serialize feature flag snapshot")?;
-        sqlx::query(
-            r"
-            UPDATE run_history
-            SET feature_flags_json = ?,
-                updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(feature_flags_json)
-        .bind(Utc::now().timestamp())
-        .bind(run_id)
-        .execute(&self.pool)
-        .await
-        .context("update run history feature flags")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("set run history feature flags", |pool| async move {
+                let feature_flags_json = serde_json::to_string(feature_flags)
+                    .context("serialize feature flag snapshot")?;
+                sqlx::query(
+                    r"
+                    UPDATE run_history
+                    SET feature_flags_json = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    ",
+                )
+                .bind(feature_flags_json)
+                .bind(Utc::now().timestamp())
+                .bind(run_id)
+                .execute(&pool)
+                .await
+                .context("update run history feature flags")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn update_run_history_head_sha(&self, run_id: i64, head_sha: &str) -> Result<()> {
-        sqlx::query(
-            r"
-            UPDATE run_history
-            SET head_sha = ?, updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(head_sha)
-        .bind(Utc::now().timestamp())
-        .bind(run_id)
-        .execute(&self.pool)
-        .await
-        .context("update run history head sha")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("update run history head sha", |pool| async move {
+                sqlx::query(
+                    r"
+                    UPDATE run_history
+                    SET head_sha = ?, updated_at = ?
+                    WHERE id = ?
+                    ",
+                )
+                .bind(head_sha)
+                .bind(Utc::now().timestamp())
+                .bind(run_id)
+                .execute(&pool)
+                .await
+                .context("update run history head sha")?;
+                Ok(())
+            })
+            .await
     }
 
     /// # Errors
@@ -281,61 +308,60 @@ impl RunHistoryRepository {
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn finish_run_history(&self, run_id: i64, finish: RunHistoryFinish) -> Result<()> {
         let now = Utc::now().timestamp();
-        let error = normalized_run_history_finish_error(&finish.result, finish.error);
-        sqlx::query(
-            r"
-            UPDATE run_history
-            SET status = 'done',
-                result = ?,
-                finished_at = ?,
-                updated_at = ?,
-                thread_id = COALESCE(?, thread_id),
-                turn_id = COALESCE(?, turn_id),
-                review_thread_id = COALESCE(?, review_thread_id),
-                preview = ?,
-                summary = ?,
-                error = ?,
-                auth_account_name = COALESCE(?, auth_account_name),
-                commit_sha = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(finish.result)
-        .bind(now)
-        .bind(now)
-        .bind(finish.thread_id)
-        .bind(finish.turn_id)
-        .bind(finish.review_thread_id)
-        .bind(finish.preview)
-        .bind(finish.summary)
-        .bind(error)
-        .bind(finish.auth_account_name)
-        .bind(finish.commit_sha)
-        .bind(run_id)
-        .execute(&self.pool)
-        .await
-        .context("finish run history")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("finish run history", move |pool| {
+                let finish = finish.clone();
+                async move {
+                    let error =
+                        normalized_run_history_finish_error(&finish.result, finish.error.clone());
+                    sqlx::query(
+                        r"
+                        UPDATE run_history
+                        SET status = 'done',
+                            result = ?,
+                            finished_at = ?,
+                            updated_at = ?,
+                            thread_id = COALESCE(?, thread_id),
+                            turn_id = COALESCE(?, turn_id),
+                            review_thread_id = COALESCE(?, review_thread_id),
+                            preview = ?,
+                            summary = ?,
+                            error = ?,
+                            auth_account_name = COALESCE(?, auth_account_name),
+                            commit_sha = ?
+                        WHERE id = ?
+                        ",
+                    )
+                    .bind(finish.result)
+                    .bind(now)
+                    .bind(now)
+                    .bind(finish.thread_id)
+                    .bind(finish.turn_id)
+                    .bind(finish.review_thread_id)
+                    .bind(finish.preview)
+                    .bind(finish.summary)
+                    .bind(error)
+                    .bind(finish.auth_account_name)
+                    .bind(finish.commit_sha)
+                    .bind(run_id)
+                    .execute(&pool)
+                    .await
+                    .context("finish run history")?;
+                    Ok(())
+                }
+            })
+            .await
     }
 
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn mark_run_history_events_incomplete(&self, run_id: i64) -> Result<()> {
-        sqlx::query(
-            r"
-            UPDATE run_history
-            SET events_persisted_cleanly = 0,
-                updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(Utc::now().timestamp())
-        .bind(run_id)
-        .execute(&self.pool)
-        .await
-        .context("mark run history events incomplete")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("mark run history events incomplete", |pool| async move {
+                mark_run_history_events_incomplete_on_pool(pool, run_id).await
+            })
+            .await
     }
 
     /// # Errors
@@ -350,52 +376,42 @@ impl RunHistoryRepository {
             return Ok(());
         }
         let created_at = Utc::now().timestamp();
-        let mut tx = self
-            .pool
-            .begin()
+        self.sqlite
+            .write_foreground("append run history events", |pool| async move {
+                append_run_history_events_on_pool(pool, run_history_id, events, created_at).await
+            })
             .await
-            .context("start sqlite transaction for run history events")?;
-        let sequence_offset = sqlx::query_scalar::<_, i64>(
-            r"
-            SELECT COALESCE(MAX(sequence), 0)
-            FROM run_history_event
-            WHERE run_history_id = ?
-            ",
-        )
-        .bind(run_history_id)
-        .fetch_one(&mut *tx)
-        .await
-        .context("load current run history event sequence")?;
-        for event in events {
-            let payload_json =
-                serde_json::to_string(&event.payload).context("serialize run history payload")?;
-            sqlx::query(
-                r"
-                INSERT INTO run_history_event (
-                    run_history_id,
-                    sequence,
-                    turn_id,
-                    event_type,
-                    payload_json,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ",
-            )
-            .bind(run_history_id)
-            .bind(sequence_offset + event.sequence)
-            .bind(event.turn_id.as_deref())
-            .bind(event.event_type.as_str())
-            .bind(payload_json)
-            .bind(created_at)
-            .execute(&mut *tx)
-            .await
-            .context("insert run history event")?;
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the background write cannot be accepted.
+    pub async fn append_run_history_events_bg(
+        &self,
+        run_history_id: i64,
+        events: Vec<NewRunHistoryEvent>,
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
         }
-        tx.commit()
+        self.sqlite
+            .enqueue_background_with_failure(
+                "append run history events",
+                move |pool| {
+                    let events = events.clone();
+                    Box::pin(async move {
+                        let created_at = Utc::now().timestamp();
+                        append_run_history_events_on_pool(pool, run_history_id, &events, created_at)
+                            .await
+                    })
+                },
+                move |pool, _error| {
+                    Box::pin(async move {
+                        mark_run_history_events_incomplete_on_pool(pool, run_history_id).await
+                    })
+                },
+            )
             .await
-            .context("commit sqlite transaction for run history events")?;
-        Ok(())
     }
 
     /// # Errors
@@ -408,7 +424,19 @@ impl RunHistoryRepository {
     ) -> Result<()> {
         let created_at = Utc::now().timestamp();
         let rewritten_events = events.to_vec();
-        self.replace_run_history_events_inner(run_history_id, rewritten_events, created_at)
+        self.sqlite
+            .write_foreground("replace run history events", move |pool| {
+                let rewritten_events = rewritten_events.clone();
+                async move {
+                    replace_run_history_events_on_pool(
+                        pool,
+                        run_history_id,
+                        rewritten_events,
+                        created_at,
+                    )
+                    .await
+                }
+            })
             .await
     }
 
@@ -422,90 +450,133 @@ impl RunHistoryRepository {
         events: &[NewRunHistoryEvent],
     ) -> Result<()> {
         let created_at = Utc::now().timestamp();
-        let existing_events = self.list_run_history_events(run_history_id).await?;
-        let rewritten_events = merge_rewritten_turn_events(existing_events, turn_id, events)
-            .with_context(|| format!("merge rewritten run history events for turn {turn_id}"))?;
-        self.replace_run_history_events_inner(run_history_id, rewritten_events, created_at)
+        self.sqlite
+            .write_foreground("replace run history events for turn", |pool| async move {
+                let existing_events =
+                    list_run_history_events_on_pool(pool.clone(), run_history_id).await?;
+                let rewritten_events =
+                    merge_rewritten_turn_events(existing_events, turn_id, events).with_context(
+                        || format!("merge rewritten run history events for turn {turn_id}"),
+                    )?;
+                replace_run_history_events_on_pool(
+                    pool,
+                    run_history_id,
+                    rewritten_events,
+                    created_at,
+                )
+                .await
+            })
             .await
     }
 
-    async fn replace_run_history_events_inner(
+    /// # Errors
+    ///
+    /// Returns an error if the background write cannot be accepted.
+    pub async fn replace_run_history_events_for_turn_bg(
         &self,
         run_history_id: i64,
+        turn_id: String,
         events: Vec<NewRunHistoryEvent>,
-        created_at: i64,
     ) -> Result<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("start sqlite transaction for run history event rewrite")?;
-        sqlx::query("DELETE FROM run_history_event WHERE run_history_id = ?")
-            .bind(run_history_id)
-            .execute(&mut *tx)
-            .await
-            .context("delete previous run history events")?;
-        for event in events {
-            let payload_json =
-                serde_json::to_string(&event.payload).context("serialize run history payload")?;
-            sqlx::query(
-                r"
-                INSERT INTO run_history_event (
-                    run_history_id,
-                    sequence,
-                    turn_id,
-                    event_type,
-                    payload_json,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ",
+        self.sqlite
+            .enqueue_background_with_failure(
+                "replace run history events for turn",
+                move |pool| {
+                    let turn_id = turn_id.clone();
+                    let events = events.clone();
+                    Box::pin(async move {
+                        let created_at = Utc::now().timestamp();
+                        let existing_events =
+                            list_run_history_events_on_pool(pool.clone(), run_history_id).await?;
+                        let rewritten_events =
+                            merge_rewritten_turn_events(existing_events, &turn_id, &events)
+                                .with_context(|| {
+                                    format!("merge rewritten run history events for turn {turn_id}")
+                                })?;
+                        replace_run_history_events_on_pool(
+                            pool,
+                            run_history_id,
+                            rewritten_events,
+                            created_at,
+                        )
+                        .await
+                    })
+                },
+                move |pool, _error| {
+                    Box::pin(async move {
+                        mark_run_history_events_incomplete_on_pool(pool, run_history_id).await
+                    })
+                },
             )
-            .bind(run_history_id)
-            .bind(event.sequence)
-            .bind(event.turn_id.as_deref())
-            .bind(event.event_type.as_str())
-            .bind(payload_json)
-            .bind(created_at)
-            .execute(&mut *tx)
             .await
-            .context("insert rewritten run history event")?;
-        }
-        sqlx::query("UPDATE run_history SET updated_at = ? WHERE id = ?")
-            .bind(created_at)
-            .bind(run_history_id)
-            .execute(&mut *tx)
-            .await
-            .context("update run history timestamp after event rewrite")?;
-        tx.commit()
-            .await
-            .context("commit sqlite transaction for run history event rewrite")?;
-        Ok(())
     }
 
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn mark_run_history_transcript_backfill_complete(&self, run_id: i64) -> Result<()> {
-        sqlx::query(
-            r"
-            UPDATE run_history
-            SET events_persisted_cleanly = 1,
-                transcript_backfill_state = ?,
-                transcript_backfill_error = NULL,
-                updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(transcript_backfill_state_label(
-            TranscriptBackfillState::Complete,
-        ))
-        .bind(Utc::now().timestamp())
-        .bind(run_id)
-        .execute(&self.pool)
-        .await
-        .context("mark run history transcript backfill complete")?;
-        Ok(())
+        self.sqlite
+            .write_foreground(
+                "mark run history transcript backfill complete",
+                |pool| async move {
+                    mark_run_history_transcript_backfill_complete_on_pool(pool, run_id).await
+                },
+            )
+            .await
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the background write cannot be accepted.
+    pub async fn mark_run_history_transcript_backfill_complete_bg(
+        &self,
+        run_id: i64,
+    ) -> Result<()> {
+        self.sqlite
+            .enqueue_background(
+                "mark run history transcript backfill complete",
+                move |pool| {
+                    Box::pin(async move {
+                        mark_run_history_transcript_backfill_complete_on_pool(pool, run_id).await
+                    })
+                },
+            )
+            .await
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the background write cannot be accepted.
+    pub async fn complete_run_history_transcript_backfill_bg(
+        &self,
+        run_history_id: i64,
+        events: Vec<NewRunHistoryEvent>,
+    ) -> Result<()> {
+        self.sqlite
+            .enqueue_background_with_failure(
+                "complete run history transcript backfill",
+                move |pool| {
+                    let events = events.clone();
+                    Box::pin(async move {
+                        let created_at = Utc::now().timestamp();
+                        replace_run_history_events_on_pool(
+                            pool.clone(),
+                            run_history_id,
+                            events,
+                            created_at,
+                        )
+                        .await?;
+                        mark_run_history_transcript_backfill_complete_on_pool(pool, run_history_id)
+                            .await
+                    })
+                },
+                move |pool, _error| {
+                    Box::pin(async move {
+                        mark_run_history_events_incomplete_on_pool(pool, run_history_id).await
+                    })
+                },
+            )
+            .await
     }
 
     /// # Errors
@@ -517,23 +588,30 @@ impl RunHistoryRepository {
         state: TranscriptBackfillState,
         error: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            r"
-            UPDATE run_history
-            SET transcript_backfill_state = ?,
-                transcript_backfill_error = ?,
-                updated_at = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(transcript_backfill_state_label(state))
-        .bind(error)
-        .bind(Utc::now().timestamp())
-        .bind(run_id)
-        .execute(&self.pool)
-        .await
-        .context("update run history transcript backfill state")?;
-        Ok(())
+        self.sqlite
+            .write_foreground(
+                "update run history transcript backfill",
+                |pool| async move {
+                    sqlx::query(
+                        r"
+                    UPDATE run_history
+                    SET transcript_backfill_state = ?,
+                        transcript_backfill_error = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    ",
+                    )
+                    .bind(transcript_backfill_state_label(state))
+                    .bind(error)
+                    .bind(Utc::now().timestamp())
+                    .bind(run_id)
+                    .execute(&pool)
+                    .await
+                    .context("update run history transcript backfill state")?;
+                    Ok(())
+                },
+            )
+            .await
     }
 
     /// # Errors
@@ -543,21 +621,7 @@ impl RunHistoryRepository {
         &self,
         run_history_id: i64,
     ) -> Result<Vec<RunHistoryEventRecord>> {
-        let rows = sqlx::query(
-            r"
-            SELECT id, run_history_id, sequence, turn_id, event_type, payload_json, created_at
-            FROM run_history_event
-            WHERE run_history_id = ?
-            ORDER BY sequence ASC, id ASC
-            ",
-        )
-        .bind(run_history_id)
-        .fetch_all(&self.pool)
-        .await
-        .context("list run history events")?;
-        rows.into_iter()
-            .map(|row| map_run_history_event_row(&row))
-            .collect()
+        list_run_history_events_on_pool(self.sqlite.read_pool().clone(), run_history_id).await
     }
 
     /// # Errors
@@ -579,7 +643,7 @@ impl RunHistoryRepository {
         let rows = sqlx::query(&sql)
             .bind(repo)
             .bind(sqlite_i64_from_u64(iid, "iid")?)
-            .fetch_all(&self.pool)
+            .fetch_all(self.sqlite.read_pool())
             .await
             .context("list run history for MR")?;
         rows.into_iter()
@@ -600,7 +664,7 @@ impl RunHistoryRepository {
         );
         let row = sqlx::query(&sql)
             .bind(run_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.sqlite.read_pool())
             .await
             .context("get run history")?;
         row.map(|row| map_run_history_row(&row)).transpose()
@@ -654,7 +718,7 @@ impl RunHistoryRepository {
 
         let mut runs = builder
             .build()
-            .fetch_all(&self.pool)
+            .fetch_all(self.sqlite.read_pool())
             .await
             .context("list run history")?;
         let has_extra = runs.len() > limit;
@@ -696,6 +760,175 @@ impl RunHistoryRepository {
             runs,
         })
     }
+}
+
+async fn mark_run_history_events_incomplete_on_pool(pool: SqlitePool, run_id: i64) -> Result<()> {
+    sqlx::query(
+        r"
+        UPDATE run_history
+        SET events_persisted_cleanly = 0,
+            updated_at = ?
+        WHERE id = ?
+        ",
+    )
+    .bind(Utc::now().timestamp())
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .context("mark run history events incomplete")?;
+    Ok(())
+}
+
+async fn append_run_history_events_on_pool(
+    pool: SqlitePool,
+    run_history_id: i64,
+    events: &[NewRunHistoryEvent],
+    created_at: i64,
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("start sqlite transaction for run history events")?;
+    let sequence_offset = sqlx::query_scalar::<_, i64>(
+        r"
+        SELECT COALESCE(MAX(sequence), 0)
+        FROM run_history_event
+        WHERE run_history_id = ?
+        ",
+    )
+    .bind(run_history_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("load current run history event sequence")?;
+    for event in events {
+        let payload_json =
+            serde_json::to_string(&event.payload).context("serialize run history payload")?;
+        sqlx::query(
+            r"
+            INSERT INTO run_history_event (
+                run_history_id,
+                sequence,
+                turn_id,
+                event_type,
+                payload_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(run_history_id)
+        .bind(sequence_offset + event.sequence)
+        .bind(event.turn_id.as_deref())
+        .bind(event.event_type.as_str())
+        .bind(payload_json)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .context("insert run history event")?;
+    }
+    tx.commit()
+        .await
+        .context("commit sqlite transaction for run history events")?;
+    Ok(())
+}
+
+async fn list_run_history_events_on_pool(
+    pool: SqlitePool,
+    run_history_id: i64,
+) -> Result<Vec<RunHistoryEventRecord>> {
+    let rows = sqlx::query(
+        r"
+        SELECT id, run_history_id, sequence, turn_id, event_type, payload_json, created_at
+        FROM run_history_event
+        WHERE run_history_id = ?
+        ORDER BY sequence ASC, id ASC
+        ",
+    )
+    .bind(run_history_id)
+    .fetch_all(&pool)
+    .await
+    .context("list run history events")?;
+    rows.into_iter()
+        .map(|row| map_run_history_event_row(&row))
+        .collect()
+}
+
+async fn replace_run_history_events_on_pool(
+    pool: SqlitePool,
+    run_history_id: i64,
+    events: Vec<NewRunHistoryEvent>,
+    created_at: i64,
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("start sqlite transaction for run history event rewrite")?;
+    sqlx::query("DELETE FROM run_history_event WHERE run_history_id = ?")
+        .bind(run_history_id)
+        .execute(&mut *tx)
+        .await
+        .context("delete previous run history events")?;
+    for event in events {
+        let payload_json =
+            serde_json::to_string(&event.payload).context("serialize run history payload")?;
+        sqlx::query(
+            r"
+            INSERT INTO run_history_event (
+                run_history_id,
+                sequence,
+                turn_id,
+                event_type,
+                payload_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(run_history_id)
+        .bind(event.sequence)
+        .bind(event.turn_id.as_deref())
+        .bind(event.event_type.as_str())
+        .bind(payload_json)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await
+        .context("insert rewritten run history event")?;
+    }
+    sqlx::query("UPDATE run_history SET updated_at = ? WHERE id = ?")
+        .bind(created_at)
+        .bind(run_history_id)
+        .execute(&mut *tx)
+        .await
+        .context("update run history timestamp after event rewrite")?;
+    tx.commit()
+        .await
+        .context("commit sqlite transaction for run history event rewrite")?;
+    Ok(())
+}
+
+async fn mark_run_history_transcript_backfill_complete_on_pool(
+    pool: SqlitePool,
+    run_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        r"
+        UPDATE run_history
+        SET events_persisted_cleanly = 1,
+            transcript_backfill_state = ?,
+            transcript_backfill_error = NULL,
+            updated_at = ?
+        WHERE id = ?
+        ",
+    )
+    .bind(transcript_backfill_state_label(
+        TranscriptBackfillState::Complete,
+    ))
+    .bind(Utc::now().timestamp())
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .context("mark run history transcript backfill complete")?;
+    Ok(())
 }
 
 pub(crate) fn merge_rewritten_turn_events(

@@ -1,16 +1,17 @@
 use anyhow::{Context, Result};
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
+use tracing::warn;
 
-use super::SecurityReviewContextCacheEntry;
+use super::{SecurityReviewContextCacheEntry, sqlite::SqliteCoordinator};
 
 #[derive(Clone)]
 pub struct SecurityContextCacheRepository {
-    pool: SqlitePool,
+    sqlite: SqliteCoordinator,
 }
 
 impl SecurityContextCacheRepository {
-    pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
+        Self { sqlite }
     }
 
     /// # Errors
@@ -24,8 +25,7 @@ impl SecurityContextCacheRepository {
         prompt_version: &str,
         now: i64,
     ) -> Result<Option<SecurityReviewContextCacheEntry>> {
-        self.delete_expired_security_review_context_cache(now)
-            .await?;
+        self.enqueue_delete_expired_security_review_context_cache(now);
         let row = sqlx::query(
             r"
             SELECT repo, base_branch, base_head_sha, prompt_version, payload_json, source_run_history_id,
@@ -44,7 +44,7 @@ impl SecurityContextCacheRepository {
         .bind(base_head_sha)
         .bind(prompt_version)
         .bind(now)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.sqlite.read_pool())
         .await
         .context("load security review context cache")?;
         row.map(|row| map_security_review_context_cache_entry(&row))
@@ -77,7 +77,7 @@ impl SecurityContextCacheRepository {
         .bind(base_branch)
         .bind(base_head_sha)
         .bind(prompt_version)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.sqlite.read_pool())
         .await
         .context("find security review context cache")?;
         row.map(|row| map_security_review_context_cache_entry(&row))
@@ -94,8 +94,7 @@ impl SecurityContextCacheRepository {
         prompt_version: &str,
         now: i64,
     ) -> Result<Option<SecurityReviewContextCacheEntry>> {
-        self.delete_expired_security_review_context_cache(now)
-            .await?;
+        self.enqueue_delete_expired_security_review_context_cache(now);
         let row = sqlx::query(
             r"
             SELECT repo, base_branch, base_head_sha, prompt_version, payload_json, source_run_history_id,
@@ -113,7 +112,7 @@ impl SecurityContextCacheRepository {
         .bind(base_branch)
         .bind(prompt_version)
         .bind(now)
-        .fetch_optional(&self.pool)
+        .fetch_optional(self.sqlite.read_pool())
         .await
         .context("load latest security review context cache for branch")?;
         row.map(|row| map_security_review_context_cache_entry(&row))
@@ -127,54 +126,82 @@ impl SecurityContextCacheRepository {
         &self,
         entry: &SecurityReviewContextCacheEntry,
     ) -> Result<()> {
-        self.delete_expired_security_review_context_cache(entry.generated_at)
-            .await?;
-        sqlx::query(
-            r"
-            INSERT INTO security_review_context_cache (
-                repo,
-                base_branch,
-                base_head_sha,
-                prompt_version,
-                payload_json,
-                source_run_history_id,
-                generated_at,
-                expires_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(repo, base_branch, base_head_sha, prompt_version) DO UPDATE SET
-                payload_json = excluded.payload_json,
-                source_run_history_id = excluded.source_run_history_id,
-                generated_at = excluded.generated_at,
-                expires_at = excluded.expires_at
-            ",
-        )
-        .bind(&entry.repo)
-        .bind(&entry.base_branch)
-        .bind(&entry.base_head_sha)
-        .bind(&entry.prompt_version)
-        .bind(&entry.payload_json)
-        .bind(entry.source_run_history_id)
-        .bind(entry.generated_at)
-        .bind(entry.expires_at)
-        .execute(&self.pool)
-        .await
-        .context("upsert security review context cache")?;
-        Ok(())
+        self.sqlite
+            .write_foreground("upsert security review context cache", |pool| async move {
+                sqlx::query(
+                    r"
+                    DELETE FROM security_review_context_cache
+                    WHERE expires_at <= ?
+                    ",
+                )
+                .bind(entry.generated_at)
+                .execute(&pool)
+                .await
+                .context("delete expired security review context cache before upsert")?;
+                sqlx::query(
+                    r"
+                    INSERT INTO security_review_context_cache (
+                        repo,
+                        base_branch,
+                        base_head_sha,
+                        prompt_version,
+                        payload_json,
+                        source_run_history_id,
+                        generated_at,
+                        expires_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(repo, base_branch, base_head_sha, prompt_version) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        source_run_history_id = excluded.source_run_history_id,
+                        generated_at = excluded.generated_at,
+                        expires_at = excluded.expires_at
+                    ",
+                )
+                .bind(&entry.repo)
+                .bind(&entry.base_branch)
+                .bind(&entry.base_head_sha)
+                .bind(&entry.prompt_version)
+                .bind(&entry.payload_json)
+                .bind(entry.source_run_history_id)
+                .bind(entry.generated_at)
+                .bind(entry.expires_at)
+                .execute(&pool)
+                .await
+                .context("upsert security review context cache")?;
+                Ok(())
+            })
+            .await
     }
 
-    async fn delete_expired_security_review_context_cache(&self, now: i64) -> Result<()> {
-        sqlx::query(
-            r"
-            DELETE FROM security_review_context_cache
-            WHERE expires_at <= ?
-            ",
-        )
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .context("delete expired security review context cache")?;
-        Ok(())
+    fn enqueue_delete_expired_security_review_context_cache(&self, now: i64) {
+        match self.sqlite.try_enqueue_background(
+            "delete expired security review context cache",
+            move |pool| {
+                Box::pin(async move {
+                    sqlx::query(
+                        r"
+                        DELETE FROM security_review_context_cache
+                        WHERE expires_at <= ?
+                        ",
+                    )
+                    .bind(now)
+                    .execute(&pool)
+                    .await
+                    .context("delete expired security review context cache")?;
+                    Ok(())
+                })
+            },
+        ) {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                "skipped expired security review context cache cleanup because sqlite background queue is full"
+            ),
+            Err(err) => warn!(
+                error = %format!("{err:#}"),
+                "failed to enqueue expired security review context cache cleanup"
+            ),
+        }
     }
 }
 
