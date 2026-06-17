@@ -14,7 +14,29 @@ env:
   IMAGE_NAME: codex-gitlab-review
 
 jobs:
+  resolve-codexusage:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve latest stable codexusage version
+        id: resolve
+        shell: bash
+        run: |
+          version="$(
+            curl --fail --silent --show-error \
+              --header 'User-Agent: codex-gitlab-review-github-actions' \
+              https://crates.io/api/v1/crates/codexusage \
+              | jq -r '.crate.max_stable_version'
+          )"
+          if [[ -z "$version" || "$version" == "null" ]]; then
+            echo "failed to resolve codexusage max_stable_version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build-amd64:
+    needs: resolve-codexusage
     runs-on: ubuntu-latest
     outputs:
       digest: ${{ steps.build.outputs.digest }}
@@ -55,6 +77,8 @@ jobs:
           push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            CODEXUSAGE_VERSION=${{ needs.resolve-codexusage.outputs.version }}
           cache-from: type=gha,scope=linux-amd64
           cache-to: type=gha,mode=max,scope=linux-amd64
 
@@ -68,11 +92,14 @@ jobs:
           platforms: linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER_LOWER }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            CODEXUSAGE_VERSION=${{ needs.resolve-codexusage.outputs.version }}
           cache-from: type=gha,scope=linux-amd64
           cache-to: type=gha,mode=max,scope=linux-amd64
 
   build-arm64:
     if: github.event_name != 'pull_request'
+    needs: resolve-codexusage
     runs-on: ubuntu-24.04-arm
     outputs:
       digest: ${{ steps.build.outputs.digest }}
@@ -111,6 +138,8 @@ jobs:
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER_LOWER }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            CODEXUSAGE_VERSION=${{ needs.resolve-codexusage.outputs.version }}
           cache-from: type=gha,scope=linux-arm64
           cache-to: type=gha,mode=max,scope=linux-arm64
 

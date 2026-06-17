@@ -1,14 +1,15 @@
-FROM rust:1.93 AS builder
-ARG CODEXUSAGE_VERSION=0.2.0
+FROM rust:1.96 AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
-RUN cargo install --locked --version ${CODEXUSAGE_VERSION} codexusage
 RUN rm -rf src
 COPY src ./src
 COPY migrations ./migrations
 RUN cargo build --release
+ARG CODEXUSAGE_VERSION=0.4.0
+RUN cargo install --locked --version "${CODEXUSAGE_VERSION}" codexusage \
+    && /usr/local/cargo/bin/codexusage --version
 
 FROM debian:trixie-slim
 RUN apt-get update \
