@@ -329,6 +329,9 @@ impl GitLabApi for DevGitLabApi {
             web_url: Some(project_web_url(path_with_namespace)),
             default_branch: Some("main".to_string()),
             last_activity_at: repo.active_mr.as_ref().map(|mr| mr.updated_at.to_rfc3339()),
+            archived: false,
+            marked_for_deletion_on: None,
+            marked_for_deletion_at: None,
         })
     }
 

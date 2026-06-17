@@ -84,6 +84,12 @@ pub struct GitLabProject {
     pub default_branch: Option<String>,
     #[serde(default)]
     pub last_activity_at: Option<String>,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub marked_for_deletion_on: Option<String>,
+    #[serde(default)]
+    pub marked_for_deletion_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,6 +169,14 @@ pub struct GitLabGroupSummary {
 }
 
 impl GitLabProjectSummary {
+    pub(crate) fn is_active(&self) -> bool {
+        !self.archived
+            && self.marked_for_deletion_on.is_none()
+            && self.marked_for_deletion_at.is_none()
+    }
+}
+
+impl GitLabProject {
     pub(crate) fn is_active(&self) -> bool {
         !self.archived
             && self.marked_for_deletion_on.is_none()

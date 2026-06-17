@@ -345,7 +345,20 @@ impl<'a> ScanPipeline<'a> {
                 return Ok(());
             }
         }
-        let mrs = self.service.gitlab.list_open_mrs(repo).await?;
+        let mrs = match self.service.gitlab.list_open_mrs(repo).await {
+            Ok(mrs) => mrs,
+            Err(err) => {
+                if self
+                    .service
+                    .should_skip_inactive_project_after_mr_listing_error(repo, &err)
+                    .await
+                {
+                    self.context.counters.skipped_inactive += 1;
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        };
         match self.scan_repo_mrs(repo, mrs).await? {
             RepoScanStatus::Complete => {
                 if let Some(marker) = activity_marker {

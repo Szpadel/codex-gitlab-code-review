@@ -195,6 +195,9 @@ mod tests {
                 web_url: None,
                 default_branch: None,
                 last_activity_at: None,
+                archived: false,
+                marked_for_deletion_on: None,
+                marked_for_deletion_at: None,
             })
         }
 

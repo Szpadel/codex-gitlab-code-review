@@ -940,7 +940,10 @@ async fn get_project_reads_last_activity() -> Result<()> {
     let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
         "web_url": "https://gitlab.example.com/group/repo",
         "default_branch": "main",
-        "last_activity_at": "2025-01-01T00:00:00Z"
+        "last_activity_at": "2025-01-01T00:00:00Z",
+        "archived": true,
+        "marked_for_deletion_on": "2025-02-01",
+        "marked_for_deletion_at": "2025-02-01T00:00:00Z"
     }));
     Mock::given(method("GET"))
         .and(path("/api/v4/projects/group%2Frepo"))
@@ -960,6 +963,16 @@ async fn get_project_reads_last_activity() -> Result<()> {
         project.last_activity_at,
         Some("2025-01-01T00:00:00Z".to_string())
     );
+    assert!(project.archived);
+    assert_eq!(
+        project.marked_for_deletion_on,
+        Some("2025-02-01".to_string())
+    );
+    assert_eq!(
+        project.marked_for_deletion_at,
+        Some("2025-02-01T00:00:00Z".to_string())
+    );
+    assert!(!project.is_active());
     Ok(())
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use async_trait::async_trait;
 #[tokio::test]
 async fn review_history_insert_failure_releases_review_lock() -> Result<()> {
     let config = test_config();
@@ -241,6 +242,194 @@ async fn security_reviews_use_canonical_project_path_for_runner_context() -> Res
         .collect::<Vec<_>>();
     assert!(run_kinds.contains(&crate::state::RunHistoryKind::Review));
     assert!(run_kinds.contains(&crate::state::RunHistoryKind::Security));
+    Ok(())
+}
+
+struct ForbiddenListOpenGitLab {
+    inner: Arc<FakeGitLab>,
+    project: crate::gitlab::GitLabProject,
+    list_open_calls: Mutex<u32>,
+}
+
+impl ForbiddenListOpenGitLab {
+    fn new(inner: Arc<FakeGitLab>, project: crate::gitlab::GitLabProject) -> Self {
+        Self {
+            inner,
+            project,
+            list_open_calls: Mutex::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl GitLabApi for ForbiddenListOpenGitLab {
+    async fn current_user(&self) -> Result<GitLabUser> {
+        self.inner.current_user().await
+    }
+
+    async fn list_projects(&self) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+        self.inner.list_projects().await
+    }
+
+    async fn list_group_projects(
+        &self,
+        group: &str,
+    ) -> Result<Vec<crate::gitlab::GitLabProjectSummary>> {
+        self.inner.list_group_projects(group).await
+    }
+
+    async fn list_open_mrs(&self, _project: &str) -> Result<Vec<MergeRequest>> {
+        *self.list_open_calls.lock().unwrap() += 1;
+        Err(anyhow::anyhow!(
+            "gitlab GET https://gitlab.example.com/api/v4/projects/group%2Frepo/merge_requests?state=opened&scope=all&per_page=100&page=1 response: status=403 Forbidden content_type=application/json body={{\"message\":\"403 Forbidden\"}}"
+        ))
+    }
+
+    async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>> {
+        self.inner.get_latest_open_mr_activity(project).await
+    }
+
+    async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest> {
+        self.inner.get_mr(project, iid).await
+    }
+
+    async fn get_project(&self, _project: &str) -> Result<crate::gitlab::GitLabProject> {
+        Ok(self.project.clone())
+    }
+
+    async fn list_awards(&self, project: &str, iid: u64) -> Result<Vec<AwardEmoji>> {
+        self.inner.list_awards(project, iid).await
+    }
+
+    async fn add_award(&self, project: &str, iid: u64, name: &str) -> Result<()> {
+        self.inner.add_award(project, iid, name).await
+    }
+
+    async fn delete_award(&self, project: &str, iid: u64, award_id: u64) -> Result<()> {
+        self.inner.delete_award(project, iid, award_id).await
+    }
+
+    async fn list_notes(&self, project: &str, iid: u64) -> Result<Vec<Note>> {
+        self.inner.list_notes(project, iid).await
+    }
+
+    async fn create_note(&self, project: &str, iid: u64, body: &str) -> Result<()> {
+        self.inner.create_note(project, iid, body).await
+    }
+}
+
+fn project_with_active_state(archived: bool) -> crate::gitlab::GitLabProject {
+    crate::gitlab::GitLabProject {
+        path_with_namespace: Some("group/repo".to_string()),
+        web_url: None,
+        default_branch: Some("main".to_string()),
+        last_activity_at: None,
+        archived,
+        marked_for_deletion_on: None,
+        marked_for_deletion_at: None,
+    }
+}
+
+#[tokio::test]
+async fn scan_skips_archived_project_when_mr_listing_is_forbidden() -> Result<()> {
+    let config = test_config();
+    let bot_user = GitLabUser {
+        id: 1,
+        username: None,
+        name: None,
+    };
+    let inner = Arc::new(FakeGitLab {
+        bot_user,
+        mrs: Mutex::new(Vec::new()),
+        awards: Mutex::new(HashMap::new()),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::new()),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let gitlab = Arc::new(ForbiddenListOpenGitLab::new(
+        inner,
+        project_with_active_state(true),
+    ));
+    let runner = Arc::new(FakeRunner {
+        result: Mutex::new(None),
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    let status = service.scan_once().await?;
+
+    assert_eq!(status, ScanRunStatus::Completed);
+    assert_eq!(*gitlab.list_open_calls.lock().unwrap(), 1);
+    assert_eq!(*runner.calls.lock().unwrap(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_keeps_forbidden_error_for_active_project() -> Result<()> {
+    let config = test_config();
+    let bot_user = GitLabUser {
+        id: 1,
+        username: None,
+        name: None,
+    };
+    let inner = Arc::new(FakeGitLab {
+        bot_user,
+        mrs: Mutex::new(Vec::new()),
+        awards: Mutex::new(HashMap::new()),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::new()),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let gitlab = Arc::new(ForbiddenListOpenGitLab::new(
+        inner,
+        project_with_active_state(false),
+    ));
+    let runner = Arc::new(FakeRunner {
+        result: Mutex::new(None),
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    let err = service
+        .scan_once()
+        .await
+        .expect_err("active project 403 should remain an error");
+
+    assert!(format!("{err:#}").contains("status=403"));
+    assert_eq!(*gitlab.list_open_calls.lock().unwrap(), 1);
+    assert_eq!(*runner.calls.lock().unwrap(), 0);
     Ok(())
 }
 

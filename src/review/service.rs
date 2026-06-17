@@ -683,6 +683,38 @@ impl ReviewService {
         }
     }
 
+    pub(super) async fn should_skip_inactive_project_after_mr_listing_error(
+        &self,
+        repo: &str,
+        err: &anyhow::Error,
+    ) -> bool {
+        if !gitlab_error_has_status(err, &[403]) {
+            return false;
+        }
+
+        match self.gitlab.get_project(repo).await {
+            Ok(project) if !project.is_active() => {
+                warn!(
+                    repo = repo,
+                    archived = project.archived,
+                    marked_for_deletion_on = project.marked_for_deletion_on.as_deref(),
+                    marked_for_deletion_at = project.marked_for_deletion_at.as_deref(),
+                    "skip: project is inactive after forbidden MR listing"
+                );
+                true
+            }
+            Ok(_) => false,
+            Err(project_err) => {
+                warn!(
+                    repo = repo,
+                    error = %project_err,
+                    "failed to load project after forbidden MR listing"
+                );
+                false
+            }
+        }
+    }
+
     pub(super) async fn resolve_repos(&self, mode: ScanMode) -> Result<Vec<String>> {
         self.target_resolver.resolve_repos(mode).await
     }
@@ -891,6 +923,9 @@ mod pending_rate_limit_tests {
                 web_url: None,
                 default_branch: None,
                 last_activity_at: None,
+                archived: false,
+                marked_for_deletion_on: None,
+                marked_for_deletion_at: None,
             })
         }
 

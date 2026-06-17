@@ -521,6 +521,9 @@ mod tests {
                     web_url: None,
                     default_branch: None,
                     last_activity_at: None,
+                    archived: false,
+                    marked_for_deletion_on: None,
+                    marked_for_deletion_at: None,
                 }))
         }
 
@@ -640,6 +643,9 @@ mod tests {
                     ),
                     default_branch: Some("main".to_string()),
                     last_activity_at: Some("2025-01-01T00:00:00Z".to_string()),
+                    archived: false,
+                    marked_for_deletion_on: None,
+                    marked_for_deletion_at: None,
                 },
             )]),
             branches: BTreeMap::from([(

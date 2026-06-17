@@ -129,6 +129,9 @@ impl GitLabApi for FakeGitLab {
             web_url: None,
             default_branch: None,
             last_activity_at: mapped.filter(|value| !value.contains('/')),
+            archived: false,
+            marked_for_deletion_on: None,
+            marked_for_deletion_at: None,
         })
     }
 
