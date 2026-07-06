@@ -59,6 +59,7 @@ mod security_context;
 mod session_runner;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod usage;
 
 use self::app_server::{
     AppServerClient, GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID, annotate_event_payload,
@@ -67,6 +68,7 @@ pub use self::auth::CodexQuotaExhausted;
 use self::auth::{AuthAccount, AuthFallbackAction};
 #[cfg(test)]
 use self::auth::{AuthFailureKind, classify_auth_failure, classify_auth_failure_for_account};
+pub(crate) use self::auth::{QUOTA_LAST_PROBE_AT_KEY, auth_account_state_key};
 use self::container::{ImagePullManager, format_command_for_log};
 use self::docker::{connect_docker, ensure_image, normalize_image_reference};
 use self::gitlab_discovery::{
@@ -77,6 +79,10 @@ use self::review_output::parse_review_output_for_lane;
 use self::scripts::{
     AppServerCommandOptions, effective_browser_mcp, restore_push_remote_url_exec_command,
     shell_quote,
+};
+pub use self::usage::{
+    CodexUsageLimitSnapshot, CodexUsageResetCredits, CodexUsageResetOutcome, CodexUsageSnapshot,
+    CodexUsageWindow, is_weekly_window_duration,
 };
 
 #[derive(Debug, Clone)]
@@ -260,7 +266,7 @@ impl Drop for SecurityContextBuildCompletionGuard {
 const REVIEW_CONTAINER_NAME_PREFIX: &str = "codex-review-";
 const BROWSER_CONTAINER_NAME_PREFIX: &str = "codex-browser-";
 const REVIEW_OWNER_LABEL_KEY: &str = "codex.gitlab.review.owner";
-const PRIMARY_AUTH_ACCOUNT_NAME: &str = "primary";
+pub(crate) const PRIMARY_AUTH_ACCOUNT_NAME: &str = "primary";
 const BROWSER_CONTAINER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const BROWSER_CONTAINER_RUNNING_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const BROWSER_CONTAINER_LOG_FETCH_TAIL: &str = "50";
@@ -317,6 +323,18 @@ pub trait CodexRunner: Send + Sync {
 
     async fn read_thread(&self, _account_name: &str, _thread_id: &str) -> Result<Value> {
         bail!("thread history is not implemented by this runner")
+    }
+
+    async fn read_usage_limits(&self, _account_name: &str) -> Result<CodexUsageSnapshot> {
+        bail!("usage limits are not implemented by this runner")
+    }
+
+    async fn consume_usage_limit_reset(
+        &self,
+        _account_name: &str,
+        _idempotency_key: &str,
+    ) -> Result<CodexUsageResetOutcome> {
+        bail!("usage limit reset is not implemented by this runner")
     }
 }
 
@@ -702,6 +720,19 @@ impl CodexRunner for DockerCodexRunner {
             .auth_account_by_name(account_name)
             .ok_or_else(|| anyhow!("unknown codex auth account: {account_name}"))?;
         self.read_thread_with_account(account, thread_id).await
+    }
+
+    async fn read_usage_limits(&self, account_name: &str) -> Result<CodexUsageSnapshot> {
+        self.read_usage_limits_with_account(account_name).await
+    }
+
+    async fn consume_usage_limit_reset(
+        &self,
+        account_name: &str,
+        idempotency_key: &str,
+    ) -> Result<CodexUsageResetOutcome> {
+        self.consume_usage_limit_reset_with_account(account_name, idempotency_key)
+            .await
     }
 }
 

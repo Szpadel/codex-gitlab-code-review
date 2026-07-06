@@ -98,6 +98,7 @@ fn render_nav(active: NavItem, development_enabled: bool) -> String {
         (NavItem::Status, "/status", "Status"),
         (NavItem::History, "/history", "History"),
         (NavItem::RateLimits, "/rate-limits", "Rate limits"),
+        (NavItem::Usage, "/usage", "Usage"),
         (NavItem::Skills, "/skills", "Skills"),
     ];
     if development_enabled {
@@ -186,6 +187,7 @@ pub(super) enum NavItem {
     Status,
     History,
     RateLimits,
+    Usage,
     Skills,
     Development,
 }

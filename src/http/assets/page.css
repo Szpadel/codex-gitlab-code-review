@@ -81,6 +81,21 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
 .summary-chip { display: inline-flex; align-items: baseline; gap: 8px; padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04); }
 .summary-chip strong { font-size: 13px; line-height: 18px; color: var(--text-primary); }
 .summary-chip-label { font-size: 12px; line-height: 16px; color: var(--text-tertiary); font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.usage-hero { margin-bottom: 16px; }
+.usage-account-card { display: grid; gap: 14px; }
+.usage-account-header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
+.usage-account-header h2 { margin: 0 0 4px; font-size: 18px; line-height: 28px; }
+.usage-account-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.usage-account-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; align-items: stretch; }
+.usage-meta-pair, .usage-reset-panel { padding: 12px; border: 1px solid var(--divider); border-radius: 8px; background: var(--surface-subtle); }
+.usage-meta-pair { display: grid; gap: 4px; }
+.usage-meta-pair span { color: var(--text-tertiary); font-size: 12px; line-height: 16px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+.usage-meta-pair strong { font-size: 13px; line-height: 18px; font-weight: 600; }
+.usage-reset-panel { display: grid; gap: 8px; }
+.usage-reset-panel form { margin: 0; }
+.usage-reset-panel .primary-button:disabled { background: var(--text-disabled); cursor: not-allowed; }
+.notice { display: flex; gap: 10px; align-items: center; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; background: var(--surface); }
+.notice-info { border-color: #CFE4F4; background: #EAF4FB; color: var(--info); }
 .target-badge-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .target-badge { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--divider); border-radius: 999px; background: var(--surface-subtle); padding: 4px 10px; font-size: 12px; line-height: 16px; color: var(--text-secondary); }
 .target-badge-kind { color: var(--text-tertiary); font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }

@@ -1,3 +1,4 @@
+use crate::codex_runner::CodexUsageSnapshot;
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
     ProjectCatalogSummary, ReviewRateLimitBucketSnapshot, ReviewRateLimitPendingEntry,
@@ -23,6 +24,20 @@ pub struct StatusRateLimitSnapshot {
     pub rules: Vec<ReviewRateLimitRule>,
     pub active_buckets: Vec<ReviewRateLimitBucketSnapshot>,
     pub pending: Vec<ReviewRateLimitPendingEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsagePageSnapshot {
+    pub generated_at: String,
+    pub accounts: Vec<UsageAccountSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageAccountSnapshot {
+    pub name: String,
+    pub auth_host_path: String,
+    pub local_limit_reset_at: Option<String>,
+    pub usage: Result<CodexUsageSnapshot, String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

@@ -18,17 +18,18 @@ use tokio::net::TcpListener;
 use tracing::error;
 
 use handlers::{
-    create_development_repo, create_rate_limit_rule, delete_development_repo,
-    delete_rate_limit_rule, delete_skill, development_page, healthcheck, history_json,
-    history_page, mr_history_json, mr_history_page, rate_limits_page, regen_rate_limit_bucket_slot,
-    run_detail_json, run_detail_page, simulate_development_commit, simulate_development_mr,
-    skill_detail_page, skills_page, status_json, status_page, update_development_repo,
-    update_feature_flag_json, update_rate_limit_rule, upload_skill,
+    apply_usage_limit_reset, create_development_repo, create_rate_limit_rule,
+    delete_development_repo, delete_rate_limit_rule, delete_skill, development_page, healthcheck,
+    history_json, history_page, mr_history_json, mr_history_page, rate_limits_page,
+    regen_rate_limit_bucket_slot, run_detail_json, run_detail_page, simulate_development_commit,
+    simulate_development_mr, skill_detail_page, skills_page, status_json, status_page,
+    update_development_repo, update_feature_flag_json, update_rate_limit_rule, upload_skill,
+    usage_page,
 };
 pub use status::{
     AdminService, BackfillService, HistoryQuery, HistorySnapshot, HttpServices, MrHistorySnapshot,
     RateLimitService, RunDetailSnapshot, SecurityContextPreview, SkillsService, StatusService,
-    TranscriptBackfillSource,
+    TranscriptBackfillSource, UsageService,
 };
 
 const MAX_SKILL_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
@@ -76,6 +77,8 @@ pub fn app_router_with_dev_tools(
             .route("/history/{run_id}", get(run_detail_page))
             .route("/mr/{repo_key}/{iid}/history", get(mr_history_page))
             .route("/skills", get(skills_page))
+            .route("/usage", get(usage_page))
+            .route("/usage/reset", post(apply_usage_limit_reset))
             .route("/rate-limits", get(rate_limits_page))
             .route("/skills/{skill_name}", get(skill_detail_page))
             .route("/skills/{skill_name}/delete", post(delete_skill))

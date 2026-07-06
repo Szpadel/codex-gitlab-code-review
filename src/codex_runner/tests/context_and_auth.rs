@@ -533,6 +533,215 @@ async fn available_accounts_quota_exhaustion_records_probe_marker() {
 }
 
 #[tokio::test]
+async fn read_usage_limits_fetches_all_rate_limit_buckets_for_account() {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result(
+            "account/rateLimits/read",
+            json!({
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 100.0,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1735693200
+                    },
+                    "secondary": null,
+                    "credits": null,
+                    "individualLimit": null,
+                    "rateLimitReachedType": "rateLimitReached"
+                },
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "primary": {
+                            "usedPercent": 100.0,
+                            "windowDurationMins": 10080,
+                            "resetsAt": 1735693200
+                        },
+                        "secondary": null,
+                        "credits": null,
+                        "individualLimit": null,
+                        "rateLimitReachedType": "rateLimitReached"
+                    },
+                    "codex_other": {
+                        "primary": null,
+                        "secondary": {
+                            "usedPercent": 25.0,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1735696800
+                        },
+                        "credits": null,
+                        "individualLimit": null,
+                        "rateLimitReachedType": null
+                    }
+                },
+                "rateLimitResetCredits": { "availableCount": 2 }
+            }),
+        ),
+    ]));
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, harness.clone(), None).await;
+
+    let snapshot = runner
+        .read_usage_limits(PRIMARY_AUTH_ACCOUNT_NAME)
+        .await
+        .expect("usage limits");
+
+    assert_eq!(
+        snapshot.rate_limit_reset_credits,
+        Some(CodexUsageResetCredits { available_count: 2 })
+    );
+    assert_eq!(snapshot.rate_limits_by_limit_id.len(), 2);
+    assert_eq!(
+        snapshot.rate_limits_by_limit_id["codex"]
+            .primary
+            .as_ref()
+            .expect("primary")
+            .window_duration_mins,
+        Some(10080)
+    );
+    assert_eq!(
+        snapshot.rate_limits_by_limit_id["codex_other"]
+            .secondary
+            .as_ref()
+            .expect("secondary")
+            .used_percent,
+        25.0
+    );
+    assert!(harness.removed_containers().contains(&"app-1".to_string()));
+}
+
+#[tokio::test]
+async fn read_usage_limits_falls_back_when_optional_limit_map_is_null() {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result(
+            "account/rateLimits/read",
+            json!({
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 75.0,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1735693200
+                    },
+                    "secondary": null,
+                    "credits": null,
+                    "individualLimit": null,
+                    "rateLimitReachedType": null
+                },
+                "rateLimitsByLimitId": null,
+                "rateLimitResetCredits": null
+            }),
+        ),
+    ]));
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, harness.clone(), None).await;
+
+    let snapshot = runner
+        .read_usage_limits(PRIMARY_AUTH_ACCOUNT_NAME)
+        .await
+        .expect("usage limits");
+
+    assert_eq!(snapshot.rate_limit_reset_credits, None);
+    assert_eq!(snapshot.rate_limits_by_limit_id.len(), 1);
+    assert_eq!(
+        snapshot.rate_limits_by_limit_id["codex"]
+            .primary
+            .as_ref()
+            .expect("primary")
+            .used_percent,
+        75.0
+    );
+}
+
+#[tokio::test]
+async fn read_usage_limits_sets_codex_home_to_configured_auth_mount_path() {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result(
+            "account/rateLimits/read",
+            json!({
+                "rateLimits": {
+                    "primary": {
+                        "usedPercent": 50.0,
+                        "windowDurationMins": 10080,
+                        "resetsAt": 1735693200
+                    },
+                    "secondary": null,
+                    "credits": null,
+                    "individualLimit": null,
+                    "rateLimitReachedType": null
+                },
+                "rateLimitsByLimitId": null,
+                "rateLimitResetCredits": { "availableCount": 1 }
+            }),
+        ),
+    ]));
+    let mut codex = test_codex_config();
+    codex.auth_mount_path = "/custom/codex-home".to_string();
+    let runner = test_runner_with_fake_runtime(codex, false, harness.clone(), None).await;
+
+    runner
+        .read_usage_limits(PRIMARY_AUTH_ACCOUNT_NAME)
+        .await
+        .expect("usage limits");
+
+    let starts = harness.app_server_starts();
+    assert_eq!(starts.len(), 1);
+    assert!(
+        starts[0]
+            .request
+            .binds
+            .contains(&"/root/.codex:/custom/codex-home:rw".to_string())
+    );
+    assert!(
+        starts[0]
+            .request
+            .cmd
+            .get(1)
+            .expect("script")
+            .contains("export CODEX_HOME=\"/custom/codex-home\""),
+        "{}",
+        starts[0].request.cmd.get(1).expect("script")
+    );
+}
+
+#[tokio::test]
+async fn consume_usage_limit_reset_sends_idempotency_key_to_app_server() {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result(
+            "account/rateLimitResetCredit/consume",
+            json!({ "outcome": "alreadyRedeemed" }),
+        ),
+    ]));
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, harness.clone(), None).await;
+
+    let outcome = runner
+        .consume_usage_limit_reset(PRIMARY_AUTH_ACCOUNT_NAME, "reset-request-1")
+        .await
+        .expect("reset outcome");
+
+    assert_eq!(outcome, CodexUsageResetOutcome::AlreadyRedeemed);
+    let requests = harness.app_protocol_requests();
+    let consume_request = requests
+        .iter()
+        .find(|request| {
+            request.get("method").and_then(Value::as_str)
+                == Some("account/rateLimitResetCredit/consume")
+        })
+        .expect("consume request");
+    assert_eq!(
+        consume_request["params"],
+        json!({ "idempotencyKey": "reset-request-1" })
+    );
+}
+
+#[tokio::test]
 async fn all_preblocked_accounts_enter_probe_mode_and_clear_successful_marker() {
     let mut codex = test_codex_config();
     codex.usage_limit_recheck_seconds = 900;

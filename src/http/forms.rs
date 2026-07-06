@@ -25,9 +25,21 @@ pub(crate) struct FeatureFlagUpdateJson {
     pub(crate) enabled: Option<bool>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct UsageQueryParams {
+    pub(crate) account: Option<String>,
+    pub(crate) reset: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct CsrfForm {
     pub(crate) csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct UsageLimitResetForm {
+    pub(crate) csrf_token: String,
+    pub(crate) account_name: String,
 }
 
 #[derive(Debug, Deserialize)]

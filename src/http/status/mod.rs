@@ -5,6 +5,7 @@ mod models;
 mod rate_limit_service;
 mod skills_service;
 mod status_service;
+mod usage_service;
 
 pub use super::transcript::ThreadSnapshot;
 pub use admin_service::AdminService;
@@ -13,11 +14,12 @@ pub use http_services::HttpServices;
 pub use models::{
     HistoryQuery, HistorySnapshot, MrHistorySnapshot, RunDetailSnapshot, SecurityContextPreview,
     StatusConfigSnapshot, StatusFeatureFlagSnapshot, StatusRateLimitSnapshot, StatusSnapshot,
-    TranscriptBackfillSnapshot,
+    TranscriptBackfillSnapshot, UsageAccountSnapshot, UsagePageSnapshot,
 };
 pub use rate_limit_service::RateLimitService;
 pub use skills_service::SkillsService;
 pub use status_service::StatusService;
+pub use usage_service::UsageService;
 
 #[cfg(test)]
 pub(crate) use backfill::{

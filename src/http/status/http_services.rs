@@ -1,6 +1,6 @@
 use super::{
     AdminService, BackfillService, RateLimitService, SkillsService, StatusService,
-    TranscriptBackfillSource,
+    TranscriptBackfillSource, UsageService,
 };
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
@@ -14,9 +14,11 @@ pub struct HttpServices {
     pub admin: Arc<AdminService>,
     pub skills: Arc<SkillsService>,
     pub ratelimit: Arc<RateLimitService>,
+    pub usage: Arc<UsageService>,
     pub backfill: Arc<BackfillService>,
     config: Config,
     state: Arc<ReviewStateStore>,
+    runner: Option<Arc<dyn CodexRunner>>,
     run_once: bool,
     runtime_mode: String,
     transcript_backfill_source_override: Option<Arc<dyn TranscriptBackfillSource>>,
@@ -29,10 +31,11 @@ impl HttpServices {
         state: Arc<ReviewStateStore>,
         run_once: bool,
         // Status-page reads stay on persisted events plus local session history.
-        // Do not reintroduce synchronous Codex thread reads on the HTTP path.
-        _runner: Option<Arc<dyn CodexRunner>>,
+        // The usage page is the only status UI path that performs live Codex
+        // app-server reads because reset eligibility depends on current usage.
+        runner: Option<Arc<dyn CodexRunner>>,
     ) -> Self {
-        Self::build(config, state, run_once, "normal".to_string(), None)
+        Self::build(config, state, runner, run_once, "normal".to_string(), None)
     }
 
     #[must_use]
@@ -55,6 +58,7 @@ impl HttpServices {
     fn build(
         config: Config,
         state: Arc<ReviewStateStore>,
+        runner: Option<Arc<dyn CodexRunner>>,
         run_once: bool,
         runtime_mode: String,
         transcript_backfill_source_override: Option<Arc<dyn TranscriptBackfillSource>>,
@@ -72,6 +76,11 @@ impl HttpServices {
             Arc::clone(&state),
             config.gitlab.targets.repos.list().to_vec(),
             config.gitlab.targets.groups.list().to_vec(),
+        ));
+        let usage = Arc::new(UsageService::new(
+            &config,
+            Arc::clone(&state),
+            runner.clone(),
         ));
         let mut backfill_service = BackfillService::new(&config, Arc::clone(&state));
         if let Some(source) = transcript_backfill_source_override.clone() {
@@ -92,9 +101,11 @@ impl HttpServices {
             admin,
             skills,
             ratelimit,
+            usage,
             backfill,
             config,
             state,
+            runner,
             run_once,
             runtime_mode,
             transcript_backfill_source_override,
@@ -105,6 +116,7 @@ impl HttpServices {
         let rebuilt = Self::build(
             self.config.clone(),
             Arc::clone(&self.state),
+            self.runner.clone(),
             self.run_once,
             self.runtime_mode.clone(),
             self.transcript_backfill_source_override.clone(),
@@ -113,6 +125,7 @@ impl HttpServices {
         self.admin = rebuilt.admin;
         self.skills = rebuilt.skills;
         self.ratelimit = rebuilt.ratelimit;
+        self.usage = rebuilt.usage;
         self.backfill = rebuilt.backfill;
     }
 }

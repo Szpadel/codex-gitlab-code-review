@@ -4,11 +4,12 @@ use super::errors::{
 };
 use super::forms::{
     CsrfBucketForm, CsrfForm, DevelopmentRepoForm, FeatureFlagUpdateJson, HistoryQueryParams,
-    RateLimitRuleForm, parse_rate_limit_rule_upsert,
+    RateLimitRuleForm, UsageLimitResetForm, UsageQueryParams, parse_rate_limit_rule_upsert,
 };
 use super::view::{
     render_development_page, render_history_page, render_mr_history_page, render_rate_limits_page,
     render_run_detail_page, render_skill_detail_page, render_skills_page, render_status_page,
+    render_usage_page,
 };
 use crate::dev_mode::DevToolsService;
 use anyhow::Context;
@@ -221,6 +222,39 @@ pub(crate) async fn rate_limits_page(
         &target_suggestions,
         Some(app_state.http_services.admin.admin_csrf_token()),
         app_state.development_enabled(),
+    )))
+}
+
+pub(crate) async fn usage_page(
+    State(app_state): State<HttpAppState>,
+    Query(params): Query<UsageQueryParams>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    let snapshot = app_state.http_services.usage.snapshot().await?;
+    Ok(Html(render_usage_page(
+        &snapshot,
+        params.account.as_deref().zip(params.reset.as_deref()),
+        Some(app_state.http_services.admin.admin_csrf_token()),
+        app_state.development_enabled(),
+    )))
+}
+
+pub(crate) async fn apply_usage_limit_reset(
+    State(app_state): State<HttpAppState>,
+    Form(form): Form<UsageLimitResetForm>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    require_admin_csrf_form_token(
+        Some(&form.csrf_token),
+        app_state.http_services.admin.admin_csrf_token(),
+    )?;
+    let outcome = app_state
+        .http_services
+        .usage
+        .consume_reset(&form.account_name)
+        .await?;
+    Ok(Redirect::to(&format!(
+        "/usage?account={}&reset={}",
+        urlencoding::encode(&form.account_name),
+        outcome.as_query_value()
     )))
 }
 
