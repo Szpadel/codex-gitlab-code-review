@@ -3,7 +3,7 @@ use super::html::{
     NavItem, escape_html, mr_history_href, render_shell, render_table_section,
     render_unix_timestamp, run_kind_label,
 };
-use crate::state::{RunHistoryKind, RunHistoryListItem, RunHistoryRecord};
+use crate::state::{RunHistoryKind, RunHistoryListItem, RunHistoryRecord, RunRetryStatus};
 use urlencoding::encode;
 
 pub(in crate::http) fn render_history_page(
@@ -184,7 +184,11 @@ fn render_history_run_row(run: &RunHistoryListItem) -> String {
         escape_html(&run.repo),
         mr_history_href(&run.repo, run.iid),
         run.iid,
-        escape_html(run.result.as_deref().unwrap_or(&run.status)),
+        escape_html(&run_result_label(
+            run.result.as_deref(),
+            &run.status,
+            run.retry.as_ref()
+        )),
         render_unix_timestamp(run.started_at),
         run.id,
         escape_html(&run_row_preview(
@@ -225,7 +229,11 @@ fn render_record_run_row(run: &RunHistoryRecord) -> String {
         escape_html(&run.repo),
         mr_history_href(&run.repo, run.iid),
         run.iid,
-        escape_html(run.result.as_deref().unwrap_or(&run.status)),
+        escape_html(&run_result_label(
+            run.result.as_deref(),
+            &run.status,
+            run.retry.as_ref()
+        )),
         render_unix_timestamp(run.started_at),
         run.id,
         escape_html(&run_row_preview(
@@ -254,6 +262,14 @@ fn run_row_preview(
     compact_text_excerpt(value, 220)
 }
 
+fn run_result_label(result: Option<&str>, status: &str, retry: Option<&RunRetryStatus>) -> String {
+    let base = result.unwrap_or(status);
+    match retry {
+        Some(retry) if base == "error" => format!("{base} {}", retry.label),
+        _ => base.to_string(),
+    }
+}
+
 fn non_empty_text(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -269,4 +285,46 @@ fn compact_text_excerpt(value: &str, max_chars: usize) -> String {
         output.push(ch);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::RunRetryStatus;
+
+    #[test]
+    fn history_result_column_includes_retry_label_for_error_run() {
+        let snapshot = HistorySnapshot {
+            generated_at: "2026-03-23T00:00:00Z".to_string(),
+            filters: HistoryQuery::default(),
+            limit: 100,
+            has_previous: false,
+            has_next: false,
+            previous_cursor: None,
+            next_cursor: None,
+            runs: vec![RunHistoryListItem {
+                id: 7,
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 11,
+                status: "done".to_string(),
+                result: Some("error".to_string()),
+                started_at: 0,
+                preview: Some("Review group/repo !11".to_string()),
+                summary: None,
+                error: Some("runner failed".to_string()),
+                retry: Some(RunRetryStatus {
+                    retry_number: 1,
+                    max_retries: 5,
+                    next_retry_at: Some(900),
+                    exhausted: false,
+                    label: "retry 1/5 in 15m".to_string(),
+                }),
+            }],
+        };
+
+        let html = render_history_page(&snapshot, None, false);
+
+        assert!(html.contains("error retry 1/5 in 15m"));
+    }
 }

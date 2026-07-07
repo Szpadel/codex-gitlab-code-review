@@ -1212,6 +1212,7 @@ fn map_run_history_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunHistoryRecord
         transcript_backfill_error: row
             .try_get("transcript_backfill_error")
             .context("read run history transcript_backfill_error")?,
+        retry: None,
     })
 }
 
@@ -1273,6 +1274,7 @@ fn map_run_history_list_item_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunHis
             .try_get("summary")
             .context("read run history list summary")?,
         error: if expose_error { error } else { None },
+        retry: None,
     })
 }
 

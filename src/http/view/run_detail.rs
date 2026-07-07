@@ -7,7 +7,7 @@ use super::html::{
     NavItem, bool_label, escape_html, pretty_print_json, render_definition_list,
     render_optional_unix_timestamp, render_shell, render_unix_timestamp, run_kind_label,
 };
-use crate::state::{RunHistoryKind, RunHistoryRecord};
+use crate::state::{RunHistoryKind, RunHistoryRecord, RunRetryStatus};
 
 pub(in crate::http) fn render_run_detail_page(
     snapshot: &RunDetailSnapshot,
@@ -49,7 +49,7 @@ pub(in crate::http) fn render_run_detail_page(
 }
 
 fn render_run_metadata(run: &RunHistoryRecord) -> String {
-    let items = vec![
+    let mut items = vec![
         ("Kind".to_string(), escape_html(run_kind_label(run.kind))),
         ("Repo".to_string(), escape_html(&run.repo)),
         ("MR".to_string(), escape_html(&format!("!{}", run.iid))),
@@ -94,7 +94,20 @@ fn render_run_metadata(run: &RunHistoryRecord) -> String {
             escape_html(&render_run_feature_flags(run)),
         ),
     ];
+    if let Some(retry) = run.retry.as_ref() {
+        items.push(("Retry".to_string(), render_retry_status(retry)));
+    }
     format!("<dl>{}</dl>", render_definition_list(&items))
+}
+
+fn render_retry_status(retry: &RunRetryStatus) -> String {
+    let mut label = escape_html(&retry.label);
+    if let Some(next_retry_at) = retry.next_retry_at {
+        label.push_str(" (");
+        label.push_str(&render_unix_timestamp(next_retry_at));
+        label.push(')');
+    }
+    label
 }
 
 fn render_run_feature_flags(run: &RunHistoryRecord) -> String {
@@ -386,6 +399,7 @@ mod tests {
             events_persisted_cleanly: true,
             transcript_backfill_state: TranscriptBackfillState::Complete,
             transcript_backfill_error: None,
+            retry: None,
         }
     }
 
@@ -407,6 +421,35 @@ mod tests {
 
         assert!(html.contains("Reused cached security context from"));
         assert!(html.contains("/history/42"));
+    }
+
+    #[test]
+    fn run_detail_page_renders_retry_status() {
+        let mut run = sample_run(RunHistoryKind::Review);
+        run.result = Some("error".to_string());
+        run.error = Some("runner failed".to_string());
+        run.retry = Some(RunRetryStatus {
+            retry_number: 1,
+            max_retries: 5,
+            next_retry_at: Some(900),
+            exhausted: false,
+            label: "retry 1/5 in 15m".to_string(),
+        });
+        let snapshot = RunDetailSnapshot {
+            generated_at: "2026-03-23T00:00:00Z".to_string(),
+            run,
+            related_runs: Vec::new(),
+            security_context_preview: None,
+            thread: None,
+            transcript_backfill: None,
+        };
+
+        let html =
+            render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None, false);
+
+        assert!(html.contains("<dt>Retry</dt>"));
+        assert!(html.contains("retry 1/5 in 15m"));
+        assert!(html.contains("data-timestamp=\"1970-01-01T00:15:00Z\""));
     }
 
     #[test]

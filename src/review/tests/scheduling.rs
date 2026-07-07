@@ -109,6 +109,160 @@ async fn error_backoff_skips_repeat_and_no_error_comment() -> Result<()> {
 }
 
 #[tokio::test]
+async fn retryable_review_failure_adds_warning_award() -> Result<()> {
+    let config = test_config();
+    let gitlab = fake_gitlab(vec![mr(6, "sha1")]);
+    let runner = Arc::new(FailingRunner {
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once().await?;
+
+    let calls = gitlab.calls.lock().unwrap();
+    assert!(calls.contains(&"add_award:group/repo:6:warning".to_string()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_start_removes_existing_warning_award() -> Result<()> {
+    let config = test_config();
+    let gitlab = fake_gitlab(vec![mr(6, "sha1")]);
+    gitlab.awards.lock().unwrap().insert(
+        ("group/repo".to_string(), 6),
+        vec![AwardEmoji {
+            id: 77,
+            name: "warning".to_string(),
+            user: gitlab.bot_user.clone(),
+        }],
+    );
+    let runner = Arc::new(FakeRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once().await?;
+
+    let calls = gitlab.calls.lock().unwrap();
+    assert!(calls.contains(&"delete_award:group/repo:6:77".to_string()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn draft_mr_clears_retry_warning_award() -> Result<()> {
+    let config = test_config();
+    let gitlab = fake_gitlab(vec![mr(6, "sha1")]);
+    let runner = Arc::new(FailingRunner {
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once().await?;
+    gitlab.awards.lock().unwrap().insert(
+        ("group/repo".to_string(), 6),
+        vec![AwardEmoji {
+            id: 88,
+            name: "warning".to_string(),
+            user: gitlab.bot_user.clone(),
+        }],
+    );
+    gitlab.mrs.lock().unwrap()[0].draft = true;
+
+    service.scan_once().await?;
+
+    assert!(
+        !service
+            .general_review_flow
+            .has_active_retry_for_mr("group/repo", 6)
+    );
+    let calls = gitlab.calls.lock().unwrap();
+    assert!(calls.contains(&"delete_award:group/repo:6:88".to_string()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_award_clears_due_retry_warning_award() -> Result<()> {
+    let config = test_config();
+    let thumbs_emoji = config.review.thumbs_emoji.clone();
+    let gitlab = fake_gitlab(vec![mr(6, "sha1")]);
+    let runner = Arc::new(FailingRunner {
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once().await?;
+    let now = Utc::now();
+    service.general_review_flow.defer_due_retries_for_mr(
+        "group/repo",
+        6,
+        now + Duration::hours(1),
+        now - Duration::seconds(1),
+    );
+    gitlab.awards.lock().unwrap().insert(
+        ("group/repo".to_string(), 6),
+        vec![
+            AwardEmoji {
+                id: 88,
+                name: "warning".to_string(),
+                user: gitlab.bot_user.clone(),
+            },
+            AwardEmoji {
+                id: 89,
+                name: thumbs_emoji,
+                user: gitlab.bot_user.clone(),
+            },
+        ],
+    );
+
+    service.scan_once().await?;
+
+    assert!(
+        !service
+            .general_review_flow
+            .has_active_retry_for_mr("group/repo", 6)
+    );
+    let calls = gitlab.calls.lock().unwrap();
+    assert!(calls.contains(&"delete_award:group/repo:6:88".to_string()));
+    assert!(!calls.contains(&"delete_award:group/repo:6:89".to_string()));
+    Ok(())
+}
+
+#[tokio::test]
 async fn fork_reviews_use_source_project_path_for_runner_context() -> Result<()> {
     let mut config = test_config();
     config.gitlab.targets.repos = TargetSelector::List(vec!["target/repo".to_string()]);
@@ -434,22 +588,143 @@ async fn scan_keeps_forbidden_error_for_active_project() -> Result<()> {
 }
 
 #[test]
-fn retry_backoff_doubles_delay() {
-    let backoff = RetryBackoff::new(Duration::hours(1));
+fn retry_backoff_uses_five_attempt_policy() {
+    let backoff = RetryBackoff::new(Duration::minutes(15), 5);
     let key = RetryKey::new(crate::review::ReviewLane::General, "group/repo", 1, "sha1");
     let start = Utc
         .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
         .single()
         .expect("valid datetime");
 
-    let next_first = backoff.record_failure(key.clone(), start);
-    assert_eq!(next_first, start + Duration::hours(1));
+    let first = backoff.record_failure(key.clone(), 101, start);
+    assert_eq!(first.retry_number, 1);
+    assert_eq!(first.max_retries, 5);
+    assert_eq!(first.next_retry_at, Some(start + Duration::minutes(15)));
+    assert!(!first.exhausted);
 
-    let next_second = backoff.record_failure(key.clone(), next_first);
-    assert_eq!(next_second, next_first + Duration::hours(2));
+    let second = backoff.record_failure(key.clone(), 102, first.next_retry_at.unwrap());
+    assert_eq!(second.retry_number, 2);
+    assert_eq!(
+        second.next_retry_at,
+        Some(start + Duration::minutes(15 + 30))
+    );
+
+    let third = backoff.record_failure(key.clone(), 103, second.next_retry_at.unwrap());
+    let fourth = backoff.record_failure(key.clone(), 104, third.next_retry_at.unwrap());
+    let fifth = backoff.record_failure(key.clone(), 105, fourth.next_retry_at.unwrap());
+    assert_eq!(fifth.retry_number, 5);
+    assert_eq!(
+        fifth.next_retry_at,
+        Some(start + Duration::minutes(15 + 30 + 60 + 120 + 240))
+    );
+    assert!(!fifth.exhausted);
+
+    let exhausted = backoff.record_failure(key.clone(), 106, fifth.next_retry_at.unwrap());
+    assert_eq!(exhausted.retry_number, 5);
+    assert_eq!(exhausted.next_retry_at, None);
+    assert!(exhausted.exhausted);
 
     let state = backoff.state_for(&key).expect("backoff state");
-    assert_eq!(state.failures, 2);
+    assert_eq!(state.retry_number, 5);
+    assert_eq!(state.run_history_id, 106);
+    assert!(state.exhausted);
+}
+
+#[test]
+fn retry_backoff_defer_until_moves_due_retry_without_incrementing() {
+    let backoff = RetryBackoff::new(Duration::minutes(15), 5);
+    let key = RetryKey::new(ReviewLane::General, "group/repo", 1, "sha1");
+    let start = Utc
+        .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+        .single()
+        .expect("valid datetime");
+    let due_at = backoff
+        .record_failure(key.clone(), 101, start)
+        .next_retry_at
+        .expect("retry time");
+    let deferred_until = due_at + Duration::hours(2);
+
+    assert!(backoff.repo_has_due_retry("group/repo", due_at));
+    assert!(backoff.defer_until(&key, deferred_until));
+    assert!(!backoff.repo_has_due_retry("group/repo", due_at));
+    assert_eq!(backoff.earliest_retry_at(), Some(deferred_until));
+
+    let state = backoff.state_for(&key).expect("backoff state");
+    assert_eq!(state.retry_number, 1);
+    assert_eq!(state.run_history_id, 101);
+    assert_eq!(state.next_retry_at, Some(deferred_until));
+}
+
+#[test]
+fn retry_backoff_keeps_mr_active_while_another_retry_key_remains() {
+    let backoff = RetryBackoff::new(Duration::minutes(15), 5);
+    let start = Utc
+        .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+        .single()
+        .expect("valid datetime");
+    let stale_general = RetryKey::new(ReviewLane::General, "group/repo", 1, "old");
+    let current_security = RetryKey::new(ReviewLane::Security, "group/repo", 1, "new");
+
+    backoff.record_failure(stale_general, 101, start);
+    backoff.record_failure(current_security, 102, start);
+
+    let removed = backoff.clear_for_mr_other_heads(ReviewLane::General, "group/repo", 1, "new");
+
+    assert_eq!(removed.len(), 1);
+    assert!(backoff.has_active_retry_for_mr("group/repo", 1));
+    assert!(backoff.has_other_active_retry_for_mr(&RetryKey::new(
+        ReviewLane::General,
+        "group/repo",
+        1,
+        "current"
+    )));
+}
+
+#[test]
+fn retry_backoff_defer_due_for_mr_moves_only_due_entries() {
+    let backoff = RetryBackoff::new(Duration::minutes(15), 5);
+    let start = Utc
+        .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+        .single()
+        .expect("valid datetime");
+    let due_key = RetryKey::new(ReviewLane::General, "group/repo", 1, "due");
+    let future_key = RetryKey::new(ReviewLane::Security, "group/repo", 1, "future");
+    let other_mr_key = RetryKey::new(ReviewLane::General, "group/repo", 2, "due");
+    let due_at = backoff
+        .record_failure(due_key.clone(), 101, start)
+        .next_retry_at
+        .expect("retry time");
+    let future_at = backoff
+        .record_failure(future_key.clone(), 102, due_at)
+        .next_retry_at
+        .expect("retry time");
+    backoff.record_failure(other_mr_key.clone(), 103, start);
+    let deferred_until = due_at + Duration::hours(1);
+
+    let deferred = backoff.defer_due_for_mr("group/repo", 1, due_at, deferred_until);
+
+    assert_eq!(deferred, 1);
+    assert_eq!(
+        backoff
+            .state_for(&due_key)
+            .expect("due state")
+            .next_retry_at,
+        Some(deferred_until)
+    );
+    assert_eq!(
+        backoff
+            .state_for(&future_key)
+            .expect("future state")
+            .next_retry_at,
+        Some(future_at)
+    );
+    assert_eq!(
+        backoff
+            .state_for(&other_mr_key)
+            .expect("other state")
+            .next_retry_at,
+        Some(due_at)
+    );
 }
 
 #[tokio::test]

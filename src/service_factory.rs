@@ -12,6 +12,7 @@ use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use crate::http::HttpServices;
 use crate::review::ReviewService;
 use crate::state::ReviewStateStore;
+use crate::state::RunRetryStatusProvider;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeMode {
@@ -149,6 +150,7 @@ fn build_dev_runtime(
             run_once,
             Some(Arc::clone(&runner)),
         )
+        .with_retry_status_provider(Arc::clone(&service) as Arc<dyn RunRetryStatusProvider>)
         .with_runtime_mode("development"),
     );
     Ok(RuntimeServices {
@@ -225,6 +227,7 @@ async fn build_normal_runtime(
             run_once,
             Some(Arc::clone(&runner)),
         )
+        .with_retry_status_provider(Arc::clone(&service) as Arc<dyn RunRetryStatusProvider>)
         .with_runtime_mode("normal"),
     );
 

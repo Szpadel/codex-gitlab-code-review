@@ -75,14 +75,28 @@ impl ScanContext {
             (_, ReviewScheduleOutcome::Disabled) => {}
             (ReviewLane::General, ReviewScheduleOutcome::SkippedBackoff) => {
                 self.counters.skipped_backoff += 1;
+                *pending_same_mr_work = true;
                 debug!(repo = repo, iid = iid, "skip: review backoff active");
             }
             (ReviewLane::Security, ReviewScheduleOutcome::SkippedBackoff) => {
                 self.counters.security_skipped_backoff += 1;
+                *pending_same_mr_work = true;
                 debug!(
                     repo = repo,
                     iid = iid,
                     "skip: security review backoff active"
+                );
+            }
+            (ReviewLane::General, ReviewScheduleOutcome::SkippedRetryExhausted) => {
+                self.counters.skipped_completed += 1;
+                debug!(repo = repo, iid = iid, "skip: review retry exhausted");
+            }
+            (ReviewLane::Security, ReviewScheduleOutcome::SkippedRetryExhausted) => {
+                self.counters.security_skipped_completed += 1;
+                debug!(
+                    repo = repo,
+                    iid = iid,
+                    "skip: security review retry exhausted"
                 );
             }
             (ReviewLane::General, ReviewScheduleOutcome::SkippedRateLimit) => {
@@ -253,14 +267,16 @@ impl ScanContext {
 struct ScanPipeline<'a> {
     service: &'a ReviewService,
     mode: ScanMode,
+    await_tasks: bool,
     context: ScanContext,
 }
 
 impl<'a> ScanPipeline<'a> {
-    fn new(service: &'a ReviewService, mode: ScanMode) -> Self {
+    fn new(service: &'a ReviewService, mode: ScanMode, await_tasks: bool) -> Self {
         Self {
             service,
             mode,
+            await_tasks,
             context: ScanContext::default(),
         }
     }
@@ -288,7 +304,7 @@ impl<'a> ScanPipeline<'a> {
             }
             self.scan_repo(repo).await?;
         }
-        if matches!(self.mode, ScanMode::Full) {
+        if self.await_tasks {
             let _ = join_all(std::mem::take(&mut self.context.tasks)).await;
         }
         self.context.log_completion(self.mode);
@@ -312,7 +328,11 @@ impl<'a> ScanPipeline<'a> {
                 .mention_quota_pending
                 .repo_has_due_mention_quota_pending(repo, now_ts)
                 .await?;
-        let due_pending_work = due_pending_review || due_pending_mention;
+        let due_review_backoff = matches!(self.mode, ScanMode::Incremental)
+            && self
+                .service
+                .repo_has_due_review_backoff_retry(repo, Utc::now());
+        let due_pending_work = due_pending_review || due_pending_mention || due_review_backoff;
         if matches!(self.mode, ScanMode::Incremental)
             && let Some(marker) = activity_marker.as_ref()
         {
@@ -396,6 +416,9 @@ impl<'a> ScanPipeline<'a> {
         info!(repo = repo, count = mrs.len(), "loaded open MRs");
         let open_iids = mrs.iter().map(|mr| mr.iid).collect::<Vec<_>>();
         self.service
+            .clear_review_backoff_retries_for_closed_mrs(repo, &open_iids)
+            .await;
+        self.service
             .remove_rate_limit_awards_for_closed_pending_mrs(repo, &open_iids)
             .await?;
         self.service
@@ -414,9 +437,15 @@ impl<'a> ScanPipeline<'a> {
                 value
             } else {
                 self.context.counters.missing_sha += 1;
+                self.service
+                    .clear_review_backoff_retries_for_mr(repo, mr.iid)
+                    .await;
                 warn!(repo = repo, iid = mr.iid, "missing head sha, skipping");
                 continue;
             };
+            self.service
+                .clear_stale_review_backoff_retries_for_mr(repo, mr.iid, &head_sha)
+                .await;
             let mention_outcome = self
                 .service
                 .schedule_mention_commands_for_mr(repo, &mr, &head_sha, &mut self.context.tasks)
@@ -426,6 +455,8 @@ impl<'a> ScanPipeline<'a> {
                 pending_same_mr_work = true;
             }
             if mention_outcome.blocks_review {
+                self.service
+                    .defer_due_review_backoff_retries_for_mr(repo, mr.iid);
                 debug!(
                     repo = repo,
                     iid = mr.iid,
@@ -435,6 +466,9 @@ impl<'a> ScanPipeline<'a> {
             }
             if mr.draft {
                 self.context.counters.skipped_draft += 1;
+                self.service
+                    .clear_review_backoff_retries_for_mr(repo, mr.iid)
+                    .await;
                 debug!(repo = repo, iid = mr.iid, "skip: draft MR");
                 continue;
             }
@@ -442,11 +476,17 @@ impl<'a> ScanPipeline<'a> {
                 value
             } else {
                 self.context.counters.skipped_created_before += 1;
+                self.service
+                    .clear_review_backoff_retries_for_mr(repo, mr.iid)
+                    .await;
                 warn!(repo = repo, iid = mr.iid, "missing created_at, skipping");
                 continue;
             };
             if created_at <= &self.service.created_after {
                 self.context.counters.skipped_created_before += 1;
+                self.service
+                    .clear_review_backoff_retries_for_mr(repo, mr.iid)
+                    .await;
                 debug!(
                     repo = repo,
                     iid = mr.iid,
@@ -498,7 +538,22 @@ pub(super) async fn run_scan_pipeline(
     service: &ReviewService,
     mode: ScanMode,
 ) -> Result<ScanRunStatus> {
-    ScanPipeline::new(service, mode).run().await
+    let await_tasks = matches!(mode, ScanMode::Full);
+    ScanPipeline::new(service, mode, await_tasks).run().await
+}
+
+pub(super) async fn run_review_backoff_retry_pipeline(
+    service: &ReviewService,
+) -> Result<ScanRunStatus> {
+    run_incremental_scan_pipeline_waiting_for_tasks(service).await
+}
+
+pub(super) async fn run_incremental_scan_pipeline_waiting_for_tasks(
+    service: &ReviewService,
+) -> Result<ScanRunStatus> {
+    ScanPipeline::new(service, ScanMode::Incremental, true)
+        .run()
+        .await
 }
 
 pub(super) async fn run_pending_rate_limit_pipeline(

@@ -23,6 +23,7 @@ use crate::state::{ScanMode, ScanOutcome};
 enum ScheduledWakeReason {
     Cron,
     PendingRateLimit,
+    ReviewBackoff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,8 +288,13 @@ async fn run_schedule_loop(
                 None
             }
         };
-        let scheduled_wake =
-            select_next_wake(now.with_timezone(&Utc), next_cron_at, next_pending_retry_at);
+        let next_review_backoff_at = service.next_review_backoff_retry_at();
+        let scheduled_wake = select_next_wake(
+            now.with_timezone(&Utc),
+            next_cron_at,
+            next_pending_retry_at,
+            next_review_backoff_at,
+        );
         if let Err(err) = admin_service
             .set_next_scan_at(Some(scheduled_wake.at))
             .await
@@ -330,7 +336,7 @@ async fn run_schedule_loop(
                 run_tracked_scan(
                     admin_service,
                     ScanMode::Incremental,
-                    service.scan_once_incremental(),
+                    service.scan_once_incremental_waiting_for_tasks(),
                 )
                 .await
             }
@@ -339,6 +345,14 @@ async fn run_schedule_loop(
                     admin_service,
                     ScanMode::Incremental,
                     service.process_due_pending_rate_limit_reviews(),
+                )
+                .await
+            }
+            ScheduledWakeReason::ReviewBackoff => {
+                run_tracked_scan(
+                    admin_service,
+                    ScanMode::Incremental,
+                    service.process_due_review_backoff_retries(),
                 )
                 .await
             }
@@ -361,6 +375,7 @@ fn select_next_wake(
     now: DateTime<Utc>,
     next_cron_at: DateTime<Utc>,
     next_pending_retry_at: Option<DateTime<Utc>>,
+    next_review_backoff_at: Option<DateTime<Utc>>,
 ) -> ScheduledWake {
     if next_cron_at <= now {
         return ScheduledWake {
@@ -369,16 +384,27 @@ fn select_next_wake(
         };
     }
 
-    match next_pending_retry_at {
-        Some(next_pending_retry_at) if next_pending_retry_at < next_cron_at => ScheduledWake {
+    let mut wake = ScheduledWake {
+        at: next_cron_at,
+        reason: ScheduledWakeReason::Cron,
+    };
+    if let Some(next_pending_retry_at) = next_pending_retry_at
+        && next_pending_retry_at < wake.at
+    {
+        wake = ScheduledWake {
             at: next_pending_retry_at,
             reason: ScheduledWakeReason::PendingRateLimit,
-        },
-        _ => ScheduledWake {
-            at: next_cron_at,
-            reason: ScheduledWakeReason::Cron,
-        },
+        };
     }
+    if let Some(next_review_backoff_at) = next_review_backoff_at
+        && next_review_backoff_at < wake.at
+    {
+        wake = ScheduledWake {
+            at: next_review_backoff_at,
+            reason: ScheduledWakeReason::ReviewBackoff,
+        };
+    }
+    wake
 }
 
 pub(crate) async fn run_tracked_scan<F>(
@@ -648,7 +674,7 @@ mod tests {
         let cron_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 30, 0).unwrap();
         let pending_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 20, 0).unwrap();
 
-        let wake = select_next_wake(now, cron_at, Some(pending_at));
+        let wake = select_next_wake(now, cron_at, Some(pending_at), None);
 
         assert_eq!(wake.at, pending_at);
         assert_eq!(wake.reason, ScheduledWakeReason::PendingRateLimit);
@@ -662,7 +688,7 @@ mod tests {
         let cron_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 30, 0).unwrap();
         let pending_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 40, 0).unwrap();
 
-        let wake = select_next_wake(now, cron_at, Some(pending_at));
+        let wake = select_next_wake(now, cron_at, Some(pending_at), None);
 
         assert_eq!(wake.at, cron_at);
         assert_eq!(wake.reason, ScheduledWakeReason::Cron);
@@ -676,10 +702,24 @@ mod tests {
         let cron_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 30, 0).unwrap();
         let pending_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 20, 0).unwrap();
 
-        let wake = select_next_wake(now, cron_at, Some(pending_at));
+        let wake = select_next_wake(now, cron_at, Some(pending_at), None);
 
         assert_eq!(wake.at, cron_at);
         assert_eq!(wake.reason, ScheduledWakeReason::Cron);
+    }
+
+    #[test]
+    fn select_next_wake_prefers_review_backoff_before_cron() {
+        use chrono::TimeZone;
+
+        let now = Utc.with_ymd_and_hms(2026, 3, 25, 12, 0, 0).unwrap();
+        let cron_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 30, 0).unwrap();
+        let review_backoff_at = Utc.with_ymd_and_hms(2026, 3, 25, 12, 15, 0).unwrap();
+
+        let wake = select_next_wake(now, cron_at, None, Some(review_backoff_at));
+
+        assert_eq!(wake.at, review_backoff_at);
+        assert_eq!(wake.reason, ScheduledWakeReason::ReviewBackoff);
     }
 
     fn test_config() -> Config {

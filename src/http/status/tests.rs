@@ -16,13 +16,95 @@ use crate::review::ReviewLane;
 use crate::state::{
     NewRunHistory, ReviewRateLimitBucketMode, ReviewRateLimitRuleUpsert, ReviewRateLimitScope,
     ReviewRateLimitTarget, ReviewRateLimitTargetKind, ReviewStateStore, RunHistoryEventRecord,
-    RunHistoryKind, RunHistoryRecord, RunHistorySessionUpdate, SecurityReviewContextCacheEntry,
-    TranscriptBackfillState,
+    RunHistoryFinish, RunHistoryKind, RunHistoryRecord, RunHistorySessionUpdate, RunRetryStatus,
+    RunRetryStatusProvider, SecurityReviewContextCacheEntry, TranscriptBackfillState,
 };
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+struct StaticRetryStatusProvider {
+    statuses: HashMap<i64, RunRetryStatus>,
+}
+
+impl RunRetryStatusProvider for StaticRetryStatusProvider {
+    fn retry_statuses_for_run_ids(&self, run_ids: &[i64]) -> HashMap<i64, RunRetryStatus> {
+        run_ids
+            .iter()
+            .filter_map(|run_id| {
+                self.statuses
+                    .get(run_id)
+                    .cloned()
+                    .map(|status| (*run_id, status))
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn history_snapshot_includes_in_memory_retry_status() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let run_id = state
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 7,
+            head_sha: "abc123".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    state
+        .run_history
+        .finish_run_history(
+            run_id,
+            RunHistoryFinish {
+                result: "error".to_string(),
+                preview: Some("Review group/repo !7".to_string()),
+                error: Some("runner failed".to_string()),
+                ..RunHistoryFinish::default()
+            },
+        )
+        .await?;
+    let services = HttpServices::new(test_config(), state, false, None).with_retry_status_provider(
+        Arc::new(StaticRetryStatusProvider {
+            statuses: HashMap::from([(
+                run_id,
+                RunRetryStatus {
+                    retry_number: 1,
+                    max_retries: 5,
+                    next_retry_at: Some(900),
+                    exhausted: false,
+                    label: "retry 1/5 in 15m".to_string(),
+                },
+            )]),
+        }),
+    );
+
+    let snapshot = services
+        .status
+        .history_snapshot(super::HistoryQuery {
+            limit: 100,
+            ..super::HistoryQuery::default()
+        })
+        .await?;
+
+    assert_eq!(snapshot.runs[0].id, run_id);
+    assert_eq!(
+        snapshot.runs[0]
+            .retry
+            .as_ref()
+            .map(|retry| retry.label.as_str()),
+        Some("retry 1/5 in 15m")
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn review_rate_limit_snapshot_includes_rules_buckets_and_pending() -> Result<()> {
@@ -1576,6 +1658,7 @@ fn sample_run_history_record(updated_at: i64) -> RunHistoryRecord {
         events_persisted_cleanly: false,
         transcript_backfill_state: TranscriptBackfillState::Failed,
         transcript_backfill_error: Some("matching Codex session history was not found".to_string()),
+        retry: None,
     }
 }
 

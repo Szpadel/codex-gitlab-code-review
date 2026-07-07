@@ -6,10 +6,12 @@ use super::{
 };
 use crate::config::Config;
 use crate::state::{
-    ReviewStateStore, RunHistoryCursor, RunHistoryKind, RunHistoryListQuery, RunHistoryRecord,
+    ReviewStateStore, RunHistoryCursor, RunHistoryKind, RunHistoryListItem, RunHistoryListQuery,
+    RunHistoryRecord, RunRetryStatusProvider,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -19,6 +21,7 @@ pub struct StatusService {
     admin: Arc<AdminService>,
     ratelimit: Arc<RateLimitService>,
     backfill: Arc<BackfillService>,
+    retry_status_provider: Option<Arc<dyn RunRetryStatusProvider>>,
 }
 
 #[derive(Clone)]
@@ -48,6 +51,7 @@ impl StatusService {
         admin: Arc<AdminService>,
         ratelimit: Arc<RateLimitService>,
         backfill: Arc<BackfillService>,
+        retry_status_provider: Option<Arc<dyn RunRetryStatusProvider>>,
     ) -> Self {
         Self {
             config: StatusConfig {
@@ -75,6 +79,7 @@ impl StatusService {
             admin,
             ratelimit,
             backfill,
+            retry_status_provider,
         }
     }
 
@@ -164,6 +169,8 @@ impl StatusService {
         let page = self.state.run_history.list_run_history(&list_query).await?;
         let mut filters = query;
         filters.limit = limit;
+        let mut runs = page.runs;
+        self.apply_retry_statuses_to_list_items(&mut runs);
         Ok(HistorySnapshot {
             generated_at: Utc::now().to_rfc3339(),
             filters,
@@ -172,7 +179,7 @@ impl StatusService {
             has_next: page.has_next,
             previous_cursor: page.previous_cursor.map(RunHistoryCursor::encode),
             next_cursor: page.next_cursor.map(RunHistoryCursor::encode),
-            runs: page.runs,
+            runs,
         })
     }
 
@@ -180,11 +187,12 @@ impl StatusService {
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn mr_history_snapshot(&self, repo: &str, iid: u64) -> Result<MrHistorySnapshot> {
-        let runs = self
+        let mut runs = self
             .state
             .run_history
             .list_run_history_for_mr(repo, iid)
             .await?;
+        self.apply_retry_statuses_to_records(&mut runs);
         Ok(MrHistorySnapshot {
             generated_at: Utc::now().to_rfc3339(),
             repo: repo.to_string(),
@@ -197,14 +205,16 @@ impl StatusService {
     ///
     /// Returns an error if the underlying operation fails.
     pub async fn run_detail_snapshot(&self, run_id: i64) -> Result<Option<RunDetailSnapshot>> {
-        let Some(run) = self.state.run_history.get_run_history(run_id).await? else {
+        let Some(mut run) = self.state.run_history.get_run_history(run_id).await? else {
             return Ok(None);
         };
-        let related_runs = self
+        let mut related_runs = self
             .state
             .run_history
             .list_run_history_for_mr(&run.repo, run.iid)
             .await?;
+        self.apply_retry_statuses_to_records(&mut related_runs);
+        self.apply_retry_statuses_to_records(std::slice::from_mut(&mut run));
         let security_context_preview = self.resolve_security_context_preview(&run).await?;
         let events = self
             .state
@@ -224,6 +234,32 @@ impl StatusService {
             thread,
             transcript_backfill,
         }))
+    }
+
+    fn apply_retry_statuses_to_list_items(&self, runs: &mut [RunHistoryListItem]) {
+        let run_ids = runs.iter().map(|run| run.id).collect::<Vec<_>>();
+        let statuses = self.retry_statuses_for_run_ids(&run_ids);
+        for run in runs {
+            run.retry = statuses.get(&run.id).cloned();
+        }
+    }
+
+    fn apply_retry_statuses_to_records(&self, runs: &mut [RunHistoryRecord]) {
+        let run_ids = runs.iter().map(|run| run.id).collect::<Vec<_>>();
+        let statuses = self.retry_statuses_for_run_ids(&run_ids);
+        for run in runs {
+            run.retry = statuses.get(&run.id).cloned();
+        }
+    }
+
+    fn retry_statuses_for_run_ids(
+        &self,
+        run_ids: &[i64],
+    ) -> HashMap<i64, crate::state::RunRetryStatus> {
+        self.retry_status_provider
+            .as_ref()
+            .map(|provider| provider.retry_statuses_for_run_ids(run_ids))
+            .unwrap_or_default()
     }
 
     async fn resolve_security_context_preview(
