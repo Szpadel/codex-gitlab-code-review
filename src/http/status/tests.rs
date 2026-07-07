@@ -12,12 +12,12 @@ use super::{
     turn_ids_from_new_events,
 };
 use crate::config::{Config, FeatureFlagSnapshot, test_builder::ConfigBuilder};
-use crate::review::ReviewLane;
+use crate::review::{ReviewLane, RunRetryStatus, RunRetryStatusProvider};
 use crate::state::{
     NewRunHistory, ReviewRateLimitBucketMode, ReviewRateLimitRuleUpsert, ReviewRateLimitScope,
     ReviewRateLimitTarget, ReviewRateLimitTargetKind, ReviewStateStore, RunHistoryEventRecord,
-    RunHistoryFinish, RunHistoryKind, RunHistoryRecord, RunHistorySessionUpdate, RunRetryStatus,
-    RunRetryStatusProvider, SecurityReviewContextCacheEntry, TranscriptBackfillState,
+    RunHistoryFinish, RunHistoryKind, RunHistoryRecord, RunHistorySessionUpdate,
+    SecurityReviewContextCacheEntry, TranscriptBackfillState,
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -1658,7 +1658,6 @@ fn sample_run_history_record(updated_at: i64) -> RunHistoryRecord {
         events_persisted_cleanly: false,
         transcript_backfill_state: TranscriptBackfillState::Failed,
         transcript_backfill_error: Some("matching Codex session history was not found".to_string()),
-        retry: None,
     }
 }
 

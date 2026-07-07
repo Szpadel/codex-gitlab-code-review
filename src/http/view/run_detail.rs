@@ -1,13 +1,15 @@
 use super::super::markdown::render_safe_markdown;
 use super::super::status::{
-    RunDetailSnapshot, SecurityContextPreview, ThreadSnapshot, TranscriptBackfillSnapshot,
+    HistoryRunRecord, RunDetailSnapshot, SecurityContextPreview, ThreadSnapshot,
+    TranscriptBackfillSnapshot,
 };
 use super::super::transcript::render_thread_stream;
 use super::html::{
     NavItem, bool_label, escape_html, pretty_print_json, render_definition_list,
     render_optional_unix_timestamp, render_shell, render_unix_timestamp, run_kind_label,
 };
-use crate::state::{RunHistoryKind, RunHistoryRecord, RunRetryStatus};
+use crate::review::RunRetryStatus;
+use crate::state::{RunHistoryKind, RunHistoryRecord};
 
 pub(in crate::http) fn render_run_detail_page(
     snapshot: &RunDetailSnapshot,
@@ -48,7 +50,7 @@ pub(in crate::http) fn render_run_detail_page(
     )
 }
 
-fn render_run_metadata(run: &RunHistoryRecord) -> String {
+fn render_run_metadata(run: &HistoryRunRecord) -> String {
     let mut items = vec![
         ("Kind".to_string(), escape_html(run_kind_label(run.kind))),
         ("Repo".to_string(), escape_html(&run.repo)),
@@ -140,7 +142,7 @@ fn render_run_feature_flags(run: &RunHistoryRecord) -> String {
     flags.join(", ")
 }
 
-fn render_failure_details_card(run: &RunHistoryRecord) -> String {
+fn render_failure_details_card(run: &HistoryRunRecord) -> String {
     if run.result.as_deref() != Some("error") {
         return String::new();
     }
@@ -156,7 +158,7 @@ fn render_failure_details_card(run: &RunHistoryRecord) -> String {
     )
 }
 
-fn render_related_runs(runs: &[RunHistoryRecord], current_id: i64) -> String {
+fn render_related_runs(runs: &[HistoryRunRecord], current_id: i64) -> String {
     let filtered = runs
         .iter()
         .filter(|run| run.id != current_id)
@@ -177,7 +179,7 @@ fn render_related_runs(runs: &[RunHistoryRecord], current_id: i64) -> String {
     }
 }
 
-fn render_trigger_card(run: &RunHistoryRecord, gitlab_base_url: &str) -> String {
+fn render_trigger_card(run: &HistoryRunRecord, gitlab_base_url: &str) -> String {
     if run.kind != RunHistoryKind::Mention {
         return String::new();
     }
@@ -360,47 +362,49 @@ fn thread_status_class(status: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::FeatureFlagSnapshot;
-    use crate::http::status::{RunDetailSnapshot, SecurityContextPreview};
+    use crate::http::status::{HistoryRunRecord, RunDetailSnapshot, SecurityContextPreview};
     use crate::state::{RunHistoryKind, RunHistoryRecord, TranscriptBackfillState};
 
-    fn sample_run(kind: RunHistoryKind) -> RunHistoryRecord {
-        RunHistoryRecord {
-            id: 7,
-            kind,
-            repo: "group/repo".to_string(),
-            iid: 11,
-            head_sha: "abc123".to_string(),
-            status: "done".to_string(),
-            result: Some("pass".to_string()),
-            started_at: 0,
-            finished_at: Some(0),
-            updated_at: 0,
-            thread_id: Some("thread-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
-            review_thread_id: None,
-            security_context_source_run_id: None,
-            security_context_base_branch: None,
-            security_context_base_head_sha: None,
-            security_context_prompt_version: None,
-            security_context_payload_json: None,
-            security_context_generated_at: None,
-            security_context_expires_at: None,
-            preview: Some("Preview".to_string()),
-            summary: Some("Summary".to_string()),
-            error: None,
-            auth_account_name: Some("primary".to_string()),
-            discussion_id: None,
-            trigger_note_id: None,
-            trigger_note_author_name: None,
-            trigger_note_body: None,
-            command_repo: None,
-            commit_sha: None,
-            feature_flags: FeatureFlagSnapshot::default(),
-            events_persisted_cleanly: true,
-            transcript_backfill_state: TranscriptBackfillState::Complete,
-            transcript_backfill_error: None,
-            retry: None,
-        }
+    fn sample_run(kind: RunHistoryKind) -> HistoryRunRecord {
+        HistoryRunRecord::new(
+            RunHistoryRecord {
+                id: 7,
+                kind,
+                repo: "group/repo".to_string(),
+                iid: 11,
+                head_sha: "abc123".to_string(),
+                status: "done".to_string(),
+                result: Some("pass".to_string()),
+                started_at: 0,
+                finished_at: Some(0),
+                updated_at: 0,
+                thread_id: Some("thread-1".to_string()),
+                turn_id: Some("turn-1".to_string()),
+                review_thread_id: None,
+                security_context_source_run_id: None,
+                security_context_base_branch: None,
+                security_context_base_head_sha: None,
+                security_context_prompt_version: None,
+                security_context_payload_json: None,
+                security_context_generated_at: None,
+                security_context_expires_at: None,
+                preview: Some("Preview".to_string()),
+                summary: Some("Summary".to_string()),
+                error: None,
+                auth_account_name: Some("primary".to_string()),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+                commit_sha: None,
+                feature_flags: FeatureFlagSnapshot::default(),
+                events_persisted_cleanly: true,
+                transcript_backfill_state: TranscriptBackfillState::Complete,
+                transcript_backfill_error: None,
+            },
+            None,
+        )
     }
 
     #[test]

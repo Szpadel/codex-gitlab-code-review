@@ -1,4 +1,5 @@
 use crate::codex_runner::CodexUsageSnapshot;
+use crate::review::RunRetryStatus;
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
     ProjectCatalogSummary, ReviewRateLimitBucketSnapshot, ReviewRateLimitPendingEntry,
@@ -6,6 +7,7 @@ use crate::state::{
     ScanOutcome, ScanState, TranscriptBackfillState,
 };
 use serde::Serialize;
+use std::ops::{Deref, DerefMut};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct StatusSnapshot {
@@ -103,7 +105,7 @@ pub struct HistorySnapshot {
     pub has_next: bool,
     pub previous_cursor: Option<String>,
     pub next_cursor: Option<String>,
-    pub runs: Vec<RunHistoryListItem>,
+    pub runs: Vec<HistoryRunListItem>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -111,17 +113,75 @@ pub struct MrHistorySnapshot {
     pub generated_at: String,
     pub repo: String,
     pub iid: u64,
-    pub runs: Vec<RunHistoryRecord>,
+    pub runs: Vec<HistoryRunRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RunDetailSnapshot {
     pub generated_at: String,
-    pub run: RunHistoryRecord,
-    pub related_runs: Vec<RunHistoryRecord>,
+    pub run: HistoryRunRecord,
+    pub related_runs: Vec<HistoryRunRecord>,
     pub security_context_preview: Option<SecurityContextPreview>,
     pub thread: Option<super::ThreadSnapshot>,
     pub transcript_backfill: Option<TranscriptBackfillSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HistoryRunListItem {
+    #[serde(flatten)]
+    run: RunHistoryListItem,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RunRetryStatus>,
+}
+
+impl HistoryRunListItem {
+    #[must_use]
+    pub fn new(run: RunHistoryListItem, retry: Option<RunRetryStatus>) -> Self {
+        Self { run, retry }
+    }
+}
+
+impl Deref for HistoryRunListItem {
+    type Target = RunHistoryListItem;
+
+    fn deref(&self) -> &Self::Target {
+        &self.run
+    }
+}
+
+impl DerefMut for HistoryRunListItem {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.run
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HistoryRunRecord {
+    #[serde(flatten)]
+    run: RunHistoryRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RunRetryStatus>,
+}
+
+impl HistoryRunRecord {
+    #[must_use]
+    pub fn new(run: RunHistoryRecord, retry: Option<RunRetryStatus>) -> Self {
+        Self { run, retry }
+    }
+}
+
+impl Deref for HistoryRunRecord {
+    type Target = RunHistoryRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.run
+    }
+}
+
+impl DerefMut for HistoryRunRecord {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.run
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

@@ -197,11 +197,7 @@ async fn draft_mr_clears_retry_warning_award() -> Result<()> {
 
     service.scan_once().await?;
 
-    assert!(
-        !service
-            .general_review_flow
-            .has_active_retry_for_mr("group/repo", 6)
-    );
+    assert!(!service.has_active_review_backoff_retry_for_mr("group/repo", 6));
     let calls = gitlab.calls.lock().unwrap();
     assert!(calls.contains(&"delete_award:group/repo:6:88".to_string()));
     Ok(())
@@ -227,7 +223,7 @@ async fn completed_award_clears_due_retry_warning_award() -> Result<()> {
 
     service.scan_once().await?;
     let now = Utc::now();
-    service.general_review_flow.defer_due_retries_for_mr(
+    service.defer_review_backoff_retries_for_mr(
         "group/repo",
         6,
         now + Duration::hours(1),
@@ -251,11 +247,7 @@ async fn completed_award_clears_due_retry_warning_award() -> Result<()> {
 
     service.scan_once().await?;
 
-    assert!(
-        !service
-            .general_review_flow
-            .has_active_retry_for_mr("group/repo", 6)
-    );
+    assert!(!service.has_active_review_backoff_retry_for_mr("group/repo", 6));
     let calls = gitlab.calls.lock().unwrap();
     assert!(calls.contains(&"delete_award:group/repo:6:88".to_string()));
     assert!(!calls.contains(&"delete_award:group/repo:6:89".to_string()));

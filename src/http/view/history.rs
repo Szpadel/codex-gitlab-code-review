@@ -1,9 +1,12 @@
-use super::super::status::{HistoryQuery, HistorySnapshot, MrHistorySnapshot};
+use super::super::status::{
+    HistoryQuery, HistoryRunListItem, HistoryRunRecord, HistorySnapshot, MrHistorySnapshot,
+};
 use super::html::{
     NavItem, escape_html, mr_history_href, render_shell, render_table_section,
     render_unix_timestamp, run_kind_label,
 };
-use crate::state::{RunHistoryKind, RunHistoryListItem, RunHistoryRecord, RunRetryStatus};
+use crate::review::RunRetryStatus;
+use crate::state::RunHistoryKind;
 use urlencoding::encode;
 
 pub(in crate::http) fn render_history_page(
@@ -155,7 +158,7 @@ fn render_kind_options(selected: Option<RunHistoryKind>) -> String {
         .collect::<String>()
 }
 
-fn render_history_run_table(title: &str, runs: &[RunHistoryListItem]) -> String {
+fn render_history_run_table(title: &str, runs: &[HistoryRunListItem]) -> String {
     render_table_section(
         title,
         if runs.is_empty() {
@@ -169,7 +172,7 @@ fn render_history_run_table(title: &str, runs: &[RunHistoryListItem]) -> String 
     )
 }
 
-fn render_history_run_row(run: &RunHistoryListItem) -> String {
+fn render_history_run_row(run: &HistoryRunListItem) -> String {
     format!(
         "<tr>\
          <td><span class=\"badge badge-{}\">{}</span></td>\
@@ -200,7 +203,7 @@ fn render_history_run_row(run: &RunHistoryListItem) -> String {
     )
 }
 
-fn render_record_run_table(title: &str, runs: &[RunHistoryRecord]) -> String {
+fn render_record_run_table(title: &str, runs: &[HistoryRunRecord]) -> String {
     render_table_section(
         title,
         if runs.is_empty() {
@@ -214,7 +217,7 @@ fn render_record_run_table(title: &str, runs: &[RunHistoryRecord]) -> String {
     )
 }
 
-fn render_record_run_row(run: &RunHistoryRecord) -> String {
+fn render_record_run_row(run: &HistoryRunRecord) -> String {
     format!(
         "<tr>\
          <td><span class=\"badge badge-{}\">{}</span></td>\
@@ -290,7 +293,7 @@ fn compact_text_excerpt(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::RunRetryStatus;
+    use crate::state::RunHistoryListItem;
 
     #[test]
     fn history_result_column_includes_retry_label_for_error_run() {
@@ -302,25 +305,27 @@ mod tests {
             has_next: false,
             previous_cursor: None,
             next_cursor: None,
-            runs: vec![RunHistoryListItem {
-                id: 7,
-                kind: RunHistoryKind::Review,
-                repo: "group/repo".to_string(),
-                iid: 11,
-                status: "done".to_string(),
-                result: Some("error".to_string()),
-                started_at: 0,
-                preview: Some("Review group/repo !11".to_string()),
-                summary: None,
-                error: Some("runner failed".to_string()),
-                retry: Some(RunRetryStatus {
+            runs: vec![HistoryRunListItem::new(
+                RunHistoryListItem {
+                    id: 7,
+                    kind: RunHistoryKind::Review,
+                    repo: "group/repo".to_string(),
+                    iid: 11,
+                    status: "done".to_string(),
+                    result: Some("error".to_string()),
+                    started_at: 0,
+                    preview: Some("Review group/repo !11".to_string()),
+                    summary: None,
+                    error: Some("runner failed".to_string()),
+                },
+                Some(RunRetryStatus {
                     retry_number: 1,
                     max_retries: 5,
                     next_retry_at: Some(900),
                     exhausted: false,
                     label: "retry 1/5 in 15m".to_string(),
                 }),
-            }],
+            )],
         };
 
         let html = render_history_page(&snapshot, None, false);

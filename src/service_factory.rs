@@ -10,9 +10,8 @@ use crate::gitlab::bot_user::resolve_and_update_bot_user_config;
 use crate::gitlab::{GitLabApi, GitLabClient};
 use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use crate::http::HttpServices;
-use crate::review::ReviewService;
+use crate::review::{ReviewService, RunRetryStatusProvider};
 use crate::state::ReviewStateStore;
-use crate::state::RunRetryStatusProvider;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeMode {

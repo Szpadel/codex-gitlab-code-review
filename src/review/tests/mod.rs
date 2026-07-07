@@ -7,7 +7,7 @@ use crate::config::TargetSelector;
 use crate::dev_mode::{DevToolsService, MockCodexRunner};
 use crate::flow::award_service::AwardService;
 use crate::flow::mention::{contains_mention, extract_parent_chain};
-use crate::flow::review::{RetryBackoff, RetryKey, ReviewRunContext};
+use crate::flow::review::ReviewRunContext;
 use crate::gitlab::{
     AwardEmoji, DiscussionNote, GitLabApi, GitLabUser, GitLabUserDetail, MergeRequest,
     MergeRequestDiff, MergeRequestDiffVersion, MergeRequestDiscussion, Note,
@@ -15,6 +15,7 @@ use crate::gitlab::{
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
 use crate::review::lane_policies::{GeneralLanePolicy, SecurityLanePolicy};
+use crate::review::retry::{RetryBackoff, RetryKey, RetryWarningAwardService};
 use crate::state::{ReviewRateLimitScope, ReviewStateStore};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};

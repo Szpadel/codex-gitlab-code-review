@@ -3,7 +3,6 @@ use crate::review::ReviewLane;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::fmt::Write as _;
 
 mod feature_flags_repository;
@@ -176,8 +175,6 @@ pub struct RunHistoryRecord {
     pub events_persisted_cleanly: bool,
     pub transcript_backfill_state: TranscriptBackfillState,
     pub transcript_backfill_error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry: Option<RunRetryStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -192,21 +189,6 @@ pub struct RunHistoryListItem {
     pub preview: Option<String>,
     pub summary: Option<String>,
     pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry: Option<RunRetryStatus>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RunRetryStatus {
-    pub retry_number: u32,
-    pub max_retries: u32,
-    pub next_retry_at: Option<i64>,
-    pub exhausted: bool,
-    pub label: String,
-}
-
-pub trait RunRetryStatusProvider: Send + Sync {
-    fn retry_statuses_for_run_ids(&self, run_ids: &[i64]) -> HashMap<i64, RunRetryStatus>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

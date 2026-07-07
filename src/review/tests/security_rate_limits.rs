@@ -101,11 +101,14 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
             crate::review::ReviewLane::Security,
         )
         .await?;
+    let award_service = AwardService::new(gitlab.clone(), 1);
+    let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
         lane: crate::review::ReviewLane::Security,
         config,
         gitlab: gitlab.clone(),
-        award_service: AwardService::new(gitlab.clone(), 1),
+        award_service,
+        retry_warning_awards,
         policy: Arc::new(SecurityLanePolicy),
         codex: runner.clone(),
         state: state.clone(),
@@ -205,11 +208,14 @@ async fn security_review_pass_stays_silent() -> Result<()> {
             crate::review::ReviewLane::Security,
         )
         .await?;
+    let award_service = AwardService::new(gitlab.clone(), 1);
+    let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
         lane: crate::review::ReviewLane::Security,
         config,
         gitlab: gitlab.clone(),
-        award_service: AwardService::new(gitlab.clone(), 1),
+        award_service,
+        retry_warning_awards,
         policy: Arc::new(SecurityLanePolicy),
         codex: runner.clone(),
         state: state.clone(),

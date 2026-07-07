@@ -571,11 +571,14 @@ async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes()
         lifecycle: Arc::clone(&lifecycle),
         calls: Mutex::new(0),
     });
+    let award_service = AwardService::new(gitlab.clone(), 1);
+    let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
         lane: crate::review::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
-        award_service: AwardService::new(gitlab.clone(), 1),
+        award_service,
+        retry_warning_awards,
         policy: Arc::new(GeneralLanePolicy),
         codex: runner.clone(),
         state: state.clone(),
@@ -665,11 +668,14 @@ async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_
         .review_state
         .begin_review("group/repo", 23, "sha23")
         .await?;
+    let award_service = AwardService::new(gitlab.clone(), 1);
+    let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
         lane: crate::review::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
-        award_service: AwardService::new(gitlab.clone(), 1),
+        award_service,
+        retry_warning_awards,
         policy: Arc::new(GeneralLanePolicy),
         codex: runner.clone(),
         state: state.clone(),
@@ -771,11 +777,14 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
         .review_state
         .begin_review("group/repo", 24, "sha24")
         .await?;
+    let award_service = AwardService::new(gitlab.clone(), 1);
+    let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
         lane: crate::review::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
-        award_service: AwardService::new(gitlab.clone(), 1),
+        award_service,
+        retry_warning_awards,
         policy: Arc::new(GeneralLanePolicy),
         codex: runner.clone(),
         state: state.clone(),
@@ -867,11 +876,14 @@ async fn review_finishes_successfully_when_graceful_drain_starts_after_runner_be
         lifecycle: Arc::clone(&lifecycle),
         calls: Mutex::new(0),
     });
+    let award_service = AwardService::new(gitlab.clone(), 1);
+    let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
         lane: crate::review::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
-        award_service: AwardService::new(gitlab.clone(), 1),
+        award_service,
+        retry_warning_awards,
         policy: Arc::new(GeneralLanePolicy),
         codex: runner.clone(),
         state: state.clone(),

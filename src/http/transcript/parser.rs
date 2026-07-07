@@ -601,7 +601,6 @@ mod tests {
             events_persisted_cleanly: false,
             transcript_backfill_state: TranscriptBackfillState::NotRequested,
             transcript_backfill_error: None,
-            retry: None,
         }
     }
 

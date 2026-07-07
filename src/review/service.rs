@@ -4,13 +4,14 @@ use crate::flow::ActiveTaskRegistry;
 use crate::flow::FlowShared;
 use crate::flow::award_service::AwardService;
 use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
-use crate::flow::review::{
-    REVIEW_RETRY_WARNING_EMOJI, RetryBackoff, ReviewFlow, ReviewScheduleOutcome,
-};
+use crate::flow::review::{ReviewFlow, ReviewScheduleOutcome};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
 use crate::review::lane_policies::{GeneralLanePolicy, SecurityLanePolicy};
+use crate::review::retry::{
+    RetryBackoff, RetryKey, RetryWarningAwardService, RunRetryStatus, RunRetryStatusProvider,
+};
 use crate::review::scan_coordinator::{DefaultScanCoordinator, ScanCoordinator};
 use crate::review::scan_pipeline::{
     run_incremental_scan_pipeline_waiting_for_tasks, run_pending_rate_limit_pipeline,
@@ -19,7 +20,7 @@ use crate::review::scan_pipeline::{
 use crate::review::target_resolver::{DefaultTargetResolver, TargetResolver};
 use crate::state::{
     MentionQuotaPendingEntry, MentionQuotaPendingUpsert, ReviewRateLimitPendingEntry,
-    ReviewStateStore, RunRetryStatus, RunRetryStatusProvider,
+    ReviewStateStore,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -64,6 +65,8 @@ pub struct ReviewService {
     mention_flow: Arc<MentionFlow>,
     lifecycle: Arc<ServiceLifecycle>,
     active_tasks: Arc<ActiveTaskRegistry>,
+    retry_backoff: Arc<RetryBackoff>,
+    retry_warning_awards: RetryWarningAwardService,
     scan_coordinator: Box<dyn ScanCoordinator>,
     target_resolver: Box<dyn TargetResolver>,
 }
@@ -86,6 +89,8 @@ impl ReviewService {
         let lifecycle = Arc::new(ServiceLifecycle::default());
         let active_tasks = Arc::new(ActiveTaskRegistry::default());
         let award_service = AwardService::new(Arc::clone(&gitlab), bot_user_id);
+        let retry_warning_awards =
+            RetryWarningAwardService::new(config.clone(), award_service.clone());
         let flow_shared = FlowShared {
             config: config.clone(),
             gitlab: Arc::clone(&gitlab),
@@ -106,7 +111,7 @@ impl ReviewService {
         ));
         let security_review_flow = Arc::new(ReviewFlow::new(
             flow_shared,
-            retry_backoff,
+            Arc::clone(&retry_backoff),
             ReviewLane::Security,
             Arc::new(SecurityLanePolicy),
         ));
@@ -134,6 +139,8 @@ impl ReviewService {
             mention_flow,
             lifecycle,
             active_tasks,
+            retry_backoff,
+            retry_warning_awards,
             scan_coordinator,
             target_resolver,
         }
@@ -171,11 +178,11 @@ impl ReviewService {
     }
 
     pub(crate) fn next_review_backoff_retry_at(&self) -> Option<DateTime<Utc>> {
-        self.general_review_flow.next_retry_at()
+        self.retry_backoff.earliest_retry_at()
     }
 
     pub(super) fn repo_has_due_review_backoff_retry(&self, repo: &str, now: DateTime<Utc>) -> bool {
-        self.general_review_flow.repo_has_due_retry(repo, now)
+        self.retry_backoff.repo_has_due_retry(repo, now)
     }
 
     /// # Errors
@@ -222,8 +229,8 @@ impl ReviewService {
         open_iids: &[u64],
     ) {
         let removed = self
-            .general_review_flow
-            .clear_closed_retries_for_repo(repo, open_iids);
+            .retry_backoff
+            .clear_for_repo_iids_not_in(repo, open_iids);
         self.remove_retry_warning_awards_for_removed_keys(removed)
             .await;
     }
@@ -234,19 +241,21 @@ impl ReviewService {
         iid: u64,
         head_sha: &str,
     ) {
-        let mut removed = self
-            .general_review_flow
-            .clear_stale_retries_for_mr(repo, iid, head_sha);
-        removed.extend(
-            self.security_review_flow
-                .clear_stale_retries_for_mr(repo, iid, head_sha),
-        );
+        let mut removed =
+            self.retry_backoff
+                .clear_for_mr_other_heads(ReviewLane::General, repo, iid, head_sha);
+        removed.extend(self.retry_backoff.clear_for_mr_other_heads(
+            ReviewLane::Security,
+            repo,
+            iid,
+            head_sha,
+        ));
         self.remove_retry_warning_awards_for_removed_keys(removed)
             .await;
     }
 
     pub(super) async fn clear_review_backoff_retries_for_mr(&self, repo: &str, iid: u64) {
-        let removed = self.general_review_flow.clear_retries_for_mr(repo, iid);
+        let removed = self.retry_backoff.clear_for_mr(repo, iid);
         self.remove_retry_warning_awards_for_removed_keys(removed)
             .await;
     }
@@ -254,9 +263,9 @@ impl ReviewService {
     pub(super) fn defer_due_review_backoff_retries_for_mr(&self, repo: &str, iid: u64) {
         let now = Utc::now();
         let next_retry_at = now + Duration::seconds(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
-        let deferred =
-            self.general_review_flow
-                .defer_due_retries_for_mr(repo, iid, now, next_retry_at);
+        let deferred = self
+            .retry_backoff
+            .defer_due_for_mr(repo, iid, now, next_retry_at);
         if deferred > 0 {
             debug!(
                 repo = repo,
@@ -268,37 +277,32 @@ impl ReviewService {
         }
     }
 
-    async fn remove_retry_warning_awards_for_removed_keys(
+    #[cfg(test)]
+    pub(super) fn defer_review_backoff_retries_for_mr(
         &self,
-        removed: Vec<crate::flow::review::RetryKey>,
-    ) {
+        repo: &str,
+        iid: u64,
+        now: DateTime<Utc>,
+        next_retry_at: DateTime<Utc>,
+    ) -> usize {
+        self.retry_backoff
+            .defer_due_for_mr(repo, iid, now, next_retry_at)
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_active_review_backoff_retry_for_mr(&self, repo: &str, iid: u64) -> bool {
+        self.retry_backoff.has_active_retry_for_mr(repo, iid)
+    }
+
+    async fn remove_retry_warning_awards_for_removed_keys(&self, removed: Vec<RetryKey>) {
         let mut removed_mrs = HashSet::new();
         for key in removed {
             removed_mrs.insert((key.repo, key.iid));
         }
         for (repo, iid) in removed_mrs {
-            if !self.general_review_flow.has_active_retry_for_mr(&repo, iid) {
-                self.remove_retry_warning_award_best_effort(&repo, iid)
-                    .await;
-            }
-        }
-    }
-
-    async fn remove_retry_warning_award_best_effort(&self, repo: &str, iid: u64) {
-        if self.config.review.dry_run {
-            return;
-        }
-        if let Err(err) = self
-            .award_service
-            .remove_award(repo, iid, REVIEW_RETRY_WARNING_EMOJI)
-            .await
-        {
-            warn!(
-                repo = repo,
-                iid = iid,
-                error = %err,
-                "failed to remove retry warning award after retry state cleared"
-            );
+            self.retry_warning_awards
+                .remove_if_no_active_retry(self.retry_backoff.as_ref(), &repo, iid)
+                .await;
         }
     }
 
@@ -909,7 +913,7 @@ impl ReviewService {
 
 impl RunRetryStatusProvider for ReviewService {
     fn retry_statuses_for_run_ids(&self, run_ids: &[i64]) -> HashMap<i64, RunRetryStatus> {
-        self.general_review_flow.retry_statuses_for_run_ids(run_ids)
+        self.retry_backoff.statuses_for_run_ids(run_ids, Utc::now())
     }
 }
 
