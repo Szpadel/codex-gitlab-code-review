@@ -174,7 +174,7 @@ config:
       mention: {}
     # Optional. Per-session overrides passed to Codex app-server.
     # Each session can set a model and/or reasoning effort independently.
-    # Supported reasoning effort values: low, medium, high, xhigh.
+    # Supported reasoning effort values: low, medium, high, xhigh, max.
     sessionOverrides:
       review:
         model: null

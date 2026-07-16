@@ -485,6 +485,29 @@ fn loads_session_overrides() {
 }
 
 #[test]
+fn loads_max_session_override_reasoning_effort() {
+    let yaml = base_config_yaml_with(
+        "",
+        r#"
+  session_overrides:
+    security_context:
+      reasoning_effort: "max"
+"#,
+        "",
+    );
+    let config = load_from_yaml(&yaml);
+    assert_eq!(
+        config
+            .codex
+            .session_overrides
+            .security_context
+            .reasoning_effort
+            .as_deref(),
+        Some("max")
+    );
+}
+
+#[test]
 fn loads_reasoning_summary_overrides() {
     let yaml = base_config_yaml_with(
         "",
@@ -918,7 +941,7 @@ fn errors_on_unsupported_session_override_reasoning_effort() {
     assert!(result.is_err());
     let msg = format!("{:#}", result.expect_err("error"));
     assert!(msg.contains(
-        "codex.session_overrides.mention.reasoning_effort must be one of: low, medium, high, xhigh"
+        "codex.session_overrides.mention.reasoning_effort must be one of: low, medium, high, xhigh, max"
     ));
 }
 

@@ -207,7 +207,7 @@ codex:
   #   codex -c model="<value>" app-server
   # reasoning_effort becomes:
   #   codex -c model_reasoning_effort="<value>" app-server
-  # Supported reasoning_effort values: low, medium, high, xhigh.
+  # Supported reasoning_effort values: low, medium, high, xhigh, max.
   session_overrides:
     review:
       model: "gpt-5.4"

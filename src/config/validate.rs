@@ -6,7 +6,7 @@ use std::env;
 use std::ops::Deref;
 use url::Url;
 
-const SUPPORTED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+const SUPPORTED_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const SUPPORTED_REASONING_SUMMARIES: &[&str] = &["none", "auto", "detailed"];
 const MIB_BYTES: u64 = 1024 * 1024;
 const MAX_WORK_TMPFS_SIZE_MIB: u64 = i64::MAX as u64 / MIB_BYTES;
