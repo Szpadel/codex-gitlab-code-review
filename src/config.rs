@@ -15,21 +15,21 @@ mod validate;
 use self::defaults::{
     default_browser_mcp_args, default_browser_mcp_command, default_browser_mcp_image,
     default_browser_mcp_remote_debugging_port, default_browser_mcp_server_name,
-    default_docker_host, default_gitlab_discovery_mcp_bind_addr,
-    default_gitlab_discovery_mcp_clone_root, default_gitlab_discovery_mcp_server_name,
-    default_reasoning_summary_override, default_refresh_seconds, default_review_quota_emoji,
-    default_review_rate_limit_emoji, default_security_context_session_override,
-    default_security_review_comment_marker_prefix, default_security_review_context_ttl_seconds,
-    default_security_review_finding_marker_prefix, default_security_review_min_confidence_score,
-    default_security_review_session_override, default_usage_limit_fallback_cooldown_seconds,
-    default_usage_limit_recheck_seconds,
+    default_deduplication_session_override, default_docker_host,
+    default_gitlab_discovery_mcp_bind_addr, default_gitlab_discovery_mcp_clone_root,
+    default_gitlab_discovery_mcp_server_name, default_reasoning_summary_override,
+    default_refresh_seconds, default_review_quota_emoji, default_review_rate_limit_emoji,
+    default_security_context_session_override, default_security_review_comment_marker_prefix,
+    default_security_review_context_ttl_seconds, default_security_review_finding_marker_prefix,
+    default_security_review_min_confidence_score, default_security_review_session_override,
+    default_usage_limit_fallback_cooldown_seconds, default_usage_limit_recheck_seconds,
 };
 pub use self::feature_flags::{
     FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
 };
 use self::load::{
-    deserialize_security_context_session_override, deserialize_security_review_session_override,
-    empty_string_as_none,
+    deserialize_deduplication_session_override, deserialize_security_context_session_override,
+    deserialize_security_review_session_override, empty_string_as_none,
 };
 
 #[cfg(test)]
@@ -319,6 +319,11 @@ pub struct SessionOverridesConfig {
         deserialize_with = "deserialize_security_review_session_override"
     )]
     pub security_review: SessionModeOverrideConfig,
+    #[serde(
+        default = "default_deduplication_session_override",
+        deserialize_with = "deserialize_deduplication_session_override"
+    )]
+    pub deduplication: SessionModeOverrideConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]

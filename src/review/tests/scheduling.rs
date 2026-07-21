@@ -1354,6 +1354,7 @@ async fn incremental_defers_same_mr_mentions_while_active_mention_blocks_review(
             ("group/repo".to_string(), 41),
             vec![MergeRequestDiscussion {
                 id: "discussion-41".to_string(),
+                individual_note: false,
                 notes: vec![
                     DiscussionNote {
                         id: 1040,
@@ -1519,6 +1520,7 @@ async fn incremental_defers_new_mentions_while_same_mr_review_is_in_progress() -
             ("group/repo".to_string(), 51),
             vec![MergeRequestDiscussion {
                 id: "discussion-51".to_string(),
+                individual_note: false,
                 notes: vec![
                     DiscussionNote {
                         id: 1050,

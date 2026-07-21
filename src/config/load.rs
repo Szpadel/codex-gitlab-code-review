@@ -1,5 +1,6 @@
 use super::defaults::{
-    default_security_context_session_override, default_security_review_session_override,
+    default_deduplication_session_override, default_security_context_session_override,
+    default_security_review_session_override,
 };
 use super::validate::{
     ValidatedConfig, gitlab_discovery_mcp_uses_cluster_service_advertise_url, validate_config,
@@ -147,5 +148,17 @@ where
     deserialize_session_override_with_default(
         deserializer,
         default_security_review_session_override(),
+    )
+}
+
+pub(crate) fn deserialize_deduplication_session_override<'de, D>(
+    deserializer: D,
+) -> std::result::Result<SessionModeOverrideConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_session_override_with_default(
+        deserializer,
+        default_deduplication_session_override(),
     )
 }

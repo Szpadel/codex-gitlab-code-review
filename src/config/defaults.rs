@@ -66,6 +66,13 @@ pub(super) fn default_security_review_session_override() -> SessionModeOverrideC
     }
 }
 
+pub(super) fn default_deduplication_session_override() -> SessionModeOverrideConfig {
+    SessionModeOverrideConfig {
+        model: default_optional_text("gpt-5.6-luna"),
+        reasoning_effort: default_optional_text("medium"),
+    }
+}
+
 fn default_security_context_reasoning_effort_override() -> Option<String> {
     default_optional_text("xhigh")
 }
@@ -143,6 +150,7 @@ impl Default for SessionOverridesConfig {
             mention: SessionModeOverrideConfig::default(),
             security_context: default_security_context_session_override(),
             security_review: default_security_review_session_override(),
+            deduplication: default_deduplication_session_override(),
         }
     }
 }

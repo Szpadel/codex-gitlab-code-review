@@ -132,6 +132,7 @@ async fn scan_runs_mention_command_for_draft_merge_request_without_reviewing_it(
             ("group/repo".to_string(), 53),
             vec![MergeRequestDiscussion {
                 id: "discussion-1".to_string(),
+                individual_note: false,
                 notes: vec![
                     DiscussionNote {
                         id: 920,

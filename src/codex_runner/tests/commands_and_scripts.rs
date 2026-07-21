@@ -1054,6 +1054,17 @@ fn security_review_session_override_uses_security_review_model_and_review_summar
 }
 
 #[test]
+fn deduplication_session_override_uses_dedicated_defaults_and_review_summary() {
+    let runner = test_runner_with_codex(test_codex_config());
+
+    let session_override = runner.deduplication_session_override();
+
+    assert_eq!(session_override.model, Some("gpt-5.6-luna"));
+    assert_eq!(session_override.reasoning_summary, Some("detailed"));
+    assert_eq!(session_override.reasoning_effort, Some("medium"));
+}
+
+#[test]
 fn thread_start_params_include_extra_workspace_write_roots() {
     let mut codex = test_codex_config();
     codex.exec_sandbox = "workspace-write".to_string();

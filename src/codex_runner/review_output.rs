@@ -99,6 +99,7 @@ pub(crate) fn parse_review_output_for_lane(
                 overall_confidence_score: None,
                 findings: Vec::new(),
                 body: parsed.comment_markdown,
+                omitted_duplicate_count: 0,
             })),
             other => Err(anyhow!("unknown verdict: {other}")),
         };
@@ -203,6 +204,7 @@ fn parse_structured_review_output(
         overall_confidence_score,
         findings,
         body,
+        omitted_duplicate_count: 0,
     }))
 }
 
@@ -248,6 +250,7 @@ fn parse_rendered_review_comment(text: &str) -> ReviewComment {
         overall_confidence_score: None,
         findings,
         body: text.to_string(),
+        omitted_duplicate_count: 0,
     }
 }
 

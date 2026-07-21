@@ -1,4 +1,208 @@
 use super::*;
+use crate::gitlab::{DiscussionNote, GitLabUser, MergeRequestDiscussion};
+use crate::review_deduplication::ReviewDiscussionSource;
+
+#[tokio::test]
+async fn review_deduplication_reuses_app_server_and_filters_original_findings() -> Result<()> {
+    const OLD_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    let review_output = json!({
+        "findings": [
+            {
+                "title": "Duplicate defect",
+                "body": "The same defect moved.",
+                "confidence_score": 0.95,
+                "priority": 1,
+                "code_location": {
+                    "absolute_file_path": "/work/repo/fork/source/src/lib.rs",
+                    "line_range": { "start": 10, "end": 10 }
+                }
+            },
+            {
+                "title": "New defect",
+                "body": "This one is new.",
+                "confidence_score": 0.9,
+                "priority": 2,
+                "code_location": {
+                    "absolute_file_path": "/work/repo/fork/source/src/new.rs",
+                    "line_range": { "start": 20, "end": 20 }
+                }
+            }
+        ],
+        "overall_explanation": null,
+        "overall_correctness": "patch is incorrect",
+        "overall_confidence_score": 0.95
+    })
+    .to_string();
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "review-thread" } })),
+        ScriptedAppRequest::result(
+            "review/start",
+            json!({ "turn": { "id": "review-turn" }, "reviewThreadId": "review-thread" }),
+        )
+        .with_after_response(vec![
+            ScriptedAppChunk::Json(json!({
+                "method": "turn/started",
+                "params": { "threadId": "review-thread", "turnId": "review-turn" }
+            })),
+            ScriptedAppChunk::Json(json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "review-thread",
+                    "turnId": "review-turn",
+                    "item": {
+                        "id": "review-item",
+                        "type": "exitedReviewMode",
+                        "review": review_output
+                    }
+                }
+            })),
+            ScriptedAppChunk::Json(json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "review-thread",
+                    "turnId": "review-turn",
+                    "turn": { "status": "completed" }
+                }
+            })),
+        ]),
+        ScriptedAppRequest::result("thread/start", json!({ "thread": { "id": "dedup-thread" } })),
+        ScriptedAppRequest::result("turn/start", json!({ "turn": { "id": "dedup-turn" } }))
+            .with_after_response(vec![
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/started",
+                    "params": { "threadId": "dedup-thread", "turnId": "dedup-turn" }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "dedup-thread",
+                        "turnId": "dedup-turn",
+                        "itemId": "dedup-item",
+                        "delta": "{\"duplicates\":[{\"finding_id\":\"finding-0\",\"discussion_id\":\"discussion-1\"}]}"
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "dedup-thread",
+                        "turnId": "dedup-turn",
+                        "item": { "id": "dedup-item", "type": "AgentMessage", "phase": "final" }
+                    }
+                })),
+                ScriptedAppChunk::Json(json!({
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "dedup-thread",
+                        "turnId": "dedup-turn",
+                        "turn": { "status": "completed" }
+                    }
+                })),
+            ]),
+    ]));
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "git fetch --no-tags --depth=1 \"$CODEX_REVIEW_FETCH_URL\" '{OLD_SHA}:refs/codex-review-history/{OLD_SHA}'"
+                ),
+            ],
+            cwd: Some("/work/repo/fork/source".to_string()),
+            env: Some(vec![
+                "CODEX_REVIEW_FETCH_URL=https://oauth2:token@gitlab.example.com/group/repo.git"
+                    .to_string(),
+            ]),
+        },
+        ContainerExecOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "historical commit unavailable".to_string(),
+        },
+    );
+
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
+    let run_history_id = runner
+        .state
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 11,
+            head_sha: "abc123".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    let marker = format!("<!-- codex-review-finding:sha={OLD_SHA} key=0123456789abcdef -->");
+    let mut ctx = review_context_with_target_branch(Some("main"));
+    ctx.run_history_id = Some(run_history_id);
+    ctx.project_path = "fork/source".to_string();
+    ctx.discussion_source = Some(Arc::new(ReviewDiscussionSource::from_discussions(
+        vec![MergeRequestDiscussion {
+            id: "discussion-1".to_string(),
+            individual_note: false,
+            notes: vec![DiscussionNote {
+                id: 1,
+                body: format!("Duplicate defect\n{marker}"),
+                author: GitLabUser {
+                    id: 7,
+                    username: None,
+                    name: None,
+                },
+                system: false,
+                in_reply_to_id: None,
+                created_at: None,
+            }],
+        }],
+        7,
+        "<!-- codex-review-finding:sha=".to_string(),
+        vec!["<!-- codex-review-finding:sha=".to_string()],
+    )));
+
+    let result = runner.run_review(ctx).await?;
+    let CodexResult::Comment(comment) = result else {
+        bail!("expected comment result");
+    };
+    assert_eq!(comment.omitted_duplicate_count, 1);
+    assert_eq!(comment.findings.len(), 1);
+    assert_eq!(comment.findings[0].title, "New defect");
+    assert_eq!(harness.app_server_starts().len(), 1);
+
+    let requests = harness.app_protocol_requests();
+    let thread_starts = requests
+        .iter()
+        .filter(|request| request["method"] == "thread/start")
+        .collect::<Vec<_>>();
+    assert_eq!(thread_starts.len(), 2);
+    let dedup_params = &thread_starts[1]["params"];
+    assert_eq!(dedup_params["model"], "gpt-5.6-luna");
+    assert_eq!(dedup_params["config"]["model_reasoning_effort"], "medium");
+    assert_eq!(dedup_params["cwd"], "/work/repo/fork/source");
+    assert_eq!(dedup_params["sandbox"], "read-only");
+    assert!(
+        dedup_params["config"]
+            .get("sandbox_workspace_write")
+            .is_none()
+    );
+    runner.state.flush_background_writes().await?;
+    let run = runner
+        .state
+        .run_history
+        .get_run_history(run_history_id)
+        .await?
+        .expect("run history");
+    assert_eq!(run.thread_id.as_deref(), Some("review-thread"));
+    assert_eq!(run.turn_id.as_deref(), Some("review-turn"));
+    Ok(())
+}
 #[tokio::test]
 async fn run_review_with_fake_runtime_starts_browser_and_returns_comment() -> Result<()> {
     let harness = Arc::new(FakeRunnerHarness::default());

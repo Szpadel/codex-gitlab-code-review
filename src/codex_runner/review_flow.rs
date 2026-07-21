@@ -8,13 +8,15 @@ use super::session_runner::{
     standard_session_launch_request,
 };
 use super::{
-    AppServerCommandOptions, Arc, AuthAccount, AuthFallbackAction, DockerCodexRunner, Instant,
-    PreparedGitLabDiscoveryMcp, Result, ReviewContext, RunHistorySessionUpdate, Utc, Value,
-    append_additional_review_instructions, build_base_branch_review_prompt,
+    AppServerCommandOptions, Arc, AuthAccount, AuthFallbackAction, CodexResult, DockerCodexRunner,
+    Instant, PreparedGitLabDiscoveryMcp, Result, ReviewContext, RunHistorySessionUpdate, Utc,
+    Value, append_additional_review_instructions, build_base_branch_review_prompt,
     build_commit_review_prompt, json, repo_checkout_root, upstream_review_prompt_source_commit,
     upstream_review_prompt_source_path, warn,
 };
+use anyhow::Context;
 use futures::FutureExt;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReviewTargetRequest {
@@ -483,7 +485,7 @@ impl DockerCodexRunner {
         &self,
         ctx: &ReviewContext,
         account: &AuthAccount,
-    ) -> Result<String> {
+    ) -> Result<CodexResult> {
         let launch = self
             .launch_runner_session(standard_session_launch_request(
                 ctx.run_history_id,
@@ -631,6 +633,48 @@ impl DockerCodexRunner {
             )
             .await;
 
+        let mut review_result = review_result.and_then(|output| {
+            super::parse_review_output_for_lane(&output, ctx.lane, ctx.min_confidence_score)
+                .with_context(|| {
+                    format!(
+                        "parse codex review output for repo {} merge request {}",
+                        ctx.repo, ctx.mr.iid
+                    )
+                })
+        });
+        if let Ok(CodexResult::Comment(comment)) = &review_result
+            && ctx.discussion_source.is_some()
+            && !comment.findings.is_empty()
+        {
+            let original_comment = comment.clone();
+            let deduplication_result = self
+                .run_session_with_timeout(
+                    RunSessionConfig {
+                        app_server_container_id: session.container_id.clone(),
+                        browser_container_id: session.browser_container_id.clone(),
+                        browser_mcp: prepared.browser_mcp.clone(),
+                        timeout_duration: Duration::from_secs(self.codex.timeout_seconds),
+                        timeout_error: "codex review deduplication timed out",
+                    },
+                    self.run_review_deduplication(
+                        ctx,
+                        &mut session,
+                        repo_path.as_str(),
+                        original_comment.clone(),
+                    ),
+                )
+                .await;
+            match deduplication_result {
+                Ok(comment) => review_result = Ok(CodexResult::Comment(comment)),
+                Err(err) => warn!(
+                    repo = ctx.repo,
+                    iid = ctx.mr.iid,
+                    error = %err,
+                    "review deduplication failed; keeping all original findings"
+                ),
+            }
+        }
+
         self.cleanup_extra_security_context_session(&extra_security_context_session)
             .await;
         self.close_runner_session(session).await;
@@ -638,7 +682,7 @@ impl DockerCodexRunner {
         review_result
     }
 
-    pub(crate) async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<String> {
+    pub(crate) async fn run_app_server_review(&self, ctx: &ReviewContext) -> Result<CodexResult> {
         self.run_with_auth_fallback(AuthFallbackAction::Review, |account| async move {
             self.run_app_server_review_with_account(ctx, &account).await
         })

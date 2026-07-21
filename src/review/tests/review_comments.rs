@@ -146,6 +146,7 @@ async fn inline_review_comments_post_inline_discussions_and_fallback_note() -> R
                         .to_string(),
                 ),
                 overall_confidence_score: None,
+                omitted_duplicate_count: 0,
                 findings: vec![
                     crate::codex_runner::ReviewFinding {
                         title: "Inline finding".to_string(),
@@ -253,6 +254,7 @@ async fn inline_review_comments_fallback_to_plain_note_when_no_diff_anchor_exist
                 summary: "needs changes".to_string(),
                 overall_explanation: None,
                 overall_confidence_score: None,
+                omitted_duplicate_count: 0,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Fallback only".to_string(),
                     body: "See /work/repo/group/repo/src/lib.rs:30 for the broken call."
@@ -301,6 +303,7 @@ async fn completed_review_state_skips_same_sha_without_note_marker() -> Result<(
         ("group/repo".to_string(), 44),
         vec![MergeRequestDiscussion {
             id: "discussion-44".to_string(),
+            individual_note: false,
             notes: vec![DiscussionNote {
                 id: 1,
                 body: "<!-- codex-review-finding:sha=sha44 key=deadbeef -->".to_string(),
@@ -616,6 +619,7 @@ async fn inline_review_comments_fallback_when_head_sha_no_longer_matches_latest_
                 summary: "needs changes".to_string(),
                 overall_explanation: None,
                 overall_confidence_score: None,
+                omitted_duplicate_count: 0,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Head moved".to_string(),
                     body: "See /work/repo/group/repo/src/lib.rs:10 before merging.".to_string(),
@@ -695,6 +699,7 @@ async fn inline_review_comments_use_matching_diff_version_even_when_not_first() 
                 summary: "needs changes".to_string(),
                 overall_explanation: None,
                 overall_confidence_score: None,
+                omitted_duplicate_count: 0,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Inline finding".to_string(),
                     body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
@@ -764,6 +769,7 @@ async fn inline_review_comments_fallback_to_note_when_marker_prefetch_fails() ->
                 summary: "needs changes".to_string(),
                 overall_explanation: None,
                 overall_confidence_score: None,
+                omitted_duplicate_count: 0,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Fallback finding".to_string(),
                     body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
@@ -839,6 +845,7 @@ async fn inline_review_comments_fallback_to_note_when_inline_post_fails() -> Res
                 summary: "needs changes".to_string(),
                 overall_explanation: Some("Overall context.".to_string()),
                 overall_confidence_score: None,
+                omitted_duplicate_count: 0,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Fallback finding".to_string(),
                     body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
@@ -915,6 +922,7 @@ async fn inline_review_comments_use_source_project_links_for_fork_mrs() -> Resul
                 summary: "needs changes".to_string(),
                 overall_explanation: Some("See /work/repo/fork/source/src/lib.rs:10.".to_string()),
                 overall_confidence_score: None,
+                omitted_duplicate_count: 0,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "Fork fallback".to_string(),
                     body: "Fix /work/repo/fork/source/src/lib.rs:10.".to_string(),
@@ -1252,6 +1260,7 @@ async fn inline_review_comments_dedupe_duplicate_findings_in_single_response() -
                 summary: "needs changes".to_string(),
                 overall_explanation: None,
                 overall_confidence_score: None,
+                omitted_duplicate_count: 0,
                 findings: vec![finding.clone(), finding],
                 body: "legacy body".to_string(),
             },

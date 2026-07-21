@@ -56,6 +56,15 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: '(?m)^      reasoning_effort: "high"$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^    deduplication:$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^      model: "gpt-5.6-luna"$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^      reasoning_effort: "medium"$'
   - it: renders codex session overrides from Helm values
     template: templates/configmap.yaml
     set:
@@ -67,6 +76,8 @@ tests:
       config.codex.sessionOverrides.securityContext.reasoningEffort: "xhigh"
       config.codex.sessionOverrides.securityReview.model: "gpt-5.4"
       config.codex.sessionOverrides.securityReview.reasoningEffort: "medium"
+      config.codex.sessionOverrides.deduplication.model: "gpt-dedup"
+      config.codex.sessionOverrides.deduplication.reasoningEffort: "low"
     asserts:
       - matchRegex:
           path: data["config.yaml"]
@@ -77,6 +88,12 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: '(?m)^      reasoning_effort: "medium"$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^      model: "gpt-dedup"$'
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^      reasoning_effort: "low"$'
   - it: renders codex work tmpfs overrides from Helm values
     template: templates/configmap.yaml
     set:

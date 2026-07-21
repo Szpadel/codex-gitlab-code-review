@@ -206,6 +206,20 @@ impl DockerCodexRunner {
         }
     }
 
+    pub(crate) fn deduplication_session_override(&self) -> ConfiguredSessionOverride<'_> {
+        ConfiguredSessionOverride {
+            model: configured_model(self.codex.session_overrides.deduplication.model.as_deref()),
+            reasoning_summary: self.review_reasoning_summary(),
+            reasoning_effort: configured_reasoning_effort(
+                self.codex
+                    .session_overrides
+                    .deduplication
+                    .reasoning_effort
+                    .as_deref(),
+            ),
+        }
+    }
+
     pub(crate) fn mention_session_override(&self) -> ConfiguredSessionOverride<'_> {
         ConfiguredSessionOverride {
             model: configured_model(self.codex.session_overrides.mention.model.as_deref()),

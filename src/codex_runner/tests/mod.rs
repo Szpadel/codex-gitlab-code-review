@@ -244,6 +244,7 @@ fn review_context_with_target_branch(target_branch: Option<&str>) -> ReviewConte
         min_confidence_score: None,
         security_context_ttl_seconds: None,
         run_history_id: None,
+        discussion_source: None,
     }
 }
 

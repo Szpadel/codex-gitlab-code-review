@@ -76,6 +76,7 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
                 summary: "confirmed auth bypass".to_string(),
                 overall_explanation: None,
                 overall_confidence_score: Some(0.93),
+                omitted_duplicate_count: 0,
                 findings: vec![crate::codex_runner::ReviewFinding {
                     title: "[P1] Missing auth guard".to_string(),
                     body: finding_body,

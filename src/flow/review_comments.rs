@@ -6,12 +6,15 @@ use crate::gitlab::{
     MergeRequestDiffVersion,
 };
 use crate::review::ReviewLane;
+use crate::review_deduplication::{
+    ReviewDiscussionSource, finding_marker, finding_markers_from_text,
+};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use tracing::warn;
 
-const REVIEW_FINDING_MARKER_PREFIX: &str = "<!-- codex-review-finding:sha=";
+pub(crate) const REVIEW_FINDING_MARKER_PREFIX: &str = "<!-- codex-review-finding:sha=";
 const MAX_INLINE_FINDING_LINE_SPAN: usize = 500;
 
 #[derive(Clone, Copy)]
@@ -32,6 +35,7 @@ pub(crate) struct PostReviewCommentRequest<'a> {
     pub mr: &'a MergeRequest,
     pub head_sha: &'a str,
     pub comment: &'a ReviewComment,
+    pub discussion_source: Option<&'a ReviewDiscussionSource>,
 }
 
 struct FallbackNoteRequest<'a> {
@@ -63,12 +67,29 @@ pub(crate) async fn post_review_comment(request: PostReviewCommentRequest<'_>) -
     let project_web_base =
         resolve_project_web_base(request.config, request.gitlab, request.repo, request.mr).await;
     let worktree_root = repo_checkout_root(request.project_path);
-    if !request.inline_review_comments_enabled || request.comment.findings.is_empty() {
+    if !request.inline_review_comments_enabled {
         let full_body = legacy_note_body(options, request.head_sha, &request.comment.body);
         request
             .gitlab
             .create_note(request.repo, request.mr.iid, &full_body)
             .await?;
+        return Ok(());
+    }
+    if request.comment.findings.is_empty() {
+        create_fallback_note(
+            request.gitlab,
+            FallbackNoteRequest {
+                options,
+                repo: request.repo,
+                iid: request.mr.iid,
+                head_sha: request.head_sha,
+                comment: request.comment,
+                fallback_findings: &[],
+                project_web_base: project_web_base.as_str(),
+                worktree_root: worktree_root.as_str(),
+            },
+        )
+        .await?;
         return Ok(());
     }
 
@@ -78,6 +99,7 @@ pub(crate) async fn post_review_comment(request: PostReviewCommentRequest<'_>) -
         request.mr.iid,
         request.bot_user_id,
         options.finding_marker_prefix,
+        request.discussion_source,
     )
     .await
     {
@@ -173,7 +195,10 @@ pub(crate) async fn post_review_comment(request: PostReviewCommentRequest<'_>) -
         }
     }
 
-    if !fallback_findings.is_empty() || request.comment.overall_explanation.is_some() {
+    if !fallback_findings.is_empty()
+        || request.comment.overall_explanation.is_some()
+        || request.comment.omitted_duplicate_count > 0
+    {
         create_fallback_note(
             request.gitlab,
             FallbackNoteRequest {
@@ -367,7 +392,10 @@ fn build_fallback_note_body(
     project_web_base: &str,
     worktree_root: &str,
 ) -> Option<String> {
-    if fallback_findings.is_empty() && comment.overall_explanation.is_none() {
+    if fallback_findings.is_empty()
+        && comment.overall_explanation.is_none()
+        && comment.omitted_duplicate_count == 0
+    {
         return None;
     }
 
@@ -389,6 +417,17 @@ fn build_fallback_note_body(
             project_web_base,
             worktree_root,
         ));
+    }
+    if comment.omitted_duplicate_count > 0 {
+        let notice = if comment.omitted_duplicate_count == 1 {
+            "_Omitted 1 finding as a duplicate of an existing review thread._".to_string()
+        } else {
+            format!(
+                "_Omitted {} findings as duplicates of existing review threads._",
+                comment.omitted_duplicate_count
+            )
+        };
+        sections.push(notice);
     }
 
     let mut body = sections.join("\n\n");
@@ -514,17 +553,10 @@ fn format_location(finding: &ReviewFinding, worktree_root: &str) -> String {
 }
 
 fn load_existing_finding_markers_from_text(text: &str, prefix: &str) -> HashSet<String> {
-    let mut markers = HashSet::new();
-    let mut remaining = text;
-    while let Some(start) = remaining.find(prefix) {
-        let slice = &remaining[start..];
-        let Some(end) = slice.find(" -->") else {
-            break;
-        };
-        markers.insert(slice[..(end + 4)].to_string());
-        remaining = &slice[(end + 4)..];
-    }
-    markers
+    finding_markers_from_text(text, prefix)
+        .into_iter()
+        .map(|marker| marker.raw)
+        .collect()
 }
 
 async fn load_existing_finding_markers(
@@ -533,6 +565,7 @@ async fn load_existing_finding_markers(
     iid: u64,
     bot_user_id: u64,
     finding_marker_prefix: &str,
+    discussion_source: Option<&ReviewDiscussionSource>,
 ) -> Result<HashSet<String>> {
     let mut markers = HashSet::new();
     for note in gitlab.list_notes(repo, iid).await? {
@@ -543,8 +576,13 @@ async fn load_existing_finding_markers(
             ));
         }
     }
-    for discussion in gitlab.list_discussions(repo, iid).await? {
-        for note in discussion.notes {
+    let discussions = if let Some(source) = discussion_source {
+        source.discussions().await?
+    } else {
+        std::sync::Arc::new(gitlab.list_discussions(repo, iid).await?)
+    };
+    for discussion in discussions.iter() {
+        for note in &discussion.notes {
             if note.author.id == bot_user_id {
                 markers.extend(load_existing_finding_markers_from_text(
                     &note.body,
@@ -554,11 +592,6 @@ async fn load_existing_finding_markers(
         }
     }
     Ok(markers)
-}
-
-fn finding_marker(finding_marker_prefix: &str, head_sha: &str, finding: &ReviewFinding) -> String {
-    let fingerprint = finding_fingerprint(finding);
-    format!("{finding_marker_prefix}{head_sha} key={fingerprint} -->")
 }
 
 fn posting_options(config: &Config, lane: ReviewLane) -> ReviewCommentPostingOptions<'_> {
@@ -586,25 +619,6 @@ fn inline_discussion_title(
     } else {
         format!("Security finding: {}", finding.title)
     }
-}
-
-fn finding_fingerprint(finding: &ReviewFinding) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in canonical_finding_key(finding).bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
-
-fn canonical_finding_key(finding: &ReviewFinding) -> String {
-    format!(
-        "{}\n{}\n{}:{}",
-        finding.title,
-        finding.code_location.absolute_file_path,
-        finding.code_location.line_range.start,
-        finding.code_location.line_range.end
-    )
 }
 
 fn normalize_repo_path(path: &str, worktree_root: &str) -> Option<String> {
@@ -832,7 +846,8 @@ mod tests {
                 line_range: crate::codex_runner::ReviewLineRange { start: 3, end: 4 },
             },
         };
-        let marker = finding_marker(REVIEW_FINDING_MARKER_PREFIX, "sha1", &finding);
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let marker = finding_marker(REVIEW_FINDING_MARKER_PREFIX, head_sha, &finding);
         let markers = load_existing_finding_markers_from_text(
             &format!("note\n{marker}\nother"),
             REVIEW_FINDING_MARKER_PREFIX,
@@ -972,5 +987,62 @@ mod tests {
             },
         };
         assert!(select_anchor(&anchors, &finding).is_none());
+    }
+
+    #[test]
+    fn fallback_note_discloses_duplicate_omissions_without_repeating_findings() {
+        let options = ReviewCommentPostingOptions {
+            review_label: "Review",
+            comment_marker_prefix: "<!-- codex-review:sha=",
+            finding_marker_prefix: REVIEW_FINDING_MARKER_PREFIX,
+        };
+        let comment = ReviewComment {
+            summary: "duplicates omitted".to_string(),
+            overall_explanation: None,
+            overall_confidence_score: None,
+            findings: Vec::new(),
+            body: "old duplicate body".to_string(),
+            omitted_duplicate_count: 1,
+        };
+
+        let body = build_fallback_note_body(
+            options,
+            "head",
+            &comment,
+            &[],
+            "https://gitlab.example.com/group/repo",
+            "/work/repo/group/repo",
+        )
+        .expect("omission note");
+
+        assert!(body.contains("_Omitted 1 finding as a duplicate of an existing review thread._"));
+        assert!(!body.contains("old duplicate body"));
+    }
+
+    #[test]
+    fn fallback_note_pluralizes_duplicate_omissions() {
+        let comment = ReviewComment {
+            summary: "duplicates omitted".to_string(),
+            overall_explanation: None,
+            overall_confidence_score: None,
+            findings: Vec::new(),
+            body: String::new(),
+            omitted_duplicate_count: 2,
+        };
+        let body = build_fallback_note_body(
+            ReviewCommentPostingOptions {
+                review_label: "Review",
+                comment_marker_prefix: "<!-- codex-review:sha=",
+                finding_marker_prefix: REVIEW_FINDING_MARKER_PREFIX,
+            },
+            "head",
+            &comment,
+            &[],
+            "https://gitlab.example.com/group/repo",
+            "/work/repo/group/repo",
+        )
+        .expect("omission note");
+
+        assert!(body.contains("_Omitted 2 findings as duplicates of existing review threads._"));
     }
 }

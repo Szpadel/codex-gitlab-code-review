@@ -6,7 +6,9 @@ use crate::flow::orchestration::{
     ActiveTaskKey, ScheduledTaskContext, finish_task_run_history, refund_review_rate_limits,
     spawn_orchestrated_task, task_cancelled_finish, task_error_finish,
 };
-use crate::flow::review_comments::{PostReviewCommentRequest, post_review_comment};
+use crate::flow::review_comments::{
+    PostReviewCommentRequest, REVIEW_FINDING_MARKER_PREFIX, post_review_comment,
+};
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
 use crate::lifecycle::ServiceLifecycle;
@@ -16,6 +18,7 @@ use crate::review::retry::{
     REVIEW_RETRY_BLOCKED_DEFER_SECONDS, RetryBackoff, RetryGateStatus, RetryKey,
     RetryWarningAwardService,
 };
+use crate::review_deduplication::ReviewDiscussionSource;
 use crate::state::{
     NewRunHistory, ReviewRateLimitAcquireOutcome, ReviewStateStore, RunHistoryFinish,
 };
@@ -1474,6 +1477,19 @@ impl ReviewRunContext {
         feature_flags: FeatureFlagSnapshot,
         run_history_id: i64,
     ) -> ReviewContext {
+        let discussion_source = feature_flags.gitlab_inline_review_comments.then(|| {
+            Arc::new(ReviewDiscussionSource::new(
+                Arc::clone(&self.gitlab),
+                repo.to_string(),
+                mr.iid,
+                self.bot_user_id,
+                self.policy.finding_marker_prefix(&self.config).to_string(),
+                vec![
+                    REVIEW_FINDING_MARKER_PREFIX.to_string(),
+                    self.config.review.security.finding_marker_prefix.clone(),
+                ],
+            ))
+        });
         ReviewContext {
             lane: self.lane,
             repo: repo.to_string(),
@@ -1487,6 +1503,7 @@ impl ReviewRunContext {
             min_confidence_score: self.policy.min_confidence_score(&self.config),
             security_context_ttl_seconds: self.policy.context_ttl_seconds(&self.config),
             run_history_id: Some(run_history_id),
+            discussion_source,
         }
     }
 
@@ -1580,6 +1597,7 @@ impl ReviewRunContext {
         mr: &MergeRequest,
         inline_review_comments_enabled: bool,
         review_project_path: &str,
+        discussion_source: Option<&ReviewDiscussionSource>,
         comment: ReviewComment,
     ) -> Result<()> {
         if self.bail_if_cancelled(run).await? {
@@ -1599,6 +1617,7 @@ impl ReviewRunContext {
                 mr,
                 head_sha: run.head_sha,
                 comment: &comment,
+                discussion_source,
             })
             .await?;
         }
@@ -1698,6 +1717,7 @@ impl ReviewRunContext {
             .build_codex_review_context_for_run(repo, &mr, head_sha, feature_flags, run_history_id)
             .await;
         let review_project_path = review_ctx.project_path.clone();
+        let discussion_source = review_ctx.discussion_source.clone();
 
         if self.bail_if_start_rejected(&run_identity).await? {
             return Ok(ReviewRunStatus::Completed);
@@ -1724,6 +1744,7 @@ impl ReviewRunContext {
                     &mr,
                     inline_review_comments_enabled,
                     &review_project_path,
+                    discussion_source.as_deref(),
                     comment,
                 )
                 .await?;

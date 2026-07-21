@@ -1129,6 +1129,7 @@ async fn list_discussions_reads_thread_notes() -> Result<()> {
     let server = MockServer::start().await;
     let response = ResponseTemplate::new(200).set_body_json(vec![serde_json::json!({
         "id": "discussion-1",
+        "individual_note": true,
         "notes": [
             {
                 "id": 101,
@@ -1160,6 +1161,7 @@ async fn list_discussions_reads_thread_notes() -> Result<()> {
     let discussions = client.list_discussions("group/repo", 9).await?;
     assert_eq!(discussions.len(), 1);
     assert_eq!(discussions[0].id, "discussion-1");
+    assert!(discussions[0].individual_note);
     assert_eq!(discussions[0].notes.len(), 2);
     assert_eq!(discussions[0].notes[1].in_reply_to_id, Some(101));
     Ok(())

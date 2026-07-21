@@ -14,6 +14,7 @@ fn mention_detection_honors_boundaries() {
 fn extract_parent_chain_uses_reply_chain_when_available() {
     let discussion = MergeRequestDiscussion {
         id: "discussion".to_string(),
+        individual_note: false,
         notes: vec![
             DiscussionNote {
                 id: 1,
@@ -93,6 +94,7 @@ fn gitlab_with_mention_trigger(
             ("group/repo".to_string(), iid),
             vec![MergeRequestDiscussion {
                 id: discussion_id.to_string(),
+                individual_note: false,
                 notes: vec![
                     DiscussionNote {
                         id: trigger_note_id - 1,
@@ -282,6 +284,7 @@ async fn scan_runs_mention_command_for_triggered_discussion_note() -> Result<()>
             ("group/repo".to_string(), 30),
             vec![MergeRequestDiscussion {
                 id: "discussion-1".to_string(),
+                individual_note: false,
                 notes: vec![
                     DiscussionNote {
                         id: 900,
@@ -406,6 +409,7 @@ async fn mention_history_insert_failure_releases_mention_lock() -> Result<()> {
             ("group/repo".to_string(), 41),
             vec![MergeRequestDiscussion {
                 id: "discussion-1".to_string(),
+                individual_note: false,
                 notes: vec![
                     DiscussionNote {
                         id: 910,
@@ -520,6 +524,7 @@ async fn mention_run_history_uses_refreshed_mr_sha() -> Result<()> {
             ("group/repo".to_string(), 42),
             vec![MergeRequestDiscussion {
                 id: "discussion-1".to_string(),
+                individual_note: false,
                 notes: vec![
                     DiscussionNote {
                         id: 920,
@@ -643,6 +648,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
                 ("group/repo".to_string(), 52),
                 vec![MergeRequestDiscussion {
                     id: "discussion-52".to_string(),
+                    individual_note: false,
                     notes: vec![
                         DiscussionNote {
                             id: 952,
@@ -667,6 +673,7 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
                 ("group/repo".to_string(), 53),
                 vec![MergeRequestDiscussion {
                     id: "discussion-53".to_string(),
+                    individual_note: false,
                     notes: vec![
                         DiscussionNote {
                             id: 962,
@@ -836,6 +843,7 @@ async fn scan_runs_mention_command_for_standalone_discussion_comment() -> Result
             ("group/repo".to_string(), 33),
             vec![MergeRequestDiscussion {
                 id: "discussion-standalone".to_string(),
+                individual_note: true,
                 notes: vec![DiscussionNote {
                     id: 930,
                     body: "@botuser please handle this standalone comment".to_string(),
@@ -949,6 +957,7 @@ async fn scan_runs_mention_command_for_reply_from_non_mr_author() -> Result<()> 
             ("group/repo".to_string(), 34),
             vec![MergeRequestDiscussion {
                 id: "discussion-reply".to_string(),
+                individual_note: false,
                 notes: vec![
                     DiscussionNote {
                         id: 940,
@@ -1072,6 +1081,7 @@ async fn dry_run_skips_mention_commands_and_thread_status_writes() -> Result<()>
             ("group/repo".to_string(), 31),
             vec![MergeRequestDiscussion {
                 id: "discussion-1".to_string(),
+                individual_note: false,
                 notes: vec![
                     DiscussionNote {
                         id: 910,
@@ -1173,6 +1183,7 @@ async fn mention_runs_even_when_mr_created_before_cutoff() -> Result<()> {
             ("group/repo".to_string(), 32),
             vec![MergeRequestDiscussion {
                 id: "discussion-1".to_string(),
+                individual_note: false,
                 notes: vec![
                     DiscussionNote {
                         id: 920,

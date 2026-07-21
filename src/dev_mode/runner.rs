@@ -56,6 +56,7 @@ impl CodexRunner for MockCodexRunner {
             overall_confidence_score: None,
             findings: Vec::new(),
             body: transcript.body,
+            omitted_duplicate_count: 0,
         }))
     }
 }

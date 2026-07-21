@@ -215,6 +215,8 @@ pub struct Note {
 pub struct MergeRequestDiscussion {
     pub id: String,
     #[serde(default)]
+    pub individual_note: bool,
+    #[serde(default)]
     pub notes: Vec<DiscussionNote>,
 }
 

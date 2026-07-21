@@ -188,6 +188,9 @@ config:
       securityReview:
         model: null
         reasoningEffort: "high"
+      deduplication:
+        model: "gpt-5.6-luna"
+        reasoningEffort: "medium"
     # Per-mode reasoning summary overrides passed to Codex app-server.
     # Defaults restore readable reasoning summaries even if upstream model defaults change.
     # Supported values: none, auto, detailed.

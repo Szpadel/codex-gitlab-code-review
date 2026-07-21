@@ -221,6 +221,24 @@ fn defaults_mention_commands_when_missing() {
         Some("high")
     );
     assert_eq!(
+        config
+            .codex
+            .session_overrides
+            .deduplication
+            .model
+            .as_deref(),
+        Some("gpt-5.6-luna")
+    );
+    assert_eq!(
+        config
+            .codex
+            .session_overrides
+            .deduplication
+            .reasoning_effort
+            .as_deref(),
+        Some("medium")
+    );
+    assert_eq!(
         config.codex.reasoning_summary.review.as_deref(),
         Some("detailed")
     );
@@ -416,6 +434,9 @@ fn loads_session_overrides() {
     security_review:
       model: "gpt-5.4"
       reasoning_effort: "xhigh"
+    deduplication:
+      model: "gpt-dedup"
+      reasoning_effort: "low"
 "#,
         "",
     );
@@ -481,6 +502,24 @@ fn loads_session_overrides() {
             .reasoning_effort
             .as_deref(),
         Some("xhigh")
+    );
+    assert_eq!(
+        config
+            .codex
+            .session_overrides
+            .deduplication
+            .model
+            .as_deref(),
+        Some("gpt-dedup")
+    );
+    assert_eq!(
+        config
+            .codex
+            .session_overrides
+            .deduplication
+            .reasoning_effort
+            .as_deref(),
+        Some("low")
     );
 }
 

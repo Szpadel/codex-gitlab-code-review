@@ -5,6 +5,7 @@ use crate::config::{
 use crate::gitlab::{MergeRequest, links::GitLabMarkdownImageUpload};
 use crate::gitlab_discovery_mcp::{GitLabDiscoveryMcpService, ResolvedGitLabDiscoveryAllowList};
 use crate::review::ReviewLane;
+use crate::review_deduplication::ReviewDiscussionSource;
 use crate::review_prompt_templates::{
     append_additional_review_instructions, build_base_branch_review_prompt,
     build_commit_review_prompt, upstream_review_prompt_source_commit,
@@ -46,6 +47,7 @@ mod auth;
 mod browser_mcp;
 mod composer;
 mod container;
+mod deduplication;
 pub mod docker;
 pub(crate) mod duration;
 mod gitlab_discovery;
@@ -97,6 +99,7 @@ pub struct ReviewContext {
     pub min_confidence_score: Option<f32>,
     pub security_context_ttl_seconds: Option<u64>,
     pub run_history_id: Option<i64>,
+    pub(crate) discussion_source: Option<Arc<ReviewDiscussionSource>>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +148,7 @@ pub struct ReviewComment {
     pub overall_confidence_score: Option<f32>,
     pub findings: Vec<ReviewFinding>,
     pub body: String,
+    pub omitted_duplicate_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -680,15 +684,7 @@ impl CodexRunner for DockerCodexRunner {
             lane = ctx.lane.as_str(),
             "starting codex review"
         );
-        let output = self.run_app_server_review(&ctx).await?;
-        parse_review_output_for_lane(&output, ctx.lane, ctx.min_confidence_score).with_context(
-            || {
-                format!(
-                    "parse codex review output for repo {} merge request {}",
-                    ctx.repo, ctx.mr.iid
-                )
-            },
-        )
+        self.run_app_server_review(&ctx).await
     }
 
     async fn run_mention_command(

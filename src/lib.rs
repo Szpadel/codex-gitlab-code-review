@@ -12,6 +12,7 @@ pub mod gitlab_discovery_mcp;
 pub mod http;
 pub mod lifecycle;
 pub mod review;
+pub(crate) mod review_deduplication;
 pub mod review_prompt_templates;
 mod scheduler;
 pub mod service_factory;

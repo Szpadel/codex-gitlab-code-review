@@ -257,6 +257,17 @@ data:
 {{- else }}
           reasoning_effort: null
 {{- end }}
+        deduplication:
+{{- if .Values.config.codex.sessionOverrides.deduplication.model }}
+          model: {{ .Values.config.codex.sessionOverrides.deduplication.model | quote }}
+{{- else }}
+          model: null
+{{- end }}
+{{- if .Values.config.codex.sessionOverrides.deduplication.reasoningEffort }}
+          reasoning_effort: {{ .Values.config.codex.sessionOverrides.deduplication.reasoningEffort | quote }}
+{{- else }}
+          reasoning_effort: null
+{{- end }}
       reasoning_summary:
 {{- if .Values.config.codex.reasoningSummary.review }}
         review: {{ .Values.config.codex.reasoningSummary.review | quote }}

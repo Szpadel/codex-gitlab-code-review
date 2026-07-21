@@ -1250,6 +1250,7 @@ mod pending_rate_limit_tests {
         };
         crate::gitlab::MergeRequestDiscussion {
             id: discussion_id.to_string(),
+            individual_note: false,
             notes: vec![
                 crate::gitlab::DiscussionNote {
                     id: trigger_note_id - 1,

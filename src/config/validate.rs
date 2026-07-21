@@ -438,6 +438,7 @@ fn validate_session_overrides(codex: &CodexConfig) -> Result<()> {
             &codex.session_overrides.security_context,
         ),
         ("security_review", &codex.session_overrides.security_review),
+        ("deduplication", &codex.session_overrides.deduplication),
     ] {
         validate_session_mode_override(field, override_config)?;
     }
