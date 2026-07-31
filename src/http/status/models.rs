@@ -3,8 +3,8 @@ use crate::review::RunRetryStatus;
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
     ProjectCatalogSummary, ReviewRateLimitBucketSnapshot, ReviewRateLimitPendingEntry,
-    ReviewRateLimitRule, RunHistoryKind, RunHistoryListItem, RunHistoryRecord, ScanMode,
-    ScanOutcome, ScanState, TranscriptBackfillState,
+    ReviewRateLimitRule, RunHistoryKind, RunHistoryListItem, RunHistoryRecord, RunTokenUsageRollup,
+    ScanMode, ScanOutcome, ScanState, TranscriptBackfillState,
 };
 use serde::Serialize;
 use std::ops::{Deref, DerefMut};
@@ -105,7 +105,16 @@ pub struct HistorySnapshot {
     pub has_next: bool,
     pub previous_cursor: Option<String>,
     pub next_cursor: Option<String>,
+    pub token_statistics: Vec<TokenUsageStatisticSnapshot>,
     pub runs: Vec<HistoryRunListItem>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TokenUsageStatisticSnapshot {
+    pub kind: Option<RunHistoryKind>,
+    pub recorded_runs: i64,
+    #[serde(flatten)]
+    pub usage: RunTokenUsageRollup,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -132,12 +141,22 @@ pub struct HistoryRunListItem {
     run: RunHistoryListItem,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<RunRetryStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<RunTokenUsageRollup>,
 }
 
 impl HistoryRunListItem {
     #[must_use]
-    pub fn new(run: RunHistoryListItem, retry: Option<RunRetryStatus>) -> Self {
-        Self { run, retry }
+    pub fn new(
+        run: RunHistoryListItem,
+        retry: Option<RunRetryStatus>,
+        token_usage: Option<RunTokenUsageRollup>,
+    ) -> Self {
+        Self {
+            run,
+            retry,
+            token_usage,
+        }
     }
 }
 
@@ -161,12 +180,22 @@ pub struct HistoryRunRecord {
     run: RunHistoryRecord,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<RunRetryStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<RunTokenUsageRollup>,
 }
 
 impl HistoryRunRecord {
     #[must_use]
-    pub fn new(run: RunHistoryRecord, retry: Option<RunRetryStatus>) -> Self {
-        Self { run, retry }
+    pub fn new(
+        run: RunHistoryRecord,
+        retry: Option<RunRetryStatus>,
+        token_usage: Option<RunTokenUsageRollup>,
+    ) -> Self {
+        Self {
+            run,
+            retry,
+            token_usage,
+        }
     }
 }
 

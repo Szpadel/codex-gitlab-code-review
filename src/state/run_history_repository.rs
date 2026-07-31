@@ -3,16 +3,33 @@ use crate::review::ReviewLane;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use std::collections::HashMap;
 
 use super::{
-    NewRunHistory, NewRunHistoryEvent, RunHistoryCursor, RunHistoryEventRecord, RunHistoryFinish,
-    RunHistoryKind, RunHistoryListItem, RunHistoryListPage, RunHistoryListQuery, RunHistoryRecord,
-    RunHistorySessionUpdate, TranscriptBackfillState, sqlite::SqliteCoordinator,
-    sqlite_i64_from_u64,
+    NewRunHistory, NewRunHistoryEvent, NewRunTokenUsage, RunHistoryCursor, RunHistoryEventRecord,
+    RunHistoryFinish, RunHistoryKind, RunHistoryListItem, RunHistoryListPage, RunHistoryListQuery,
+    RunHistoryRecord, RunHistorySessionUpdate, RunTokenUsageRollup, RunTokenUsageStatistic,
+    TranscriptBackfillState, sqlite::SqliteCoordinator, sqlite_i64_from_u64,
 };
 
 const MISSING_ERROR_DETAILS: &str =
     "Run finished with result error, but no failure details were recorded.";
+const UPSERT_RUN_TOKEN_USAGE_SQL: &str = r"
+    INSERT INTO run_history_token_usage (
+        run_history_id, response_id, thread_id, turn_id, input_tokens,
+        cached_input_tokens, cache_write_input_tokens, output_tokens,
+        reasoning_output_tokens, total_tokens, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(run_history_id, response_id) DO UPDATE SET
+        thread_id = excluded.thread_id,
+        turn_id = excluded.turn_id,
+        input_tokens = excluded.input_tokens,
+        cached_input_tokens = excluded.cached_input_tokens,
+        cache_write_input_tokens = excluded.cache_write_input_tokens,
+        output_tokens = excluded.output_tokens,
+        reasoning_output_tokens = excluded.reasoning_output_tokens,
+        total_tokens = excluded.total_tokens
+    ";
 /// Column list consumed by `map_run_history_row`; keep the two in sync.
 const RUN_HISTORY_COLUMNS: &str = "id, kind, repo, iid, head_sha, status, result, \
     started_at, finished_at, updated_at, thread_id, turn_id, review_thread_id, \
@@ -624,6 +641,111 @@ impl RunHistoryRepository {
         list_run_history_events_on_pool(self.sqlite.read_pool().clone(), run_history_id).await
     }
 
+    /// Records exact usage for one upstream model response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails or a count is negative.
+    pub async fn record_run_token_usage(
+        &self,
+        run_history_id: i64,
+        usage: &NewRunTokenUsage,
+    ) -> Result<()> {
+        validate_token_usage(usage)?;
+        self.sqlite
+            .write_foreground("record run token usage", |pool| async move {
+                let created_at = Utc::now().timestamp();
+                upsert_run_token_usage(&pool, run_history_id, usage, created_at).await
+            })
+            .await
+    }
+
+    /// Returns token usage totals keyed by run id. Runs without captured usage are omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
+    pub async fn token_usage_for_runs(
+        &self,
+        run_ids: &[i64],
+    ) -> Result<HashMap<i64, RunTokenUsageRollup>> {
+        let mut usage = HashMap::new();
+        for run_ids in run_ids.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(
+                "SELECT run_history_id, COUNT(*) AS response_count, \
+                 SUM(input_tokens) AS input_tokens, SUM(cached_input_tokens) AS cached_input_tokens, \
+                 SUM(cache_write_input_tokens) AS cache_write_input_tokens, \
+                 SUM(output_tokens) AS output_tokens, \
+                 SUM(reasoning_output_tokens) AS reasoning_output_tokens, \
+                 SUM(total_tokens) AS total_tokens FROM run_history_token_usage WHERE run_history_id IN (",
+            );
+            let mut separated = builder.separated(", ");
+            for run_id in run_ids {
+                separated.push_bind(*run_id);
+            }
+            separated.push_unseparated(") GROUP BY run_history_id");
+            let rows = builder
+                .build()
+                .fetch_all(self.sqlite.read_pool())
+                .await
+                .context("load run token usage totals")?;
+            for row in rows {
+                let run_id = row
+                    .try_get("run_history_id")
+                    .context("read token usage run_history_id")?;
+                usage.insert(run_id, map_token_usage_rollup(&row)?);
+            }
+        }
+        Ok(usage)
+    }
+
+    /// Returns usage totals grouped by run kind for all runs matching the supplied filters.
+    /// Pagination cursors and limits are intentionally ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
+    pub async fn token_usage_statistics(
+        &self,
+        query: &RunHistoryListQuery,
+    ) -> Result<Vec<RunTokenUsageStatistic>> {
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT filtered.kind, COUNT(DISTINCT filtered.id) AS recorded_runs, \
+             COUNT(*) AS response_count, SUM(usage.input_tokens) AS input_tokens, \
+             SUM(usage.cached_input_tokens) AS cached_input_tokens, \
+             SUM(usage.cache_write_input_tokens) AS cache_write_input_tokens, \
+             SUM(usage.output_tokens) AS output_tokens, \
+             SUM(usage.reasoning_output_tokens) AS reasoning_output_tokens, \
+             SUM(usage.total_tokens) AS total_tokens \
+             FROM (SELECT id, kind FROM run_history",
+        );
+        append_run_history_filters(&mut builder, query)?;
+        builder.push(
+            ") AS filtered JOIN run_history_token_usage AS usage \
+             ON usage.run_history_id = filtered.id GROUP BY filtered.kind ORDER BY filtered.kind",
+        );
+        let rows = builder
+            .build()
+            .fetch_all(self.sqlite.read_pool())
+            .await
+            .context("load run token usage statistics")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RunTokenUsageStatistic {
+                    kind: parse_run_history_kind(
+                        row.try_get::<String, _>("kind")
+                            .context("read token usage statistic kind")?
+                            .as_str(),
+                    )?,
+                    recorded_runs: row
+                        .try_get("recorded_runs")
+                        .context("read token usage statistic recorded_runs")?,
+                    usage: map_token_usage_rollup(&row)?,
+                })
+            })
+            .collect()
+    }
+
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
@@ -825,6 +947,10 @@ async fn append_run_history_events_on_pool(
         .execute(&mut *tx)
         .await
         .context("insert run history event")?;
+        if let Some(usage) = token_usage_from_event(event)? {
+            upsert_run_token_usage_in_transaction(&mut tx, run_history_id, &usage, created_at)
+                .await?;
+        }
     }
     tx.commit()
         .await
@@ -893,6 +1019,12 @@ async fn replace_run_history_events_on_pool(
         .execute(&mut *tx)
         .await
         .context("insert rewritten run history event")?;
+        // Usage is an independent audit record: transcript rewrites never delete observations,
+        // but any exact raw-response records present in recovered history are still upserted.
+        if let Some(usage) = token_usage_from_event(&event)? {
+            upsert_run_token_usage_in_transaction(&mut tx, run_history_id, &usage, created_at)
+                .await?;
+        }
     }
     sqlx::query("UPDATE run_history SET updated_at = ? WHERE id = ?")
         .bind(created_at)
@@ -987,6 +1119,149 @@ pub(crate) fn merge_rewritten_turn_events(
         event.sequence = i64::try_from(index + 1).context("convert merged event index")?;
     }
     Ok(merged_events)
+}
+
+fn token_usage_from_event(event: &NewRunHistoryEvent) -> Result<Option<NewRunTokenUsage>> {
+    if event.event_type != "raw_response_completed" {
+        return Ok(None);
+    }
+    let Some(usage) = event.payload.get("usage").filter(|usage| !usage.is_null()) else {
+        return Ok(None);
+    };
+    let required_i64 = |name: &str| {
+        usage
+            .get(name)
+            .and_then(serde_json::Value::as_i64)
+            .with_context(|| format!("read raw response usage {name}"))
+    };
+    Ok(Some(NewRunTokenUsage {
+        response_id: event
+            .payload
+            .get("responseId")
+            .and_then(serde_json::Value::as_str)
+            .context("read raw response responseId")?
+            .to_string(),
+        thread_id: event
+            .payload
+            .get("threadId")
+            .and_then(serde_json::Value::as_str)
+            .context("read raw response threadId")?
+            .to_string(),
+        turn_id: event
+            .payload
+            .get("turnId")
+            .and_then(serde_json::Value::as_str)
+            .or(event.turn_id.as_deref())
+            .context("read raw response turnId")?
+            .to_string(),
+        input_tokens: required_i64("inputTokens")?,
+        cached_input_tokens: required_i64("cachedInputTokens")?,
+        cache_write_input_tokens: usage
+            .get("cacheWriteInputTokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+        output_tokens: required_i64("outputTokens")?,
+        reasoning_output_tokens: required_i64("reasoningOutputTokens")?,
+        total_tokens: required_i64("totalTokens")?,
+    }))
+}
+
+fn validate_token_usage(usage: &NewRunTokenUsage) -> Result<()> {
+    if usage.response_id.trim().is_empty()
+        || usage.thread_id.trim().is_empty()
+        || usage.turn_id.trim().is_empty()
+    {
+        bail!("token usage response, thread, and turn ids must not be empty");
+    }
+    if [
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_write_input_tokens,
+        usage.output_tokens,
+        usage.reasoning_output_tokens,
+        usage.total_tokens,
+    ]
+    .into_iter()
+    .any(|value| value < 0)
+    {
+        bail!("token usage counts must not be negative");
+    }
+    Ok(())
+}
+
+async fn upsert_run_token_usage(
+    pool: &SqlitePool,
+    run_history_id: i64,
+    usage: &NewRunTokenUsage,
+    created_at: i64,
+) -> Result<()> {
+    sqlx::query(UPSERT_RUN_TOKEN_USAGE_SQL)
+        .bind(run_history_id)
+        .bind(&usage.response_id)
+        .bind(&usage.thread_id)
+        .bind(&usage.turn_id)
+        .bind(usage.input_tokens)
+        .bind(usage.cached_input_tokens)
+        .bind(usage.cache_write_input_tokens)
+        .bind(usage.output_tokens)
+        .bind(usage.reasoning_output_tokens)
+        .bind(usage.total_tokens)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .context("upsert run token usage")?;
+    Ok(())
+}
+
+async fn upsert_run_token_usage_in_transaction(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    run_history_id: i64,
+    usage: &NewRunTokenUsage,
+    created_at: i64,
+) -> Result<()> {
+    validate_token_usage(usage)?;
+    sqlx::query(UPSERT_RUN_TOKEN_USAGE_SQL)
+        .bind(run_history_id)
+        .bind(&usage.response_id)
+        .bind(&usage.thread_id)
+        .bind(&usage.turn_id)
+        .bind(usage.input_tokens)
+        .bind(usage.cached_input_tokens)
+        .bind(usage.cache_write_input_tokens)
+        .bind(usage.output_tokens)
+        .bind(usage.reasoning_output_tokens)
+        .bind(usage.total_tokens)
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await
+        .context("upsert captured run token usage")?;
+    Ok(())
+}
+
+fn map_token_usage_rollup(row: &sqlx::sqlite::SqliteRow) -> Result<RunTokenUsageRollup> {
+    Ok(RunTokenUsageRollup {
+        response_count: row
+            .try_get("response_count")
+            .context("read token usage response_count")?,
+        input_tokens: row
+            .try_get("input_tokens")
+            .context("read token usage input_tokens")?,
+        cached_input_tokens: row
+            .try_get("cached_input_tokens")
+            .context("read token usage cached_input_tokens")?,
+        cache_write_input_tokens: row
+            .try_get("cache_write_input_tokens")
+            .context("read token usage cache_write_input_tokens")?,
+        output_tokens: row
+            .try_get("output_tokens")
+            .context("read token usage output_tokens")?,
+        reasoning_output_tokens: row
+            .try_get("reasoning_output_tokens")
+            .context("read token usage reasoning_output_tokens")?,
+        total_tokens: row
+            .try_get("total_tokens")
+            .context("read token usage total_tokens")?,
+    })
 }
 
 fn run_history_kind_label(kind: RunHistoryKind) -> &'static str {

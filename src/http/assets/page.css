@@ -45,6 +45,8 @@ dd { margin: 0; word-break: break-word; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 10px 8px; border-top: 1px solid var(--divider); vertical-align: top; }
 thead th { border-top: 0; color: var(--text-tertiary); font-size: 12px; line-height: 16px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; }
+th.numeric, td.numeric { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.token-usage-note { margin-bottom: 12px; }
 a { color: var(--accent); }
 code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12px; line-height: 18px; }
 .empty { margin: 0; color: var(--text-secondary); }

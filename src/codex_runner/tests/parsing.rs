@@ -1,5 +1,43 @@
 use super::*;
 #[test]
+fn raw_response_usage_is_captured_with_cache_write_tokens() -> Result<()> {
+    let mut client = empty_app_server_client();
+    let mut capture = TurnHistoryCapture::default();
+    let outcome = client.handle_turn_notification(
+        "rawResponse/completed",
+        Some(&json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "responseId": "response-1",
+            "usage": {
+                "inputTokens": 100,
+                "cachedInputTokens": 20,
+                "cacheWriteInputTokens": 5,
+                "outputTokens": 30,
+                "reasoningOutputTokens": 10,
+                "totalTokens": 130
+            }
+        })),
+        TurnNotificationContext {
+            thread_id: "thread-1",
+            turn_id: "turn-1",
+            history_capture: &mut capture,
+        },
+        |_, _| {},
+        |_| {},
+    )?;
+
+    assert_eq!(outcome, TurnStreamNotificationOutcome::Continue);
+    assert_eq!(capture.events.len(), 1);
+    assert_eq!(capture.events[0].event_type, "raw_response_completed");
+    assert_eq!(
+        capture.events[0].payload["usage"]["cacheWriteInputTokens"],
+        5
+    );
+    Ok(())
+}
+
+#[test]
 fn parse_review_output_json_pass() -> Result<()> {
     let text = r#"{"verdict":"pass","summary":"ok","comment_markdown":""}"#;
     let result = parse_review_output(text)?;

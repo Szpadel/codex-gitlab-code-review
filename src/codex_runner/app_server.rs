@@ -558,6 +558,15 @@ impl AppServerClient {
                     on_item_completed(&completed_item);
                 }
             }
+            "rawResponse/completed" => {
+                if let Some(payload) = params {
+                    history_capture.push(
+                        Some(turn_id_from_params(params).unwrap_or(turn_id)),
+                        "raw_response_completed",
+                        payload.clone(),
+                    );
+                }
+            }
             "turn/completed" => {
                 let status = params
                     .and_then(|value| value.get("turn"))

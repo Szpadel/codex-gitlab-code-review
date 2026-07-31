@@ -592,6 +592,7 @@ impl DockerCodexRunner {
             "approvalPolicy": "never",
             "sandbox": self.sandbox_mode_value(),
             "persistExtendedHistory": true,
+            "experimentalRawEvents": true,
         });
         if let Some(developer_instructions) = developer_instructions {
             params["developerInstructions"] = Value::String(developer_instructions);

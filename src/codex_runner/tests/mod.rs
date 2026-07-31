@@ -1,6 +1,6 @@
 use super::app_server::{
-    AppServerIoFailure, TurnHistoryCapture, TurnNotificationContext, is_app_server_io_failure,
-    item_is_successful_gitlab_discovery_call, with_recent_runner_errors,
+    AppServerIoFailure, TurnHistoryCapture, TurnNotificationContext, TurnStreamNotificationOutcome,
+    is_app_server_io_failure, item_is_successful_gitlab_discovery_call, with_recent_runner_errors,
 };
 use super::app_server_diagnostics::{
     AppServerContainerDiagnostics, AppServerContainerStateSnapshot, AppServerLogTail,

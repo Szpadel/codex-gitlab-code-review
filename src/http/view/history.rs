@@ -1,8 +1,9 @@
 use super::super::status::{
     HistoryQuery, HistoryRunListItem, HistoryRunRecord, HistorySnapshot, MrHistorySnapshot,
+    TokenUsageStatisticSnapshot,
 };
 use super::html::{
-    NavItem, escape_html, mr_history_href, render_shell, render_table_section,
+    NavItem, escape_html, format_number, mr_history_href, render_shell, render_table_section,
     render_unix_timestamp, run_kind_label,
 };
 use crate::review::RunRetryStatus;
@@ -16,11 +17,13 @@ pub(in crate::http) fn render_history_page(
 ) -> String {
     let filters = &snapshot.filters;
     let body = format!(
-        "<section class=\"hero\"><h1>Run history</h1><p class=\"muted\">Append-only review and mention sessions.</p></section>\
+        "<section class=\"hero\"><h1>Run history</h1><p class=\"muted\">Append-only review, security, and mention sessions.</p></section>\
+         {}\
          {}\
          {}\
          {}",
         render_history_filters(filters),
+        render_token_statistics(&snapshot.token_statistics),
         render_history_run_table("All runs", &snapshot.runs),
         render_history_pagination(snapshot)
     );
@@ -158,6 +161,63 @@ fn render_kind_options(selected: Option<RunHistoryKind>) -> String {
         .collect::<String>()
 }
 
+fn render_token_statistics(statistics: &[TokenUsageStatisticSnapshot]) -> String {
+    let all = statistics.iter().find(|statistic| statistic.kind.is_none());
+    let recorded_total = all.map_or(0, |statistic| statistic.usage.total_tokens);
+    let recorded_responses = all.map_or(0, |statistic| statistic.usage.response_count);
+    if statistics.is_empty() || recorded_responses == 0 {
+        return render_table_section(
+            "Token usage for matching history",
+            "<p class=\"empty\">No token usage has been recorded for matching runs.</p>"
+                .to_string(),
+        );
+    }
+    let show_cache_write = statistics
+        .iter()
+        .any(|statistic| statistic.usage.cache_write_input_tokens > 0);
+    let cache_write_header = if show_cache_write {
+        "<th class=\"numeric\">Cache write</th>"
+    } else {
+        ""
+    };
+    let rows = statistics
+        .iter()
+        .map(|statistic| {
+            let kind = statistic.kind.map_or("all", run_kind_label);
+            let cache_write = if show_cache_write {
+                format!(
+                    "<td class=\"numeric\">{}</td>",
+                    format_number(statistic.usage.cache_write_input_tokens)
+                )
+            } else {
+                String::new()
+            };
+            let share = if recorded_total == 0 {
+                0.0
+            } else {
+                statistic.usage.total_tokens as f64 * 100.0 / recorded_total as f64
+            };
+            format!(
+                "<tr><td>{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\">{}</td>{}<td class=\"numeric\">{}</td><td class=\"numeric\">{}</td><td class=\"numeric\"><strong>{}</strong></td><td class=\"numeric\">{share:.1}%</td></tr>",
+                escape_html(kind),
+                format_number(statistic.recorded_runs),
+                format_number(statistic.usage.input_tokens),
+                format_number(statistic.usage.cached_input_tokens),
+                cache_write,
+                format_number(statistic.usage.output_tokens),
+                format_number(statistic.usage.reasoning_output_tokens),
+                format_number(statistic.usage.total_tokens),
+            )
+        })
+        .collect::<String>();
+    render_table_section(
+        "Token usage for matching history",
+        format!(
+            "<p class=\"muted token-usage-note\">Exact usage recorded from Codex model responses. Cached input and reasoning output are included in the total, not added to it.</p><div class=\"table-scroll\"><table><thead><tr><th>Kind</th><th class=\"numeric\">Runs</th><th class=\"numeric\">Input</th><th class=\"numeric\">Cached input</th>{cache_write_header}<th class=\"numeric\">Output</th><th class=\"numeric\">Reasoning</th><th class=\"numeric\">Total</th><th class=\"numeric\">Share</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        ),
+    )
+}
+
 fn render_history_run_table(title: &str, runs: &[HistoryRunListItem]) -> String {
     render_table_section(
         title,
@@ -166,7 +226,7 @@ fn render_history_run_table(title: &str, runs: &[HistoryRunListItem]) -> String 
         } else {
             let rows = runs.iter().map(render_history_run_row).collect::<String>();
             format!(
-                "<table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Result</th><th>Started</th><th>Preview</th></tr></thead><tbody>{rows}</tbody></table>"
+                "<div class=\"table-scroll\"><table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Result</th><th>Started</th><th class=\"numeric\">Total tokens</th><th>Preview</th></tr></thead><tbody>{rows}</tbody></table></div>"
             )
         },
     )
@@ -180,6 +240,7 @@ fn render_history_run_row(run: &HistoryRunListItem) -> String {
          <td><a href=\"{}\">!{}</a></td>\
          <td><span class=\"badge badge-result\">{}</span></td>\
          <td>{}</td>\
+         <td class=\"numeric\">{}</td>\
          <td><a href=\"/history/{}\">{}</a></td>\
          </tr>",
         escape_html(run_kind_label(run.kind)),
@@ -193,6 +254,7 @@ fn render_history_run_row(run: &HistoryRunListItem) -> String {
             run.retry.as_ref()
         )),
         render_unix_timestamp(run.started_at),
+        render_optional_tokens(run.token_usage.as_ref().map(|usage| usage.total_tokens)),
         run.id,
         escape_html(&run_row_preview(
             run.result.as_deref(),
@@ -211,7 +273,7 @@ fn render_record_run_table(title: &str, runs: &[HistoryRunRecord]) -> String {
         } else {
             let rows = runs.iter().map(render_record_run_row).collect::<String>();
             format!(
-                "<table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Result</th><th>Started</th><th>Preview</th></tr></thead><tbody>{rows}</tbody></table>"
+                "<div class=\"table-scroll\"><table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Result</th><th>Started</th><th class=\"numeric\">Total tokens</th><th>Preview</th></tr></thead><tbody>{rows}</tbody></table></div>"
             )
         },
     )
@@ -225,6 +287,7 @@ fn render_record_run_row(run: &HistoryRunRecord) -> String {
          <td><a href=\"{}\">!{}</a></td>\
          <td><span class=\"badge badge-result\">{}</span></td>\
          <td>{}</td>\
+         <td class=\"numeric\">{}</td>\
          <td><a href=\"/history/{}\">{}</a></td>\
          </tr>",
         escape_html(run_kind_label(run.kind)),
@@ -238,6 +301,7 @@ fn render_record_run_row(run: &HistoryRunRecord) -> String {
             run.retry.as_ref()
         )),
         render_unix_timestamp(run.started_at),
+        render_optional_tokens(run.token_usage.as_ref().map(|usage| usage.total_tokens)),
         run.id,
         escape_html(&run_row_preview(
             run.result.as_deref(),
@@ -246,6 +310,10 @@ fn render_record_run_row(run: &HistoryRunRecord) -> String {
             run.error.as_deref()
         ))
     )
+}
+
+fn render_optional_tokens(tokens: Option<i64>) -> String {
+    tokens.map_or_else(|| "Not recorded".to_string(), format_number)
 }
 
 fn run_row_preview(
@@ -305,6 +373,7 @@ mod tests {
             has_next: false,
             previous_cursor: None,
             next_cursor: None,
+            token_statistics: Vec::new(),
             runs: vec![HistoryRunListItem::new(
                 RunHistoryListItem {
                     id: 7,
@@ -325,6 +394,7 @@ mod tests {
                     exhausted: false,
                     label: "retry 1/5 in 15m".to_string(),
                 }),
+                None,
             )],
         };
 

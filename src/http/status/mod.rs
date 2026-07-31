@@ -14,8 +14,8 @@ pub use http_services::HttpServices;
 pub use models::{
     HistoryQuery, HistoryRunListItem, HistoryRunRecord, HistorySnapshot, MrHistorySnapshot,
     RunDetailSnapshot, SecurityContextPreview, StatusConfigSnapshot, StatusFeatureFlagSnapshot,
-    StatusRateLimitSnapshot, StatusSnapshot, TranscriptBackfillSnapshot, UsageAccountSnapshot,
-    UsagePageSnapshot,
+    StatusRateLimitSnapshot, StatusSnapshot, TokenUsageStatisticSnapshot,
+    TranscriptBackfillSnapshot, UsageAccountSnapshot, UsagePageSnapshot,
 };
 pub use rate_limit_service::RateLimitService;
 pub use skills_service::SkillsService;

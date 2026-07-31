@@ -81,7 +81,7 @@ pub struct ProjectCatalog {
     pub projects: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunHistoryKind {
     Review,
@@ -270,6 +270,37 @@ pub struct NewRunHistoryEvent {
     pub turn_id: Option<String>,
     pub event_type: String,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewRunTokenUsage {
+    pub response_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub cache_write_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RunTokenUsageRollup {
+    pub response_count: i64,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub cache_write_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunTokenUsageStatistic {
+    pub kind: RunHistoryKind,
+    pub recorded_runs: i64,
+    pub usage: RunTokenUsageRollup,
 }
 
 #[derive(Debug, Clone, PartialEq)]

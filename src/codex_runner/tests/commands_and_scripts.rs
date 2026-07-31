@@ -1062,6 +1062,10 @@ fn deduplication_session_override_uses_dedicated_defaults_and_review_summary() {
     assert_eq!(session_override.model, Some("gpt-5.6-luna"));
     assert_eq!(session_override.reasoning_summary, Some("detailed"));
     assert_eq!(session_override.reasoning_effort, Some("medium"));
+    assert_eq!(
+        runner.deduplication_thread_start_params("/work/repo")["experimentalRawEvents"],
+        true
+    );
 }
 
 #[test]
@@ -1074,6 +1078,7 @@ fn thread_start_params_include_extra_workspace_write_roots() {
         runner.thread_start_params("/work/repo/group/repo", None, &["/work/mcp".to_string()]);
 
     assert_eq!(params["sandbox"], "workspace-write");
+    assert_eq!(params["experimentalRawEvents"], true);
     assert_eq!(
         params["config"]["sandbox_workspace_write"]["writable_roots"],
         serde_json::json!(["/work/mcp", "/work/repo/group/repo"])
@@ -1093,6 +1098,7 @@ fn thread_start_params_preserve_workspace_write_defaults_without_extra_roots() {
     let params = runner.thread_start_params("/work/repo/group/repo", None, &[]);
 
     assert_eq!(params["sandbox"], "workspace-write");
+    assert_eq!(params["experimentalRawEvents"], true);
     assert!(params.get("config").is_none());
 }
 

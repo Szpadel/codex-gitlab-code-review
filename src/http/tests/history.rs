@@ -1,4 +1,63 @@
 use super::*;
+
+#[tokio::test]
+async fn history_and_detail_surface_recorded_token_usage_and_kind_statistics() -> Result<()> {
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let run_id = RunFixture::security("group/repo", 70, "token-sha")
+        .result("pass")
+        .preview("Security review token usage")
+        .insert(&srv.state)
+        .await?;
+    srv.state
+        .run_history
+        .record_run_token_usage(
+            run_id,
+            &NewRunTokenUsage {
+                response_id: "response-70".to_string(),
+                thread_id: "thread-70".to_string(),
+                turn_id: "turn-70".to_string(),
+                input_tokens: 1_200,
+                cached_input_tokens: 400,
+                cache_write_input_tokens: 50,
+                output_tokens: 300,
+                reasoning_output_tokens: 120,
+                total_tokens: 1_500,
+            },
+        )
+        .await?;
+
+    let api: Value = reqwest::get(format!("http://{}/api/history?kind=security", srv.address))
+        .await?
+        .json()
+        .await?;
+    assert_eq!(api["runs"][0]["token_usage"]["total_tokens"], 1_500);
+    let security = api["token_statistics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|statistic| statistic["kind"] == "security")
+        .unwrap();
+    assert_eq!(security["recorded_runs"], 1);
+    assert_eq!(security["total_tokens"], 1_500);
+
+    let history = reqwest::get(format!("http://{}/history?kind=security", srv.address))
+        .await?
+        .text()
+        .await?;
+    assert!(history.contains("Token usage for matching history"));
+    assert!(history.contains("1,500"));
+    assert!(history.contains("Cache write"));
+
+    let detail = reqwest::get(format!("http://{}/history/{run_id}", srv.address))
+        .await?
+        .text()
+        .await?;
+    assert!(detail.contains("<h2>Token usage</h2>"));
+    assert!(detail.contains("Cached prompt input"));
+    assert!(detail.contains("1,500"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn history_snapshot_filters_runs_and_returns_summary_rows() -> Result<()> {
     let srv = HttpTestServerBuilder::new().spawn().await?;

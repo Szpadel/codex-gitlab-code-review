@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::service_factory::build_review_state_store;
 use crate::state::{
-    NewRunHistory, NewRunHistoryEvent, ReviewStateStore, RunHistoryFinish, RunHistoryKind,
-    RunHistoryRecord, RunHistorySessionUpdate,
+    NewRunHistory, NewRunHistoryEvent, NewRunTokenUsage, ReviewStateStore, RunHistoryFinish,
+    RunHistoryKind, RunHistoryRecord, RunHistorySessionUpdate,
 };
 use anyhow::{Context, Result};
 use chrono::{Duration, SecondsFormat, TimeZone, Utc};
@@ -153,6 +153,9 @@ async fn seed_example_history_with_store(
             )
             .await
             .with_context(|| format!("finish demo run history for run {run_id}"))?;
+        if spec.transcript.is_some() {
+            seed_demo_token_usage(state, run_id, &spec).await?;
+        }
         let stored = state
             .run_history
             .get_run_history(run_id)
@@ -165,6 +168,44 @@ async fn seed_example_history_with_store(
         database_path: database_path.to_string(),
         runs,
     })
+}
+
+async fn seed_demo_token_usage(
+    state: &ReviewStateStore,
+    run_id: i64,
+    spec: &DemoRunSpec,
+) -> Result<()> {
+    let response_count = if spec.transcript == Some(DemoTranscriptKind::ReviewRich) {
+        2
+    } else {
+        1
+    };
+    for index in 0..response_count {
+        let input_tokens = 1_800 + i64::from(index) * 420 + i64::try_from(spec.iid % 100)?;
+        let output_tokens = 240 + i64::from(index) * 60;
+        state
+            .run_history
+            .record_run_token_usage(
+                run_id,
+                &NewRunTokenUsage {
+                    response_id: format!("demo-response-{run_id}-{index}"),
+                    thread_id: format!("demo-usage-thread-{run_id}"),
+                    turn_id: format!("demo-usage-turn-{run_id}-{index}"),
+                    input_tokens,
+                    cached_input_tokens: input_tokens / 3,
+                    cache_write_input_tokens: if spec.kind == RunHistoryKind::Security {
+                        input_tokens / 8
+                    } else {
+                        0
+                    },
+                    output_tokens,
+                    reasoning_output_tokens: output_tokens / 2,
+                    total_tokens: input_tokens + output_tokens,
+                },
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 fn build_seeded_run_summary(run: RunHistoryRecord) -> SeededRunSummary {
@@ -252,6 +293,23 @@ fn demo_run_specs() -> Vec<DemoRunSpec> {
             command_repo: None,
             transcript: None,
             use_review_thread_id: false,
+        },
+        DemoRunSpec {
+            kind: RunHistoryKind::Security,
+            repo: "demo/group/service-secure",
+            iid: 350,
+            head_sha: "ffffffffffffffffffffffffffffffffffffffff",
+            result: "pass",
+            preview: "Demo security review: threat-model guided assessment",
+            summary: "Demo security review found no exploitable behavior in the changed trust boundary.",
+            error: None,
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+            transcript: Some(DemoTranscriptKind::ReviewRich),
+            use_review_thread_id: true,
         },
         DemoRunSpec {
             kind: RunHistoryKind::Mention,
@@ -758,7 +816,7 @@ mod tests {
         let report =
             seed_example_history_with_store(&state, db_path.to_string_lossy().as_ref()).await?;
 
-        assert_eq!(report.runs.len(), 5);
+        assert_eq!(report.runs.len(), 6);
         let mr_runs = state
             .run_history
             .list_run_history_for_mr("demo/group/service-a", 101)
@@ -820,6 +878,12 @@ mod tests {
         assert!(fallback.thread_id.is_none());
         assert!(fallback.review_thread_id.is_none());
         assert_eq!(fallback.auth_account_name, None);
+        let usage = state
+            .run_history
+            .token_usage_for_runs(&[rich_run.run_id, fallback_run.run_id])
+            .await?;
+        assert!(usage.contains_key(&rich_run.run_id));
+        assert!(!usage.contains_key(&fallback_run.run_id));
         Ok(())
     }
 

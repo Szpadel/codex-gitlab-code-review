@@ -43,13 +43,14 @@ impl DockerCodexRunner {
         })
     }
 
-    fn deduplication_thread_start_params(&self, repo_path: &str) -> Value {
+    pub(super) fn deduplication_thread_start_params(&self, repo_path: &str) -> Value {
         let session_override = self.deduplication_session_override();
         let mut params = json!({
             "cwd": repo_path,
             "approvalPolicy": "never",
             "sandbox": "read-only",
             "persistExtendedHistory": true,
+            "experimentalRawEvents": true,
         });
         if let Some(model) = session_override.model {
             params["model"] = Value::String(model.to_string());

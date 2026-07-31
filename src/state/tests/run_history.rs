@@ -1,5 +1,127 @@
 use super::*;
 #[tokio::test]
+async fn run_token_usage_is_captured_idempotently_and_grouped_by_filtered_kind() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let review_id = store
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 42,
+            head_sha: "sha-review".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    let usage_event = NewRunHistoryEvent {
+        sequence: 1,
+        turn_id: Some("turn-1".to_string()),
+        event_type: "raw_response_completed".to_string(),
+        payload: serde_json::json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "responseId": "response-1",
+            "usage": {
+                "inputTokens": 120,
+                "cachedInputTokens": 40,
+                "cacheWriteInputTokens": 10,
+                "outputTokens": 30,
+                "reasoningOutputTokens": 12,
+                "totalTokens": 150
+            }
+        }),
+    };
+    store
+        .run_history
+        .append_run_history_events(review_id, std::slice::from_ref(&usage_event))
+        .await?;
+    store
+        .run_history
+        .record_run_token_usage(
+            review_id,
+            &NewRunTokenUsage {
+                response_id: "response-1".to_string(),
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                input_tokens: 125,
+                cached_input_tokens: 45,
+                cache_write_input_tokens: 10,
+                output_tokens: 35,
+                reasoning_output_tokens: 14,
+                total_tokens: 160,
+            },
+        )
+        .await?;
+    store
+        .run_history
+        .record_run_token_usage(
+            review_id,
+            &NewRunTokenUsage {
+                response_id: "response-2".to_string(),
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-2".to_string(),
+                input_tokens: 200,
+                cached_input_tokens: 80,
+                cache_write_input_tokens: 0,
+                output_tokens: 50,
+                reasoning_output_tokens: 20,
+                total_tokens: 250,
+            },
+        )
+        .await?;
+
+    let totals = store
+        .run_history
+        .token_usage_for_runs(&[review_id, 999])
+        .await?;
+    assert_eq!(
+        totals.get(&review_id),
+        Some(&RunTokenUsageRollup {
+            response_count: 2,
+            input_tokens: 325,
+            cached_input_tokens: 125,
+            cache_write_input_tokens: 10,
+            output_tokens: 85,
+            reasoning_output_tokens: 34,
+            total_tokens: 410,
+        })
+    );
+
+    store
+        .run_history
+        .replace_run_history_events(review_id, std::slice::from_ref(&usage_event))
+        .await?;
+    store
+        .run_history
+        .replace_run_history_events(review_id, &[])
+        .await?;
+    let totals_after_rewrite = store.run_history.token_usage_for_runs(&[review_id]).await?;
+    assert_eq!(totals_after_rewrite[&review_id].total_tokens, 400);
+
+    let statistics = store
+        .run_history
+        .token_usage_statistics(&RunHistoryListQuery {
+            repo: Some("group/repo".to_string()),
+            kind: Some(RunHistoryKind::Review),
+            limit: 1,
+            after: Some(RunHistoryCursor {
+                started_at: i64::MAX,
+                id: i64::MAX,
+            }),
+            ..RunHistoryListQuery::default()
+        })
+        .await?;
+    assert_eq!(statistics.len(), 1);
+    assert_eq!(statistics[0].kind, RunHistoryKind::Review);
+    assert_eq!(statistics[0].recorded_runs, 1);
+    assert_eq!(statistics[0].usage.total_tokens, 400);
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_history_is_append_only_for_same_mr() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
 
@@ -866,19 +988,40 @@ async fn background_run_history_append_persists_after_flush() -> Result<()> {
         .run_history
         .append_run_history_events_bg(
             run_id,
-            vec![NewRunHistoryEvent {
-                sequence: 1,
-                turn_id: Some("turn-bg".to_string()),
-                event_type: "turn_started".to_string(),
-                payload: serde_json::json!({}),
-            }],
+            vec![
+                NewRunHistoryEvent {
+                    sequence: 1,
+                    turn_id: Some("turn-bg".to_string()),
+                    event_type: "turn_started".to_string(),
+                    payload: serde_json::json!({}),
+                },
+                NewRunHistoryEvent {
+                    sequence: 2,
+                    turn_id: Some("turn-bg".to_string()),
+                    event_type: "raw_response_completed".to_string(),
+                    payload: serde_json::json!({
+                        "threadId": "thread-bg",
+                        "turnId": "turn-bg",
+                        "responseId": "response-bg",
+                        "usage": {
+                            "inputTokens": 100,
+                            "cachedInputTokens": 25,
+                            "outputTokens": 20,
+                            "reasoningOutputTokens": 5,
+                            "totalTokens": 120
+                        }
+                    }),
+                },
+            ],
         )
         .await?;
     store.flush_background_writes().await?;
 
     let events = store.run_history.list_run_history_events(run_id).await?;
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     assert_eq!(events[0].turn_id.as_deref(), Some("turn-bg"));
+    let usage = store.run_history.token_usage_for_runs(&[run_id]).await?;
+    assert_eq!(usage[&run_id].total_tokens, 120);
     Ok(())
 }
 

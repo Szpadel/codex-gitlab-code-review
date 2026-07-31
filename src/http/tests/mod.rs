@@ -7,10 +7,10 @@ use crate::codex_runner::{
 use crate::config::FallbackAuthAccountConfig;
 use crate::review::ReviewLane;
 use crate::state::{
-    NewRunHistory, NewRunHistoryEvent, PersistedScanStatus, ReviewRateLimitBucketMode,
-    ReviewRateLimitRuleUpsert, ReviewRateLimitScope, ReviewRateLimitTarget,
-    ReviewRateLimitTargetKind, RunHistoryFinish, RunHistoryKind, RunHistorySessionUpdate, ScanMode,
-    ScanOutcome, ScanState, TranscriptBackfillState,
+    NewRunHistory, NewRunHistoryEvent, NewRunTokenUsage, PersistedScanStatus,
+    ReviewRateLimitBucketMode, ReviewRateLimitRuleUpsert, ReviewRateLimitScope,
+    ReviewRateLimitTarget, ReviewRateLimitTargetKind, RunHistoryFinish, RunHistoryKind,
+    RunHistorySessionUpdate, ScanMode, ScanOutcome, ScanState, TranscriptBackfillState,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;

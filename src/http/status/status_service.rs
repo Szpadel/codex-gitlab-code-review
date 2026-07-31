@@ -3,12 +3,13 @@ use super::models::scan_into_snapshot;
 use super::{
     AdminService, HistoryQuery, HistoryRunListItem, HistoryRunRecord, HistorySnapshot,
     MrHistorySnapshot, RateLimitService, RunDetailSnapshot, SecurityContextPreview,
-    StatusConfigSnapshot, StatusSnapshot,
+    StatusConfigSnapshot, StatusSnapshot, TokenUsageStatisticSnapshot,
 };
 use crate::config::Config;
 use crate::review::{RunRetryStatus, RunRetryStatusProvider};
 use crate::state::{
     ReviewStateStore, RunHistoryCursor, RunHistoryKind, RunHistoryListQuery, RunHistoryRecord,
+    RunTokenUsageRollup,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -168,9 +169,14 @@ impl StatusService {
         };
         let limit = list_query.normalized_limit();
         let page = self.state.run_history.list_run_history(&list_query).await?;
+        let statistics = self
+            .state
+            .run_history
+            .token_usage_statistics(&list_query)
+            .await?;
         let mut filters = query;
         filters.limit = limit;
-        let runs = self.with_list_retry_statuses(page.runs);
+        let runs = self.with_list_retry_statuses(page.runs).await?;
         Ok(HistorySnapshot {
             generated_at: Utc::now().to_rfc3339(),
             filters,
@@ -179,6 +185,7 @@ impl StatusService {
             has_next: page.has_next,
             previous_cursor: page.previous_cursor.map(RunHistoryCursor::encode),
             next_cursor: page.next_cursor.map(RunHistoryCursor::encode),
+            token_statistics: token_usage_statistic_snapshots(statistics),
             runs,
         })
     }
@@ -192,7 +199,7 @@ impl StatusService {
             .run_history
             .list_run_history_for_mr(repo, iid)
             .await?;
-        let runs = self.with_record_retry_statuses(runs);
+        let runs = self.with_record_retry_statuses(runs).await?;
         Ok(MrHistorySnapshot {
             generated_at: Utc::now().to_rfc3339(),
             repo: repo.to_string(),
@@ -224,8 +231,8 @@ impl StatusService {
             .backfill
             .resolve_transcript_backfill(&run, thread.as_ref())
             .await?;
-        let run = self.with_record_retry_statuses(vec![run]).remove(0);
-        let related_runs = self.with_record_retry_statuses(related_runs);
+        let run = self.with_record_retry_statuses(vec![run]).await?.remove(0);
+        let related_runs = self.with_record_retry_statuses(related_runs).await?;
         Ok(Some(RunDetailSnapshot {
             generated_at: Utc::now().to_rfc3339(),
             run,
@@ -236,29 +243,46 @@ impl StatusService {
         }))
     }
 
-    fn with_list_retry_statuses(
+    async fn with_list_retry_statuses(
         &self,
         runs: Vec<crate::state::RunHistoryListItem>,
-    ) -> Vec<HistoryRunListItem> {
+    ) -> Result<Vec<HistoryRunListItem>> {
         let run_ids = runs.iter().map(|run| run.id).collect::<Vec<_>>();
         let mut statuses = self.retry_statuses_for_run_ids(&run_ids);
-        runs.into_iter()
+        let mut usage = self
+            .state
+            .run_history
+            .token_usage_for_runs(&run_ids)
+            .await?;
+        Ok(runs
+            .into_iter()
             .map(|run| {
                 let retry = statuses.remove(&run.id);
-                HistoryRunListItem::new(run, retry)
+                let token_usage = usage.remove(&run.id);
+                HistoryRunListItem::new(run, retry, token_usage)
             })
-            .collect()
+            .collect())
     }
 
-    fn with_record_retry_statuses(&self, runs: Vec<RunHistoryRecord>) -> Vec<HistoryRunRecord> {
+    async fn with_record_retry_statuses(
+        &self,
+        runs: Vec<RunHistoryRecord>,
+    ) -> Result<Vec<HistoryRunRecord>> {
         let run_ids = runs.iter().map(|run| run.id).collect::<Vec<_>>();
         let mut statuses = self.retry_statuses_for_run_ids(&run_ids);
-        runs.into_iter()
+        let mut usage = self
+            .state
+            .run_history
+            .token_usage_for_runs(&run_ids)
+            .await?;
+        Ok(runs
+            .into_iter()
             .map(|run| {
                 let retry = statuses.remove(&run.id);
-                HistoryRunRecord::new(run, retry)
+                let token_usage = usage.remove(&run.id);
+                HistoryRunRecord::new(run, retry, token_usage)
             })
-            .collect()
+            .collect())
     }
 
     fn retry_statuses_for_run_ids(&self, run_ids: &[i64]) -> HashMap<i64, RunRetryStatus> {
@@ -319,4 +343,42 @@ impl StatusService {
             expires_at: entry.expires_at,
         }))
     }
+}
+
+fn token_usage_statistic_snapshots(
+    statistics: Vec<crate::state::RunTokenUsageStatistic>,
+) -> Vec<TokenUsageStatisticSnapshot> {
+    let mut by_kind = statistics
+        .into_iter()
+        .map(|statistic| (statistic.kind, statistic))
+        .collect::<HashMap<_, _>>();
+    let mut snapshots = Vec::new();
+    let mut all = TokenUsageStatisticSnapshot {
+        kind: None,
+        recorded_runs: 0,
+        usage: RunTokenUsageRollup::default(),
+    };
+    for kind in [
+        RunHistoryKind::Review,
+        RunHistoryKind::Security,
+        RunHistoryKind::Mention,
+    ] {
+        let statistic = by_kind.remove(&kind);
+        let snapshot = TokenUsageStatisticSnapshot {
+            kind: Some(kind),
+            recorded_runs: statistic.as_ref().map_or(0, |value| value.recorded_runs),
+            usage: statistic.map_or_else(RunTokenUsageRollup::default, |value| value.usage),
+        };
+        all.recorded_runs += snapshot.recorded_runs;
+        all.usage.response_count += snapshot.usage.response_count;
+        all.usage.input_tokens += snapshot.usage.input_tokens;
+        all.usage.cached_input_tokens += snapshot.usage.cached_input_tokens;
+        all.usage.cache_write_input_tokens += snapshot.usage.cache_write_input_tokens;
+        all.usage.output_tokens += snapshot.usage.output_tokens;
+        all.usage.reasoning_output_tokens += snapshot.usage.reasoning_output_tokens;
+        all.usage.total_tokens += snapshot.usage.total_tokens;
+        snapshots.push(snapshot);
+    }
+    snapshots.push(all);
+    snapshots
 }

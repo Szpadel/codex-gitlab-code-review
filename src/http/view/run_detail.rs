@@ -5,7 +5,7 @@ use super::super::status::{
 };
 use super::super::transcript::render_thread_stream;
 use super::html::{
-    NavItem, bool_label, escape_html, pretty_print_json, render_definition_list,
+    NavItem, bool_label, escape_html, format_number, pretty_print_json, render_definition_list,
     render_optional_unix_timestamp, render_shell, render_unix_timestamp, run_kind_label,
 };
 use crate::review::RunRetryStatus;
@@ -22,6 +22,7 @@ pub(in crate::http) fn render_run_detail_page(
         "<section class=\"hero\"><h1>Run {}</h1><p class=\"muted\">{} run for {} !{}.</p></section>\
          <section class=\"grid\">\
          <article class=\"card\"><h2>Run metadata</h2>{}</article>\
+         <article class=\"card\"><h2>Token usage</h2>{}</article>\
          <article class=\"card\"><h2>Related sessions</h2>{}</article>\
          </section>\
          {}{}{}{}",
@@ -30,6 +31,7 @@ pub(in crate::http) fn render_run_detail_page(
         escape_html(&run.repo),
         run.iid,
         render_run_metadata(run),
+        render_token_usage(run),
         render_related_runs(&snapshot.related_runs, run.id),
         render_trigger_card(run, gitlab_base_url),
         render_security_context_card(run, snapshot.security_context_preview.as_ref()),
@@ -100,6 +102,39 @@ fn render_run_metadata(run: &HistoryRunRecord) -> String {
         items.push(("Retry".to_string(), render_retry_status(retry)));
     }
     format!("<dl>{}</dl>", render_definition_list(&items))
+}
+
+fn render_token_usage(run: &HistoryRunRecord) -> String {
+    let Some(usage) = run.token_usage.as_ref() else {
+        return "<p class=\"empty\">Token usage was not recorded for this run.</p>".to_string();
+    };
+    format!(
+        "<p class=\"muted token-usage-note\">Exact usage across all model responses in this run.</p><dl>{}</dl>",
+        render_definition_list(&[
+            (
+                "Model responses".to_string(),
+                format_number(usage.response_count)
+            ),
+            ("Input".to_string(), format_number(usage.input_tokens)),
+            (
+                "Cached prompt input".to_string(),
+                format_number(usage.cached_input_tokens),
+            ),
+            (
+                "Cache-write input".to_string(),
+                format_number(usage.cache_write_input_tokens),
+            ),
+            ("Output".to_string(), format_number(usage.output_tokens)),
+            (
+                "Reasoning output".to_string(),
+                format_number(usage.reasoning_output_tokens),
+            ),
+            (
+                "Total tokens".to_string(),
+                format!("<strong>{}</strong>", format_number(usage.total_tokens)),
+            ),
+        ])
+    )
 }
 
 fn render_retry_status(retry: &RunRetryStatus) -> String {
@@ -409,6 +444,7 @@ mod tests {
                 transcript_backfill_state: TranscriptBackfillState::Complete,
                 transcript_backfill_error: None,
             },
+            None,
             None,
         )
     }
