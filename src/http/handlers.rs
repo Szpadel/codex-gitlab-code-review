@@ -487,8 +487,7 @@ fn decode_repo_key(repo_key: &str) -> anyhow::Result<String> {
         anyhow::bail!("invalid repo key");
     }
     let mut bytes = Vec::with_capacity(repo_key.len() / 2);
-    let chars = repo_key.as_bytes().chunks_exact(2);
-    for chunk in chars {
+    for chunk in repo_key.as_bytes().as_chunks::<2>().0 {
         let hex = std::str::from_utf8(chunk)?;
         let value = u8::from_str_radix(hex, 16)?;
         bytes.push(value);

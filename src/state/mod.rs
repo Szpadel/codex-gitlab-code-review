@@ -451,7 +451,7 @@ fn decode_hex(input: &str) -> Result<Vec<u8>> {
         bail!("hex input must have an even length");
     }
     let mut bytes = Vec::with_capacity(input.len() / 2);
-    for chunk in input.as_bytes().chunks_exact(2) {
+    for chunk in input.as_bytes().as_chunks::<2>().0 {
         let high = decode_hex_nibble(chunk[0]).context("decode high hex nibble")?;
         let low = decode_hex_nibble(chunk[1]).context("decode low hex nibble")?;
         bytes.push((high << 4) | low);
