@@ -254,7 +254,7 @@ fn run_row_preview(
     summary: Option<&str>,
     error: Option<&str>,
 ) -> String {
-    let value = if result == Some("error") {
+    let value = if matches!(result, Some("error" | "flagged")) {
         non_empty_text(error)
             .or_else(|| non_empty_text(summary))
             .or_else(|| non_empty_text(preview))

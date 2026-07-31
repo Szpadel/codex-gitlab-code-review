@@ -510,6 +510,24 @@ impl CodexRunner for CapturingReviewRunner {
     }
 }
 
+pub(super) struct CybersecurityFlagRunner {
+    pub(super) security_calls: Mutex<u32>,
+}
+
+#[async_trait]
+impl CodexRunner for CybersecurityFlagRunner {
+    async fn run_review(&self, ctx: ReviewContext) -> Result<CodexResult> {
+        if ctx.lane.is_security() {
+            *self.security_calls.lock().unwrap() += 1;
+            Err(SecurityReviewContentFlagged.into())
+        } else {
+            Ok(CodexResult::Pass {
+                summary: "ok".to_string(),
+            })
+        }
+    }
+}
+
 pub(super) struct FailingRunner {
     pub(super) calls: Mutex<u32>,
 }

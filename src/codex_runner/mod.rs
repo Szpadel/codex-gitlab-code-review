@@ -170,6 +170,18 @@ pub struct MentionCommandResult {
     pub reply_message: String,
 }
 
+const CYBERSECURITY_RISK_FLAG_MESSAGE: &str = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber";
+
+#[derive(Debug, thiserror::Error)]
+#[error("{CYBERSECURITY_RISK_FLAG_MESSAGE}")]
+pub(crate) struct SecurityReviewContentFlagged;
+
+impl SecurityReviewContentFlagged {
+    pub(crate) fn matches(text: &str) -> bool {
+        text.trim() == CYBERSECURITY_RISK_FLAG_MESSAGE
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SecurityContextBuildKey {
     pub(crate) repo: String,

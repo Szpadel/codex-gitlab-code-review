@@ -143,15 +143,21 @@ fn render_run_feature_flags(run: &RunHistoryRecord) -> String {
 }
 
 fn render_failure_details_card(run: &HistoryRunRecord) -> String {
-    if run.result.as_deref() != Some("error") {
+    let Some(result @ ("error" | "flagged")) = run.result.as_deref() else {
         return String::new();
-    }
+    };
     let details = run
         .error
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("Run finished with result error, but no failure details were recorded.");
+        .unwrap_or_else(|| {
+            if result == "flagged" {
+                "Run was flagged, but no details were recorded."
+            } else {
+                "Run finished with result error, but no failure details were recorded."
+            }
+        });
     format!(
         "<section class=\"card failure-card\"><h2>Failure details</h2><pre class=\"codeblock failure-details\">{}</pre></section>",
         escape_html(details)

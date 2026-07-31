@@ -1,6 +1,7 @@
 use super::{
     AsyncWriteExt, Future, HashMap, LogOutput, NewRunHistoryEvent, Pin, RefCell, Result,
-    SecondsFormat, StreamExt, Utc, Uuid, Value, VecDeque, anyhow, debug, info, json, warn,
+    SecondsFormat, SecurityReviewContentFlagged, StreamExt, Utc, Uuid, Value, VecDeque, anyhow,
+    debug, info, json, warn,
 };
 
 pub(crate) struct TurnNotificationContext<'a> {
@@ -576,6 +577,9 @@ impl AppServerClient {
                 info!(status, "codex turn completed");
                 if status == "failed" {
                     let error_message = error_message.as_deref().unwrap_or("unknown error");
+                    if SecurityReviewContentFlagged::matches(error_message) {
+                        return Err(SecurityReviewContentFlagged.into());
+                    }
                     return Err(anyhow!("codex turn failed: {error_message}"));
                 }
                 return Ok(TurnStreamNotificationOutcome::TurnCompleted);

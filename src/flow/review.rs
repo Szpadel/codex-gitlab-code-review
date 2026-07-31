@@ -1,4 +1,6 @@
-use crate::codex_runner::{CodexQuotaExhausted, CodexResult, ReviewComment, ReviewContext};
+use crate::codex_runner::{
+    CodexQuotaExhausted, CodexResult, ReviewComment, ReviewContext, SecurityReviewContentFlagged,
+};
 use crate::config::Config;
 use crate::config::FeatureFlagSnapshot;
 use crate::flow::award_service::AwardService;
@@ -52,6 +54,7 @@ pub(crate) enum ReviewRunResult {
     Comment,
     DryRunComment,
     Error,
+    Flagged,
     Cancelled,
 }
 
@@ -68,6 +71,7 @@ impl ReviewRunResult {
             Self::Comment => "comment",
             Self::DryRunComment => "dry_run_comment",
             Self::Error => "error",
+            Self::Flagged => "flagged",
             Self::Cancelled => "cancelled",
         }
     }
@@ -79,13 +83,14 @@ impl ReviewRunResult {
             "comment" => Some(Self::Comment),
             "dry_run_comment" => Some(Self::DryRunComment),
             "error" => Some(Self::Error),
+            "flagged" => Some(Self::Flagged),
             "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
 
     pub(crate) const fn is_completed_review(self) -> bool {
-        matches!(self, Self::Pass | Self::Comment)
+        matches!(self, Self::Pass | Self::Comment | Self::Flagged)
     }
 }
 
@@ -1647,6 +1652,26 @@ impl ReviewRunContext {
         Ok(())
     }
 
+    async fn handle_flagged(&self, run: &ReviewRunIdentity<'_>, err: Error) -> Result<()> {
+        warn!(
+            repo = run.repo,
+            iid = run.iid,
+            error = ?err,
+            "security review content was flagged; not retrying"
+        );
+        self.record_outcome(
+            run,
+            true,
+            ReviewRunResult::Flagged,
+            task_error_finish(
+                ReviewRunResult::Flagged.as_str(),
+                self.review_preview(run.repo, run.iid),
+                &err,
+            ),
+        )
+        .await
+    }
+
     async fn handle_error(&self, run: &ReviewRunIdentity<'_>, err: Error) -> Result<()> {
         let retry = self.retry_backoff.record_failure(
             (*run.retry_key).clone(),
@@ -1755,6 +1780,11 @@ impl ReviewRunContext {
                     let quota = quota.clone();
                     self.handle_quota_exhausted(&run_identity, &quota).await?;
                     ReviewRunStatus::QuotaDeferred
+                } else if self.lane.is_security()
+                    && err.downcast_ref::<SecurityReviewContentFlagged>().is_some()
+                {
+                    self.handle_flagged(&run_identity, err).await?;
+                    ReviewRunStatus::Completed
                 } else {
                     self.handle_error(&run_identity, err).await?;
                     ReviewRunStatus::Completed
@@ -1804,6 +1834,7 @@ mod tests {
             ReviewRunResult::Comment,
             ReviewRunResult::DryRunComment,
             ReviewRunResult::Error,
+            ReviewRunResult::Flagged,
             ReviewRunResult::Cancelled,
         ] {
             assert_eq!(ReviewRunResult::parse(result.as_str()), Some(result));

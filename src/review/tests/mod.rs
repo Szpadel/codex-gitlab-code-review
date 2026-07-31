@@ -1,6 +1,6 @@
 use super::*;
 use crate::codex_runner::{
-    CodexResult, DockerCodexRunner, RunnerRuntimeOptions,
+    CodexResult, DockerCodexRunner, RunnerRuntimeOptions, SecurityReviewContentFlagged,
     test_support::{FakeRunnerHarness, ScriptedAppChunk, ScriptedAppRequest, ScriptedAppServer},
 };
 use crate::config::TargetSelector;
@@ -16,7 +16,7 @@ use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
 use crate::review::lane_policies::{GeneralLanePolicy, SecurityLanePolicy};
 use crate::review::retry::{RetryBackoff, RetryKey, RetryWarningAwardService};
-use crate::state::{ReviewRateLimitScope, ReviewStateStore};
+use crate::state::{ReviewRateLimitScope, ReviewStateStore, RunHistoryListQuery};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::Row;

@@ -109,6 +109,57 @@ async fn error_backoff_skips_repeat_and_no_error_comment() -> Result<()> {
 }
 
 #[tokio::test]
+async fn flagged_security_review_is_terminal_and_not_retried() -> Result<()> {
+    let mut config = test_config();
+    config.feature_flags.security_review = true;
+    let gitlab = fake_gitlab(vec![mr(6, "sha1")]);
+    let runner = Arc::new(CybersecurityFlagRunner {
+        security_calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        Arc::clone(&state),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once().await?;
+    service.scan_once().await?;
+
+    assert_eq!(*runner.security_calls.lock().unwrap(), 1);
+    assert!(!service.has_active_review_backoff_retry_for_mr("group/repo", 6));
+    let security_result: Option<String> = sqlx::query_scalar(
+        "SELECT result FROM run_history WHERE kind = 'security' AND repo = ? AND iid = ?",
+    )
+    .bind("group/repo")
+    .bind(6_i64)
+    .fetch_one(state.pool())
+    .await?;
+    assert_eq!(security_result.as_deref(), Some("flagged"));
+    let history = state
+        .run_history
+        .list_run_history(&RunHistoryListQuery::default())
+        .await?;
+    let flagged_run = history
+        .runs
+        .iter()
+        .find(|run| run.result.as_deref() == Some("flagged"))
+        .expect("flagged run should be listed");
+    assert!(
+        flagged_run
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("possible cybersecurity risk"))
+    );
+    let calls = gitlab.calls.lock().unwrap();
+    assert!(!calls.iter().any(|call| call.ends_with(":warning")));
+    Ok(())
+}
+
+#[tokio::test]
 async fn retryable_review_failure_adds_warning_award() -> Result<()> {
     let config = test_config();
     let gitlab = fake_gitlab(vec![mr(6, "sha1")]);

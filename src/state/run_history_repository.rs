@@ -1249,7 +1249,7 @@ fn map_run_history_list_item_row(row: &sqlx::sqlite::SqliteRow) -> Result<RunHis
     let error: Option<String> = row
         .try_get("error")
         .context("read run history list error")?;
-    let expose_error = result.as_deref() == Some("error");
+    let expose_error = matches!(result.as_deref(), Some("error" | "flagged"));
     Ok(RunHistoryListItem {
         id: row.try_get("id").context("read run history list id")?,
         kind: parse_run_history_kind(

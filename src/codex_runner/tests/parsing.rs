@@ -171,6 +171,45 @@ fn parse_security_review_output_rejects_unstructured_text() {
 }
 
 #[test]
+fn parse_security_review_output_preserves_cybersecurity_flag() {
+    let text = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber";
+    let err = parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(0.85))
+        .expect_err("flagged security review should fail");
+
+    assert!(err.downcast_ref::<SecurityReviewContentFlagged>().is_some());
+}
+
+#[test]
+fn parse_security_review_output_does_not_flag_text_containing_only_the_first_sentence() {
+    let err = parse_review_output_for_lane(
+        "This content was flagged for possible cybersecurity risk. unrelated text",
+        crate::review::ReviewLane::Security,
+        Some(0.85),
+    )
+    .expect_err("non-canonical prose should still be rejected");
+
+    assert!(err.downcast_ref::<SecurityReviewContentFlagged>().is_none());
+    assert!(
+        err.to_string()
+            .contains("security review output must be a structured JSON object")
+    );
+}
+
+#[test]
+fn parse_security_review_output_allows_flag_sentence_inside_structured_output() -> Result<()> {
+    let text = r#"{
+      "findings": [],
+      "overall_correctness": "patch is correct",
+      "overall_explanation": "This content was flagged for possible cybersecurity risk."
+    }"#;
+
+    let result =
+        parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(0.85))?;
+    assert!(matches!(result, CodexResult::Pass { .. }));
+    Ok(())
+}
+
+#[test]
 fn parse_security_review_output_rejects_wrapped_json() {
     let text = r#"Security review result:
 {
@@ -495,6 +534,37 @@ fn handle_turn_notification_enriches_command_output_from_deltas() -> Result<()> 
     assert_eq!(events.len(), 1);
     assert!(events[0].payload["createdAt"].is_string());
     assert_eq!(events[0].payload["aggregatedOutput"], "line one\nline two");
+    Ok(())
+}
+
+#[test]
+fn handle_turn_notification_classifies_exact_cybersecurity_flag() -> Result<()> {
+    let mut client = empty_app_server_client();
+    let mut capture = TurnHistoryCapture::default();
+    let message = SecurityReviewContentFlagged.to_string();
+
+    let err = client
+        .handle_turn_notification(
+            "turn/completed",
+            Some(&json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "turn": {
+                    "status": "failed",
+                    "error": { "message": message }
+                }
+            })),
+            TurnNotificationContext {
+                thread_id: "thread-1",
+                turn_id: "turn-1",
+                history_capture: &mut capture,
+            },
+            |_, _| {},
+            |_| {},
+        )
+        .expect_err("flagged turn should return an error");
+
+    assert!(err.downcast_ref::<SecurityReviewContentFlagged>().is_some());
     Ok(())
 }
 
