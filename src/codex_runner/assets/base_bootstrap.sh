@@ -33,22 +33,5 @@ fi
 @@AFTER_REMOTE_SANITIZE_SCRIPT@@@@DEPS_PREFETCH_SCRIPT@@# Use the mounted auth directory directly so token refresh persists.
 mkdir -p @@AUTH_MOUNT_PATH_Q@@
 export CODEX_HOME=@@AUTH_MOUNT_PATH_Q@@
-# Ensure Codex CLI is available for app-server mode
-if ! command -v codex >/dev/null 2>&1; then
-  echo "codex-runner: codex not found, installing"
-  if command -v npm >/dev/null 2>&1; then
-    if [ "${CODEX_RUNNER_DEBUG:-}" = "1" ]; then
-      npm install -g @openai/codex
-    else
-      if ! npm install -g @openai/codex >/tmp/codex-install.log 2>&1; then
-        echo "codex-runner-error: codex install failed"
-        tail -n 50 /tmp/codex-install.log | sed 's/^/codex-runner-error: /'
-        exit 1
-      fi
-    fi
-  else
-    echo "codex-runner-error: npm not found; provide a base image with node/npm or preinstall codex"
-    exit 1
-  fi
-fi
-@@BROWSER_PREREQ_SCRIPT@@@@BROWSER_WAIT_SCRIPT@@@@APP_SERVER_EXEC_CMD@@
+@@CODEX_CLI_BOOTSTRAP_SCRIPT@@@@BROWSER_PREREQ_SCRIPT@@@@BROWSER_WAIT_SCRIPT@@echo "codex-runner: starting codex app-server"
+@@APP_SERVER_EXEC_CMD@@

@@ -1,11 +1,4 @@
----
-source: src/codex_runner/scripts.rs
-expression: history_reader
----
-set -eu
-mkdir -p "/root/.codex"
-export CODEX_HOME="/root/.codex"
-codex_install_log='/tmp/codex-install.log'
+codex_install_log=@@CODEX_INSTALL_LOG_PATH_Q@@
 if ! rm -f "$codex_install_log" "${codex_install_log}.tmp"; then
   echo "codex-runner-error: could not prepare codex install log"
   exit 1
@@ -20,13 +13,13 @@ if ! command -v codex >/dev/null 2>&1; then
   capture_codex_install_log() {
     while :; do
       codex_install_chunk=""
-      IFS= read -r -N 65536 -t 0.1 codex_install_chunk
+      IFS= read -r -N @@CODEX_INSTALL_LOG_CHUNK_BYTES@@ -t 0.1 codex_install_chunk
       codex_install_read_status="$?"
       if [ -n "$codex_install_chunk" ]; then
-        printf '%s' "$codex_install_chunk" | tail -c 65536 >>"$codex_install_log"
+        printf '%s' "$codex_install_chunk" | tail -c @@CODEX_INSTALL_LOG_CHUNK_BYTES@@ >>"$codex_install_log"
         codex_install_log_size="$(wc -c <"$codex_install_log")"
-        if [ "$codex_install_log_size" -gt 524288 ]; then
-          tail -c 524288 "$codex_install_log" >"${codex_install_log}.tmp"
+        if [ "$codex_install_log_size" -gt @@CODEX_INSTALL_LOG_MAX_BYTES@@ ]; then
+          tail -c @@CODEX_INSTALL_LOG_MAX_BYTES@@ "$codex_install_log" >"${codex_install_log}.tmp"
           mv "${codex_install_log}.tmp" "$codex_install_log"
         fi
       fi
@@ -58,5 +51,3 @@ if ! codex_version="$("$codex_path" --version 2>&1)" || [ -z "$codex_version" ];
   exit 1
 fi
 echo "codex-runner: using $codex_version at $codex_path"
-echo "codex-runner: starting codex app-server"
-exec codex app-server --listen stdio://

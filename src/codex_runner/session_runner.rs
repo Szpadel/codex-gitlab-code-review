@@ -320,13 +320,17 @@ impl DockerCodexRunner {
                     .enrich_error_with_browser_diagnostics(err, browser_container_id, browser_mcp)
                     .await)
             }
-            Err(_) => Err(self
-                .enrich_error_with_browser_diagnostics(
-                    anyhow!(config.timeout_error),
-                    browser_container_id,
-                    browser_mcp,
-                )
-                .await),
+            Err(_) => {
+                let err = self
+                    .enrich_error_with_app_server_diagnostics(
+                        anyhow!(config.timeout_error),
+                        app_server_container_id,
+                    )
+                    .await;
+                Err(self
+                    .enrich_error_with_browser_diagnostics(err, browser_container_id, browser_mcp)
+                    .await)
+            }
         }
     }
 

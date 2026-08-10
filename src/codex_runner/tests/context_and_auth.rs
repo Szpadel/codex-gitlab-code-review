@@ -316,7 +316,7 @@ fn classify_auth_failure_preserves_non_auth_errors() {
 }
 
 #[tokio::test]
-async fn unclassified_review_failure_surfaces_error_chain_in_top_level_message() {
+async fn unclassified_review_failure_preserves_one_copy_of_the_error_chain() {
     let runner = test_runner_with_fake_runtime(
         test_codex_config(),
         false,
@@ -335,15 +335,16 @@ async fn unclassified_review_failure_surfaces_error_chain_in_top_level_message()
         .await
         .expect_err("unclassified review failure should stop fallback");
 
-    let message = err.to_string();
-    assert!(message.contains("codex review failed for account 'primary':"));
-    assert!(message.contains("recent runner errors: codex-runner-error: git clone failed"));
-    assert!(message.contains("codex app-server closed stdout"));
-    assert!(!message.contains("without fallback classification"));
+    assert_eq!(err.to_string(), "codex review failed for account 'primary'");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("recent runner errors: codex-runner-error: git clone failed"));
+    assert!(chain.contains("codex app-server closed stdout"));
+    assert_eq!(chain.matches("codex app-server closed stdout").count(), 1);
+    assert!(!chain.contains("without fallback classification"));
 }
 
 #[tokio::test]
-async fn unclassified_mention_failure_surfaces_error_chain_in_top_level_message() {
+async fn unclassified_mention_failure_preserves_one_copy_of_the_error_chain() {
     let runner = test_runner_with_fake_runtime(
         test_codex_config(),
         true,
@@ -361,11 +362,15 @@ async fn unclassified_mention_failure_surfaces_error_chain_in_top_level_message(
         .await
         .expect_err("unclassified mention failure should stop fallback");
 
-    let message = err.to_string();
-    assert!(message.contains("mention command failed for account 'primary':"));
-    assert!(message.contains("mention command setup failed"));
-    assert!(message.contains("git status failed"));
-    assert!(!message.contains("without fallback classification"));
+    assert_eq!(
+        err.to_string(),
+        "mention command failed for account 'primary'"
+    );
+    let chain = format!("{err:#}");
+    assert!(chain.contains("mention command setup failed"));
+    assert!(chain.contains("git status failed"));
+    assert_eq!(chain.matches("git status failed").count(), 1);
+    assert!(!chain.contains("without fallback classification"));
 }
 
 #[test]
@@ -388,6 +393,31 @@ fn classify_auth_failure_ignores_generic_app_server_429_without_codex_limit_cont
     let err =
         anyhow!("codex app-server closed stdout: recent runner errors: git clone failed with 429");
     let kind = classify_auth_failure(&err, now, 3600);
+    assert_eq!(kind, AuthFailureKind::Other);
+}
+
+#[test]
+fn classify_auth_failure_ignores_app_server_diagnostic_auth_phrases() {
+    let now = Utc
+        .with_ymd_and_hms(2026, 3, 2, 10, 0, 0)
+        .single()
+        .expect("valid");
+    let account = AuthAccount {
+        name: "primary".to_string(),
+        auth_host_path: "/root/.codex".to_string(),
+        state_key: auth_account_state_key("primary", "/root/.codex"),
+        is_primary: true,
+    };
+    let err = anyhow!("codex review timed out").context(
+        AppServerContainerDiagnosticsContext::new(
+            "app-server container diagnostics:\n  error=mount /root/.codex: no such file or directory\n  codex install log tail:\n    npm ERR! authentication required: rate_limit_exceeded"
+                .to_string(),
+        ),
+    );
+
+    let base = classify_auth_failure(&err, now, 3600);
+    let kind = classify_auth_failure_for_account(base, &err, &account);
+
     assert_eq!(kind, AuthFailureKind::Other);
 }
 

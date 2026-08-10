@@ -557,6 +557,8 @@ fn app_server_container_diagnostics_context_includes_state_and_logs() {
     let diagnostics = AppServerContainerDiagnostics {
         container_id: "app-123".to_string(),
         state: Some(AppServerContainerStateSnapshot {
+            image: Some("ghcr.io/openai/codex-universal:latest".to_string()),
+            image_id: Some("sha256:runner-image".to_string()),
             status: Some("exited".to_string()),
             running: Some(false),
             exit_code: Some(1),
@@ -574,17 +576,115 @@ fn app_server_container_diagnostics_context_includes_state_and_logs() {
             stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
         },
         log_collection_error: None,
+        codex_install_log_tail: Some(vec![
+            "npm timing reify completed in 22000ms".to_string(),
+            "npm ERR! code ENOSPC".to_string(),
+        ]),
+        codex_install_log_collection_error: None,
     };
 
     let formatted = diagnostics.format_context();
 
     assert!(formatted.contains("app-server container diagnostics"));
     assert!(formatted.contains("app-123"));
+    assert!(formatted.contains("image=ghcr.io/openai/codex-universal:latest"));
+    assert!(formatted.contains("image_id=sha256:runner-image"));
     assert!(formatted.contains("status=exited"));
     assert!(formatted.contains("exit_code=1"));
     assert!(formatted.contains("codex-runner-error: git clone failed"));
     assert!(formatted.contains("npm ERR! 429 Too Many Requests"));
     assert!(formatted.contains("MCP server chrome-devtools failed to start"));
+    assert!(formatted.contains("codex install log tail"));
+    assert!(formatted.contains("npm ERR! code ENOSPC"));
+}
+
+#[test]
+fn app_server_log_collection_keeps_a_bounded_byte_tail() {
+    let mut buffer = vec![b'a'; 400 * 1024];
+    let chunk = vec![b'b'; 400 * 1024];
+
+    append_bounded_log_bytes(&mut buffer, &chunk);
+
+    assert_eq!(buffer.len(), 512 * 1024);
+    assert!(buffer.ends_with(&chunk));
+}
+
+#[test]
+fn app_server_state_snapshot_keeps_image_when_state_is_absent() {
+    let inspect = ContainerInspectResponse {
+        image: Some("sha256:runner-image".to_string()),
+        config: Some(bollard::models::ContainerConfig {
+            image: Some("registry.example/codex-runner:stable".to_string()),
+            ..Default::default()
+        }),
+        state: None,
+        ..Default::default()
+    };
+
+    let snapshot = app_server_container_state_snapshot(inspect);
+
+    assert_eq!(
+        snapshot.image.as_deref(),
+        Some("registry.example/codex-runner:stable")
+    );
+    assert_eq!(snapshot.image_id.as_deref(), Some("sha256:runner-image"));
+    assert_eq!(snapshot.status, None);
+}
+
+#[test]
+fn missing_codex_install_log_is_explicit_in_diagnostics() {
+    let diagnostics = AppServerContainerDiagnostics {
+        container_id: "app-123".to_string(),
+        state: None,
+        state_collection_error: Some("container unavailable".to_string()),
+        log_tail: AppServerLogTail::default(),
+        log_collection_error: None,
+        codex_install_log_tail: None,
+        codex_install_log_collection_error: None,
+    };
+
+    assert!(
+        diagnostics
+            .format_context()
+            .contains("codex install log tail: <not present>")
+    );
+}
+
+#[test]
+fn app_server_install_log_tail_from_archive_is_redacted() -> Result<()> {
+    let content = concat!(
+        "npm timing reify completed in 22000ms\n",
+        "npm ERR! token https://oauth2:token@example.com/repo.git\n",
+        "npm ERR! registry https://build:registry-secret@registry.example/pkg\n",
+        "npm ERR! //registry.example/:_authToken=npm-secret\n",
+        "npm ERR! //registry.example/:_authToken=\"quoted-secret\"\n",
+        "npm ERR! //registry.example/:_password=legacy-secret\n",
+    );
+    let mut archive_bytes = Vec::new();
+    {
+        let mut archive = tar::Builder::new(&mut archive_bytes);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o600);
+        header.set_cksum();
+        archive.append_data(&mut header, "codex-install.log", content.as_bytes())?;
+        archive.finish()?;
+    }
+
+    let tail = app_server_install_log_tail_from_archive(&archive_bytes, Some("token"))?;
+
+    assert_eq!(
+        tail,
+        vec![
+            "npm timing reify completed in 22000ms".to_string(),
+            "npm ERR! [REDACTED_GITLAB_TOKEN] https://[REDACTED]@example.com/repo.git".to_string(),
+            "npm ERR! registry https://[REDACTED]@registry.example/pkg".to_string(),
+            "npm ERR! //registry.example/:_authToken=[REDACTED_NPM_SECRET]".to_string(),
+            "npm ERR! //registry.example/:_authToken=\"[REDACTED_NPM_SECRET]\"".to_string(),
+            "npm ERR! //registry.example/:_password=[REDACTED_NPM_SECRET]".to_string(),
+        ]
+    );
+    Ok(())
 }
 
 #[test]
@@ -595,6 +695,8 @@ fn app_server_log_tail_keeps_sanitized_stdout() {
             "codex-runner-error: clone https://oauth2:token@example.com/repo.git failed\n",
             "plain crash line token\n",
             "codex-install-error: npm failed token\n",
+            "registry https://build:registry-secret@registry.example/pkg\n",
+            "//registry.example/:_auth=legacy-secret\n",
         ),
         "stderr token https://oauth2:token@example.com/repo.git\n",
         Some("token"),
@@ -604,18 +706,97 @@ fn app_server_log_tail_keeps_sanitized_stdout() {
         tail.stdout,
         vec![
             "{\"method\":\"turn/started\",\"params\":{\"secret\":\"[REDACTED_GITLAB_TOKEN]\"}}",
-            "codex-runner-error: clone https://oauth2:[REDACTED]@example.com/repo.git failed",
+            "codex-runner-error: clone https://[REDACTED]@example.com/repo.git failed",
             "plain crash line [REDACTED_GITLAB_TOKEN]",
             "codex-install-error: npm failed [REDACTED_GITLAB_TOKEN]",
+            "registry https://[REDACTED]@registry.example/pkg",
+            "//registry.example/:_auth=[REDACTED_NPM_SECRET]",
         ]
     );
     assert_eq!(
         tail.stderr,
-        vec![
-            "stderr [REDACTED_GITLAB_TOKEN] https://oauth2:[REDACTED]@example.com/repo.git"
-                .to_string()
-        ]
+        vec!["stderr [REDACTED_GITLAB_TOKEN] https://[REDACTED]@example.com/repo.git".to_string()]
     );
+}
+
+#[test]
+fn history_reader_reports_missing_codex_after_successful_install() -> Result<()> {
+    let auth_dir = tempfile::tempdir()?;
+    let generated = DockerCodexRunner::build_history_reader_script(
+        auth_dir.path().to_str().expect("temporary path is UTF-8"),
+    );
+    let generated = generated.replacen(
+        "codex_install_log='/tmp/codex-install.log'",
+        &format!(
+            "codex_install_log='{}'",
+            auth_dir.path().join("codex-install.log").display()
+        ),
+        1,
+    );
+    assert!(!generated.contains("codex_install_log='/tmp/codex-install.log'"));
+    let script = format!(
+        r#"
+mkdir() {{ /bin/mkdir "$@"; }}
+rm() {{ /bin/rm "$@"; }}
+tail() {{ /bin/tail "$@"; }}
+sed() {{ /bin/sed "$@"; }}
+npm() {{ return 0; }}
+export PATH=/codex-runner-test-empty-path
+{generated}
+"#
+    );
+
+    let output = Command::new("bash").arg("-c").arg(script).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(!output.status.success());
+    assert!(stdout.contains("codex-runner: codex install completed"));
+    assert!(stdout.contains("codex-runner-error: codex validation failed: executable not found"));
+    Ok(())
+}
+
+#[test]
+fn history_reader_retains_install_progress_before_npm_exits() -> Result<()> {
+    let auth_dir = tempfile::tempdir()?;
+    let install_log = auth_dir.path().join("codex-install.log");
+    let generated = DockerCodexRunner::build_history_reader_script(
+        auth_dir.path().to_str().expect("temporary path is UTF-8"),
+    )
+    .replacen(
+        "codex_install_log='/tmp/codex-install.log'",
+        &format!("codex_install_log='{}'", install_log.display()),
+        1,
+    );
+    let script = format!(
+        r#"
+mkdir() {{ /bin/mkdir "$@"; }}
+rm() {{ /bin/rm "$@"; }}
+tail() {{ /bin/tail "$@"; }}
+sed() {{ /bin/sed "$@"; }}
+wc() {{ /bin/wc "$@"; }}
+mv() {{ /bin/mv "$@"; }}
+npm() {{ echo "npm timing fetch manifest"; /bin/sleep 1; return 1; }}
+export PATH=/codex-runner-test-empty-path
+{generated}
+"#
+    );
+    let child = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    thread::sleep(Duration::from_millis(200));
+    let progress = std::fs::read_to_string(&install_log).unwrap_or_default();
+    let output = child.wait_with_output()?;
+
+    assert!(
+        progress.contains("npm timing fetch manifest"),
+        "{progress:?}"
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("codex install failed"));
+    Ok(())
 }
 
 #[test]
@@ -641,6 +822,10 @@ fn build_command_script_sets_writable_codex_home() {
     assert!(script.contains("export CODEX_HOME='/root/.codex'"));
     assert!(script.contains("mkdir -p '/root/.codex'"));
     assert!(script.contains("repo_dir='/work/repo/repo'"));
+    assert!(script.contains("codex-runner: codex install completed"));
+    assert!(script.contains("codex-runner-error: codex validation failed"));
+    assert!(script.contains("codex-runner: using $codex_version at $codex_path"));
+    assert!(script.contains("codex-runner: starting codex app-server"));
 }
 
 #[test]

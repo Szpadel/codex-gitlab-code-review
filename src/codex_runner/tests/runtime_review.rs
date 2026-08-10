@@ -763,6 +763,61 @@ async fn wait_for_browser_container_ready_accepts_headless_shell_wrapper_interna
 }
 
 #[tokio::test]
+async fn history_reader_timeouts_collect_app_server_install_diagnostics() {
+    fn diagnostics(container_id: &str) -> AppServerContainerDiagnostics {
+        AppServerContainerDiagnostics {
+            container_id: container_id.to_string(),
+            state: Some(AppServerContainerStateSnapshot {
+                image: Some("registry.example/codex-runner:stable".to_string()),
+                image_id: Some("sha256:runner-image".to_string()),
+                status: Some("running".to_string()),
+                running: Some(true),
+                exit_code: Some(0),
+                oom_killed: Some(false),
+                error: None,
+                started_at: Some("2026-03-18T10:00:00Z".to_string()),
+                finished_at: None,
+            }),
+            state_collection_error: None,
+            log_tail: AppServerLogTail::default(),
+            log_collection_error: None,
+            codex_install_log_tail: Some(vec!["npm timing reify:loadTrees".to_string()]),
+            codex_install_log_collection_error: None,
+        }
+    }
+
+    let delayed_server = || {
+        ScriptedAppServer::from_requests(vec![
+            ScriptedAppRequest::result("initialize", json!({}))
+                .with_after_response(vec![ScriptedAppChunk::SleepMillis(1_500)]),
+        ])
+    };
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(delayed_server());
+    harness.push_app_server(delayed_server());
+    harness.set_app_server_diagnostics("app-1", vec![diagnostics("app-1")]);
+    harness.set_app_server_diagnostics("app-2", vec![diagnostics("app-2")]);
+    let mut config = test_codex_config();
+    config.timeout_seconds = 1;
+    let runner = test_runner_with_fake_runtime(config, false, Arc::clone(&harness), None).await;
+
+    let thread_error = runner
+        .read_thread("primary", "thread-1")
+        .await
+        .expect_err("thread read should time out");
+    let usage_error = runner
+        .read_usage_limits_with_account("primary")
+        .await
+        .expect_err("usage read should time out");
+
+    for error in [thread_error, usage_error] {
+        let chain = format!("{error:#}");
+        assert!(chain.contains("timed out"), "{chain}");
+        assert!(chain.contains("npm timing reify:loadTrees"), "{chain}");
+    }
+}
+
+#[tokio::test]
 async fn run_review_with_fake_runtime_enriches_app_server_stdout_close_with_diagnostics() {
     let harness = Arc::new(FakeRunnerHarness::default());
     harness.push_app_server(ScriptedAppServer::from_requests(vec![
@@ -786,6 +841,8 @@ async fn run_review_with_fake_runtime_enriches_app_server_stdout_close_with_diag
         vec![AppServerContainerDiagnostics {
             container_id: "app-1".to_string(),
             state: Some(AppServerContainerStateSnapshot {
+                image: Some("ghcr.io/openai/codex-universal:latest".to_string()),
+                image_id: Some("sha256:runner-image".to_string()),
                 status: Some("exited".to_string()),
                 running: Some(false),
                 exit_code: Some(1),
@@ -803,6 +860,8 @@ async fn run_review_with_fake_runtime_enriches_app_server_stdout_close_with_diag
                 stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
             },
             log_collection_error: None,
+            codex_install_log_tail: Some(vec!["npm ERR! code ENOSPC".to_string()]),
+            codex_install_log_collection_error: None,
         }],
     );
     harness.set_browser_diagnostics(
@@ -847,6 +906,8 @@ async fn run_review_with_fake_runtime_enriches_app_server_stdout_close_with_diag
     assert!(text.contains("codex-runner-error: browser MCP endpoint did not become ready"));
     assert!(text.contains("npm ERR! 429 Too Many Requests"));
     assert!(text.contains("MCP server chrome-devtools failed to start"));
+    assert!(text.contains("npm ERR! code ENOSPC"));
+    assert_eq!(text.matches("app-server container diagnostics").count(), 1);
     assert!(text.contains("browser container diagnostics"));
     assert!(text.contains("DevTools listening on ws://127.0.0.1:9223"));
 }
@@ -861,6 +922,8 @@ async fn run_review_with_fake_runtime_enriches_app_server_initialize_write_failu
         vec![AppServerContainerDiagnostics {
             container_id: "app-1".to_string(),
             state: Some(AppServerContainerStateSnapshot {
+                image: Some("ghcr.io/openai/codex-universal:latest".to_string()),
+                image_id: Some("sha256:runner-image".to_string()),
                 status: Some("exited".to_string()),
                 running: Some(false),
                 exit_code: Some(1),
@@ -875,6 +938,8 @@ async fn run_review_with_fake_runtime_enriches_app_server_initialize_write_failu
                 stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
             },
             log_collection_error: None,
+            codex_install_log_tail: None,
+            codex_install_log_collection_error: None,
         }],
     );
 
@@ -909,6 +974,8 @@ async fn read_thread_with_fake_runtime_enriches_app_server_initialize_write_fail
         vec![AppServerContainerDiagnostics {
             container_id: "app-1".to_string(),
             state: Some(AppServerContainerStateSnapshot {
+                image: Some("ghcr.io/openai/codex-universal:latest".to_string()),
+                image_id: Some("sha256:runner-image".to_string()),
                 status: Some("exited".to_string()),
                 running: Some(false),
                 exit_code: Some(1),
@@ -923,6 +990,8 @@ async fn read_thread_with_fake_runtime_enriches_app_server_initialize_write_fail
                 stderr: vec!["MCP server chrome-devtools failed to start".to_string()],
             },
             log_collection_error: None,
+            codex_install_log_tail: None,
+            codex_install_log_collection_error: None,
         }],
     );
 

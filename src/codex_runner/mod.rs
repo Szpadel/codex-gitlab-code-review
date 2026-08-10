@@ -644,28 +644,30 @@ impl DockerCodexRunner {
             )
             .await?;
 
-        let result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
-            client.initialize().await?;
-            client.initialized().await?;
-            client
-                .request(
-                    "thread/read",
-                    json!({
-                        "threadId": thread_id,
-                        "includeTurns": true,
-                    }),
-                )
-                .await
-        })
-        .await;
-
-        let result = match result {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(err)) => Err(self
-                .enrich_app_server_io_error_if_needed(err, &container_id)
-                .await),
-            Err(_) => Err(anyhow!("codex thread/read timed out")),
-        };
+        let result = self
+            .run_session_with_timeout(
+                session_runner::RunSessionConfig {
+                    app_server_container_id: container_id.clone(),
+                    browser_container_id: browser_container_id.clone(),
+                    browser_mcp: None,
+                    timeout_duration: Duration::from_secs(self.codex.timeout_seconds),
+                    timeout_error: "codex thread/read timed out",
+                },
+                async {
+                    client.initialize().await?;
+                    client.initialized().await?;
+                    client
+                        .request(
+                            "thread/read",
+                            json!({
+                                "threadId": thread_id,
+                                "includeTurns": true,
+                            }),
+                        )
+                        .await
+                },
+            )
+            .await;
 
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
             .await;

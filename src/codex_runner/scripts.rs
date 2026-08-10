@@ -3,12 +3,16 @@ use super::{
     GitLabDiscoveryMcpRuntimeConfig, MentionCommandContext, Result, ReviewContext, Url, anyhow,
     repo_checkout_root,
 };
+use crate::codex_runner::app_server_diagnostics::{
+    CODEX_INSTALL_LOG_CHUNK_BYTES, CODEX_INSTALL_LOG_MAX_BYTES, CODEX_INSTALL_LOG_PATH,
+};
 use crate::codex_runner::placeholders::render_placeholders;
 use std::fmt::Write as _;
 
 const MENTION_COMMAND_TEMPLATE: &str = include_str!("assets/mention_command.sh");
 const REVIEW_COMMAND_TEMPLATE: &str = include_str!("assets/review_command.sh");
 const BASE_BOOTSTRAP_TEMPLATE: &str = include_str!("assets/base_bootstrap.sh");
+const CODEX_CLI_BOOTSTRAP_TEMPLATE: &str = include_str!("assets/codex_cli_bootstrap.sh");
 const DEPS_PREFETCH_TEMPLATE: &str = include_str!("assets/deps_prefetch.sh");
 const HISTORY_READER_TEMPLATE: &str = include_str!("assets/history_reader.sh");
 const GIT_BOOTSTRAP_AUTH_CLEANUP_TEMPLATE: &str =
@@ -308,11 +312,29 @@ impl DockerCodexRunner {
     }
 
     pub(crate) fn build_history_reader_script(auth_mount_path: &str) -> String {
+        let codex_cli_bootstrap = codex_cli_bootstrap_script();
         render_script_template(
             HISTORY_READER_TEMPLATE,
-            &[("AUTH_MOUNT_PATH", auth_mount_path)],
+            &[
+                ("AUTH_MOUNT_PATH", auth_mount_path),
+                ("CODEX_CLI_BOOTSTRAP_SCRIPT", &codex_cli_bootstrap),
+            ],
         )
     }
+}
+
+fn codex_cli_bootstrap_script() -> String {
+    let install_log_path_q = shell_quote(CODEX_INSTALL_LOG_PATH);
+    let install_log_chunk_bytes = CODEX_INSTALL_LOG_CHUNK_BYTES.to_string();
+    let install_log_max_bytes = CODEX_INSTALL_LOG_MAX_BYTES.to_string();
+    render_script_template(
+        CODEX_CLI_BOOTSTRAP_TEMPLATE,
+        &[
+            ("CODEX_INSTALL_LOG_PATH_Q", &install_log_path_q),
+            ("CODEX_INSTALL_LOG_CHUNK_BYTES", &install_log_chunk_bytes),
+            ("CODEX_INSTALL_LOG_MAX_BYTES", &install_log_max_bytes),
+        ],
+    )
 }
 
 fn render_base_bootstrap_script(request: BuildCommandScriptRequest<'_>) -> String {
@@ -353,6 +375,7 @@ run_git fetch git fetch --unshallow\n"
         request.app_server.mcp_server_overrides,
         request.app_server.session_override,
     );
+    let codex_cli_bootstrap = codex_cli_bootstrap_script();
     render_script_template(
         BASE_BOOTSTRAP_TEMPLATE,
         &[
@@ -367,6 +390,7 @@ run_git fetch git fetch --unshallow\n"
             ("DEPS_PREFETCH_SCRIPT", deps_prefetch_script),
             ("GIT_AUTH_SETUP_SCRIPT", &git_auth_setup_script),
             ("GIT_AUTH_CLEANUP_SCRIPT", git_auth_cleanup_script),
+            ("CODEX_CLI_BOOTSTRAP_SCRIPT", &codex_cli_bootstrap),
             ("BROWSER_PREREQ_SCRIPT", &browser_prereq_script),
             ("BROWSER_WAIT_SCRIPT", &browser_wait_script),
             ("APP_SERVER_EXEC_CMD", &app_server_exec_cmd),

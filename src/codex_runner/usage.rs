@@ -1,8 +1,8 @@
+use super::session_runner::RunSessionConfig;
 use super::{DockerCodexRunner, Duration, Result, StartedAppServer, Value, anyhow, bail, json};
 use anyhow::Context;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use tokio::time::timeout;
 
 const WEEKLY_WINDOW_MINS: i64 = 7 * 24 * 60;
 const WINDOW_LABEL_TOLERANCE_PERCENT: f64 = 0.05;
@@ -163,20 +163,22 @@ impl DockerCodexRunner {
             )
             .await?;
 
-        let result = timeout(Duration::from_secs(self.codex.timeout_seconds), async {
-            client.initialize().await?;
-            client.initialized().await?;
-            client.request(method, params).await
-        })
-        .await;
-
-        let result = match result {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(err)) => Err(self
-                .enrich_app_server_io_error_if_needed(err, &container_id)
-                .await),
-            Err(_) => Err(anyhow!(timeout_error)),
-        };
+        let result = self
+            .run_session_with_timeout(
+                RunSessionConfig {
+                    app_server_container_id: container_id.clone(),
+                    browser_container_id: browser_container_id.clone(),
+                    browser_mcp: None,
+                    timeout_duration: Duration::from_secs(self.codex.timeout_seconds),
+                    timeout_error,
+                },
+                async {
+                    client.initialize().await?;
+                    client.initialized().await?;
+                    client.request(method, params).await
+                },
+            )
+            .await;
 
         self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
             .await;

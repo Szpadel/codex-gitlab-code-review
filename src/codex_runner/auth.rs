@@ -2,6 +2,8 @@ use super::{
     ChronoDuration, CodexConfig, DateTime, DockerCodexRunner, PRIMARY_AUTH_ACCOUNT_NAME,
     QuotaBlock, Result, Utc, bail, info, warn,
 };
+use crate::codex_runner::app_server::is_app_server_io_failure;
+use crate::codex_runner::app_server_diagnostics::AppServerContainerDiagnosticsContext;
 use crate::codex_runner::duration::{
     parse_duration_seconds_from_text, safe_cooldown_duration, safe_duration_from_seconds,
 };
@@ -124,12 +126,11 @@ impl AuthFallbackAction {
         }
     }
 
-    fn unexpected_failure_context(self, account_name: &str, err: &anyhow::Error) -> String {
-        let cause = error_chain_summary(err);
+    fn unexpected_failure_context(self, account_name: &str) -> String {
         match self {
-            Self::Review => format!("codex review failed for account '{account_name}': {cause}"),
+            Self::Review => format!("codex review failed for account '{account_name}'"),
             Self::MentionCommand => {
-                format!("mention command failed for account '{account_name}': {cause}")
+                format!("mention command failed for account '{account_name}'")
             }
         }
     }
@@ -368,8 +369,7 @@ impl DockerCodexRunner {
                             );
                         }
                         AuthFailureKind::Other => {
-                            let context =
-                                action.unexpected_failure_context(account.name.as_str(), &err);
+                            let context = action.unexpected_failure_context(account.name.as_str());
                             if probe_started {
                                 self.state
                                     .service_state
@@ -483,19 +483,14 @@ fn quota_retry_at(
     reset_at.min(recheck_at)
 }
 
-fn error_chain_summary(err: &anyhow::Error) -> String {
-    err.chain()
-        .map(ToString::to_string)
-        .filter(|cause| !cause.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join(": ")
-}
-
 pub(crate) fn classify_auth_failure(
     err: &anyhow::Error,
     now: DateTime<Utc>,
     fallback_cooldown_seconds: u64,
 ) -> AuthFailureKind {
+    if is_app_server_diagnostic_failure(err) {
+        return AuthFailureKind::Other;
+    }
     let chain = format!("{err:#}");
     let chain_lower = chain.to_ascii_lowercase();
     if is_usage_limit_error(&chain_lower) {
@@ -514,7 +509,7 @@ pub(crate) fn classify_auth_failure_for_account(
     err: &anyhow::Error,
     account: &AuthAccount,
 ) -> AuthFailureKind {
-    if base != AuthFailureKind::Other {
+    if base != AuthFailureKind::Other || is_app_server_diagnostic_failure(err) {
         return base;
     }
     let chain_lower = format!("{err:#}").to_ascii_lowercase();
@@ -523,6 +518,13 @@ pub(crate) fn classify_auth_failure_for_account(
     } else {
         AuthFailureKind::Other
     }
+}
+
+fn is_app_server_diagnostic_failure(err: &anyhow::Error) -> bool {
+    is_app_server_io_failure(err)
+        || err
+            .downcast_ref::<AppServerContainerDiagnosticsContext>()
+            .is_some()
 }
 
 pub(crate) fn is_usage_limit_error(error_text_lower: &str) -> bool {

@@ -3,8 +3,10 @@ use super::app_server::{
     is_app_server_io_failure, item_is_successful_gitlab_discovery_call, with_recent_runner_errors,
 };
 use super::app_server_diagnostics::{
-    AppServerContainerDiagnostics, AppServerContainerStateSnapshot, AppServerLogTail,
-    app_server_log_tail_from_raw,
+    AppServerContainerDiagnostics, AppServerContainerDiagnosticsContext,
+    AppServerContainerStateSnapshot, AppServerLogTail, app_server_container_state_snapshot,
+    app_server_install_log_tail_from_archive, app_server_log_tail_from_raw,
+    append_bounded_log_bytes,
 };
 use super::auth::{
     CodexQuotaExhausted, QUOTA_LAST_PROBE_AT_KEY, auth_account_state_key,

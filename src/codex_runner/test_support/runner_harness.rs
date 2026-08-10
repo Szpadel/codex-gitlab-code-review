@@ -327,20 +327,29 @@ impl RunnerHarness for FakeRunnerHarness {
             return diagnostics;
         }
 
+        let image = state
+            .app_server_starts
+            .iter()
+            .find(|start| start.container_id == app_server_container_id)
+            .map(|start| start.request.image.clone());
         AppServerContainerDiagnostics {
             container_id: app_server_container_id.to_string(),
             state: Some(AppServerContainerStateSnapshot {
-                status: Some("running".to_string()),
-                running: Some(true),
-                exit_code: Some(0),
+                image,
+                image_id: Some("sha256:fake-runner-image".to_string()),
+                status: Some("exited".to_string()),
+                running: Some(false),
+                exit_code: Some(1),
                 oom_killed: Some(false),
                 error: None,
                 started_at: Some("2026-03-18T10:00:00Z".to_string()),
-                finished_at: None,
+                finished_at: Some("2026-03-18T10:00:01Z".to_string()),
             }),
             state_collection_error: None,
             log_tail: AppServerLogTail::default(),
             log_collection_error: None,
+            codex_install_log_tail: None,
+            codex_install_log_collection_error: None,
         }
     }
 
