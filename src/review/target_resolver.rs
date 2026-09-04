@@ -1,29 +1,25 @@
+//! Repository target discovery, caching, and exclusions.
+
 use super::{DynamicRepoSource, ScanMode};
 use crate::config::Config;
 use crate::gitlab::GitLabApi;
 use crate::state::ReviewStateStore;
 use anyhow::Result;
-use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-#[async_trait]
-pub(crate) trait TargetResolver: Send + Sync {
-    fn set_dynamic_repo_source(&mut self, dynamic_repo_source: Arc<dyn DynamicRepoSource>);
-
-    async fn resolve_repos(&self, mode: ScanMode) -> Result<Vec<String>>;
-}
-
-pub(crate) struct DefaultTargetResolver {
+/// Resolves configured repositories or a runtime-provided repository list.
+pub(crate) struct TargetResolver {
     config: Config,
     gitlab: Arc<dyn GitLabApi>,
     state: Arc<ReviewStateStore>,
     dynamic_repo_source: Option<Arc<dyn DynamicRepoSource>>,
 }
 
-impl DefaultTargetResolver {
+impl TargetResolver {
+    /// Creates a resolver backed by GitLab discovery and the persisted catalog.
     pub(crate) fn new(
         config: Config,
         gitlab: Arc<dyn GitLabApi>,
@@ -130,15 +126,17 @@ impl DefaultTargetResolver {
             }
         }
     }
-}
 
-#[async_trait]
-impl TargetResolver for DefaultTargetResolver {
-    fn set_dynamic_repo_source(&mut self, dynamic_repo_source: Arc<dyn DynamicRepoSource>) {
+    /// Overrides configured discovery with a runtime repository source.
+    pub(crate) fn set_dynamic_repo_source(
+        &mut self,
+        dynamic_repo_source: Arc<dyn DynamicRepoSource>,
+    ) {
         self.dynamic_repo_source = Some(dynamic_repo_source);
     }
 
-    async fn resolve_repos(&self, mode: ScanMode) -> Result<Vec<String>> {
+    /// Returns sorted, unique targets, applying exclusions to configured discovery.
+    pub(crate) async fn resolve_repos(&self, mode: ScanMode) -> Result<Vec<String>> {
         if let Some(dynamic_repo_source) = self.dynamic_repo_source.as_ref() {
             let mut repos = dynamic_repo_source.list_repos().await?;
             repos.sort();

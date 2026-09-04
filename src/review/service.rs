@@ -8,16 +8,15 @@ use crate::flow::review::{ReviewFlow, ReviewScheduleOutcome};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
-use crate::review::lane_policies::{GeneralLanePolicy, SecurityLanePolicy};
 use crate::review::retry::{
     RetryBackoff, RetryKey, RetryWarningAwardService, RunRetryStatus, RunRetryStatusProvider,
 };
-use crate::review::scan_coordinator::{DefaultScanCoordinator, ScanCoordinator};
+use crate::review::scan_coordinator::ScanCoordinator;
 use crate::review::scan_pipeline::{
     run_incremental_scan_pipeline_waiting_for_tasks, run_pending_rate_limit_pipeline,
     run_review_backoff_retry_pipeline, run_scan_pipeline,
 };
-use crate::review::target_resolver::{DefaultTargetResolver, TargetResolver};
+use crate::review::target_resolver::TargetResolver;
 use crate::state::{
     MentionQuotaPendingEntry, MentionQuotaPendingUpsert, ReviewRateLimitPendingEntry,
     ReviewStateStore,
@@ -67,8 +66,8 @@ pub struct ReviewService {
     active_tasks: Arc<ActiveTaskRegistry>,
     retry_backoff: Arc<RetryBackoff>,
     retry_warning_awards: RetryWarningAwardService,
-    scan_coordinator: Box<dyn ScanCoordinator>,
-    target_resolver: Box<dyn TargetResolver>,
+    scan_coordinator: ScanCoordinator,
+    target_resolver: TargetResolver,
 }
 
 impl ReviewService {
@@ -107,27 +106,22 @@ impl ReviewService {
             flow_shared.clone(),
             Arc::clone(&retry_backoff),
             ReviewLane::General,
-            Arc::new(GeneralLanePolicy),
         ));
         let security_review_flow = Arc::new(ReviewFlow::new(
             flow_shared,
             Arc::clone(&retry_backoff),
             ReviewLane::Security,
-            Arc::new(SecurityLanePolicy),
         ));
-        let scan_coordinator = Box::new(DefaultScanCoordinator::new(
+        let scan_coordinator = ScanCoordinator::new(
             Arc::clone(&state),
             Arc::clone(&active_tasks),
             Arc::clone(&codex),
             Arc::clone(&general_review_flow),
             Arc::clone(&security_review_flow),
             Arc::clone(&mention_flow),
-        ));
-        let target_resolver = Box::new(DefaultTargetResolver::new(
-            config.clone(),
-            Arc::clone(&gitlab),
-            Arc::clone(&state),
-        ));
+        );
+        let target_resolver =
+            TargetResolver::new(config.clone(), Arc::clone(&gitlab), Arc::clone(&state));
         Self {
             config,
             gitlab,

@@ -366,6 +366,10 @@ async fn security_reviews_use_canonical_project_path_for_runner_context() -> Res
     let mut config = test_config();
     config.gitlab.targets.repos = TargetSelector::List(vec!["target/repo".to_string()]);
     config.feature_flags.security_review = true;
+    config.review.security.additional_developer_instructions =
+        Some("Check authorization".to_string());
+    config.review.security.min_confidence_score = 0.73;
+    config.review.security.context_ttl_seconds = 1234;
     let bot_user = GitLabUser {
         id: 1,
         username: None,
@@ -414,20 +418,25 @@ async fn security_reviews_use_canonical_project_path_for_runner_context() -> Res
     {
         let contexts = runner.review_contexts.lock().unwrap();
         assert_eq!(contexts.len(), 2);
-        assert_eq!(
-            contexts
-                .iter()
-                .find(|ctx| ctx.lane == crate::review::ReviewLane::General)
-                .map(|ctx| ctx.project_path.as_str()),
-            Some("forks/source-repo")
-        );
-        assert_eq!(
-            contexts
-                .iter()
-                .find(|ctx| ctx.lane == crate::review::ReviewLane::Security)
-                .map(|ctx| ctx.project_path.as_str()),
-            Some("target/repo")
-        );
+        for (lane, project_path, instructions, confidence, ttl) in [
+            (ReviewLane::General, "forks/source-repo", None, None, None),
+            (
+                ReviewLane::Security,
+                "target/repo",
+                Some("Check authorization"),
+                Some(0.73),
+                Some(1234),
+            ),
+        ] {
+            let context = contexts.iter().find(|ctx| ctx.lane == lane).unwrap();
+            assert_eq!(context.project_path, project_path);
+            assert_eq!(
+                context.additional_developer_instructions.as_deref(),
+                instructions
+            );
+            assert_eq!(context.min_confidence_score, confidence);
+            assert_eq!(context.security_context_ttl_seconds, ttl);
+        }
     }
     let run_kinds = service
         .state

@@ -1,5 +1,4 @@
 pub mod lane;
-pub(crate) mod lane_policies;
 pub(crate) mod retry;
 mod scan_coordinator;
 mod scan_pipeline;

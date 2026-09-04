@@ -14,7 +14,6 @@ use crate::gitlab::{
 };
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
-use crate::review::lane_policies::{GeneralLanePolicy, SecurityLanePolicy};
 use crate::review::retry::{RetryBackoff, RetryKey, RetryWarningAwardService};
 use crate::state::{ReviewRateLimitScope, ReviewStateStore, RunHistoryListQuery};
 use anyhow::{Context, Result};

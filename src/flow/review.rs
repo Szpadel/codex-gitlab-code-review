@@ -15,7 +15,6 @@ use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
-use crate::review::lane_policies::ReviewLanePolicy;
 use crate::review::retry::{
     REVIEW_RETRY_BLOCKED_DEFER_SECONDS, RetryBackoff, RetryGateStatus, RetryKey,
     RetryWarningAwardService,
@@ -108,20 +107,20 @@ struct PreparedReviewRun {
     feature_flags: FeatureFlagSnapshot,
 }
 
+/// Admits and schedules reviews for one lane.
 pub(crate) struct ReviewFlow {
     shared: FlowShared,
     retry_backoff: Arc<RetryBackoff>,
     retry_warning_awards: RetryWarningAwardService,
     lane: ReviewLane,
-    policy: Arc<dyn ReviewLanePolicy>,
 }
 
 impl ReviewFlow {
+    /// Creates a flow whose behavior is determined entirely by its lane.
     pub(crate) fn new(
         shared: FlowShared,
         retry_backoff: Arc<RetryBackoff>,
         lane: ReviewLane,
-        policy: Arc<dyn ReviewLanePolicy>,
     ) -> Self {
         let retry_warning_awards =
             RetryWarningAwardService::new(shared.config.clone(), shared.award_service.clone());
@@ -130,24 +129,24 @@ impl ReviewFlow {
             retry_backoff,
             retry_warning_awards,
             lane,
-            policy,
         }
     }
 
     fn review_marker_prefix(&self) -> &str {
-        self.policy.comment_marker_prefix(&self.shared.config)
+        self.lane.comment_marker_prefix(&self.shared.config)
     }
 
     fn finding_marker_prefix(&self) -> &str {
-        self.policy.finding_marker_prefix(&self.shared.config)
+        self.lane.finding_marker_prefix(&self.shared.config)
     }
 
+    /// Reports whether this lane publishes review awards.
     pub(crate) fn uses_awards(&self) -> bool {
-        self.policy.uses_awards()
+        self.lane.uses_awards()
     }
 
     fn is_enabled(&self, feature_flags: &FeatureFlagSnapshot) -> bool {
-        self.policy.is_enabled(feature_flags)
+        self.lane.is_enabled(feature_flags)
     }
 
     pub(crate) async fn clear_stale_in_progress(&self) -> Result<()> {
@@ -402,7 +401,7 @@ impl ReviewFlow {
             .review_result_for_lane(repo, iid, head_sha, self.lane)
             .await?;
         let parsed_review_result = review_result.as_deref().and_then(ReviewRunResult::parse);
-        if self.policy.skips_completed_review_result()
+        if self.lane.skips_completed_review_result()
             && parsed_review_result.is_some_and(ReviewRunResult::is_completed_review)
         {
             return Ok(Some(ReviewScheduleOutcome::SkippedCompleted));
@@ -628,7 +627,7 @@ impl ReviewFlow {
 
     fn new_review_run_history(&self, repo: &str, iid: u64, head_sha: &str) -> NewRunHistory {
         NewRunHistory {
-            kind: self.policy.run_history_kind(),
+            kind: self.lane.run_history_kind(),
             repo: repo.to_string(),
             iid,
             head_sha: head_sha.to_string(),
@@ -715,7 +714,6 @@ impl ReviewFlow {
             gitlab: Arc::clone(&self.shared.gitlab),
             award_service: self.shared.award_service.clone(),
             retry_warning_awards: self.retry_warning_awards.clone(),
-            policy: Arc::clone(&self.policy),
             codex: Arc::clone(&self.shared.codex),
             state: Arc::clone(&self.shared.state),
             retry_backoff: Arc::clone(&self.retry_backoff),
@@ -1142,7 +1140,7 @@ impl ReviewFlow {
 #[async_trait]
 impl MergeRequestFlow for ReviewFlow {
     fn flow_name(&self) -> &'static str {
-        self.policy.flow_name()
+        self.lane.flow_name()
     }
 
     async fn clear_stale_in_progress(&self) -> Result<()> {
@@ -1154,13 +1152,13 @@ impl MergeRequestFlow for ReviewFlow {
     }
 }
 
+/// Holds dependencies and acquired rate limits for executing one lane's review.
 pub(crate) struct ReviewRunContext {
     pub(crate) lane: ReviewLane,
     pub(crate) config: Config,
     pub(crate) gitlab: Arc<dyn GitLabApi>,
     pub(crate) award_service: AwardService,
     pub(crate) retry_warning_awards: RetryWarningAwardService,
-    pub(crate) policy: Arc<dyn ReviewLanePolicy>,
     pub(crate) codex: Arc<dyn crate::codex_runner::CodexRunner>,
     pub(crate) state: Arc<ReviewStateStore>,
     pub(crate) retry_backoff: Arc<RetryBackoff>,
@@ -1179,7 +1177,7 @@ struct ReviewRunIdentity<'a> {
 
 impl ReviewRunContext {
     fn uses_awards(&self) -> bool {
-        self.policy.uses_awards()
+        self.lane.uses_awards()
     }
 
     fn review_preview(&self, repo: &str, iid: u64) -> String {
@@ -1488,7 +1486,7 @@ impl ReviewRunContext {
                 repo.to_string(),
                 mr.iid,
                 self.bot_user_id,
-                self.policy.finding_marker_prefix(&self.config).to_string(),
+                self.lane.finding_marker_prefix(&self.config).to_string(),
                 vec![
                     REVIEW_FINDING_MARKER_PREFIX.to_string(),
                     self.config.review.security.finding_marker_prefix.clone(),
@@ -1503,10 +1501,10 @@ impl ReviewRunContext {
             head_sha: head_sha.to_string(),
             feature_flags,
             additional_developer_instructions: self
-                .policy
+                .lane
                 .additional_developer_instructions(&self.config),
-            min_confidence_score: self.policy.min_confidence_score(&self.config),
-            security_context_ttl_seconds: self.policy.context_ttl_seconds(&self.config),
+            min_confidence_score: self.lane.min_confidence_score(&self.config),
+            security_context_ttl_seconds: self.lane.context_ttl_seconds(&self.config),
             run_history_id: Some(run_history_id),
             discussion_source,
         }
@@ -1520,7 +1518,7 @@ impl ReviewRunContext {
         feature_flags: FeatureFlagSnapshot,
         run_history_id: i64,
     ) -> ReviewContext {
-        let project_path = if self.policy.resolves_review_project_path() {
+        let project_path = if self.lane.resolves_review_project_path() {
             self.resolve_review_project_path(repo, mr).await
         } else {
             repo.to_string()

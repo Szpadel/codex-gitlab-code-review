@@ -1,21 +1,16 @@
+//! Startup recovery and stale-state maintenance for merge-request flows.
+
 use crate::codex_runner::CodexRunner;
 use crate::flow::mention::MentionFlow;
 use crate::flow::review::ReviewFlow;
 use crate::flow::{ActiveTaskRegistry, MergeRequestFlow};
 use crate::state::ReviewStateStore;
 use anyhow::Result;
-use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-#[async_trait]
-pub(crate) trait ScanCoordinator: Send + Sync {
-    async fn recover_in_progress(&self) -> Result<()>;
-
-    async fn clear_stale_flow_state(&self) -> Result<()>;
-}
-
-pub(crate) struct DefaultScanCoordinator {
+/// Coordinates recovery across review and mention flows.
+pub(crate) struct ScanCoordinator {
     state: Arc<ReviewStateStore>,
     active_tasks: Arc<ActiveTaskRegistry>,
     codex: Arc<dyn CodexRunner>,
@@ -24,7 +19,8 @@ pub(crate) struct DefaultScanCoordinator {
     mention_flow: Arc<MentionFlow>,
 }
 
-impl DefaultScanCoordinator {
+impl ScanCoordinator {
+    /// Shares the active flows and state used during recovery.
     pub(crate) fn new(
         state: Arc<ReviewStateStore>,
         active_tasks: Arc<ActiveTaskRegistry>,
@@ -77,11 +73,9 @@ impl DefaultScanCoordinator {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl ScanCoordinator for DefaultScanCoordinator {
-    async fn recover_in_progress(&self) -> Result<()> {
+    /// Attempts to stop leftover containers before recovering each flow's persisted work.
+    pub(crate) async fn recover_in_progress(&self) -> Result<()> {
         if let Err(err) = self.codex.stop_active_reviews().await {
             warn!(error = %err, "failed to stop active codex review containers");
         }
@@ -92,7 +86,8 @@ impl ScanCoordinator for DefaultScanCoordinator {
         Ok(())
     }
 
-    async fn clear_stale_flow_state(&self) -> Result<()> {
+    /// Refreshes active claims before clearing stale flow state.
+    pub(crate) async fn clear_stale_flow_state(&self) -> Result<()> {
         self.refresh_active_flow_state().await?;
         for flow in self.flows() {
             flow.clear_stale_in_progress().await?;
