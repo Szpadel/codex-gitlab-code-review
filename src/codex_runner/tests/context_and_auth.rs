@@ -79,10 +79,13 @@ async fn prepare_runner_session_components_respects_discovery_toggle() {
         )
         .expect("gitlab discovery service"),
     );
-    let mut runner =
-        test_runner_with_fake_runtime(codex, false, Arc::new(FakeRunnerHarness::default()), None)
-            .await;
-    runner.gitlab_discovery_mcp = Some(service as Arc<dyn GitLabDiscoveryHandle>);
+    let runner = test_runner_with_fake_runtime(
+        codex,
+        false,
+        Arc::new(FakeRunnerHarness::default()),
+        Some(service as Arc<dyn GitLabDiscoveryHandle>),
+    )
+    .await;
     let mut ctx = review_context_with_target_branch(Some("main"));
     ctx.lane = crate::review::ReviewLane::Security;
     ctx.project_path = "fork/source".to_string();
@@ -563,6 +566,45 @@ async fn available_accounts_quota_exhaustion_records_probe_marker() {
 }
 
 #[tokio::test]
+async fn usage_requests_reuse_one_initialized_account_container() {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", json!({})),
+        ScriptedAppRequest::result(
+            "account/rateLimits/read",
+            json!({"rateLimitResetCredits": {"availableCount": 2}}),
+        ),
+        ScriptedAppRequest::result(
+            "account/rateLimitResetCredit/consume",
+            json!({"outcome": "reset"}),
+        ),
+        ScriptedAppRequest::result(
+            "account/rateLimits/read",
+            json!({"rateLimitResetCredits": {"availableCount": 1}}),
+        ),
+    ]));
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, harness.clone(), None).await;
+
+    runner
+        .read_usage_limits(PRIMARY_AUTH_ACCOUNT_NAME)
+        .await
+        .unwrap();
+    let outcome = runner
+        .consume_usage_limit_reset(PRIMARY_AUTH_ACCOUNT_NAME, "reset-key")
+        .await
+        .unwrap();
+    assert_eq!(outcome, CodexUsageResetOutcome::Reset);
+    let usage = runner
+        .read_usage_limits(PRIMARY_AUTH_ACCOUNT_NAME)
+        .await
+        .unwrap();
+    assert_eq!(usage.rate_limit_reset_credits.unwrap().available_count, 1);
+    assert_eq!(harness.app_server_starts().len(), 1);
+    assert!(harness.removed_containers().is_empty());
+}
+
+#[tokio::test]
 async fn read_usage_limits_fetches_all_rate_limit_buckets_for_account() {
     let harness = Arc::new(FakeRunnerHarness::default());
     harness.push_app_server(ScriptedAppServer::from_requests(vec![
@@ -638,7 +680,9 @@ async fn read_usage_limits_fetches_all_rate_limit_buckets_for_account() {
             .used_percent,
         25.0
     );
-    assert!(harness.removed_containers().contains(&"app-1".to_string()));
+    assert!(harness.removed_containers().is_empty());
+    runner.shutdown_usage_sessions().await.unwrap();
+    assert_eq!(harness.removed_containers(), vec!["app-1"]);
 }
 
 #[tokio::test]
@@ -1035,6 +1079,8 @@ fn build_auth_accounts_keeps_primary_first_then_fallback_order() {
 fn runner_env_vars_do_not_include_proxy_settings() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let runner = DockerCodexRunner {
+        self_weak: std::sync::Weak::new(),
+        usage_sessions: Mutex::new(super::super::usage_session::UsageSessions::default()),
         runtime: RunnerRuntime::Docker {
             docker: connect_docker(&DockerConfig {
                 host: "tcp://127.0.0.1:2375".to_string(),

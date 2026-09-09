@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::state::ReviewStateStore;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{SecondsFormat, Utc};
+use futures::{StreamExt, TryStreamExt, stream};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -43,27 +44,32 @@ impl UsageService {
     ///
     /// Returns an error if reading local usage-limit marker state fails.
     pub async fn snapshot(&self) -> Result<UsagePageSnapshot> {
-        let mut accounts = Vec::with_capacity(self.accounts.len());
-        for account in &self.accounts {
-            let local_limit_reset_at = self
-                .state
-                .service_state
-                .get_auth_limit_reset_at(&account.state_key)
-                .await?;
-            let usage = match &self.runner {
-                Some(runner) => runner
-                    .read_usage_limits(&account.name)
-                    .await
-                    .map_err(|err| format!("{err:#}")),
-                None => Err("Codex runner is not available".to_string()),
-            };
-            accounts.push(UsageAccountSnapshot {
-                name: account.name.clone(),
-                auth_host_path: account.auth_host_path.clone(),
-                local_limit_reset_at,
-                usage,
-            });
-        }
+        let pending: Vec<_> = self
+            .accounts
+            .iter()
+            .map(|account| async {
+                let local_limit_reset_at = self
+                    .state
+                    .service_state
+                    .get_auth_limit_reset_at(&account.state_key)
+                    .await?;
+                let usage = match &self.runner {
+                    Some(runner) => runner
+                        .read_usage_limits(&account.name)
+                        .await
+                        .map_err(|err| format!("{err:#}")),
+                    None => Err("Codex runner is not available".to_string()),
+                };
+                Ok::<_, anyhow::Error>(UsageAccountSnapshot {
+                    name: account.name.clone(),
+                    auth_host_path: account.auth_host_path.clone(),
+                    local_limit_reset_at,
+                    usage,
+                })
+            })
+            .collect();
+        // Bound simultaneous container starts while preserving configured account order.
+        let accounts = stream::iter(pending).buffered(4).try_collect().await?;
         Ok(UsagePageSnapshot {
             generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             accounts,

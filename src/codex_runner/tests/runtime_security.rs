@@ -381,8 +381,7 @@ async fn concurrent_security_reviews_reuse_single_inflight_context_build() -> Re
     let mut codex = test_codex_config();
     codex.session_overrides.security_review.model = Some("gpt-5.4".to_string());
     codex.session_overrides.security_context.model = Some("gpt-5.4-mini".to_string());
-    let runner =
-        Arc::new(test_runner_with_fake_runtime(codex, false, Arc::clone(&harness), None).await);
+    let runner = test_runner_with_fake_runtime(codex, false, Arc::clone(&harness), None).await;
     let run_history_id_1 = runner
         .state
         .run_history

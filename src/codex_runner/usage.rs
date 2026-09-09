@@ -1,5 +1,4 @@
-use super::session_runner::RunSessionConfig;
-use super::{DockerCodexRunner, Duration, Result, StartedAppServer, Value, anyhow, bail, json};
+use super::{DockerCodexRunner, Result, Value, bail, json};
 use anyhow::Context;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -103,12 +102,9 @@ impl DockerCodexRunner {
         &self,
         account_name: &str,
     ) -> Result<CodexUsageSnapshot> {
-        let account = self
-            .auth_account_by_name(account_name)
-            .ok_or_else(|| anyhow!("unknown codex auth account: {account_name}"))?;
         let response = self
-            .run_usage_app_server_request(
-                account.auth_host_path.as_str(),
+            .request_usage(
+                account_name,
                 "account/rateLimits/read",
                 json!({}),
                 "codex usage limits read timed out",
@@ -125,12 +121,9 @@ impl DockerCodexRunner {
         if idempotency_key.trim().is_empty() {
             bail!("invalid usage reset request: idempotency key must not be empty");
         }
-        let account = self
-            .auth_account_by_name(account_name)
-            .ok_or_else(|| anyhow!("unknown codex auth account: {account_name}"))?;
         let response = self
-            .run_usage_app_server_request(
-                account.auth_host_path.as_str(),
+            .request_usage(
+                account_name,
                 "account/rateLimitResetCredit/consume",
                 json!({ "idempotencyKey": idempotency_key }),
                 "codex usage reset timed out",
@@ -139,51 +132,6 @@ impl DockerCodexRunner {
         let parsed: ConsumeResetResponse = serde_json::from_value(response)
             .context("decode codex usage reset consume response")?;
         Ok(parsed.outcome)
-    }
-
-    async fn run_usage_app_server_request(
-        &self,
-        auth_host_path: &str,
-        method: &str,
-        params: Value,
-        timeout_error: &'static str,
-    ) -> Result<Value> {
-        let StartedAppServer {
-            container_id,
-            browser_container_id,
-            mut client,
-        } = self
-            .start_app_server_container(
-                Self::build_history_reader_script(&self.codex.auth_mount_path),
-                auth_host_path,
-                Vec::new(),
-                Vec::new(),
-                None,
-                Vec::new(),
-            )
-            .await?;
-
-        let result = self
-            .run_session_with_timeout(
-                RunSessionConfig {
-                    app_server_container_id: container_id.clone(),
-                    browser_container_id: browser_container_id.clone(),
-                    browser_mcp: None,
-                    timeout_duration: Duration::from_secs(self.codex.timeout_seconds),
-                    timeout_error,
-                },
-                async {
-                    client.initialize().await?;
-                    client.initialized().await?;
-                    client.request(method, params).await
-                },
-            )
-            .await;
-
-        self.cleanup_app_server_containers(&container_id, browser_container_id.as_deref())
-            .await;
-
-        result
     }
 }
 

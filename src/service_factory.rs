@@ -193,7 +193,7 @@ async fn build_normal_runtime(
         tokio::spawn(Arc::clone(service).run(listener));
     }
 
-    let runner = Arc::new(DockerCodexRunner::new(
+    let runner = DockerCodexRunner::new(
         &config.docker,
         config.codex.clone(),
         git_base,
@@ -209,7 +209,7 @@ async fn build_normal_runtime(
                 .additional_developer_instructions
                 .clone(),
         },
-    )?) as Arc<dyn CodexRunner>;
+    )? as Arc<dyn CodexRunner>;
 
     let service = Arc::new(ReviewService::new(
         config.clone(),

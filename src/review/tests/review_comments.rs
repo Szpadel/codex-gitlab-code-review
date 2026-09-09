@@ -64,7 +64,7 @@ async fn scan_once_with_fake_runtime_runner_posts_review_comment() -> Result<()>
         ]),
     ]));
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let runner = Arc::new(DockerCodexRunner::new_with_test_runtime(
+    let runner = DockerCodexRunner::new_with_test_runtime(
         config.codex.clone(),
         url::Url::parse("https://gitlab.example.com").expect("url"),
         Arc::clone(&state),
@@ -77,7 +77,7 @@ async fn scan_once_with_fake_runtime_runner_posts_review_comment() -> Result<()>
             review_additional_developer_instructions: None,
         },
         harness.clone(),
-    ));
+    );
     let service = ReviewService::new(
         config.clone(),
         gitlab.clone(),

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 #[derive(Default)]
 struct FakeUsageRunner {
+    read_barrier: Option<Arc<tokio::sync::Barrier>>,
     snapshots: Mutex<BTreeMap<String, VecDeque<Result<CodexUsageSnapshot, String>>>>,
     reset_outcomes: Mutex<VecDeque<Result<CodexUsageResetOutcome, String>>>,
     reset_calls: Mutex<Vec<(String, String)>>,
@@ -33,6 +34,9 @@ impl FakeUsageRunner {
 #[async_trait]
 impl CodexRunner for FakeUsageRunner {
     async fn read_usage_limits(&self, account_name: &str) -> Result<CodexUsageSnapshot> {
+        if let Some(barrier) = &self.read_barrier {
+            barrier.wait().await;
+        }
         self.snapshots
             .lock()
             .expect("snapshots")
@@ -73,7 +77,10 @@ async fn usage_page_renders_all_accounts_and_all_returned_limits() -> Result<()>
         name: "backup-high".to_string(),
         auth_host_path: "/tmp/codex-backup-high".to_string(),
     }];
-    let runner = Arc::new(FakeUsageRunner::default());
+    let runner = Arc::new(FakeUsageRunner {
+        read_barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        ..FakeUsageRunner::default()
+    });
     runner.with_snapshot(
         "primary",
         usage_snapshot(
@@ -94,12 +101,24 @@ async fn usage_page_renders_all_accounts_and_all_returned_limits() -> Result<()>
         .spawn()
         .await?;
 
-    let response = test_get(format!("http://{}/usage", srv.address)).await?;
+    // Both accounts must enter the runner before either read can complete.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        test_get(format!("http://{}/usage", srv.address)),
+    )
+    .await??;
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await?;
     assert!(body.contains("Usage limits"));
     assert!(body.contains("primary"));
     assert!(body.contains("backup-high"));
+    assert!(
+        body.find("<h2>primary</h2>")
+            .expect("primary account heading")
+            < body
+                .find("<h2>backup-high</h2>")
+                .expect("backup account heading")
+    );
     assert!(body.contains("codex"));
     assert!(body.contains("codex_other"));
     assert!(body.contains("Weekly"));
@@ -109,6 +128,67 @@ async fn usage_page_renders_all_accounts_and_all_returned_limits() -> Result<()>
     assert!(body.contains("2 reset credits"));
     assert!(body.contains("Use reset"));
     assert!(body.contains("<a class=\"nav-link active\" href=\"/usage\""));
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_usage_page_requests_reuse_the_codex_connection() -> Result<()> {
+    use crate::codex_runner::test_support::{
+        FakeRunnerHarness, ScriptedAppRequest, ScriptedAppServer,
+    };
+    use crate::codex_runner::{DockerCodexRunner, RunnerRuntimeOptions};
+    use crate::state::ReviewStateStore;
+
+    let config = test_config();
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_app_server(ScriptedAppServer::from_requests(vec![
+        ScriptedAppRequest::result("initialize", serde_json::json!({})),
+        ScriptedAppRequest::result(
+            "account/rateLimits/read",
+            serde_json::json!({
+                "rateLimitResetCredits": {"availableCount": 2}
+            }),
+        ),
+        ScriptedAppRequest::result(
+            "account/rateLimits/read",
+            serde_json::json!({
+                "rateLimitResetCredits": {"availableCount": 1}
+            }),
+        ),
+    ]));
+    let runner = DockerCodexRunner::new_with_test_runtime(
+        config.codex.clone(),
+        url::Url::parse(&config.gitlab.base_url)?,
+        Arc::new(ReviewStateStore::new(":memory:").await?),
+        None,
+        RunnerRuntimeOptions {
+            gitlab_token: String::new(),
+            log_all_json: false,
+            owner_id: "usage-page-test".to_string(),
+            mention_commands_active: false,
+            review_additional_developer_instructions: None,
+        },
+        harness.clone(),
+    );
+    let server = HttpTestServerBuilder::new()
+        .with_config(config)
+        .with_runner(runner.clone())
+        .spawn()
+        .await?;
+    for credits in [2, 1] {
+        let response = test_get(format!("http://{}/usage", server.address)).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .text()
+                .await?
+                .contains(&format!("{credits} reset credits"))
+        );
+    }
+    assert_eq!(harness.app_server_starts().len(), 1);
+    assert!(harness.removed_containers().is_empty());
+    runner.shutdown_usage_sessions().await?;
+    assert_eq!(harness.removed_containers(), vec!["app-1"]);
     Ok(())
 }
 

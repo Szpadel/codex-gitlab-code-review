@@ -672,18 +672,15 @@ impl RunHistoryRepository {
         let mut usage = HashMap::new();
         for run_ids in run_ids.chunks(500) {
             let mut builder = QueryBuilder::<Sqlite>::new(
-                "SELECT run_history_id, COUNT(*) AS response_count, \
-                 SUM(input_tokens) AS input_tokens, SUM(cached_input_tokens) AS cached_input_tokens, \
-                 SUM(cache_write_input_tokens) AS cache_write_input_tokens, \
-                 SUM(output_tokens) AS output_tokens, \
-                 SUM(reasoning_output_tokens) AS reasoning_output_tokens, \
-                 SUM(total_tokens) AS total_tokens FROM run_history_token_usage WHERE run_history_id IN (",
+                "SELECT run_history_id, response_count, input_tokens, cached_input_tokens, \
+                 cache_write_input_tokens, output_tokens, reasoning_output_tokens, total_tokens \
+                 FROM run_history_token_usage_rollup WHERE run_history_id IN (",
             );
             let mut separated = builder.separated(", ");
             for run_id in run_ids {
                 separated.push_bind(*run_id);
             }
-            separated.push_unseparated(") GROUP BY run_history_id");
+            separated.push_unseparated(")");
             let rows = builder
                 .build()
                 .fetch_all(self.sqlite.read_pool())
@@ -710,8 +707,8 @@ impl RunHistoryRepository {
         query: &RunHistoryListQuery,
     ) -> Result<Vec<RunTokenUsageStatistic>> {
         let mut builder = QueryBuilder::<Sqlite>::new(
-            "SELECT filtered.kind, COUNT(DISTINCT filtered.id) AS recorded_runs, \
-             COUNT(*) AS response_count, SUM(usage.input_tokens) AS input_tokens, \
+            "SELECT filtered.kind, COUNT(*) AS recorded_runs, \
+             SUM(usage.response_count) AS response_count, SUM(usage.input_tokens) AS input_tokens, \
              SUM(usage.cached_input_tokens) AS cached_input_tokens, \
              SUM(usage.cache_write_input_tokens) AS cache_write_input_tokens, \
              SUM(usage.output_tokens) AS output_tokens, \
@@ -721,7 +718,7 @@ impl RunHistoryRepository {
         );
         append_run_history_filters(&mut builder, query)?;
         builder.push(
-            ") AS filtered JOIN run_history_token_usage AS usage \
+            ") AS filtered JOIN run_history_token_usage_rollup AS usage \
              ON usage.run_history_id = filtered.id GROUP BY filtered.kind ORDER BY filtered.kind",
         );
         let rows = builder

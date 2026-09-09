@@ -62,6 +62,7 @@ mod session_runner;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod usage;
+mod usage_session;
 
 use self::app_server::{
     AppServerClient, GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID, annotate_event_payload,
@@ -352,6 +353,16 @@ pub trait CodexRunner: Send + Sync {
     ) -> Result<CodexUsageResetOutcome> {
         bail!("usage limit reset is not implemented by this runner")
     }
+
+    /// Releases reusable Usage sessions before service exit. Runners with sessions must
+    /// reject new Usage requests once shutdown starts. The default has no sessions to release.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a worker fails or Docker cannot remove a Usage container.
+    async fn shutdown_usage_sessions(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +372,8 @@ pub struct QuotaBlock {
 }
 
 pub struct DockerCodexRunner {
+    self_weak: std::sync::Weak<Self>,
+    usage_sessions: Mutex<usage_session::UsageSessions>,
     runtime: RunnerRuntime,
     security_context_builds:
         Arc<Mutex<HashMap<SecurityContextBuildKey, Arc<SecurityContextBuildSlot>>>>,
@@ -508,6 +521,8 @@ impl DockerCodexRunner {
         }
     }
 
+    /// Creates a shared runner. Usage workers borrow it only while processing requests.
+    ///
     /// # Errors
     ///
     /// Returns an error if connecting to Docker fails.
@@ -518,10 +533,12 @@ impl DockerCodexRunner {
         state: Arc<ReviewStateStore>,
         gitlab_discovery_mcp: Option<Arc<GitLabDiscoveryMcpService>>,
         runtime: RunnerRuntimeOptions,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Self>> {
         let docker = connect_docker(docker_cfg)?;
         let auth_accounts = Self::build_auth_accounts(&codex);
-        Ok(Self {
+        Ok(Arc::new_cyclic(|self_weak| Self {
+            self_weak: self_weak.clone(),
+            usage_sessions: Mutex::new(usage_session::UsageSessions::default()),
             runtime: RunnerRuntime::Docker {
                 docker,
                 image_pull_manager: ImagePullManager::new(),
@@ -541,7 +558,7 @@ impl DockerCodexRunner {
             owner_id: runtime.owner_id,
             state,
             auth_accounts,
-        })
+        }))
     }
 
     #[cfg(test)]
@@ -552,9 +569,11 @@ impl DockerCodexRunner {
         gitlab_discovery_mcp: Option<Arc<dyn GitLabDiscoveryHandle>>,
         runtime: RunnerRuntimeOptions,
         harness: Arc<dyn test_support::RunnerHarness>,
-    ) -> Self {
+    ) -> Arc<Self> {
         let auth_accounts = Self::build_auth_accounts(&codex);
-        Self {
+        Arc::new_cyclic(|self_weak| Self {
+            self_weak: self_weak.clone(),
+            usage_sessions: Mutex::new(usage_session::UsageSessions::default()),
             runtime: RunnerRuntime::Fake(harness),
             security_context_builds: Arc::new(Mutex::new(HashMap::new())),
             codex,
@@ -568,7 +587,7 @@ impl DockerCodexRunner {
             owner_id: runtime.owner_id,
             state,
             auth_accounts,
-        }
+        })
     }
 }
 
@@ -735,6 +754,10 @@ impl CodexRunner for DockerCodexRunner {
 
     async fn read_usage_limits(&self, account_name: &str) -> Result<CodexUsageSnapshot> {
         self.read_usage_limits_with_account(account_name).await
+    }
+
+    async fn shutdown_usage_sessions(&self) -> Result<()> {
+        self.stop_usage_sessions().await
     }
 
     async fn consume_usage_limit_reset(

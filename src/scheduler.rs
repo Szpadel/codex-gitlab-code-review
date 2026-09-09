@@ -85,6 +85,20 @@ pub(crate) async fn run_with_hooks(
     signal_source: &dyn ShutdownSignalSource,
     http_launcher: &dyn HttpServerLauncher,
 ) -> Result<()> {
+    let runner = Arc::clone(&runtime.runner);
+    let result = run_until_stopped(runtime, signal_source, http_launcher).await;
+    let cleanup = runner.shutdown_usage_sessions().await;
+    if let Err(error) = &cleanup {
+        warn!(error = %error, "Failed to shut down Usage sessions");
+    }
+    result.and(cleanup)
+}
+
+async fn run_until_stopped(
+    runtime: BootstrappedRuntime,
+    signal_source: &dyn ShutdownSignalSource,
+    http_launcher: &dyn HttpServerLauncher,
+) -> Result<()> {
     let BootstrappedRuntime {
         config,
         run_once,
@@ -570,6 +584,16 @@ mod tests {
         launches: Arc<AtomicUsize>,
     }
 
+    struct ImmediateSignalSource(Option<ServiceLifecycleSignal>);
+
+    impl ShutdownSignalSource for ImmediateSignalSource {
+        fn wait_for_shutdown_signal(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<ServiceLifecycleSignal>> + Send + '_>> {
+            Box::pin(async { self.0.ok_or_else(|| anyhow!("signal source failed")) })
+        }
+    }
+
     impl HttpServerLauncher for RecordingHttpServerLauncher {
         fn launch(
             &self,
@@ -660,9 +684,50 @@ mod tests {
 
         assert_eq!(
             *events.lock().expect("event log lock"),
-            vec!["warmup", "resolve_repos"]
+            vec!["warmup", "resolve_repos", "usage_shutdown"]
         );
         assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_shuts_down_usage_after_signals_and_errors() -> Result<()> {
+        for signal in [
+            Some(ServiceLifecycleSignal::GracefulDrain),
+            Some(ServiceLifecycleSignal::FastStop),
+            None,
+        ] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let warmup_started = Arc::new(Notify::new());
+            let release_warmup = Arc::new(Notify::new());
+            let runner = Arc::new(BlockingWarmupRunner {
+                events: events.clone(),
+                warmup_started: warmup_started.clone(),
+                release_warmup: release_warmup.clone(),
+            });
+            let mut runtime =
+                runtime_with_recording_sources(events.clone(), warmup_started, runner).await?;
+            runtime.run_once = false;
+            let launcher = RecordingHttpServerLauncher {
+                launches: Arc::new(AtomicUsize::new(0)),
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_with_hooks(runtime, &ImmediateSignalSource(signal), &launcher),
+            )
+            .await?;
+            release_warmup.notify_waiters();
+            assert_eq!(result.is_ok(), signal.is_some());
+            assert_eq!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| **event == "usage_shutdown")
+                    .count(),
+                1
+            );
+        }
         Ok(())
     }
 
@@ -779,6 +844,14 @@ mod tests {
 
     #[async_trait]
     impl CodexRunner for BlockingWarmupRunner {
+        async fn shutdown_usage_sessions(&self) -> Result<()> {
+            self.events
+                .lock()
+                .expect("event log lock")
+                .push("usage_shutdown");
+            Ok(())
+        }
+
         async fn warm_up_images(&self) -> Result<()> {
             self.events.lock().expect("event log lock").push("warmup");
             self.warmup_started.notify_one();

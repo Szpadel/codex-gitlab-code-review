@@ -1,4 +1,81 @@
 use super::*;
+
+#[tokio::test]
+async fn token_usage_rollup_migration_preserves_updates_deletes_and_rollback() -> Result<()> {
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
+    sqlx::raw_sql(include_str!("../../../migrations/0007_run_history.sql"))
+        .execute(&pool)
+        .await?;
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/0023_run_history_token_usage.sql"
+    ))
+    .execute(&pool)
+    .await?;
+    sqlx::raw_sql(
+        "INSERT INTO run_history (id, kind, repo, iid, head_sha, status, started_at, updated_at)
+         VALUES (1, 'review', 'group/repo', 1, 'sha', 'done', 0, 0);
+         INSERT INTO run_history_token_usage VALUES
+         (1, 'response-1', 'thread', 'turn', 100, 20, 5, 30, 10, 130, 0),
+         (1, 'response-2', 'thread', 'turn', 200, 40, 10, 60, 20, 260, 0);",
+    )
+    .execute(&pool)
+    .await?;
+
+    let migration = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations/0024_run_history_token_usage_rollup.sql"
+    ))?;
+    sqlx::raw_sql(&migration).execute(&pool).await?;
+    let totals =
+        sqlx::query("SELECT * FROM run_history_token_usage_rollup WHERE run_history_id = 1")
+            .fetch_one(&pool)
+            .await?;
+    for (column, expected) in [
+        ("response_count", 2_i64),
+        ("input_tokens", 300),
+        ("cached_input_tokens", 60),
+        ("cache_write_input_tokens", 15),
+        ("output_tokens", 90),
+        ("reasoning_output_tokens", 30),
+        ("total_tokens", 390),
+    ] {
+        assert_eq!(totals.try_get::<i64, _>(column)?, expected, "{column}");
+    }
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("UPDATE run_history_token_usage SET total_tokens = 0")
+        .execute(&mut *transaction)
+        .await?;
+    transaction.rollback().await?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT total_tokens FROM run_history_token_usage_rollup WHERE run_history_id = 1",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(total, 390);
+
+    sqlx::raw_sql(
+        "UPDATE run_history_token_usage SET total_tokens = 140 WHERE response_id = 'response-1';
+         DELETE FROM run_history_token_usage WHERE response_id = 'response-2';",
+    )
+    .execute(&pool)
+    .await?;
+    let totals: (i64, i64) =
+        sqlx::query_as("SELECT response_count, total_tokens FROM run_history_token_usage_rollup")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(totals, (1, 140));
+    sqlx::query("DELETE FROM run_history WHERE id = 1")
+        .execute(&pool)
+        .await?;
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM run_history_token_usage_rollup")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(remaining, 0);
+    pool.close().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn run_token_usage_is_captured_idempotently_and_grouped_by_filtered_kind() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;

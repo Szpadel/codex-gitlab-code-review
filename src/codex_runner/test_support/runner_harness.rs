@@ -23,6 +23,11 @@ struct ExpectedExec {
 pub(crate) trait RunnerHarness: Send + Sync {
     async fn ensure_image_available(&self, image: &str) -> Result<()>;
     async fn remove_container_best_effort(&self, id: &str);
+    /// Usage sessions must surface removal failures and retain the cleanup obligation.
+    async fn remove_usage_container(&self, id: &str) -> Result<()> {
+        self.remove_container_best_effort(id).await;
+        Ok(())
+    }
     async fn start_app_server_container(
         &self,
         request: StartAppServerContainerRequest,
@@ -58,6 +63,7 @@ struct FakeRunnerHarnessState {
     next_browser_container_id: u64,
     ensured_images: Vec<String>,
     removed_containers: Vec<String>,
+    usage_removal_errors: VecDeque<String>,
     scripted_app_servers: VecDeque<ScriptedAppServer>,
     app_server_starts: Vec<AppServerStartRecord>,
     browser_starts: Vec<BrowserStartRecord>,
@@ -70,6 +76,14 @@ struct FakeRunnerHarnessState {
 }
 
 impl FakeRunnerHarness {
+    pub(crate) fn push_usage_removal_error(&self, error: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .usage_removal_errors
+            .push_back(error.to_string());
+    }
+
     pub(crate) fn push_app_server(&self, scripted: ScriptedAppServer) {
         self.state
             .lock()
@@ -186,6 +200,14 @@ impl RunnerHarness for FakeRunnerHarness {
             .unwrap()
             .removed_containers
             .push(id.to_string());
+    }
+
+    async fn remove_usage_container(&self, id: &str) -> Result<()> {
+        if let Some(error) = self.state.lock().unwrap().usage_removal_errors.pop_front() {
+            bail!(error);
+        }
+        self.remove_container_best_effort(id).await;
+        Ok(())
     }
 
     async fn start_app_server_container(

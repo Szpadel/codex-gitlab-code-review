@@ -219,6 +219,7 @@ mod runtime_discovery;
 mod runtime_mention;
 mod runtime_review;
 mod runtime_security;
+mod usage_sessions;
 
 fn review_context_with_target_branch(target_branch: Option<&str>) -> ReviewContext {
     ReviewContext {
@@ -429,7 +430,7 @@ async fn test_runner_with_fake_runtime(
     mention_commands_active: bool,
     harness: Arc<FakeRunnerHarness>,
     gitlab_discovery_mcp: Option<Arc<dyn GitLabDiscoveryHandle>>,
-) -> DockerCodexRunner {
+) -> Arc<DockerCodexRunner> {
     DockerCodexRunner::new_with_test_runtime(
         codex,
         Url::parse("https://gitlab.example.com").expect("url"),
@@ -452,6 +453,8 @@ fn test_runner_with_codex_and_mentions(
 ) -> DockerCodexRunner {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     DockerCodexRunner {
+        self_weak: std::sync::Weak::new(),
+        usage_sessions: Mutex::new(super::usage_session::UsageSessions::default()),
         runtime: RunnerRuntime::Docker {
             docker: connect_docker(&DockerConfig {
                 host: "tcp://127.0.0.1:2375".to_string(),
