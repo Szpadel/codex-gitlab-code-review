@@ -30,8 +30,8 @@ pub use review_rate_limits::{
     ReviewRateLimitTargetKind,
 };
 pub use review_state_repository::ReviewStateRepository;
-pub use run_history_repository::RunHistoryRepository;
 pub(crate) use run_history_repository::merge_rewritten_turn_events;
+pub use run_history_repository::{RelatedRun, RunHistoryRepository};
 pub use security_context_cache_repository::SecurityContextCacheRepository;
 pub use security_review_debounce_repository::SecurityReviewDebounceRepository;
 pub use service_state_repository::ServiceStateRepository;

@@ -129,7 +129,7 @@ pub struct MrHistorySnapshot {
 pub struct RunDetailSnapshot {
     pub generated_at: String,
     pub run: HistoryRunRecord,
-    pub related_runs: Vec<HistoryRunRecord>,
+    pub related_runs: Vec<crate::state::RelatedRun>,
     pub security_context_preview: Option<SecurityContextPreview>,
     pub thread: Option<super::ThreadSnapshot>,
     pub transcript_backfill: Option<TranscriptBackfillSnapshot>,

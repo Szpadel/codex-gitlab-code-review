@@ -218,7 +218,7 @@ impl StatusService {
         let related_runs = self
             .state
             .run_history
-            .list_run_history_for_mr(&run.repo, run.iid)
+            .related_runs(&run.repo, run.iid)
             .await?;
         let security_context_preview = self.resolve_security_context_preview(&run).await?;
         let events = self
@@ -232,7 +232,6 @@ impl StatusService {
             .resolve_transcript_backfill(&run, thread.as_ref())
             .await?;
         let run = self.with_record_retry_statuses(vec![run]).await?.remove(0);
-        let related_runs = self.with_record_retry_statuses(related_runs).await?;
         Ok(Some(RunDetailSnapshot {
             generated_at: Utc::now().to_rfc3339(),
             run,

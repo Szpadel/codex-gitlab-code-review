@@ -5,8 +5,9 @@ use super::super::status::{
 };
 use super::super::transcript::render_thread_stream;
 use super::html::{
-    NavItem, bool_label, escape_html, format_number, pretty_print_json, render_definition_list,
-    render_optional_unix_timestamp, render_shell, render_unix_timestamp, run_kind_label,
+    NavItem, bool_label, escape_html, format_number, mr_history_href, pretty_print_json,
+    render_definition_list, render_optional_unix_timestamp, render_shell, render_unix_timestamp,
+    run_kind_label,
 };
 use crate::review::RunRetryStatus;
 use crate::state::{RunHistoryKind, RunHistoryRecord};
@@ -23,7 +24,7 @@ pub(in crate::http) fn render_run_detail_page(
          <section class=\"grid\">\
          <article class=\"card\"><h2>Run metadata</h2>{}</article>\
          <article class=\"card\"><h2>Token usage</h2>{}</article>\
-         <article class=\"card\"><h2>Related sessions</h2>{}</article>\
+         <article class=\"card\"><h2>Related sessions</h2>{}<p><a href=\"{}\">View MR history</a></p></article>\
          </section>\
          {}{}{}{}",
         run.id,
@@ -33,6 +34,7 @@ pub(in crate::http) fn render_run_detail_page(
         render_run_metadata(run),
         render_token_usage(run),
         render_related_runs(&snapshot.related_runs, run.id),
+        mr_history_href(&run.repo, run.iid),
         render_trigger_card(run, gitlab_base_url),
         render_security_context_card(run, snapshot.security_context_preview.as_ref()),
         render_failure_details_card(run),
@@ -199,7 +201,7 @@ fn render_failure_details_card(run: &HistoryRunRecord) -> String {
     )
 }
 
-fn render_related_runs(runs: &[HistoryRunRecord], current_id: i64) -> String {
+fn render_related_runs(runs: &[crate::state::RelatedRun], current_id: i64) -> String {
     let filtered = runs
         .iter()
         .filter(|run| run.id != current_id)
@@ -214,7 +216,7 @@ fn render_related_runs(runs: &[HistoryRunRecord], current_id: i64) -> String {
         })
         .collect::<Vec<_>>();
     if filtered.is_empty() {
-        "<p class=\"empty\">No other recorded sessions for this MR.</p>".to_string()
+        "<p class=\"empty\">No other sessions in the recent history.</p>".to_string()
     } else {
         format!("<ul class=\"simple-list\">{}</ul>", filtered.join(""))
     }

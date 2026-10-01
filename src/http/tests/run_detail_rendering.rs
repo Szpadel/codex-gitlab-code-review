@@ -1,4 +1,49 @@
 use super::*;
+
+#[tokio::test]
+async fn run_detail_limits_related_sessions_and_links_to_mr_history() -> Result<()> {
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let mut ids = Vec::new();
+    for _ in 0..60 {
+        ids.push(
+            RunFixture::review("group/repo", 7, "sha")
+                .result("pass")
+                .insert(&srv.state)
+                .await?,
+        );
+    }
+    let run_id = ids[0];
+    let snapshot = srv
+        .services
+        .status
+        .run_detail_snapshot(run_id)
+        .await?
+        .unwrap();
+    assert_eq!(snapshot.related_runs.len(), 50);
+    assert_eq!(snapshot.related_runs[0].id, ids[59]);
+    assert_eq!(snapshot.related_runs[49].id, ids[10]);
+    let serialized = serde_json::to_value(&snapshot)?;
+    assert!(
+        serialized["related_runs"][0]
+            .get("security_context_payload_json")
+            .is_none()
+    );
+    assert!(
+        serialized["related_runs"][0]
+            .get("trigger_note_body")
+            .is_none()
+    );
+    let body = reqwest::get(format!("http://{}/history/{run_id}", srv.address))
+        .await?
+        .text()
+        .await?;
+    assert!(body.contains("View MR history"));
+    assert!(body.contains(&format!(
+        "/mr/{}/7/history",
+        crate::http::view::encode_repo_key("group/repo")
+    )));
+    Ok(())
+}
 #[tokio::test]
 async fn run_detail_page_renders_trigger_note_and_thread_preview() -> Result<()> {
     let srv = HttpTestServerBuilder::new().spawn().await?;

@@ -44,6 +44,16 @@ pub struct RunHistoryRepository {
     sqlite: SqliteCoordinator,
 }
 
+/// Metadata for navigation between runs. Transcript and request bodies are excluded.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RelatedRun {
+    pub id: i64,
+    pub kind: RunHistoryKind,
+    pub status: String,
+    pub result: Option<String>,
+    pub started_at: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorDirection {
     After,
@@ -777,6 +787,33 @@ impl RunHistoryRepository {
             .context("list run history for MR")?;
         rows.into_iter()
             .map(|row| map_run_history_row(&row))
+            .collect()
+    }
+
+    /// Returns the 50 most recent sessions for run-detail navigation, newest first.
+    ///
+    /// # Errors
+    /// Returns an error if the database query fails or the IID does not fit in SQLite.
+    pub async fn related_runs(&self, repo: &str, iid: u64) -> Result<Vec<RelatedRun>> {
+        let rows = sqlx::query(
+            "SELECT id, kind, status, result, started_at FROM run_history
+             WHERE repo = ? AND iid = ? ORDER BY started_at DESC, id DESC LIMIT 50",
+        )
+        .bind(repo)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
+        .fetch_all(self.sqlite.read_pool())
+        .await
+        .context("load related runs")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RelatedRun {
+                    id: row.try_get("id")?,
+                    kind: parse_run_history_kind(row.try_get::<String, _>("kind")?.as_str())?,
+                    status: row.try_get("status")?,
+                    result: row.try_get("result")?,
+                    started_at: row.try_get("started_at")?,
+                })
+            })
             .collect()
     }
 
