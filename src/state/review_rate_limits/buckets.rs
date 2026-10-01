@@ -128,7 +128,8 @@ impl BucketRepository {
                 let mut acquired_bucket_ids = Vec::with_capacity(materialized.len());
                 for state in materialized {
                     let new_available = (state.current_available - 1.0).max(0.0);
-                    if state.had_bucket_row {
+                    // Full rows were deleted above, so they must use the insert path.
+                    if state.had_bucket_row && !state.is_full {
                         if new_available + REVIEW_RATE_LIMIT_EPSILON >= f64::from(state.capacity) {
                             sqlx::query(
                                 "DELETE FROM runtime_review_rate_limit_bucket WHERE bucket_id = ?",

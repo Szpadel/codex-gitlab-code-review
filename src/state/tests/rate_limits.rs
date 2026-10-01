@@ -79,6 +79,51 @@ async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
 }
 
 #[tokio::test]
+async fn runtime_rate_limit_consumption_after_full_refill_is_persisted() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    store
+        .review_rate_limit
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "rule-full-refill",
+            "Full refill",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                targets: vec![repo_target("group/repo")],
+                bucket_mode: ReviewRateLimitBucketMode::Shared,
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 100,
+            },
+        ))
+        .await?;
+
+    for now in [1_000, 1_100] {
+        let outcome = store
+            .review_rate_limit
+            .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 7, now)
+            .await?;
+        assert!(matches!(
+            outcome,
+            ReviewRateLimitAcquireOutcome::Acquired { .. }
+        ));
+    }
+
+    let outcome = store
+        .review_rate_limit
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 7, 1_100)
+        .await?;
+    assert_eq!(
+        outcome,
+        ReviewRateLimitAcquireOutcome::Blocked {
+            next_retry_at: 1_200
+        }
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn runtime_rate_limit_refill_math_exposes_fractional_slots() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let rule_id = store
