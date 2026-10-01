@@ -47,6 +47,7 @@ pub(crate) struct RunnerSession {
     pub(crate) run_history_id: Option<i64>,
     gitlab_discovery_mcp: Option<PreparedGitLabDiscoveryMcp>,
     gitlab_discovery_session: Option<RegisteredGitLabDiscoverySession>,
+    gitlab_discovery_warning_cleared: bool,
 }
 
 pub(crate) struct SessionLaunch {
@@ -186,6 +187,7 @@ impl DockerCodexRunner {
             // Browser diagnostics use browser container id + launch config at call sites.
             gitlab_discovery_mcp: config.gitlab_discovery_mcp,
             gitlab_discovery_session: None,
+            gitlab_discovery_warning_cleared: false,
         };
 
         session.gitlab_discovery_session = match self
@@ -446,6 +448,7 @@ impl DockerCodexRunner {
         let gitlab_discovery_server_name = session
             .gitlab_discovery_server_name()
             .map(ToOwned::to_owned);
+        let warning_cleared = &mut session.gitlab_discovery_warning_cleared;
         session
             .client
             .stream_turn_message(
@@ -456,9 +459,15 @@ impl DockerCodexRunner {
                     self.append_run_history_events(run_history_id, &events)
                         .await;
                 },
-                || async move {
-                    self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
-                        .await;
+                || {
+                    let clear_warning = !*warning_cleared;
+                    *warning_cleared = true;
+                    async move {
+                        if clear_warning {
+                            self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
+                                .await;
+                        }
+                    }
                 },
             )
             .await
@@ -474,6 +483,7 @@ impl DockerCodexRunner {
         let gitlab_discovery_server_name = session
             .gitlab_discovery_server_name()
             .map(ToOwned::to_owned);
+        let warning_cleared = &mut session.gitlab_discovery_warning_cleared;
         session
             .client
             .stream_review(
@@ -484,9 +494,15 @@ impl DockerCodexRunner {
                     self.append_run_history_events(run_history_id, &events)
                         .await;
                 },
-                || async move {
-                    self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
-                        .await;
+                || {
+                    let clear_warning = !*warning_cleared;
+                    *warning_cleared = true;
+                    async move {
+                        if clear_warning {
+                            self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
+                                .await;
+                        }
+                    }
                 },
             )
             .await

@@ -1,6 +1,69 @@
 use super::*;
 
 #[tokio::test]
+async fn clearing_absent_warning_turn_does_not_rewrite_events() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let run_id = store
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 1,
+            head_sha: "sha".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+    store
+        .run_history
+        .append_run_history_events(
+            run_id,
+            &[NewRunHistoryEvent {
+                sequence: 1,
+                turn_id: Some("review".to_string()),
+                event_type: "turn_started".to_string(),
+                payload: serde_json::json!({}),
+            }],
+        )
+        .await?;
+    sqlx::raw_sql(
+        "CREATE TABLE rewrites (count INTEGER NOT NULL);
+        INSERT INTO rewrites VALUES (0);
+        CREATE TRIGGER count_rewrites AFTER DELETE ON run_history_event
+        BEGIN UPDATE rewrites SET count = count + 1; END;",
+    )
+    .execute(store.pool())
+    .await?;
+    for _ in 0..8 {
+        store
+            .run_history
+            .replace_run_history_events_for_turn_bg(
+                run_id,
+                "gitlab-discovery-mcp-startup".to_string(),
+                vec![],
+            )
+            .await?;
+    }
+    store.flush_background_writes().await?;
+    let rewrites: i64 = sqlx::query_scalar("SELECT count FROM rewrites")
+        .fetch_one(store.pool())
+        .await?;
+    assert_eq!(rewrites, 0);
+    assert_eq!(
+        store
+            .run_history
+            .list_run_history_events(run_id)
+            .await?
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn token_usage_rollup_migration_preserves_updates_deletes_and_rollback() -> Result<()> {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
     sqlx::raw_sql(include_str!("../../../migrations/0007_run_history.sql"))

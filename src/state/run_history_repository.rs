@@ -469,6 +469,11 @@ impl RunHistoryRepository {
         let created_at = Utc::now().timestamp();
         self.sqlite
             .write_foreground("replace run history events for turn", |pool| async move {
+                if events.is_empty()
+                    && !run_history_turn_exists(&pool, run_history_id, turn_id).await?
+                {
+                    return Ok(());
+                }
                 let existing_events =
                     list_run_history_events_on_pool(pool.clone(), run_history_id).await?;
                 let rewritten_events =
@@ -503,6 +508,11 @@ impl RunHistoryRepository {
                     let events = events.clone();
                     Box::pin(async move {
                         let created_at = Utc::now().timestamp();
+                        if events.is_empty()
+                            && !run_history_turn_exists(&pool, run_history_id, &turn_id).await?
+                        {
+                            return Ok(());
+                        }
                         let existing_events =
                             list_run_history_events_on_pool(pool.clone(), run_history_id).await?;
                         let rewritten_events =
@@ -896,6 +906,18 @@ async fn mark_run_history_events_incomplete_on_pool(pool: SqlitePool, run_id: i6
     .await
     .context("mark run history events incomplete")?;
     Ok(())
+}
+
+async fn run_history_turn_exists(pool: &SqlitePool, run_id: i64, turn_id: &str) -> Result<bool> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM run_history_event WHERE run_history_id = ? AND turn_id = ? LIMIT 1",
+    )
+    .bind(run_id)
+    .bind(turn_id)
+    .fetch_optional(pool)
+    .await
+    .context("check run history turn events")?;
+    Ok(exists.is_some())
 }
 
 async fn append_run_history_events_on_pool(
