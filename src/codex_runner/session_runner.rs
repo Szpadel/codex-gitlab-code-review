@@ -1,4 +1,5 @@
 use super::app_server::is_app_server_io_failure;
+use super::container::{AppServerContainerExtras, ContainerCleanup};
 use super::{
     AppServerClient, AuthAccount, BrowserMcpConfig, DockerCodexRunner, Duration, Instant,
     PreparedGitLabDiscoveryMcp, RegisteredGitLabDiscoverySession, Result, StartedAppServer, Value,
@@ -35,6 +36,7 @@ pub(crate) struct RunnerSessionConfig {
     pub(crate) browser_mcp: Option<BrowserMcpConfig>,
     pub(crate) gitlab_discovery_mcp: Option<PreparedGitLabDiscoveryMcp>,
     pub(crate) gitlab_discovery_extra_hosts: Vec<String>,
+    pub(crate) startup_cleanup: Option<ContainerCleanup>,
 }
 
 pub(crate) struct RunnerSession {
@@ -62,6 +64,7 @@ pub(crate) struct SessionLaunchRequest<'a, F> {
     pub(crate) allow_gitlab_discovery: bool,
     pub(crate) auth_account: &'a AuthAccount,
     pub(crate) build_script: F,
+    pub(crate) startup_cleanup: Option<ContainerCleanup>,
 }
 
 pub(crate) struct SessionInitializeRequest<'a> {
@@ -112,6 +115,7 @@ pub(crate) fn standard_session_launch_request<'a, F>(
         allow_gitlab_discovery,
         auth_account,
         build_script,
+        startup_cleanup: None,
     }
 }
 
@@ -164,8 +168,10 @@ impl DockerCodexRunner {
             .start_app_server_container(
                 config.script,
                 &config.auth_account.auth_host_path,
-                Vec::new(),
-                Vec::new(),
+                AppServerContainerExtras {
+                    cleanup: config.startup_cleanup,
+                    ..Default::default()
+                },
                 config.browser_mcp.as_ref(),
                 config.gitlab_discovery_extra_hosts,
             )
@@ -252,6 +258,7 @@ impl DockerCodexRunner {
                 browser_mcp: prepared.browser_mcp.clone(),
                 gitlab_discovery_mcp: prepared.gitlab_discovery_mcp.clone(),
                 gitlab_discovery_extra_hosts: prepared.gitlab_discovery_extra_hosts.clone(),
+                startup_cleanup: request.startup_cleanup,
             })
             .await?;
         Ok(SessionLaunch {

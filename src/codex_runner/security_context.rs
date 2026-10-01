@@ -1,9 +1,10 @@
 //! Security-review context cache lifecycle and separate-session context building.
 
+use super::container::ContainerCleanup;
 use super::session_runner::{PreparedRunnerSessionComponents, standard_session_launch_request};
 use super::{
-    AppServerClient, AppServerCommandOptions, Arc, AuthAccount, BrowserMcpConfig, Context,
-    DockerCodexRunner, Mutex, Result, ReviewContext, RunHistorySessionUpdate,
+    AppServerClient, AppServerCommandOptions, AuthAccount, BrowserMcpConfig, Context,
+    DockerCodexRunner, Result, ReviewContext, RunHistorySessionUpdate,
     SecurityContextBuildCompletionGuard, SecurityContextBuildKey, SecurityContextBuildRegistration,
     Utc, Value, anyhow, bail, debug, json, warn,
 };
@@ -29,7 +30,7 @@ struct SecurityContextPayloadRequest<'a> {
     base_head_sha: &'a str,
 }
 
-pub(super) type ExtraSecurityContextSessionContainer = Arc<Mutex<Option<(String, Option<String>)>>>;
+pub(super) type ExtraSecurityContextSessionContainer = ContainerCleanup;
 
 pub(super) struct SeparateSecurityContextSessionRequest<'a> {
     pub(super) account: &'a AuthAccount,
@@ -623,38 +624,28 @@ impl DockerCodexRunner {
         ctx: &ReviewContext,
         request: SeparateSecurityContextSessionRequest<'_>,
     ) -> Result<String> {
-        let launch = self
-            .launch_runner_session(standard_session_launch_request(
-                ctx.run_history_id,
-                &ctx.feature_flags,
-                &ctx.project_path,
-                &self.codex.mcp_server_overrides.review,
-                false,
-                request.account,
-                |_prepared: &PreparedRunnerSessionComponents| {
-                    self.command(
-                        ctx,
-                        AppServerCommandOptions {
-                            browser_mcp: request.browser_mcp,
-                            gitlab_discovery_mcp: None,
-                            mcp_server_overrides: &self.codex.mcp_server_overrides.review,
-                            session_override: self.security_context_session_override(),
-                        },
-                    )
-                },
-            ))
-            .await?;
+        let mut launch_request = standard_session_launch_request(
+            ctx.run_history_id,
+            &ctx.feature_flags,
+            &ctx.project_path,
+            &self.codex.mcp_server_overrides.review,
+            false,
+            request.account,
+            |_prepared: &PreparedRunnerSessionComponents| {
+                self.command(
+                    ctx,
+                    AppServerCommandOptions {
+                        browser_mcp: request.browser_mcp,
+                        gitlab_discovery_mcp: None,
+                        mcp_server_overrides: &self.codex.mcp_server_overrides.review,
+                        session_override: self.security_context_session_override(),
+                    },
+                )
+            },
+        );
+        launch_request.startup_cleanup = Some(request.extra_session_container.clone());
+        let launch = self.launch_runner_session(launch_request).await?;
         let mut session = launch.session;
-        {
-            let mut slot = request
-                .extra_session_container
-                .lock()
-                .expect("security context extra session lock poisoned");
-            *slot = Some((
-                session.container_id.clone(),
-                session.browser_container_id.clone(),
-            ));
-        }
 
         let build_result = async {
             session.client.initialize().await?;
@@ -708,13 +699,7 @@ impl DockerCodexRunner {
         };
 
         self.close_runner_session(session).await;
-        {
-            let mut slot = request
-                .extra_session_container
-                .lock()
-                .expect("security context extra session lock poisoned");
-            *slot = None;
-        }
+        request.extra_session_container.take();
 
         build_result
     }

@@ -1,5 +1,6 @@
 //! Per-account Usage workers own connections independently of HTTP request lifetimes.
 
+use super::container::AppServerContainerExtras;
 use super::session_runner::RunSessionConfig;
 use super::{DockerCodexRunner, RunnerRuntime, StartedAppServer};
 use anyhow::{Context, Result, anyhow, bail};
@@ -208,8 +209,7 @@ async fn run_usage_worker(
                 .start_app_server_container(
                     DockerCodexRunner::build_history_reader_script(&runner.codex.auth_mount_path),
                     &auth_host_path,
-                    Vec::new(),
-                    Vec::new(),
+                    AppServerContainerExtras::default(),
                     None,
                     Vec::new(),
                 )

@@ -86,6 +86,48 @@ pub(crate) struct ContainerExecOutput {
     pub(crate) stderr: String,
 }
 
+/// Retain created container IDs so an outer owner can remove them after cancelled startup.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ContainerCleanup {
+    containers: Arc<Mutex<Vec<String>>>,
+}
+
+impl ContainerCleanup {
+    pub(crate) fn record(&self, container_id: &str) {
+        self.containers
+            .lock()
+            .expect("container cleanup lock poisoned")
+            .push(container_id.to_string());
+    }
+
+    /// Release an ID after its container removal finishes.
+    pub(crate) fn forget(&self, container_id: &str) {
+        self.containers
+            .lock()
+            .expect("container cleanup lock poisoned")
+            .retain(|id| id != container_id);
+    }
+
+    /// Transfer all pending IDs to the caller for removal.
+    pub(crate) fn take(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .containers
+                .lock()
+                .expect("container cleanup lock poisoned"),
+        )
+    }
+}
+
+/// Additional mounts, environment, and cancellation cleanup for container startup.
+#[derive(Default)]
+pub(crate) struct AppServerContainerExtras {
+    pub(crate) binds: Vec<String>,
+    pub(crate) env: Vec<String>,
+    /// The outer owner removes retained IDs if startup is cancelled.
+    pub(crate) cleanup: Option<ContainerCleanup>,
+}
+
 impl DockerCodexRunner {
     const WORK_TMPFS_TARGET: &'static str = "/work";
 
@@ -190,6 +232,18 @@ impl DockerCodexRunner {
         if let Some(browser_container_id) = browser_container_id {
             self.remove_container_best_effort(browser_container_id)
                 .await;
+        }
+    }
+
+    /// Remove a failed startup container before releasing its outer cleanup record.
+    pub(crate) async fn remove_startup_container(
+        &self,
+        id: &str,
+        cleanup: Option<&ContainerCleanup>,
+    ) {
+        self.remove_container_best_effort(id).await;
+        if let Some(cleanup) = cleanup {
+            cleanup.forget(id);
         }
     }
 
@@ -480,11 +534,15 @@ impl DockerCodexRunner {
         &self,
         script: String,
         auth_host_path: &str,
-        extra_binds: Vec<String>,
-        extra_env: Vec<String>,
+        extras: AppServerContainerExtras,
         browser_mcp: Option<&BrowserMcpConfig>,
         extra_hosts: Vec<String>,
     ) -> Result<StartedAppServer> {
+        let AppServerContainerExtras {
+            binds: extra_binds,
+            env: extra_env,
+            cleanup,
+        } = extras;
         #[cfg(test)]
         if let RunnerRuntime::Fake(harness) = &self.runtime {
             let image_ref = Self::normalize_image_reference(&self.codex.image);
@@ -512,6 +570,12 @@ impl DockerCodexRunner {
                     log_all_json: self.log_all_json,
                 })
                 .await?;
+            if let Some(cleanup) = cleanup.as_ref() {
+                if let Some(browser_id) = started.browser_container_id.as_deref() {
+                    cleanup.record(browser_id);
+                }
+                cleanup.record(&started.container_id);
+            }
             if let (Some(browser_container_id), Some(launch)) = (
                 started.browser_container_id.as_deref(),
                 browser_launch.as_ref(),
@@ -519,11 +583,12 @@ impl DockerCodexRunner {
                 .wait_for_browser_container_ready(browser_container_id, launch)
                 .await
             {
-                self.cleanup_app_server_containers(
-                    &started.container_id,
-                    started.browser_container_id.as_deref(),
-                )
-                .await;
+                self.remove_startup_container(&started.container_id, cleanup.as_ref())
+                    .await;
+                if let Some(browser_id) = started.browser_container_id.as_deref() {
+                    self.remove_startup_container(browser_id, cleanup.as_ref())
+                        .await;
+                }
                 return Err(err);
             }
             return Ok(started);
@@ -540,7 +605,7 @@ impl DockerCodexRunner {
         self.ensure_image_available(&image_ref).await?;
         let browser_container_id = if let Some(browser_mcp) = browser_mcp {
             Some(
-                self.start_browser_container(browser_mcp, extra_hosts.clone())
+                self.start_browser_container(browser_mcp, extra_hosts.clone(), cleanup.as_ref())
                     .await?,
             )
         } else {
@@ -596,20 +661,25 @@ impl DockerCodexRunner {
             Ok(create) => create,
             Err(err) => {
                 if let Some(browser_id) = browser_container_id.as_deref() {
-                    self.remove_container_best_effort(browser_id).await;
+                    self.remove_startup_container(browser_id, cleanup.as_ref())
+                        .await;
                 }
                 return Err(err);
             }
         };
         let id = create.id;
+        if let Some(cleanup) = cleanup.as_ref() {
+            cleanup.record(&id);
+        }
         let start_result = docker
             .start_container(&id, Some(StartContainerOptionsBuilder::new().build()))
             .await
             .with_context(|| format!("start docker container {id}"));
         if let Err(err) = start_result {
-            self.remove_container_best_effort(&id).await;
+            self.remove_startup_container(&id, cleanup.as_ref()).await;
             if let Some(browser_id) = browser_container_id.as_deref() {
-                self.remove_container_best_effort(browser_id).await;
+                self.remove_startup_container(browser_id, cleanup.as_ref())
+                    .await;
             }
             return Err(err);
         }
@@ -632,9 +702,10 @@ impl DockerCodexRunner {
         {
             Ok(attach) => attach,
             Err(err) => {
-                self.remove_container_best_effort(&id).await;
+                self.remove_startup_container(&id, cleanup.as_ref()).await;
                 if let Some(browser_id) = browser_container_id.as_deref() {
-                    self.remove_container_best_effort(browser_id).await;
+                    self.remove_startup_container(browser_id, cleanup.as_ref())
+                        .await;
                 }
                 return Err(err);
             }

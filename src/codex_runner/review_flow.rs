@@ -8,7 +8,7 @@ use super::session_runner::{
     standard_session_launch_request,
 };
 use super::{
-    AppServerCommandOptions, Arc, AuthAccount, AuthFallbackAction, CodexResult, DockerCodexRunner,
+    AppServerCommandOptions, AuthAccount, AuthFallbackAction, CodexResult, DockerCodexRunner,
     Instant, PreparedGitLabDiscoveryMcp, Result, ReviewContext, RunHistorySessionUpdate, Utc,
     Value, append_additional_review_instructions, build_base_branch_review_prompt,
     build_commit_review_prompt, json, repo_checkout_root, upstream_review_prompt_source_commit,
@@ -307,7 +307,7 @@ impl DockerCodexRunner {
                     repo_path,
                     base_branch: base_branch.as_str(),
                     base_head_sha: base_head_sha.as_str(),
-                    extra_session_container: Arc::clone(extra_session),
+                    extra_session_container: extra_session.clone(),
                 },
             )
             .await;
@@ -466,18 +466,8 @@ impl DockerCodexRunner {
         &self,
         extra_session: &ExtraSecurityContextSessionContainer,
     ) {
-        let extra_session = {
-            let mut slot = extra_session
-                .lock()
-                .expect("security context extra session lock poisoned");
-            slot.take()
-        };
-        if let Some((extra_container_id, extra_browser_container_id)) = extra_session {
-            self.cleanup_app_server_containers(
-                &extra_container_id,
-                extra_browser_container_id.as_deref(),
-            )
-            .await;
+        for container_id in extra_session.take().into_iter().rev() {
+            self.remove_container_best_effort(&container_id).await;
         }
     }
 

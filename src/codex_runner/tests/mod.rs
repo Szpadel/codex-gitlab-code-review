@@ -223,6 +223,7 @@ mod runtime_discovery;
 mod runtime_mention;
 mod runtime_review;
 mod runtime_security;
+mod runtime_security_cleanup;
 mod usage_sessions;
 
 fn review_context_with_target_branch(target_branch: Option<&str>) -> ReviewContext {

@@ -656,8 +656,7 @@ impl DockerCodexRunner {
             .start_app_server_container(
                 script,
                 &account.auth_host_path,
-                Vec::new(),
-                Vec::new(),
+                container::AppServerContainerExtras::default(),
                 None,
                 Vec::new(),
             )

@@ -1,3 +1,4 @@
+use super::container::ContainerCleanup;
 use super::{
     BROWSER_CONTAINER_LOG_FETCH_TAIL, BROWSER_CONTAINER_LOG_LINE_LIMIT,
     BROWSER_CONTAINER_LOG_LINE_MAX_CHARS, BROWSER_CONTAINER_NAME_PREFIX,
@@ -340,6 +341,7 @@ impl DockerCodexRunner {
         &self,
         browser_mcp: &BrowserMcpConfig,
         extra_hosts: Vec<String>,
+        cleanup: Option<&ContainerCleanup>,
     ) -> Result<String> {
         #[cfg(test)]
         let docker = match &self.runtime {
@@ -387,6 +389,9 @@ impl DockerCodexRunner {
                 format!("create docker browser container {name} with image {image_ref}")
             })?;
         let id = create.id;
+        if let Some(cleanup) = cleanup {
+            cleanup.record(&id);
+        }
         let start_result = docker
             .start_container(&id, Some(StartContainerOptionsBuilder::new().build()))
             .await
@@ -395,7 +400,7 @@ impl DockerCodexRunner {
             let err = self
                 .enrich_error_with_browser_diagnostics(err, Some(&id), Some(browser_mcp))
                 .await;
-            self.remove_container_best_effort(&id).await;
+            self.remove_startup_container(&id, cleanup).await;
             return Err(err);
         }
         info!(
@@ -407,7 +412,7 @@ impl DockerCodexRunner {
             "started browser container"
         );
         if let Err(err) = self.wait_for_browser_container_ready(&id, &launch).await {
-            self.remove_container_best_effort(&id).await;
+            self.remove_startup_container(&id, cleanup).await;
             return Err(err);
         }
         Ok(id)
