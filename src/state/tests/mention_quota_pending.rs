@@ -1,5 +1,39 @@
 use super::*;
 
+#[tokio::test]
+async fn pending_mention_due_lookup_uses_the_full_key_and_retry_boundary() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    store
+        .mention_quota_pending
+        .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+            repo: "group/repo",
+            iid: 7,
+            discussion_id: "discussion",
+            trigger_note_id: 11,
+            head_sha: "sha",
+            blocked_at: 100,
+            next_retry_at: 200,
+        })
+        .await?;
+    for (repo, iid, discussion, note, now, expected) in [
+        ("group/repo", 7, "discussion", 11, 199, false),
+        ("group/repo", 7, "discussion", 11, 200, true),
+        ("other/repo", 7, "discussion", 11, 200, false),
+        ("group/repo", 8, "discussion", 11, 200, false),
+        ("group/repo", 7, "other", 11, 200, false),
+        ("group/repo", 7, "discussion", 12, 200, false),
+    ] {
+        assert_eq!(
+            store
+                .mention_quota_pending
+                .mention_quota_pending_is_due(repo, iid, discussion, note, now)
+                .await?,
+            expected
+        );
+    }
+    Ok(())
+}
+
 fn pending<'a>(
     repo: &'a str,
     iid: u64,

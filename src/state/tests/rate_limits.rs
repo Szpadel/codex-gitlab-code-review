@@ -1,4 +1,43 @@
 use super::*;
+
+#[tokio::test]
+async fn pending_review_repo_query_preserves_order_and_both_lanes() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    for (lane, repo, iid, blocked) in [
+        (ReviewLane::Security, "group/repo", 2, 100),
+        (ReviewLane::General, "group/repo", 1, 100),
+        (ReviewLane::General, "other/repo", 1, 50),
+        (ReviewLane::General, "group/repo", 3, 50),
+    ] {
+        store
+            .review_rate_limit
+            .upsert_review_rate_limit_pending(lane, repo, iid, "sha", blocked, 200)
+            .await?;
+    }
+    let rows = store
+        .review_rate_limit
+        .list_review_rate_limit_pending_for_repo("group/repo")
+        .await?;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.lane, row.iid))
+            .collect::<Vec<_>>(),
+        vec![
+            (ReviewLane::General, 3),
+            (ReviewLane::General, 1),
+            (ReviewLane::Security, 2)
+        ]
+    );
+    assert!(rows.iter().all(|row| row.repo == "group/repo"));
+    assert!(
+        store
+            .review_rate_limit
+            .list_review_rate_limit_pending_for_repo("missing")
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
 #[tokio::test]
 async fn runtime_rate_limit_rule_crud_roundtrips() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;

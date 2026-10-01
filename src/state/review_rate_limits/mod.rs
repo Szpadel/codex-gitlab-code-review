@@ -162,7 +162,20 @@ impl ReviewRateLimitRepository {
     ///
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn list_review_rate_limit_pending(&self) -> Result<Vec<ReviewRateLimitPendingEntry>> {
-        self.pending.list_review_rate_limit_pending().await
+        self.pending.list_review_rate_limit_pending(None).await
+    }
+
+    /// Returns pending reviews for one repository, oldest blocked session first.
+    ///
+    /// # Errors
+    /// Returns an error if the database query fails.
+    pub async fn list_review_rate_limit_pending_for_repo(
+        &self,
+        repo: &str,
+    ) -> Result<Vec<ReviewRateLimitPendingEntry>> {
+        self.pending
+            .list_review_rate_limit_pending(Some(repo))
+            .await
     }
 
     /// # Errors

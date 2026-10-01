@@ -135,6 +135,34 @@ impl MentionQuotaPendingRepository {
             .collect()
     }
 
+    /// Checks the full command key without loading other pending commands.
+    ///
+    /// # Errors
+    /// Returns an error if the database query fails or an identifier does not fit in SQLite.
+    pub async fn mention_quota_pending_is_due(
+        &self,
+        repo: &str,
+        iid: u64,
+        discussion_id: &str,
+        trigger_note_id: u64,
+        now: i64,
+    ) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM runtime_mention_quota_pending
+             WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
+             AND next_retry_at <= ? LIMIT 1",
+        )
+        .bind(repo)
+        .bind(sqlite_i64_from_u64(iid, "iid")?)
+        .bind(discussion_id)
+        .bind(sqlite_i64_from_u64(trigger_note_id, "trigger_note_id")?)
+        .bind(now)
+        .fetch_optional(self.sqlite.read_pool())
+        .await
+        .context("check pending mention retry time")?;
+        Ok(exists.is_some())
+    }
+
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.

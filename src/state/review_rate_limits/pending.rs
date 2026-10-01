@@ -95,17 +95,23 @@ impl PendingRepository {
     /// Returns an error if the `SQLite` state operation fails.
     pub(super) async fn list_review_rate_limit_pending(
         &self,
+        repo: Option<&str>,
     ) -> Result<Vec<ReviewRateLimitPendingEntry>> {
-        let rows = sqlx::query(
+        let mut query = QueryBuilder::<Sqlite>::new(
             r"
             SELECT lane, repo, iid, first_blocked_at, last_blocked_at, last_seen_head_sha, next_retry_at
             FROM runtime_review_rate_limit_pending
-            ORDER BY first_blocked_at ASC, lane ASC, repo ASC, iid ASC
             ",
-        )
-        .fetch_all(self.sqlite.read_pool())
-        .await
-        .context("list runtime review rate limit pending rows")?;
+        );
+        if let Some(repo) = repo {
+            query.push(" WHERE repo = ").push_bind(repo);
+        }
+        query.push(" ORDER BY first_blocked_at ASC, lane ASC, repo ASC, iid ASC");
+        let rows = query
+            .build()
+            .fetch_all(self.sqlite.read_pool())
+            .await
+            .context("list runtime review rate limit pending rows")?;
 
         rows.into_iter()
             .map(|row| map_review_rate_limit_pending_row(&row))

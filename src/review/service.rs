@@ -529,16 +529,14 @@ impl ReviewService {
                 let still_due = self
                     .state
                     .mention_quota_pending
-                    .list_mention_quota_pending()
-                    .await?
-                    .into_iter()
-                    .any(|entry| {
-                        entry.repo == pending.repo
-                            && entry.iid == pending.iid
-                            && entry.discussion_id == pending.discussion_id
-                            && entry.trigger_note_id == pending.trigger_note_id
-                            && entry.next_retry_at <= now
-                    });
+                    .mention_quota_pending_is_due(
+                        &pending.repo,
+                        pending.iid,
+                        &pending.discussion_id,
+                        pending.trigger_note_id,
+                        now,
+                    )
+                    .await?;
                 if still_due
                     && !outcome.blocked_pending_work
                     && self
@@ -756,10 +754,10 @@ impl ReviewService {
         let pending_to_clear = self
             .state
             .review_rate_limit
-            .list_review_rate_limit_pending()
+            .list_review_rate_limit_pending_for_repo(repo)
             .await?
             .into_iter()
-            .filter(|pending| pending.repo == repo && !open_iids_set.contains(&pending.iid))
+            .filter(|pending| !open_iids_set.contains(&pending.iid))
             .collect::<Vec<_>>();
         if pending_to_clear.is_empty() {
             return Ok(());
