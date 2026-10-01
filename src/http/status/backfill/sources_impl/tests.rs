@@ -5,6 +5,60 @@ use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
+thread_local! {
+    pub(super) static ARCHIVE_READ_COUNTS: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+}
+
+#[test]
+fn two_review_parents_enumerate_and_parse_siblings_once() -> Result<()> {
+    let root = env::temp_dir().join(format!("codex-review-archive-cost-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let mut outer = vec![json!({"type": "session_meta", "payload": {"id": "outer"}})];
+    let mut sibling = vec![json!({"type": "session_meta", "payload": {
+        "id": "sibling", "source": {"subagent": "review"}
+    }})];
+    for index in 1..=2 {
+        let parent = format!("parent-{index}");
+        let child = format!("child-{index}");
+        outer.extend([
+            json!({"type": "event_msg", "payload": {"type": "entered_review_mode", "user_facing_hint": parent}}),
+            json!({"type": "event_msg", "payload": {"type": "task_started", "turn_id": child}}),
+            json!({"type": "event_msg", "payload": {"type": "task_complete", "turn_id": parent}}),
+        ]);
+        sibling.extend([
+            json!({"type": "turn_context", "payload": {"turn_id": child}}),
+            json!({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": format!("summary-{index}")} ]}}),
+        ]);
+    }
+    for (name, records) in [("outer", outer), ("sibling", sibling)] {
+        fs::write(
+            root.join(format!("{name}.jsonl")),
+            records
+                .into_iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )?;
+    }
+    ARCHIVE_READ_COUNTS.with(|counts| counts.set((0, 0)));
+    let events = load_events_from_root(&root, "outer", None)?.context("backfilled events")?;
+    let counts = ARCHIVE_READ_COUNTS.with(std::cell::Cell::get);
+    fs::remove_dir_all(&root)?;
+    for index in 1..=2 {
+        assert!(events.iter().any(|event| {
+            event.turn_id.as_deref() == Some(format!("parent-{index}").as_str())
+                && event.payload["text"] == format!("summary-{index}")
+        }));
+    }
+    assert_eq!(
+        counts,
+        (1, 2),
+        "one enumeration, outer and sibling parsed once"
+    );
+    Ok(())
+}
+
 #[test]
 fn normalize_response_item_builds_dynamic_tool_call_from_function_pair() -> Result<()> {
     let mut pending = HashMap::new();
@@ -198,7 +252,8 @@ fn find_session_file_prefers_newest_matching_jsonl() -> Result<()> {
     let newer = temp_root.join("thread-123.jsonl");
     fs::write(&newer, "")?;
 
-    let selected = find_session_file(&temp_root, "thread-123")?.context("selected session file")?;
+    let selected = find_session_file(&collect_session_files(&temp_root)?, "thread-123")
+        .context("selected session file")?;
     assert_eq!(selected, newer);
     fs::remove_dir_all(&temp_root)?;
     Ok(())

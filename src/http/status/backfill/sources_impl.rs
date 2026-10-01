@@ -6,7 +6,7 @@ use crate::state::NewRunHistoryEvent;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -46,6 +46,12 @@ struct ReviewSubagentLoad {
     missing_child_turn_ids: HashSet<String>,
 }
 
+#[derive(Debug, Default)]
+struct ReviewSiblingIndex {
+    sessions: Vec<(ParsedSessionFile, SystemTime)>,
+    by_child_turn: HashMap<String, Vec<usize>>,
+}
+
 impl SessionHistoryBackfillSource {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -73,7 +79,8 @@ fn load_events_from_root(
     thread_id: &str,
     turn_id: Option<&str>,
 ) -> Result<Option<Vec<NewRunHistoryEvent>>> {
-    let Some(path) = find_session_file(root, thread_id)? else {
+    let candidates = collect_session_files(root)?;
+    let Some(path) = find_session_file(&candidates, thread_id) else {
         return Ok(None);
     };
     let Some(outer) = parse_session_file_details(&path, Some(thread_id), turn_id)? else {
@@ -87,13 +94,13 @@ fn load_events_from_root(
             .iter()
             .flat_map(|(_, child_turn_ids)| child_turn_ids.iter().cloned())
             .collect::<HashSet<_>>();
+        let siblings = load_review_sibling_index(&candidates, &path, &review_child_turn_ids)?;
         for (parent_turn_id, child_turn_ids) in &review_mappings {
             let sibling_load = load_review_subagent_events(
-                root,
-                &path,
+                &siblings,
                 child_turn_ids.iter().map(String::as_str).collect(),
                 parent_turn_id,
-            )?;
+            );
             if !sibling_load.missing_child_turn_ids.is_empty() {
                 events = annotate_parent_missing_review_child_turn_ids(
                     events,
@@ -124,23 +131,26 @@ fn load_events_from_root(
     Ok(Some(resequence_events(events)))
 }
 
-fn find_session_file(root: &Path, thread_id: &str) -> Result<Option<PathBuf>> {
-    if !root.exists() {
-        return Err(anyhow!(TRANSCRIPT_BACKFILL_SOURCE_UNAVAILABLE_ERROR));
-    }
-    let candidates = collect_session_files(root)?
-        .into_iter()
+fn find_session_file(candidates: &[PathBuf], thread_id: &str) -> Option<PathBuf> {
+    let candidates = candidates
+        .iter()
         .filter(|candidate| {
             candidate
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| session_file_name_matches(name, thread_id))
         })
+        .cloned()
         .collect::<Vec<_>>();
-    Ok(select_newest_session_file(candidates))
+    select_newest_session_file(candidates)
 }
 
 fn collect_session_files(root: &Path) -> Result<Vec<PathBuf>> {
+    #[cfg(test)]
+    tests::ARCHIVE_READ_COUNTS.with(|counts| {
+        let (enumerations, parses) = counts.get();
+        counts.set((enumerations + 1, parses));
+    });
     let mut pending = vec![root.to_path_buf()];
     let mut candidates = Vec::<PathBuf>::new();
     while let Some(path) = pending.pop() {
@@ -213,6 +223,11 @@ fn parse_session_file_details(
     expected_session_id: Option<&str>,
     target_turn_id: Option<&str>,
 ) -> Result<Option<ParsedSessionFile>> {
+    #[cfg(test)]
+    tests::ARCHIVE_READ_COUNTS.with(|counts| {
+        let (enumerations, parses) = counts.get();
+        counts.set((enumerations, parses + 1));
+    });
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read session file {}", path.display()))?;
     let non_empty_line_count = raw.lines().filter(|line| !line.trim().is_empty()).count();
@@ -598,18 +613,18 @@ fn normalize_agent_message_event(payload: &Value, timestamp: &str) -> Option<Val
     Some(item)
 }
 
-fn load_review_subagent_events(
-    root: &Path,
+fn load_review_sibling_index(
+    candidates: &[PathBuf],
     outer_path: &Path,
-    child_turn_ids: Vec<&str>,
-    parent_turn_id: &str,
-) -> Result<ReviewSubagentLoad> {
-    if child_turn_ids.is_empty() {
-        return Ok(ReviewSubagentLoad::default());
-    }
-    let matching_paths = collect_session_files(root)?
-        .into_iter()
-        .filter(|candidate| candidate != outer_path)
+    child_turn_ids: &HashSet<String>,
+) -> Result<ReviewSiblingIndex> {
+    let child_turn_ids = child_turn_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let matching_paths = candidates
+        .iter()
+        .filter(|candidate| candidate.as_path() != outer_path)
         .collect::<Vec<_>>();
     let mut matching_paths = matching_paths;
     matching_paths.sort_by(|left, right| {
@@ -624,20 +639,15 @@ fn load_review_subagent_events(
             .then_with(|| left.cmp(right))
     });
 
-    let mut matching_review_session_events = Vec::new();
-    let mut review_session_candidates = HashMap::<String, ReviewSessionCandidate>::new();
-    let mut unmatched_child_turn_ids = child_turn_ids
-        .iter()
-        .map(|turn_id| (*turn_id).to_string())
-        .collect::<HashSet<_>>();
+    let mut siblings = ReviewSiblingIndex::default();
     for candidate in matching_paths {
-        if !raw_session_file_might_match_review_sibling(&candidate, &child_turn_ids)? {
+        if !raw_session_file_might_match_review_sibling(candidate, &child_turn_ids)? {
             continue;
         }
-        let candidate_modified = fs::metadata(&candidate)
+        let candidate_modified = fs::metadata(candidate)
             .and_then(|metadata| metadata.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        let parsed = match parse_session_file_details(&candidate, None, None) {
+        let parsed = match parse_session_file_details(candidate, None, None) {
             Ok(Some(parsed)) => parsed,
             Ok(None) => continue,
             Err(err) if err.to_string() == TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR => {
@@ -648,14 +658,45 @@ fn load_review_subagent_events(
         if !parsed.is_review_subagent {
             continue;
         }
-        if !parsed.events.iter().any(|event| {
-            event
-                .turn_id
-                .as_deref()
-                .is_some_and(|turn_id| child_turn_ids.contains(&turn_id))
-        }) {
-            continue;
+        let index = siblings.sessions.len();
+        let matched_child_turn_ids = parsed
+            .events
+            .iter()
+            .filter(|event| review_subagent_event_has_review_content(event))
+            .filter_map(|event| event.turn_id.as_ref())
+            .filter(|turn_id| child_turn_ids.contains(&turn_id.as_str()))
+            .collect::<HashSet<_>>();
+        for child_turn_id in matched_child_turn_ids {
+            siblings
+                .by_child_turn
+                .entry(child_turn_id.clone())
+                .or_default()
+                .push(index);
         }
+        siblings.sessions.push((parsed, candidate_modified));
+    }
+    Ok(siblings)
+}
+
+fn load_review_subagent_events(
+    siblings: &ReviewSiblingIndex,
+    child_turn_ids: Vec<&str>,
+    parent_turn_id: &str,
+) -> ReviewSubagentLoad {
+    let matching_sessions = child_turn_ids
+        .iter()
+        .filter_map(|turn_id| siblings.by_child_turn.get(*turn_id))
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut matching_review_session_events = Vec::new();
+    let mut review_session_candidates = HashMap::<String, ReviewSessionCandidate>::new();
+    let mut unmatched_child_turn_ids = child_turn_ids
+        .iter()
+        .map(|turn_id| (*turn_id).to_string())
+        .collect::<HashSet<_>>();
+    for index in matching_sessions {
+        let (parsed, candidate_modified) = &siblings.sessions[index];
         let matched_child_turn_ids = parsed
             .events
             .iter()
@@ -672,17 +713,17 @@ fn load_review_subagent_events(
             continue;
         }
         let filtered_events =
-            filter_review_subagent_events(parsed.events, &child_turn_ids, parent_turn_id);
+            filter_review_subagent_events(&parsed.events, &child_turn_ids, parent_turn_id);
         if filtered_events.is_empty() {
             continue;
         }
-        if let Some(session_id) = parsed.session_id {
+        if let Some(session_id) = &parsed.session_id {
             let candidate = ReviewSessionCandidate {
                 matched_child_turn_ids,
                 filtered_events,
-                modified_at: candidate_modified,
+                modified_at: *candidate_modified,
             };
-            match review_session_candidates.entry(session_id) {
+            match review_session_candidates.entry(session_id.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     if review_session_candidate_is_better(&candidate, entry.get()) {
                         entry.insert(candidate);
@@ -706,12 +747,12 @@ fn load_review_subagent_events(
     }
 
     if matching_review_session_events.is_empty() {
-        return Ok(ReviewSubagentLoad {
+        return ReviewSubagentLoad {
             events: Vec::new(),
             missing_child_turn_ids: unmatched_child_turn_ids,
-        });
+        };
     }
-    Ok(ReviewSubagentLoad {
+    ReviewSubagentLoad {
         events: sort_item_events(
             matching_review_session_events
                 .into_iter()
@@ -719,7 +760,7 @@ fn load_review_subagent_events(
                 .collect::<Vec<_>>(),
         ),
         missing_child_turn_ids: unmatched_child_turn_ids,
-    })
+    }
 }
 
 fn raw_session_file_might_match_review_sibling(
@@ -776,19 +817,20 @@ fn review_session_candidate_is_better(
 }
 
 fn filter_review_subagent_events(
-    events: Vec<NewRunHistoryEvent>,
+    events: &[NewRunHistoryEvent],
     child_turn_ids: &[&str],
     parent_turn_id: &str,
 ) -> Vec<NewRunHistoryEvent> {
     events
-        .into_iter()
+        .iter()
         .filter(|event| {
             event
                 .turn_id
                 .as_deref()
                 .is_some_and(|turn_id| child_turn_ids.contains(&turn_id))
         })
-        .filter(review_subagent_event_is_renderable)
+        .filter(|event| review_subagent_event_is_renderable(event))
+        .cloned()
         .map(|mut event| {
             event.turn_id = Some(parent_turn_id.to_string());
             event
