@@ -848,8 +848,8 @@ fn build_command_script_fetches_target_branch() {
             session_override: ConfiguredSessionOverride::default(),
         },
     );
-    assert!(script.contains("git fetch --depth 1 origin \"main\""));
-    assert!(script.contains("git branch --force \"main\" FETCH_HEAD"));
+    assert!(script.contains("git fetch --depth 1 origin 'main'"));
+    assert!(script.contains("git branch --force 'main' FETCH_HEAD"));
     assert!(script.contains("git fetch --unshallow"));
 }
 
@@ -964,7 +964,7 @@ fn build_command_script_clears_bootstrap_git_auth_before_app_server() {
         .find("git remote set-url origin \"$sanitized_origin\"")
         .expect("origin sanitization");
     let target_fetch_pos = script
-        .find("git fetch --depth 1 origin \"main\"")
+        .find("git fetch --depth 1 origin 'main'")
         .expect("target branch fetch");
     let exec_pos = script
         .find("exec codex app-server")

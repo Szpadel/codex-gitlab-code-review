@@ -341,9 +341,10 @@ fn render_base_bootstrap_script(request: BuildCommandScriptRequest<'_>) -> Strin
     let target_branch_script = request
         .target_branch
         .map(|branch| {
+            let branch_q = shell_quote(branch);
             format!(
-                "run_git fetch git fetch --depth 1 origin \"{branch}\"\n\
-git branch --force \"{branch}\" FETCH_HEAD\n\
+                "run_git fetch git fetch --depth 1 origin {branch_q}\n\
+git branch --force {branch_q} FETCH_HEAD\n\
 # Ensure merge-base works for PR review by unshallowing history.\n\
 run_git fetch git fetch --unshallow\n"
             )
@@ -843,5 +844,50 @@ mod tests {
             "git_bootstrap_auth_cleanup_script",
             git_bootstrap_auth_cleanup_script()
         );
+    }
+
+    #[test]
+    fn target_branch_is_literal_in_executed_git_commands() -> Result<()> {
+        for branch in ["$(printf injected)", "branch\"with'quotes"] {
+            let script = DockerCodexRunner::build_command_script(
+                BuildCommandScriptInput {
+                    clone_url: "https://example.com/repo.git",
+                    gitlab_token: "token",
+                    repo: "repo",
+                    project_path: "repo",
+                    head_sha: "abc",
+                    auth_mount_path: "/root/.codex",
+                    target_branch: Some(branch),
+                    deps_enabled: false,
+                },
+                AppServerCommandOptions {
+                    browser_mcp: None,
+                    gitlab_discovery_mcp: None,
+                    mcp_server_overrides: &BTreeMap::new(),
+                    session_override: ConfiguredSessionOverride::default(),
+                },
+            );
+            let fragment = script
+                .split_once("run_git submodule_update git submodule update --init --recursive\n")
+                .expect("submodule command")
+                .1
+                .split_once(git_bootstrap_auth_cleanup_script())
+                .expect("auth cleanup")
+                .0;
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "run_git() {{ shift; \"$@\"; }}\ngit() {{ printf '%s\\n' \"$@\"; }}\n{fragment}"
+                ))
+                .output()?;
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                String::from_utf8(output.stdout)?,
+                format!(
+                    "fetch\n--depth\n1\norigin\n{branch}\nbranch\n--force\n{branch}\nFETCH_HEAD\nfetch\n--unshallow\n"
+                )
+            );
+        }
+        Ok(())
     }
 }

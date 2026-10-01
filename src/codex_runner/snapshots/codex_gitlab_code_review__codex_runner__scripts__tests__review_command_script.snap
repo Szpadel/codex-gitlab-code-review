@@ -35,8 +35,8 @@ cd "$repo_dir"
 run_git fetch git fetch --depth 1 origin 'abc123'
 run_git checkout git checkout 'abc123'
 run_git submodule_update git submodule update --init --recursive
-run_git fetch git fetch --depth 1 origin "main"
-git branch --force "main" FETCH_HEAD
+run_git fetch git fetch --depth 1 origin 'main'
+git branch --force 'main' FETCH_HEAD
 # Ensure merge-base works for PR review by unshallowing history.
 run_git fetch git fetch --unshallow
 if [ -n "${GIT_CONFIG_COUNT:-}" ]; then
