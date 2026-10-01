@@ -86,7 +86,7 @@ fn apply_dev_mode_profile_switches_to_safe_mocked_runtime() {
 
     apply_dev_mode_profile(&mut config);
 
-    assert_eq!(config.gitlab.base_url, crate::dev_mode::DEV_MODE_BASE_URL);
+    assert_eq!(config.gitlab.base_url, crate::config::DEV_MODE_BASE_URL);
     assert!(config.server.status_ui_enabled);
     assert!(!config.codex.browser_mcp.enabled);
     assert!(!config.codex.gitlab_discovery_mcp.enabled);

@@ -54,7 +54,7 @@ pub fn load_validated_config(dev_mode: bool) -> Result<ValidatedConfig> {
 }
 
 pub(crate) fn apply_dev_mode_profile(config: &mut Config) {
-    config.gitlab.base_url = crate::dev_mode::DEV_MODE_BASE_URL.to_string();
+    config.gitlab.base_url = crate::config::DEV_MODE_BASE_URL.to_string();
     config.gitlab.token.clear();
     config.gitlab.bot_user_id = Some(1);
     config.gitlab.targets.repos = TargetSelector::All;

@@ -43,6 +43,9 @@ pub use self::validate::{
     ValidatedConfig, gitlab_discovery_mcp_uses_cluster_service_advertise_url, validate_config,
 };
 
+/// Synthetic GitLab base URL used by the development profile.
+pub const DEV_MODE_BASE_URL: &str = "https://dev-mode.invalid";
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]

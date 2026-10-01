@@ -2,6 +2,7 @@ pub mod demo_history;
 mod runner;
 mod transcript;
 
+use crate::config::DEV_MODE_BASE_URL;
 use crate::gitlab::{
     AwardEmoji, GitLabApi, GitLabProject, GitLabProjectSummary, GitLabUser, GitLabUserDetail,
     MergeRequest, Note,
@@ -20,7 +21,6 @@ use tokio::sync::RwLock;
 
 pub use runner::MockCodexRunner;
 
-pub const DEV_MODE_BASE_URL: &str = "https://dev-mode.invalid";
 const DEFAULT_REPOS: &[&str] = &[
     "demo/group/service-a",
     "demo/group/service-b",
