@@ -1,7 +1,7 @@
 use super::{
-    AsyncWriteExt, Future, HashMap, LogOutput, NewRunHistoryEvent, Pin, RefCell, Result,
-    SecondsFormat, SecurityReviewContentFlagged, StreamExt, Utc, Uuid, Value, VecDeque, anyhow,
-    debug, info, json, warn,
+    AsyncWriteExt, Duration, Future, HashMap, Instant, LogOutput, NewRunHistoryEvent, Pin, RefCell,
+    Result, SecondsFormat, SecurityReviewContentFlagged, StreamExt, Utc, Uuid, Value, VecDeque,
+    anyhow, debug, info, json, warn,
 };
 use std::sync::{Arc, Mutex};
 
@@ -58,6 +58,7 @@ pub(crate) enum TurnStreamNotificationOutcome {
 pub(crate) struct TurnHistoryCapture {
     pub(crate) next_sequence: i64,
     pub(crate) events: Vec<NewRunHistoryEvent>,
+    oldest_event_at: Option<Instant>,
     pending_on_drop: Option<Arc<Mutex<Vec<NewRunHistoryEvent>>>>,
 }
 
@@ -65,6 +66,8 @@ pub(crate) const GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID: &str = "gitlab-discovery-
 
 // Bound each SQLite transaction while reducing writes during notification bursts.
 const HISTORY_EVENT_BATCH_SIZE: usize = 32;
+// Limit transcript lag when a later event arrives, without a timer task.
+const HISTORY_EVENT_BATCH_MAX_AGE: Duration = Duration::from_secs(2);
 
 impl TurnHistoryCapture {
     /// Move unflushed events to the outer cleanup when this capture is dropped.
@@ -76,6 +79,7 @@ impl TurnHistoryCapture {
     }
 
     pub(crate) fn push(&mut self, turn_id: Option<&str>, event_type: &str, payload: Value) {
+        self.oldest_event_at.get_or_insert_with(Instant::now);
         self.next_sequence += 1;
         let payload = annotate_event_payload(payload);
         self.events.push(NewRunHistoryEvent {
@@ -86,8 +90,18 @@ impl TurnHistoryCapture {
         });
     }
 
+    /// Check the count bound, and check age only if the notification added an event.
+    fn batch_is_due_after_notification(&self, previous_event_count: usize) -> bool {
+        self.events.len() >= HISTORY_EVENT_BATCH_SIZE
+            || (self.events.len() > previous_event_count
+                && self
+                    .oldest_event_at
+                    .is_some_and(|started_at| started_at.elapsed() > HISTORY_EVENT_BATCH_MAX_AGE))
+    }
+
     pub(crate) fn take_pending(&mut self) -> Vec<NewRunHistoryEvent> {
         self.next_sequence = 0;
+        self.oldest_event_at = None;
         std::mem::take(&mut self.events)
     }
 }
@@ -212,6 +226,7 @@ impl AppServerClient {
             }
 
             let mut history_capture = std::mem::take(&mut self.pending_history);
+            let previous_event_count = history_capture.events.len();
             let outcome = self.handle_turn_notification(
                 method,
                 params,
@@ -245,7 +260,9 @@ impl AppServerClient {
                     break Err(err);
                 }
             };
-            if self.pending_history.events.len() >= HISTORY_EVENT_BATCH_SIZE
+            if self
+                .pending_history
+                .batch_is_due_after_notification(previous_event_count)
                 || outcome == TurnStreamNotificationOutcome::TurnCompleted
             {
                 self.flush_pending_history(&mut persist_events).await;
@@ -295,6 +312,7 @@ impl AppServerClient {
             }
 
             let mut history_capture = std::mem::take(&mut self.pending_history);
+            let previous_event_count = history_capture.events.len();
             let outcome = self.handle_turn_notification(
                 method,
                 params,
@@ -351,7 +369,9 @@ impl AppServerClient {
                     break Err(err);
                 }
             };
-            if self.pending_history.events.len() >= HISTORY_EVENT_BATCH_SIZE
+            if self
+                .pending_history
+                .batch_is_due_after_notification(previous_event_count)
                 || outcome == TurnStreamNotificationOutcome::TurnCompleted
             {
                 self.flush_pending_history(&mut persist_events).await;

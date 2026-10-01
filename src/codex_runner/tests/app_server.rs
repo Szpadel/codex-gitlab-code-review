@@ -1,6 +1,115 @@
 use super::*;
 
 #[tokio::test]
+async fn sparse_stream_events_flush_by_oldest_age_and_reset_the_batch_age() -> Result<()> {
+    for kind in [RunHistoryKind::Review, RunHistoryKind::Mention] {
+        let state = ReviewStateStore::new(":memory:").await?;
+        let run_id = state
+            .run_history
+            .start_run_history(NewRunHistory {
+                kind,
+                repo: "group/repo".to_string(),
+                iid: 1,
+                head_sha: "sha".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        let notifications = [
+            (0, json!({"method": "turn/started", "params": {}})),
+            (
+                1100,
+                json!({"method": "item/completed", "params": {
+                    "item": {"id": "first", "type": "agentMessage", "text": "First"}
+                }}),
+            ),
+            // The delta does not add an event. The next completed item triggers the age check.
+            (
+                1000,
+                json!({"method": "item/agentMessage/delta", "params": {
+                    "itemId": "second", "delta": "Second"
+                }}),
+            ),
+            (
+                0,
+                json!({"method": "item/completed", "params": {
+                    "item": {"id": "second", "type": "agentMessage", "text": "Second"}
+                }}),
+            ),
+            (
+                0,
+                json!({"method": "item/completed", "params": {
+                    "item": {"id": "fresh", "type": "agentMessage", "text": "Fresh"}
+                }}),
+            ),
+        ];
+        let mut client = empty_app_server_client();
+        client.output = Box::pin(
+            futures::stream::iter(notifications)
+                .then(|(delay_ms, notification)| async move {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    Ok(LogOutput::StdOut {
+                        message: format!("{notification}\n").into(),
+                    })
+                })
+                .chain(futures::stream::pending()),
+        );
+        let mut persist_events = |events: Vec<NewRunHistoryEvent>| {
+            let state = &state;
+            async move {
+                state
+                    .run_history
+                    .append_run_history_events(run_id, &events)
+                    .await
+                    .expect("persist batch");
+            }
+        };
+        let stream = async {
+            if kind == RunHistoryKind::Review {
+                client
+                    .stream_review("thread", "turn", None, &mut persist_events, || async {})
+                    .await
+            } else {
+                client
+                    .stream_turn_message("thread", "turn", None, &mut persist_events, || async {})
+                    .await
+            }
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), stream)
+                .await
+                .is_err()
+        );
+        let persisted = state.run_history.list_run_history_events(run_id).await?;
+        assert_eq!(
+            persisted.len(),
+            3,
+            "flush an aged batch before the turn ends"
+        );
+        assert_eq!(persisted[0].event_type, "turn_started");
+        assert_eq!(persisted[1].payload["id"], "first");
+        assert_eq!(persisted[2].payload["id"], "second");
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        client.flush_pending_history(&mut persist_events).await;
+        let persisted = state.run_history.list_run_history_events(run_id).await?;
+        assert_eq!(persisted.len(), 4);
+        assert_eq!(persisted[3].payload["id"], "fresh");
+        assert_eq!(persisted[3].sequence, 4);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn stream_batches_events_and_preserves_order_on_completion_and_io_failure() -> Result<()> {
     for complete in [true, false] {
         let state = ReviewStateStore::new(":memory:").await?;

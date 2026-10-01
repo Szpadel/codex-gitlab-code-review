@@ -43,6 +43,13 @@ container. Cleanup failures are logged and cause an unsuccessful process exit.
 After a forced process termination, the existing startup sweep removes leftover
 managed containers.
 
+## Transcript event batches
+
+Captured transcript events flush at 32 events. They also flush when a new event
+arrives and the oldest buffered event is more than two seconds old. Completion,
+failure, and session cleanup also flush pending events. An idle stream does not
+trigger an age-based flush.
+
 ## Transcript bodies
 
 The run detail page omits collapsed bodies larger than 16 KiB from its initial
@@ -66,6 +73,7 @@ the cost of building that snapshot.
 cargo test run_history --lib
 cargo test usage --lib
 cargo test scheduler::tests --lib
+cargo test sparse_stream_events --lib
 cargo test run_detail_loads_large_collapsed_bodies --lib
 node --test tests/transcript_body.test.cjs
 ```
