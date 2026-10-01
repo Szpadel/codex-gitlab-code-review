@@ -57,7 +57,9 @@ impl GitLabDiscoveryMcpServer {
             .path
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+            .map(validated_repo_path)
+            .transpose()?;
         let listing =
             browse_listing_for_path(&self.service.gitlab, &binding.allow, current_path).await?;
 
@@ -172,9 +174,13 @@ impl GitLabDiscoveryMcpServer {
 
 fn validated_repo_path(repo_path: &str) -> Result<&str, McpError> {
     let repo_path = repo_path.trim();
-    if repo_path.is_empty() {
+    // Reject paths that Git can normalize outside the allowed GitLab group.
+    if repo_path
+        .split('/')
+        .any(|segment| matches!(segment, "" | "." | ".."))
+    {
         return Err(McpError::invalid_params(
-            "repo_path must not be empty",
+            "GitLab path must not contain empty, '.' or '..' segments",
             None,
         ));
     }
@@ -426,14 +432,155 @@ mod tests {
         GitLabProjectSummary, GitLabUser, MergeRequest, Note,
     };
     use crate::gitlab_discovery_mcp::{
-        GitLabDiscoveryMcpService, GitLabDiscoverySessionBinding, InspectGitLabRepoResponse,
+        CloneGitLabRepoRequest, GitLabDiscoveryMcpService, GitLabDiscoverySessionBinding,
+        InspectGitLabRepoRequest, InspectGitLabRepoResponse, ListGitLabPathsRequest,
         ResolvedGitLabDiscoveryAllowList,
     };
     use anyhow::Result;
     use async_trait::async_trait;
+    use rmcp::handler::server::{tool::Extension, wrapper::Parameters};
     use rmcp::model::ErrorCode;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn server_with_allowed_group(
+        base_url: &str,
+    ) -> Result<(GitLabDiscoveryMcpServer, axum::http::request::Parts)> {
+        let service = Arc::new(GitLabDiscoveryMcpService::new(
+            DockerConfig::default(),
+            &GitLabConfig {
+                base_url: base_url.to_string(),
+                token: "token".to_string(),
+                bot_user_id: None,
+                created_after: None,
+                targets: GitLabTargets::default(),
+            },
+            GitLabDiscoveryMcpConfig {
+                advertise_url: "http://host.docker.internal:8091/mcp".to_string(),
+                ..GitLabDiscoveryMcpConfig::default()
+            },
+        )?);
+        let (mut parts, _) = axum::http::Request::new(()).into_parts();
+        parts.extensions.insert(GitLabDiscoverySessionBinding {
+            run_history_id: 1,
+            container_id: "codex".to_string(),
+            network_container_id: "codex".to_string(),
+            peer_ips: BTreeSet::new(),
+            source_repo: "allowed/repo".to_string(),
+            clone_root: "/work/mcp".to_string(),
+            feature_flags: FeatureFlagSnapshot::default(),
+            allow: ResolvedGitLabDiscoveryAllowList {
+                target_repos: BTreeSet::new(),
+                target_groups: BTreeSet::from(["allowed".to_string()]),
+            },
+            created_at: chrono::Utc::now(),
+        });
+        Ok((
+            GitLabDiscoveryMcpServer {
+                tool_router: GitLabDiscoveryMcpServer::tool_router(),
+                service,
+            },
+            parts,
+        ))
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_reject_unsafe_paths_before_io() -> Result<()> {
+        let mock = MockServer::start().await;
+        let (server, parts) = server_with_allowed_group(&mock.uri())?;
+        for repo_path in [
+            "allowed/../private/repo",
+            "allowed/./repo",
+            "allowed//repo",
+            "/allowed/repo",
+            "allowed/repo/",
+            ".",
+            "..",
+        ] {
+            let clone = server
+                .clone_gitlab_repo(
+                    Parameters(CloneGitLabRepoRequest {
+                        repo_path: repo_path.to_string(),
+                        checkout_ref: None,
+                        commit_sha: None,
+                    }),
+                    Extension(parts.clone()),
+                )
+                .await
+                .err()
+                .expect("unsafe clone path must fail");
+            let inspect = server
+                .inspect_gitlab_repo(
+                    Parameters(InspectGitLabRepoRequest {
+                        repo_path: repo_path.to_string(),
+                    }),
+                    Extension(parts.clone()),
+                )
+                .await
+                .err()
+                .expect("unsafe inspection path must fail");
+            let list = server
+                .list_gitlab_paths(
+                    Parameters(ListGitLabPathsRequest {
+                        path: Some(repo_path.to_string()),
+                    }),
+                    Extension(parts.clone()),
+                )
+                .await
+                .err()
+                .expect("unsafe group path must fail");
+            assert_eq!(clone.code, ErrorCode::INVALID_PARAMS, "{repo_path}");
+            assert_eq!(inspect.code, ErrorCode::INVALID_PARAMS, "{repo_path}");
+            assert_eq!(list.code, ErrorCode::INVALID_PARAMS, "{repo_path}");
+        }
+        assert!(mock.received_requests().await.unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mcp_inspection_accepts_normal_paths_and_listing_accepts_omitted_path() -> Result<()> {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/allowed%2Frepo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "path_with_namespace": "allowed/repo", "default_branch": "main"
+            })))
+            .mount(&mock)
+            .await;
+        for suffix in ["branches", "tags"] {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/api/v4/projects/allowed%2Frepo/repository/{suffix}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .mount(&mock)
+                .await;
+        }
+        let (server, parts) = server_with_allowed_group(&mock.uri())?;
+        let inspection = server
+            .inspect_gitlab_repo(
+                Parameters(InspectGitLabRepoRequest {
+                    repo_path: " allowed/repo ".to_string(),
+                }),
+                Extension(parts.clone()),
+            )
+            .await?;
+        assert_eq!(inspection.0.repo_path, "allowed/repo");
+        assert_eq!(inspection.0.default_branch.as_deref(), Some("main"));
+        for path in [None, Some(String::new()), Some("  ".to_string())] {
+            let listing = server
+                .list_gitlab_paths(
+                    Parameters(ListGitLabPathsRequest { path }),
+                    Extension(parts.clone()),
+                )
+                .await?;
+            assert_eq!(listing.0.subgroups, ["allowed"]);
+            assert!(listing.0.current_path.is_none());
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn mcp_endpoint_accepts_only_the_advertised_host() -> Result<()> {
