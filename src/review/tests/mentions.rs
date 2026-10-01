@@ -54,7 +54,7 @@ fn extract_parent_chain_uses_reply_chain_when_available() {
             },
         ],
     };
-    let chain = extract_parent_chain(&discussion, 3).expect("chain");
+    let chain = DiscussionParentIndex::new(&discussion).chain_through(2);
     assert_eq!(
         chain.iter().map(|note| note.id).collect::<Vec<_>>(),
         vec![1, 2, 3]

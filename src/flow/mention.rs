@@ -386,40 +386,57 @@ impl MentionFlow {
         )
     }
 
-    fn collect_mention_triggers(
+    async fn collect_mention_triggers(
         &self,
+        repo: &str,
+        iid: u64,
         discussions: &[MergeRequestDiscussion],
         bot_username: &str,
-    ) -> Vec<MentionTrigger> {
+        outcome: &mut MentionScheduleOutcome,
+    ) -> Result<Vec<MentionTrigger>> {
         let mut triggers = Vec::new();
         for discussion in discussions {
-            for note in &discussion.notes {
-                if note.system {
+            let mut parent_index = None;
+            for (note_index, note) in discussion.notes.iter().enumerate() {
+                if note.system
+                    || note.author.id == self.shared.bot_user_id
+                    || !contains_mention(note.body.as_str(), bot_username)
+                {
                     continue;
                 }
-                if note.author.id == self.shared.bot_user_id {
-                    continue;
-                }
-                if !contains_mention(note.body.as_str(), bot_username) {
-                    continue;
-                }
-                if let Some(parent_chain) = extract_parent_chain(discussion, note.id) {
-                    let filtered_chain = parent_chain
-                        .into_iter()
-                        .filter(|entry| !entry.system)
-                        .collect::<Vec<_>>();
-                    if filtered_chain.is_empty() {
+                match self
+                    .shared
+                    .state
+                    .mention_commands
+                    .mention_command_scan_state(repo, iid, &discussion.id, note.id)
+                    .await?
+                {
+                    MentionCommandScanState::InProgress => {
+                        outcome.skipped_processed += 1;
+                        outcome.blocks_review = true;
+                        outcome.blocked_pending_work = true;
                         continue;
                     }
-                    triggers.push(MentionTrigger {
-                        discussion_id: discussion.id.clone(),
-                        trigger_note: note.clone(),
-                        parent_chain: filtered_chain,
-                    });
+                    MentionCommandScanState::Completed => {
+                        outcome.skipped_processed += 1;
+                        continue;
+                    }
+                    MentionCommandScanState::Ready => {}
                 }
+                let index =
+                    parent_index.get_or_insert_with(|| DiscussionParentIndex::new(discussion));
+                triggers.push(MentionTrigger {
+                    discussion_id: discussion.id.clone(),
+                    trigger_note: note.clone(),
+                    parent_chain: index
+                        .chain_through(note_index)
+                        .into_iter()
+                        .filter(|entry| !entry.system)
+                        .collect(),
+                });
             }
         }
-        triggers
+        Ok(triggers)
     }
 
     fn build_mention_prompt(
@@ -646,7 +663,9 @@ impl MentionFlow {
                 mr.iid
             )
         })?;
-        let triggers = self.collect_mention_triggers(discussions, bot_username);
+        let triggers = self
+            .collect_mention_triggers(repo, mr.iid, discussions, bot_username, &mut outcome)
+            .await?;
         let command_repo = self.resolve_mention_command_repo(repo, mr).await?;
         let mention_eyes_emoji = self.mention_eyes_emoji();
         let additional_developer_instructions = self
@@ -662,25 +681,6 @@ impl MentionFlow {
                 break;
             }
             let trigger_note_id = trigger.trigger_note.id;
-            match self
-                .shared
-                .state
-                .mention_commands
-                .mention_command_scan_state(repo, mr.iid, &trigger.discussion_id, trigger_note_id)
-                .await?
-            {
-                MentionCommandScanState::InProgress => {
-                    outcome.skipped_processed += 1;
-                    outcome.blocks_review = true;
-                    outcome.blocked_pending_work = true;
-                    continue;
-                }
-                MentionCommandScanState::Completed => {
-                    outcome.skipped_processed += 1;
-                    continue;
-                }
-                MentionCommandScanState::Ready => {}
-            }
             if self
                 .shared
                 .state
@@ -1428,36 +1428,47 @@ fn is_mention_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.'
 }
 
-pub(crate) fn extract_parent_chain(
-    discussion: &MergeRequestDiscussion,
-    trigger_note_id: u64,
-) -> Option<Vec<DiscussionNote>> {
-    let notes = &discussion.notes;
-    let trigger_index = notes.iter().position(|note| note.id == trigger_note_id)?;
-    let trigger_note = notes[trigger_index].clone();
-    let has_explicit_parent = trigger_note.in_reply_to_id.is_some();
-    if !has_explicit_parent {
-        return Some(notes.iter().take(trigger_index + 1).cloned().collect());
+/// Borrows discussion notes so each ready trigger can reuse the parent lookup.
+pub(crate) struct DiscussionParentIndex<'a> {
+    notes: &'a [DiscussionNote],
+    by_id: HashMap<u64, &'a DiscussionNote>,
+}
+
+impl<'a> DiscussionParentIndex<'a> {
+    pub(crate) fn new(discussion: &'a MergeRequestDiscussion) -> Self {
+        Self {
+            notes: &discussion.notes,
+            by_id: discussion
+                .notes
+                .iter()
+                .map(|note| (note.id, note))
+                .collect(),
+        }
     }
 
-    let mut by_id: HashMap<u64, DiscussionNote> = HashMap::new();
-    for note in notes {
-        by_id.insert(note.id, note.clone());
-    }
-    let mut chain = Vec::new();
-    let mut current = Some(trigger_note);
-    let mut seen = HashSet::new();
-    while let Some(note) = current {
-        if !seen.insert(note.id) {
-            break;
+    /// Uses explicit reply links when present. Otherwise returns the preceding
+    /// notes and the trigger. The zero-based index must belong to this discussion.
+    /// Stops at a missing parent or a repeated note.
+    pub(crate) fn chain_through(&self, trigger_index: usize) -> Vec<DiscussionNote> {
+        let trigger_note = &self.notes[trigger_index];
+        if trigger_note.in_reply_to_id.is_none() {
+            return self.notes[..=trigger_index].to_vec();
         }
-        current = note
-            .in_reply_to_id
-            .and_then(|parent_id| by_id.get(&parent_id).cloned());
-        chain.push(note);
+        let mut chain = Vec::new();
+        let mut current = Some(trigger_note);
+        let mut seen = HashSet::new();
+        while let Some(note) = current {
+            if !seen.insert(note.id) {
+                break;
+            }
+            current = note
+                .in_reply_to_id
+                .and_then(|parent_id| self.by_id.get(&parent_id).copied());
+            chain.push(note.clone());
+        }
+        chain.reverse();
+        chain
     }
-    chain.reverse();
-    Some(chain)
 }
 
 pub(crate) fn sanitize_email_local_part(input: &str) -> String {
@@ -1480,6 +1491,59 @@ pub(crate) fn sanitize_email_local_part(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::gitlab::DiffRefs;
+
+    #[tokio::test]
+    async fn processed_mentions_have_no_collected_parent_chains() -> Result<()> {
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        state
+            .mention_commands
+            .begin_mention_command("group/repo", 1, "discussion", 2, "sha1")
+            .await?;
+        state
+            .mention_commands
+            .finish_mention_command("group/repo", 1, "discussion", 2, "sha1", "committed")
+            .await?;
+        let gitlab = Arc::new(crate::gitlab::GitLabClient::new("http://127.0.0.1:9", "")?);
+        let flow = MentionFlow::new(
+            FlowShared {
+                config: crate::config::test_builder::ConfigBuilder::for_review_tests().build(),
+                gitlab: gitlab.clone(),
+                award_service: AwardService::new(gitlab, 1),
+                codex: Arc::new(crate::dev_mode::MockCodexRunner::new(state.clone())),
+                state,
+                bot_user_id: 1,
+                semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                lifecycle: Arc::new(crate::lifecycle::ServiceLifecycle::default()),
+                active_tasks: Arc::new(crate::flow::ActiveTaskRegistry::default()),
+            },
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let discussions = vec![MergeRequestDiscussion {
+            id: "discussion".to_string(),
+            individual_note: true,
+            notes: vec![DiscussionNote {
+                id: 2,
+                body: "@bot check this".to_string(),
+                author: GitLabUser {
+                    id: 7,
+                    username: None,
+                    name: None,
+                },
+                system: false,
+                in_reply_to_id: None,
+                created_at: None,
+            }],
+        }];
+
+        let mut outcome = MentionScheduleOutcome::default();
+        let triggers = flow
+            .collect_mention_triggers("group/repo", 1, &discussions, "bot", &mut outcome)
+            .await?;
+
+        assert!(triggers.is_empty());
+        assert_eq!(outcome.skipped_processed, 1);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn branch_waiters_share_one_lock_until_the_last_release() {
