@@ -8,6 +8,7 @@ mod transcript;
 mod view;
 
 use crate::dev_mode::DevToolsService;
+use anyhow::{Context, Result};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -16,7 +17,6 @@ use axum::{
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
 
 use handlers::{
     apply_usage_limit_reset, create_development_repo, create_rate_limit_rule,
@@ -133,28 +133,20 @@ pub fn app_router_with_dev_tools(
     router.with_state(app_state)
 }
 
+/// Serves a bound listener until cancellation. Returns server errors.
 pub async fn run_http_server_with_dev_tools(
-    bind_addr: String,
+    listener: TcpListener,
     http_services: Arc<HttpServices>,
     dev_tools_service: Option<Arc<DevToolsService>>,
     cancellation: CancellationToken,
-) {
-    match TcpListener::bind(&bind_addr).await {
-        Ok(listener) => {
-            if let Err(err) = axum::serve(
-                listener,
-                app_router_with_dev_tools(http_services, dev_tools_service),
-            )
-            .with_graceful_shutdown(cancellation.cancelled_owned())
-            .await
-            {
-                error!(error = %err, "http server failed");
-            }
-        }
-        Err(err) => {
-            error!(error = %err, "failed to bind http server");
-        }
-    }
+) -> Result<()> {
+    axum::serve(
+        listener,
+        app_router_with_dev_tools(http_services, dev_tools_service),
+    )
+    .with_graceful_shutdown(cancellation.cancelled_owned())
+    .await
+    .context("serve HTTP requests")
 }
 
 #[cfg(test)]

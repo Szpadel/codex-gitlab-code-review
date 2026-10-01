@@ -206,14 +206,14 @@ async fn build_normal_runtime(
         let background_tasks = state.background_tasks();
         let cancellation = background_tasks.cancellation();
         let service = Arc::clone(service);
-        background_tasks.spawn(async move {
+        background_tasks.spawn_listener("GitLab discovery MCP server", async move {
             let server = Arc::clone(&service).run(listener);
             tokio::pin!(server);
             tokio::select! {
-                () = &mut server => {}
+                result = &mut server => result,
                 () = cancellation.cancelled() => {
                     service.shutdown();
-                    server.await;
+                    server.await
                 }
             }
         });

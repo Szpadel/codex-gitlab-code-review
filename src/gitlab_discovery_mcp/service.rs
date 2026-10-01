@@ -23,7 +23,6 @@ use rmcp::ErrorData as McpError;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
 use url::Url;
 
 const CLONE_REPOSITORY_SCRIPT_TEMPLATE: &str = include_str!("assets/clone_repository.sh");
@@ -193,17 +192,16 @@ impl GitLabDiscoveryMcpService {
             })
     }
 
-    pub async fn run(self: Arc<Self>, listener: TcpListener) {
+    /// Serves the bound listener until shutdown. Returns server errors.
+    pub async fn run(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         let app = build_router(&self);
-        if let Err(err) = axum::serve(
+        axum::serve(
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
         .with_graceful_shutdown(async move { self.shutdown.cancelled().await })
         .await
-        {
-            error!(error = %err, "gitlab discovery MCP server failed");
-        }
+        .context("serve GitLab discovery MCP requests")
     }
 
     pub fn shutdown(&self) {
@@ -718,6 +716,32 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
+
+    #[tokio::test]
+    async fn occupied_discovery_port_fails_binding() -> anyhow::Result<()> {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config =
+            crate::config::test_builder::ConfigBuilder::for_service_factory_tests().build();
+        let service = GitLabDiscoveryMcpService::new(
+            config.docker,
+            &config.gitlab,
+            crate::config::GitLabDiscoveryMcpConfig {
+                bind_addr: occupied.local_addr()?.to_string(),
+                advertise_url: "http://host.docker.internal:8091/mcp".to_string(),
+                ..Default::default()
+            },
+        )?;
+        let error = service
+            .bind_listener()
+            .await
+            .expect_err("occupied MCP port must fail startup");
+        assert!(
+            error
+                .to_string()
+                .contains("bind gitlab discovery MCP server")
+        );
+        Ok(())
+    }
 
     #[test]
     fn clone_script_removes_failed_clones_and_keeps_tokens_off_disk() -> anyhow::Result<()> {

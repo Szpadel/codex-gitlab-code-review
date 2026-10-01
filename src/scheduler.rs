@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use std::future::Future;
@@ -52,32 +53,41 @@ impl ShutdownSignalSource for OsShutdownSignalSource {
     }
 }
 
+#[async_trait]
 pub(crate) trait HttpServerLauncher: Send + Sync {
-    fn launch(
+    async fn launch(
         &self,
         bind_addr: String,
         http_services: Arc<HttpServices>,
         dev_tools: Option<Arc<DevToolsService>>,
         background_tasks: &BackgroundTasks,
-    ) -> JoinHandle<()>;
+    ) -> Result<()>;
 }
 
 struct DefaultHttpServerLauncher;
 
+#[async_trait]
 impl HttpServerLauncher for DefaultHttpServerLauncher {
-    fn launch(
+    async fn launch(
         &self,
         bind_addr: String,
         http_services: Arc<HttpServices>,
         dev_tools: Option<Arc<DevToolsService>>,
         background_tasks: &BackgroundTasks,
-    ) -> JoinHandle<()> {
-        background_tasks.spawn(run_http_server_with_dev_tools(
-            bind_addr,
-            http_services,
-            dev_tools,
-            background_tasks.cancellation(),
-        ))
+    ) -> Result<()> {
+        let listener = tokio::net::TcpListener::bind(&bind_addr)
+            .await
+            .with_context(|| format!("bind HTTP server on {bind_addr}"))?;
+        background_tasks.spawn_listener(
+            "HTTP server",
+            run_http_server_with_dev_tools(
+                listener,
+                http_services,
+                dev_tools,
+                background_tasks.cancellation(),
+            ),
+        );
+        Ok(())
     }
 }
 
@@ -140,12 +150,15 @@ async fn run_until_stopped(
         warn!(error = %err, "failed to reconcile startup scan status");
     }
 
-    let _http_server = http_launcher.launch(
-        config.server.bind_addr.clone(),
-        Arc::clone(&http_services),
-        dev_tools.clone(),
-        &state.background_tasks(),
-    );
+    let background_tasks = state.background_tasks();
+    http_launcher
+        .launch(
+            config.server.bind_addr.clone(),
+            Arc::clone(&http_services),
+            dev_tools.clone(),
+            &background_tasks,
+        )
+        .await?;
     let _startup_warmup = spawn_startup_warmup(runner, &state.background_tasks());
 
     if run_once {
@@ -153,17 +166,34 @@ async fn run_until_stopped(
         if let Err(err) = http_services.admin.clear_next_scan_at().await {
             warn!(error = %err, "failed to clear next scheduled scan status");
         }
-        run_tracked_scan(
+        let scan = run_tracked_scan(
             http_services.admin.as_ref(),
             ScanMode::Full,
             service.scan_once(),
-        )
-        .await?;
+        );
+        tokio::pin!(scan);
+        tokio::select! {
+            result = &mut scan => result?,
+            error = background_tasks.wait_for_listener_failure() => {
+                let (shutdown_tx, _) = watch::channel(false);
+                handle_service_signal(ServiceLifecycleSignal::FastStop, service.as_ref(),
+                    http_services.admin.as_ref(), gitlab_discovery_mcp.as_ref(), &shutdown_tx).await;
+                if let Err(scan_error) = scan.await {
+                    warn!(error = %scan_error, "single scan failed during shutdown");
+                }
+                return Err(error);
+            }
+        }
         info!("single scan complete");
         return Ok(());
     }
 
-    let shutdown_signal = signal_source.wait_for_shutdown_signal();
+    let shutdown_signal = async {
+        tokio::select! {
+            signal = signal_source.wait_for_shutdown_signal() => signal,
+            error = background_tasks.wait_for_listener_failure() => Err(error),
+        }
+    };
     tokio::pin!(shutdown_signal);
 
     info!("starting scan loop");
@@ -180,7 +210,7 @@ async fn run_until_stopped(
     });
     tokio::select! {
         signal_result = &mut shutdown_signal => {
-            let signal = signal_result?;
+            let signal = *signal_result.as_ref().unwrap_or(&ServiceLifecycleSignal::FastStop);
             handle_service_signal(
                 signal,
                 service.as_ref(),
@@ -197,7 +227,7 @@ async fn run_until_stopped(
                 )
                 .await;
             }
-            return Ok(());
+            return signal_result.map(|_| ());
         }
         initial_result = &mut initial_scan => {
             if let Ok(Err(err)) = &initial_result {
@@ -231,7 +261,7 @@ async fn run_until_stopped(
 
     tokio::select! {
         signal_result = &mut shutdown_signal => {
-            let signal = signal_result?;
+            let signal = *signal_result.as_ref().unwrap_or(&ServiceLifecycleSignal::FastStop);
             handle_service_signal(
                 signal,
                 service.as_ref(),
@@ -248,7 +278,7 @@ async fn run_until_stopped(
                 )
                 .await;
             }
-            Ok(())
+            signal_result.map(|_| ())
         }
         scheduled_result = &mut scheduled_loop => {
             match scheduled_result {
@@ -593,6 +623,38 @@ mod tests {
 
     struct ImmediateSignalSource(Option<ServiceLifecycleSignal>);
 
+    struct PendingSignalSource;
+
+    impl ShutdownSignalSource for PendingSignalSource {
+        fn wait_for_shutdown_signal(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<ServiceLifecycleSignal>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct EndingHttpServerLauncher;
+
+    #[async_trait]
+    impl HttpServerLauncher for EndingHttpServerLauncher {
+        async fn launch(
+            &self,
+            bind_addr: String,
+            http_services: Arc<HttpServices>,
+            dev_tools: Option<Arc<DevToolsService>>,
+            background_tasks: &BackgroundTasks,
+        ) -> Result<()> {
+            let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            cancellation.cancel();
+            background_tasks.spawn_listener(
+                "HTTP server",
+                run_http_server_with_dev_tools(listener, http_services, dev_tools, cancellation),
+            );
+            Ok(())
+        }
+    }
+
     impl ShutdownSignalSource for ImmediateSignalSource {
         fn wait_for_shutdown_signal(
             &self,
@@ -601,16 +663,18 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl HttpServerLauncher for RecordingHttpServerLauncher {
-        fn launch(
+        async fn launch(
             &self,
             _bind_addr: String,
             _http_services: Arc<HttpServices>,
             _dev_tools: Option<Arc<DevToolsService>>,
             background_tasks: &BackgroundTasks,
-        ) -> JoinHandle<()> {
+        ) -> Result<()> {
             self.launches.fetch_add(1, Ordering::SeqCst);
-            background_tasks.spawn(async {})
+            background_tasks.spawn(async {});
+            Ok(())
         }
     }
 
@@ -829,6 +893,99 @@ mod tests {
                 .is_err(),
             "shutdown must reject new background writes"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn occupied_http_port_fails_before_scan_admission() -> Result<()> {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warmup_started = Arc::new(Notify::new());
+        let runner = Arc::new(BlockingWarmupRunner {
+            events: events.clone(),
+            warmup_started: warmup_started.clone(),
+            release_warmup: Arc::new(Notify::new()),
+        });
+        let mut runtime =
+            runtime_with_recording_sources(events.clone(), warmup_started, runner).await?;
+        let mut config = runtime.config.clone().into_inner();
+        config.server.bind_addr = occupied.local_addr()?.to_string();
+        runtime.config = validate_config(config)?;
+
+        let error = run_with_hooks(runtime, &PanicSignalSource, &DefaultHttpServerLauncher)
+            .await
+            .expect_err("an occupied HTTP port must fail startup");
+        assert!(format!("{error:#}").contains("bind HTTP server"));
+        assert!(!events.lock().unwrap().contains(&"resolve_repos"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unexpected_listener_exit_stops_scheduler_with_error() -> Result<()> {
+        for discovery_listener in [false, true] {
+            let mut config = test_config();
+            apply_dev_mode_profile(&mut config);
+            let mut runtime = bootstrap_runtime_from_config(
+                validate_config(config)?,
+                BootstrapOptions {
+                    run_once: false,
+                    force_dry_run: false,
+                    log_all_json: false,
+                    dev_mode: true,
+                },
+            )
+            .await?;
+            let state = Arc::clone(&runtime.state);
+            let launcher: &dyn HttpServerLauncher = if discovery_listener {
+                &DefaultHttpServerLauncher
+            } else {
+                &EndingHttpServerLauncher
+            };
+            let release = if discovery_listener {
+                let service = Arc::new(GitLabDiscoveryMcpService::new(
+                    runtime.config.docker.clone(),
+                    &runtime.config.gitlab,
+                    crate::config::GitLabDiscoveryMcpConfig {
+                        bind_addr: "127.0.0.1:0".to_string(),
+                        advertise_url: "http://host.docker.internal:8091/mcp".to_string(),
+                        ..Default::default()
+                    },
+                )?);
+                let listener = service.bind_listener().await?;
+                state.background_tasks().spawn_listener(
+                    "GitLab discovery MCP server",
+                    Arc::clone(&service).run(listener),
+                );
+                runtime.gitlab_discovery_mcp = Some(service.clone());
+                Some(tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    service.shutdown();
+                }))
+            } else {
+                None
+            };
+
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_with_hooks(runtime, &PendingSignalSource, launcher),
+            )
+            .await?
+            .expect_err("unexpected listener exit must stop the scheduler");
+            let name = if discovery_listener {
+                "GitLab discovery MCP server"
+            } else {
+                "HTTP server"
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{name} exited before shutdown")),
+                "{error:#}"
+            );
+            if let Some(release) = release {
+                release.await?;
+            }
+        }
         Ok(())
     }
 
