@@ -14,6 +14,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const BACKGROUND_QUEUE_CAPACITY: usize = 256;
@@ -50,6 +51,8 @@ struct SqliteCoordinatorInner {
     pending_background: AtomicUsize,
     pending_background_notify: Notify,
     background_errors: Mutex<Vec<String>>,
+    accepting_background: std::sync::Mutex<bool>,
+    background_shutdown: CancellationToken,
     #[cfg(test)]
     background_pause: Arc<Mutex<()>>,
 }
@@ -103,6 +106,8 @@ impl SqliteCoordinator {
             pending_background: AtomicUsize::new(0),
             pending_background_notify: Notify::new(),
             background_errors: Mutex::new(Vec::new()),
+            accepting_background: std::sync::Mutex::new(true),
+            background_shutdown: CancellationToken::new(),
             #[cfg(test)]
             background_pause: Arc::new(Mutex::new(())),
         });
@@ -192,6 +197,14 @@ impl SqliteCoordinator {
         };
         match self.background_tx.try_reserve() {
             Ok(permit) => {
+                let accepting = self
+                    .inner
+                    .accepting_background
+                    .lock()
+                    .expect("background acceptance lock");
+                if !*accepting {
+                    bail!("enqueue sqlite background write {label}: background writer closed");
+                }
                 self.inner.pending_background.fetch_add(1, Ordering::SeqCst);
                 permit.send(job);
                 Ok(true)
@@ -222,6 +235,14 @@ impl SqliteCoordinator {
             .reserve()
             .await
             .map_err(|err| anyhow!("enqueue sqlite background write {label}: {err}"))?;
+        let accepting = self
+            .inner
+            .accepting_background
+            .lock()
+            .expect("background acceptance lock");
+        if !*accepting {
+            bail!("enqueue sqlite background write {label}: background writer closed");
+        }
         self.inner.pending_background.fetch_add(1, Ordering::SeqCst);
         permit.send(job);
         Ok(())
@@ -250,6 +271,14 @@ impl SqliteCoordinator {
         }
     }
 
+    /// Rejects new jobs and waits for all accepted writes.
+    /// Returns an error if an accepted write failed. The caller bounds the wait.
+    pub(crate) async fn shutdown_background_writes(&self) -> Result<()> {
+        close_background_acceptance(&self.inner);
+        self.inner.background_shutdown.cancel();
+        self.flush_background_writes().await
+    }
+
     #[cfg(test)]
     pub(crate) async fn pause_background_writes_for_test(
         &self,
@@ -273,7 +302,15 @@ fn spawn_background_writer(
             }
             let job = tokio::select! {
                 biased;
-                () = cancellation.cancelled() => break,
+                () = cancellation.cancelled(), if !background_rx.is_closed() => {
+                    close_background_acceptance(&inner);
+                    background_rx.close();
+                    background_rx.recv().await
+                }
+                () = inner.background_shutdown.cancelled(), if !background_rx.is_closed() => {
+                    background_rx.close();
+                    background_rx.recv().await
+                }
                 job = background_rx.recv() => job,
             };
             let Some(job) = job else {
@@ -290,6 +327,13 @@ fn spawn_background_writer(
             }
         }
     });
+}
+
+fn close_background_acceptance(inner: &SqliteCoordinatorInner) {
+    *inner
+        .accepting_background
+        .lock()
+        .expect("background acceptance lock") = false;
 }
 
 async fn run_background_job(inner: &Arc<SqliteCoordinatorInner>, job: BackgroundJob) {

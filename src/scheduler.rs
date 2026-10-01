@@ -20,6 +20,9 @@ use crate::lifecycle::ServiceLifecycleSignal;
 use crate::review::{ReviewService, ScanRunStatus};
 use crate::state::{ScanMode, ScanOutcome};
 
+// Give accepted writes 30 seconds to persist without an unbounded exit delay.
+const SQLITE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScheduledWakeReason {
     Cron,
@@ -91,15 +94,26 @@ pub(crate) async fn run_with_hooks(
 ) -> Result<()> {
     let runner = Arc::clone(&runtime.runner);
     let service = Arc::clone(&runtime.service);
+    let state = Arc::clone(&runtime.state);
     let background_tasks = runtime.state.background_tasks();
     let result = run_until_stopped(runtime, signal_source, http_launcher).await;
     service.request_shutdown();
-    background_tasks.shutdown().await;
     let cleanup = runner.shutdown_usage_sessions().await;
     if let Err(error) = &cleanup {
         warn!(error = %error, "Failed to shut down Usage sessions");
     }
-    result.and(cleanup)
+    let drain = tokio::time::timeout(
+        SQLITE_SHUTDOWN_DRAIN_TIMEOUT,
+        state.shutdown_background_writes(),
+    )
+    .await
+    .context("sqlite background drain timed out")
+    .and_then(|result| result);
+    if let Err(error) = &drain {
+        warn!(error = %error, "sqlite background drain failed");
+    }
+    background_tasks.shutdown().await;
+    result.and(cleanup).and(drain)
 }
 
 async fn run_until_stopped(
@@ -139,28 +153,12 @@ async fn run_until_stopped(
         if let Err(err) = http_services.admin.clear_next_scan_at().await {
             warn!(error = %err, "failed to clear next scheduled scan status");
         }
-        let scan_result = run_tracked_scan(
+        run_tracked_scan(
             http_services.admin.as_ref(),
             ScanMode::Full,
             service.scan_once(),
         )
-        .await;
-        let flush_result = state
-            .flush_background_writes()
-            .await
-            .context("flush sqlite background writes after single scan");
-        match (scan_result, flush_result) {
-            (Ok(()), Ok(())) => {}
-            (Err(scan_err), Ok(())) => return Err(scan_err),
-            (Ok(()), Err(flush_err)) => return Err(flush_err),
-            (Err(scan_err), Err(flush_err)) => {
-                warn!(
-                    error = %format!("{flush_err:#}"),
-                    "failed to flush sqlite background writes after failed single scan"
-                );
-                return Err(scan_err);
-            }
-        }
+        .await?;
         info!("single scan complete");
         return Ok(());
     }
@@ -195,7 +193,6 @@ async fn run_until_stopped(
             if matches!(signal, ServiceLifecycleSignal::GracefulDrain) {
                 finalize_graceful_drain(
                     service.as_ref(),
-                    state.as_ref(),
                     gitlab_discovery_mcp.as_ref(),
                 )
                 .await;
@@ -247,7 +244,6 @@ async fn run_until_stopped(
             if matches!(signal, ServiceLifecycleSignal::GracefulDrain) {
                 finalize_graceful_drain(
                     service.as_ref(),
-                    state.as_ref(),
                     gitlab_discovery_mcp.as_ref(),
                 )
                 .await;
@@ -524,17 +520,10 @@ async fn handle_service_signal(
 
 async fn finalize_graceful_drain(
     service: &ReviewService,
-    state: &crate::state::ReviewStateStore,
     gitlab_discovery_mcp: Option<&Arc<GitLabDiscoveryMcpService>>,
 ) {
     service.wait_for_started_runs().await;
     service.wait_for_active_tasks().await;
-    if let Err(err) = state.flush_background_writes().await {
-        warn!(
-            error = %format!("{err:#}"),
-            "failed to flush sqlite background writes during graceful drain"
-        );
-    }
     if let Some(service) = gitlab_discovery_mcp {
         service.shutdown();
     }
@@ -752,6 +741,94 @@ mod tests {
                 1
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fast_stop_persists_accepted_background_events_and_closes_admission() -> Result<()> {
+        use crate::state::{NewRunHistory, NewRunHistoryEvent, RunHistoryKind};
+
+        let mut config = test_config();
+        apply_dev_mode_profile(&mut config);
+        let runtime = bootstrap_runtime_from_config(
+            validate_config(config)?,
+            BootstrapOptions {
+                run_once: false,
+                force_dry_run: false,
+                log_all_json: false,
+                dev_mode: true,
+            },
+        )
+        .await?;
+        let state = Arc::clone(&runtime.state);
+        let run_id = state
+            .run_history
+            .start_run_history(NewRunHistory {
+                kind: RunHistoryKind::Review,
+                repo: "group/repo".to_string(),
+                iid: 1,
+                head_sha: "sha".to_string(),
+                discussion_id: None,
+                trigger_note_id: None,
+                trigger_note_author_name: None,
+                trigger_note_body: None,
+                command_repo: None,
+            })
+            .await?;
+        let pause = state.pause_background_writes_for_test().await;
+        for sequence in 1..=5 {
+            state
+                .run_history
+                .append_run_history_events_bg(
+                    run_id,
+                    vec![NewRunHistoryEvent {
+                        sequence,
+                        turn_id: None,
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({}),
+                    }],
+                )
+                .await?;
+        }
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(pause);
+        });
+        let launcher = RecordingHttpServerLauncher {
+            launches: Arc::new(AtomicUsize::new(0)),
+        };
+        run_with_hooks(
+            runtime,
+            &ImmediateSignalSource(Some(ServiceLifecycleSignal::FastStop)),
+            &launcher,
+        )
+        .await?;
+        release.await?;
+        assert_eq!(
+            state
+                .run_history
+                .list_run_history_events(run_id)
+                .await?
+                .len(),
+            5,
+            "FastStop must persist all accepted events"
+        );
+        assert!(
+            state
+                .run_history
+                .append_run_history_events_bg(
+                    run_id,
+                    vec![NewRunHistoryEvent {
+                        sequence: 6,
+                        turn_id: None,
+                        event_type: "turn_started".to_string(),
+                        payload: serde_json::json!({}),
+                    }]
+                )
+                .await
+                .is_err(),
+            "shutdown must reject new background writes"
+        );
         Ok(())
     }
 

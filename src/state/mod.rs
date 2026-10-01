@@ -473,6 +473,12 @@ impl ReviewStateStore {
         self.sqlite.flush_background_writes().await
     }
 
+    /// Rejects new background jobs and drains accepted writes.
+    /// Returns write failures. The runtime must set a shutdown timeout.
+    pub(crate) async fn shutdown_background_writes(&self) -> Result<()> {
+        self.sqlite.shutdown_background_writes().await
+    }
+
     pub(crate) fn background_tasks(&self) -> crate::background_tasks::BackgroundTasks {
         self.sqlite.background_tasks()
     }
