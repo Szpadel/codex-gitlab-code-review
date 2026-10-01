@@ -23,7 +23,7 @@ use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use url::Url;
@@ -62,6 +62,47 @@ struct PreparedMentionRun {
     source_branch_key: String,
     requester: RequesterIdentity,
     feature_flags: FeatureFlagSnapshot,
+}
+
+/// Retains a branch entry through acquisition, execution, and cancellation.
+struct MentionBranchLock {
+    locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+    key: String,
+    lock: Arc<TokioMutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl MentionBranchLock {
+    fn new(locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>, key: String) -> Self {
+        let lock = locks
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone();
+        Self {
+            locks,
+            key,
+            lock,
+            guard: None,
+        }
+    }
+
+    async fn acquire(mut self) -> Self {
+        self.guard = Some(self.lock.clone().lock_owned().await);
+        self
+    }
+}
+
+impl Drop for MentionBranchLock {
+    fn drop(&mut self) {
+        self.guard.take();
+        let mut locks = self.locks.lock().unwrap();
+        // Only the map and this holder remain. Waiters retain their own Arc.
+        if Arc::strong_count(&self.lock) == 2 {
+            locks.remove(&self.key);
+        }
+    }
 }
 
 pub(crate) struct MentionFlow {
@@ -338,13 +379,11 @@ impl MentionFlow {
         Ok(path_with_namespace.to_string())
     }
 
-    fn mention_branch_lock(&self, command_repo: &str, source_branch: &str) -> Arc<TokioMutex<()>> {
-        let key = format!("{command_repo}::{source_branch}");
-        let mut locks = self.mention_branch_locks.lock().unwrap();
-        locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(TokioMutex::new(())))
-            .clone()
+    fn mention_branch_lock(&self, command_repo: &str, source_branch: &str) -> MentionBranchLock {
+        MentionBranchLock::new(
+            Arc::clone(&self.mention_branch_locks),
+            format!("{command_repo}::{source_branch}"),
+        )
     }
 
     fn collect_mention_triggers(
@@ -776,7 +815,7 @@ impl MentionFlow {
                 &self.shared,
                 ActiveTaskKey::Mention(mention_key),
                 tasks,
-                async move { branch_lock.lock_owned().await },
+                async move { branch_lock.acquire().await },
                 move |_branch_guard| async move {
                     warn!(
                         repo = closed_repo.as_str(),
@@ -1441,6 +1480,47 @@ pub(crate) fn sanitize_email_local_part(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::gitlab::DiffRefs;
+
+    #[tokio::test]
+    async fn branch_waiters_share_one_lock_until_the_last_release() {
+        let locks = Arc::new(Mutex::new(HashMap::new()));
+        let first = MentionBranchLock::new(locks.clone(), "repo::branch".to_string())
+            .acquire()
+            .await;
+        let mut waiter =
+            Box::pin(MentionBranchLock::new(locks.clone(), "repo::branch".to_string()).acquire());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(first);
+        assert_eq!(locks.lock().unwrap().len(), 1);
+        let second = waiter.await;
+        let third = MentionBranchLock::new(locks.clone(), "repo::branch".to_string());
+        assert!(Arc::ptr_eq(&second.lock, &third.lock));
+        drop(third);
+        drop(second);
+        assert!(locks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_branch_waiter_does_not_retain_an_entry() {
+        let locks = Arc::new(Mutex::new(HashMap::new()));
+        let first = MentionBranchLock::new(locks.clone(), "repo::branch".to_string())
+            .acquire()
+            .await;
+        let mut waiter =
+            Box::pin(MentionBranchLock::new(locks.clone(), "repo::branch".to_string()).acquire());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(first);
+        drop(waiter);
+        assert!(locks.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn build_mention_prompt_absolutizes_gitlab_upload_image_urls() {
