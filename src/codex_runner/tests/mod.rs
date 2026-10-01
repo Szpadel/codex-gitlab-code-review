@@ -55,7 +55,8 @@ fn empty_app_server_client() -> AppServerClient {
     AppServerClient {
         input: Box::pin(tokio::io::sink()),
         output: Box::pin(futures::stream::empty()),
-        buffer: Vec::new(),
+        stdout_buffer: Vec::new(),
+        stderr_buffer: Vec::new(),
         pending_notifications: VecDeque::new(),
         reasoning_buffers: HashMap::new(),
         agent_message_buffers: HashMap::new(),

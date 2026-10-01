@@ -14,7 +14,8 @@ pub(crate) struct AppServerClient {
     pub(crate) input: Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
     pub(crate) output:
         Pin<Box<dyn futures::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>,
-    pub(crate) buffer: Vec<u8>,
+    pub(crate) stdout_buffer: Vec<u8>,
+    pub(crate) stderr_buffer: Vec<u8>,
     pub(crate) pending_notifications: VecDeque<Value>,
     pub(crate) reasoning_buffers: HashMap<String, ReasoningBuffer>,
     pub(crate) agent_message_buffers: HashMap<String, String>,
@@ -97,7 +98,8 @@ impl AppServerClient {
         Self {
             input: attach.input,
             output: attach.output,
-            buffer: Vec::new(),
+            stdout_buffer: Vec::new(),
+            stderr_buffer: Vec::new(),
             pending_notifications: VecDeque::new(),
             reasoning_buffers: HashMap::new(),
             agent_message_buffers: HashMap::new(),
@@ -718,33 +720,14 @@ impl AppServerClient {
 
     pub(crate) async fn next_message(&mut self) -> Result<Value> {
         loop {
-            if let Some(pos) = self.buffer.iter().position(|byte| *byte == b'\n') {
-                let line = self.buffer.drain(..=pos).collect::<Vec<u8>>();
+            if let Some(pos) = self.stdout_buffer.iter().position(|byte| *byte == b'\n') {
+                let line = self.stdout_buffer.drain(..=pos).collect::<Vec<u8>>();
                 let line = String::from_utf8_lossy(&line);
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
-                if trimmed.starts_with("codex-runner:") {
-                    info!("{}", trimmed);
-                    continue;
-                }
-                if trimmed.starts_with("codex-runner-warn:") {
-                    warn!("{}", trimmed);
-                    continue;
-                }
-                if trimmed.starts_with("codex-runner-error:") {
-                    warn!("{}", trimmed);
-                    self.push_runner_error(trimmed);
-                    continue;
-                }
-                if trimmed.starts_with("codex-install:") {
-                    info!("{}", trimmed);
-                    continue;
-                }
-                if trimmed.starts_with("codex-install-error:") {
-                    warn!("{}", trimmed);
-                    self.push_runner_error(trimmed);
+                if self.handle_runner_diagnostic(trimmed) {
                     continue;
                 }
                 if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
@@ -761,10 +744,21 @@ impl AppServerClient {
 
             match self.output.next().await {
                 Some(Ok(output)) => match output {
-                    LogOutput::StdOut { message }
-                    | LogOutput::StdErr { message }
-                    | LogOutput::Console { message } => {
-                        self.buffer.extend_from_slice(&message);
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                        self.stdout_buffer.extend_from_slice(&message);
+                    }
+                    LogOutput::StdErr { message } => {
+                        self.stderr_buffer.extend_from_slice(&message);
+                        while let Some(pos) =
+                            self.stderr_buffer.iter().position(|byte| *byte == b'\n')
+                        {
+                            let line = self.stderr_buffer.drain(..=pos).collect::<Vec<u8>>();
+                            let line = String::from_utf8_lossy(&line);
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() && !self.handle_runner_diagnostic(trimmed) {
+                                debug!(line = %trimmed, "codex app-server stderr");
+                            }
+                        }
                     }
                     LogOutput::StdIn { .. } => {}
                 },
@@ -782,6 +776,23 @@ impl AppServerClient {
                 }
             }
         }
+    }
+
+    /// Log runner prefixes and retain errors for later I/O failures.
+    fn handle_runner_diagnostic(&mut self, line: &str) -> bool {
+        if line.starts_with("codex-runner:") || line.starts_with("codex-install:") {
+            info!("{}", line);
+        } else if line.starts_with("codex-runner-error:")
+            || line.starts_with("codex-install-error:")
+        {
+            warn!("{}", line);
+            self.push_runner_error(line);
+        } else if line.starts_with("codex-runner-warn:") {
+            warn!("{}", line);
+        } else {
+            return false;
+        }
+        true
     }
 
     pub(crate) fn push_runner_error(&mut self, line: &str) {

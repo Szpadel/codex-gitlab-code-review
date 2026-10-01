@@ -38,7 +38,8 @@ pub(super) fn build_scripted_app_client(
     AppServerClient {
         input: Box::pin(client_input),
         output: Box::pin(output),
-        buffer: Vec::new(),
+        stdout_buffer: Vec::new(),
+        stderr_buffer: Vec::new(),
         pending_notifications: VecDeque::new(),
         reasoning_buffers: HashMap::new(),
         agent_message_buffers: HashMap::new(),
