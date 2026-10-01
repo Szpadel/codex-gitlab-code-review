@@ -160,6 +160,31 @@ impl ServiceStateRepository {
             .await
     }
 
+    /// Delete only the observed marker. A replaced or absent marker is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
+    pub(crate) async fn clear_auth_limit_reset_at_if_matches(
+        &self,
+        account_name: &str,
+        observed_value: &str,
+    ) -> Result<()> {
+        self.sqlite
+            .write_foreground("clear observed auth limit reset", |pool| async move {
+                sqlx::query("DELETE FROM service_state WHERE key = ? AND value = ?")
+                    .bind(auth_limit_reset_key(account_name))
+                    .bind(observed_value)
+                    .execute(&pool)
+                    .await
+                    .with_context(|| {
+                        format!("delete observed codex auth limit reset state for account {account_name}")
+                    })?;
+                Ok(())
+            })
+            .await
+    }
+
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.

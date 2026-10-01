@@ -216,6 +216,7 @@ mod app_server;
 mod commands_and_scripts;
 mod container_management;
 mod context_and_auth;
+mod context_quota_cleanup;
 mod image_refs;
 mod mention_templates;
 mod parsing;

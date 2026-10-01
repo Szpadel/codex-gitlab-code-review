@@ -128,6 +128,49 @@ async fn auth_limit_reset_roundtrip_and_clear() -> Result<()> {
 }
 
 #[tokio::test]
+async fn auth_limit_reset_conditional_delete_preserves_replaced_marker() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let account = "primary";
+    store
+        .service_state
+        .set_auth_limit_reset_at(account, "invalid timestamp")
+        .await?;
+    let observed = store
+        .service_state
+        .get_auth_limit_reset_at(account)
+        .await?
+        .expect("marker");
+    let newer = "2026-03-02T12:00:00Z";
+    store
+        .service_state
+        .set_auth_limit_reset_at(account, newer)
+        .await?;
+
+    store
+        .service_state
+        .clear_auth_limit_reset_at_if_matches(account, &observed)
+        .await?;
+    assert_eq!(
+        store.service_state.get_auth_limit_reset_at(account).await?,
+        Some(newer.to_string())
+    );
+
+    store
+        .service_state
+        .clear_auth_limit_reset_at_if_matches(account, newer)
+        .await?;
+    assert_eq!(
+        store.service_state.get_auth_limit_reset_at(account).await?,
+        None
+    );
+    store
+        .service_state
+        .clear_auth_limit_reset_at_if_matches(account, newer)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn auth_limit_reset_tracks_accounts_independently() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     store

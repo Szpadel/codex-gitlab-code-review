@@ -38,6 +38,12 @@ pub(crate) struct AuthAccount {
     pub(crate) is_primary: bool,
 }
 
+/// Preserve the stored text for conditional deletion, including its timestamp format.
+struct AuthLimitResetMarker {
+    raw: String,
+    reset_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuthFailureKind {
     UsageLimited { reset_at: DateTime<Utc> },
@@ -171,6 +177,18 @@ impl DockerCodexRunner {
         account: &AuthAccount,
         now: DateTime<Utc>,
     ) -> Result<Option<DateTime<Utc>>> {
+        Ok(self
+            .stored_limit_reset_marker(account, now)
+            .await?
+            .map(|marker| marker.reset_at))
+    }
+
+    /// Return a future reset marker. Delete malformed values only if they are unchanged.
+    async fn stored_limit_reset_marker(
+        &self,
+        account: &AuthAccount,
+        now: DateTime<Utc>,
+    ) -> Result<Option<AuthLimitResetMarker>> {
         let Some(raw_reset_at) = self
             .state
             .service_state
@@ -182,18 +200,21 @@ impl DockerCodexRunner {
         match DateTime::parse_from_rfc3339(&raw_reset_at) {
             Ok(parsed) => {
                 let reset_at = parsed.with_timezone(&Utc);
-                Ok((reset_at > now).then_some(reset_at))
+                Ok((reset_at > now).then_some(AuthLimitResetMarker {
+                    raw: raw_reset_at,
+                    reset_at,
+                }))
             }
             Err(err) => {
                 warn!(
                     account = account.name.as_str(),
                     raw_reset_at = raw_reset_at.as_str(),
                     error = %err,
-                    "invalid account reset timestamp in state; clearing stale entry"
+                    "invalid account reset timestamp in state"
                 );
                 self.state
                     .service_state
-                    .clear_auth_limit_reset_at(&account.state_key)
+                    .clear_auth_limit_reset_at_if_matches(&account.state_key, &raw_reset_at)
                     .await?;
                 Ok(None)
             }
@@ -233,14 +254,14 @@ impl DockerCodexRunner {
                 if should_clear_limit_reset(reset_at, attempt_started_at) {
                     self.state
                         .service_state
-                        .clear_auth_limit_reset_at(&account.state_key)
+                        .clear_auth_limit_reset_at_if_matches(&account.state_key, &raw_reset_at)
                         .await?;
                 }
             }
             Err(_) => {
                 self.state
                     .service_state
-                    .clear_auth_limit_reset_at(&account.state_key)
+                    .clear_auth_limit_reset_at_if_matches(&account.state_key, &raw_reset_at)
                     .await?;
             }
         }
@@ -306,10 +327,9 @@ impl DockerCodexRunner {
         let mut saw_auth_unavailable = false;
         for account in available_accounts {
             let attempt_started_at = Utc::now();
-            let had_future_reset_at_attempt = self
-                .stored_limit_reset_at(&account, attempt_started_at)
-                .await?
-                .is_some();
+            let reset_marker_at_attempt = self
+                .stored_limit_reset_marker(&account, attempt_started_at)
+                .await?;
             info!(
                 account = account.name.as_str(),
                 is_primary = account.is_primary,
@@ -318,10 +338,10 @@ impl DockerCodexRunner {
             );
             match execute(account.clone()).await {
                 Ok(output) => {
-                    if had_future_reset_at_attempt {
+                    if let Some(marker) = reset_marker_at_attempt {
                         self.state
                             .service_state
-                            .clear_auth_limit_reset_at(&account.state_key)
+                            .clear_auth_limit_reset_at_if_matches(&account.state_key, &marker.raw)
                             .await?;
                     } else {
                         self.clear_limit_reset_if_stale(&account, attempt_started_at)
