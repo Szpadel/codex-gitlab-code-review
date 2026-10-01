@@ -598,7 +598,7 @@ mod tests {
     use crate::config::apply_dev_mode_profile;
     use crate::config::{Config, test_builder::ConfigBuilder, validate_config};
     use crate::review::DynamicRepoSource;
-    use crate::service_factory::build_review_state_store;
+    use crate::state::build_review_state_store;
     use anyhow::anyhow;
     use async_trait::async_trait;
     use sqlx::Executor;

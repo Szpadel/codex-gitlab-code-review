@@ -3,7 +3,6 @@ use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::background_tasks::BackgroundTasks;
 use crate::codex_runner::{CodexRunner, DockerCodexRunner, RunnerRuntimeOptions};
 use crate::config::{Config, ValidatedConfig, validate_config};
 use crate::dev_mode::{DevToolsService, MockCodexRunner};
@@ -13,7 +12,7 @@ use crate::gitlab::{GitLabApi, GitLabClient};
 use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use crate::http::HttpServices;
 use crate::review::ReviewService;
-use crate::state::ReviewStateStore;
+use crate::state::{ReviewStateStore, build_review_state_store};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeMode {
@@ -125,16 +124,6 @@ pub async fn build_service_bundle(
         background_tasks.shutdown().await;
     }
     result
-}
-
-pub(crate) async fn build_review_state_store(config: &Config) -> Result<Arc<ReviewStateStore>> {
-    Ok(Arc::new(
-        ReviewStateStore::new_with_background_tasks(
-            &config.database.path,
-            BackgroundTasks::default(),
-        )
-        .await?,
-    ))
 }
 
 fn build_dev_runtime(

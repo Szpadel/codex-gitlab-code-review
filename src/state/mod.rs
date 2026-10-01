@@ -1,10 +1,12 @@
-use crate::config::FeatureFlagSnapshot;
+use crate::background_tasks::BackgroundTasks;
+use crate::config::{Config, FeatureFlagSnapshot};
 use crate::review_lane::ReviewLane;
 use crate::run_history_kind::RunHistoryKind;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 mod feature_flags_repository;
 mod mention_commands_repository;
@@ -402,6 +404,18 @@ pub struct ProjectCatalogSummary {
     pub cache_key: String,
     pub fetched_at: i64,
     pub project_count: usize,
+}
+
+/// Creates the configured database with a default background task owner.
+/// Returns an error if database setup or migration fails.
+pub(crate) async fn build_review_state_store(config: &Config) -> Result<Arc<ReviewStateStore>> {
+    Ok(Arc::new(
+        ReviewStateStore::new_with_background_tasks(
+            &config.database.path,
+            BackgroundTasks::default(),
+        )
+        .await?,
+    ))
 }
 
 impl ReviewStateStore {
