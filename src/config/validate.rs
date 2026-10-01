@@ -38,6 +38,11 @@ impl Deref for ValidatedConfig {
 ///
 /// Returns an error if loaded configuration is semantically invalid.
 pub fn validate_config(mut config: Config) -> Result<ValidatedConfig> {
+    anyhow::ensure!(
+        config.review.max_concurrent > 0,
+        "review.max_concurrent must be greater than 0"
+    );
+
     if config.codex.auth_host_path.is_empty() {
         config.codex.auth_host_path = config.codex.auth_mount_path.clone();
     }

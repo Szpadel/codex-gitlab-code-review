@@ -171,6 +171,17 @@ fn errors_on_unknown_exec_sandbox() {
 }
 
 #[test]
+fn errors_on_zero_review_concurrency() {
+    let yaml = base_config_yaml("").replace("max_concurrent: 1", "max_concurrent: 0");
+    let error = try_load_from_yaml(&yaml).expect_err("zero concurrency must fail validation");
+    assert!(
+        error
+            .to_string()
+            .contains("review.max_concurrent must be greater than 0")
+    );
+}
+
+#[test]
 fn defaults_docker_host_when_empty() {
     let yaml = base_config_yaml(
         r#"
