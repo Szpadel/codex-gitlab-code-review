@@ -1,10 +1,13 @@
 use super::diff::{DiffLineKind, classified_diff_lines};
-use super::models::{FileChangeBodyFormat, ThreadItemKind, ThreadItemSnapshot, ThreadSnapshot};
+use super::models::{
+    FileChangeBody, FileChangeBodyFormat, FileChangeBodySection, ThreadItemKind,
+    ThreadItemSnapshot, ThreadSnapshot,
+};
 use super::parser::thread_item_snapshot_from_event;
+use super::serialization::serialized_body_len;
 use crate::http::markdown::render_safe_markdown;
 use crate::http::timestamp;
 use crate::state::RunHistoryEventRecord;
-use serde::Deserialize;
 
 // Avoid sending verbose details before readers request them.
 const LAZY_TRANSCRIPT_BODY_THRESHOLD_BYTES: usize = 16 * 1024;
@@ -325,11 +328,7 @@ pub(crate) fn render_transcript_event_body(event: &RunHistoryEventRecord) -> Opt
 }
 
 fn render_collapsed_item_body(item: &ThreadItemSnapshot, run_id: i64) -> String {
-    if item
-        .body
-        .as_ref()
-        .is_none_or(|body| body.len() <= LAZY_TRANSCRIPT_BODY_THRESHOLD_BYTES)
-    {
+    if serialized_body_len(item) <= LAZY_TRANSCRIPT_BODY_THRESHOLD_BYTES {
         return render_expandable_item_body(item).unwrap_or_default();
     }
     let url = format!("/api/history/{run_id}/entries/{}/body", item.event_id);
@@ -350,7 +349,7 @@ fn render_expandable_item_body(item: &ThreadItemSnapshot) -> Option<String> {
             .1
             .map(|body| format!("<div class=\"reasoning-body\">{}</div>", escape_html(body)))
             .unwrap_or_default(),
-        ThreadItemKind::FileChange { .. } => render_file_change_body(item),
+        ThreadItemKind::FileChange { body, .. } => render_file_change_body(body),
         _ => {
             let class = match &item.kind {
                 ThreadItemKind::McpToolCall { .. } => "activity-body mcp-body",
@@ -615,46 +614,33 @@ fn render_colored_diff(body: &str) -> String {
     format!("<div class=\"diff-view\">{lines}</div>")
 }
 
-fn render_file_change_body(item: &ThreadItemSnapshot) -> String {
-    let Some(body) = item.body.as_deref() else {
-        return String::new();
-    };
-    match item.file_change_format() {
-        Some(FileChangeBodyFormat::Diff) => render_colored_diff(body),
-        Some(FileChangeBodyFormat::Mixed) => render_mixed_file_change_body(body),
-        _ => format!("<pre class=\"activity-body\">{}</pre>", escape_html(body)),
+fn render_file_change_body(body: &FileChangeBody) -> String {
+    match body {
+        FileChangeBody::Diff(text) => render_colored_diff(text),
+        FileChangeBody::Mixed(sections) => render_mixed_file_change_body(sections),
+        FileChangeBody::Payload(text) => text
+            .as_deref()
+            .map(|text| format!("<pre class=\"activity-body\">{}</pre>", escape_html(text)))
+            .unwrap_or_default(),
     }
 }
 
-#[derive(Deserialize)]
-struct FileChangeBodySection {
-    kind: String,
-    path: String,
-    body: String,
-}
-
-fn render_mixed_file_change_body(body: &str) -> String {
-    let Ok(sections) = serde_json::from_str::<Vec<FileChangeBodySection>>(body) else {
-        return format!("<pre class=\"activity-body\">{}</pre>", escape_html(body));
-    };
-
+fn render_mixed_file_change_body(sections: &[FileChangeBodySection]) -> String {
     sections
         .iter()
         .map(|section| {
-            let content = if section.kind == "diff" {
-                render_colored_diff(&section.body)
-            } else {
-                format!(
-                    "<pre class=\"activity-body\">{}</pre>",
-                    escape_html(&section.body)
-                )
+            let content = match section {
+                FileChangeBodySection::Diff { body, .. } => render_colored_diff(body),
+                FileChangeBodySection::Payload { body, .. } => {
+                    format!("<pre class=\"activity-body\">{}</pre>", escape_html(body))
+                }
             };
             format!(
                 "<section class=\"file-change-section\">\
                  <div class=\"file-change-section-path\"><code>{}</code></div>\
                  {}\
                  </section>",
-                escape_html(&section.path),
+                escape_html(section.path()),
                 content
             )
         })
@@ -774,6 +760,60 @@ mod tests {
             transcript_backfill_state: TranscriptBackfillState::NotRequested,
             transcript_backfill_error: None,
         }
+    }
+
+    fn mixed_file_change_event(diff: &str) -> RunHistoryEventRecord {
+        RunHistoryEventRecord {
+            id: 9,
+            run_history_id: 1,
+            sequence: 1,
+            turn_id: Some("turn-1".to_string()),
+            event_type: "item_completed".to_string(),
+            payload: json!({
+                "type": "fileChange",
+                "status": "completed",
+                "changes": {
+                    "src/lib.rs": {"unified_diff": diff},
+                    "README.md": {"type": "rename"}
+                }
+            }),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn mixed_file_changes_preserve_external_body_shape() {
+        let event = mixed_file_change_event("@@ -1 +1 @@\n-old\n+new\n");
+        let item = thread_item_snapshot_from_event(&event);
+        let serialized = serde_json::to_value(&item).expect("serialized transcript");
+        assert_eq!(serialized["kind"], "fileChange");
+        assert_eq!(serialized["bodyFormat"], "mixed");
+        assert_eq!(serialized["addedLines"], 1);
+        assert_eq!(serialized["removedLines"], 1);
+        let sections: serde_json::Value =
+            serde_json::from_str(serialized["body"].as_str().expect("string body"))
+                .expect("section JSON");
+        assert_eq!(
+            sections,
+            json!([
+                {"kind": "payload", "path": "README.md", "body": "{\n  \"type\": \"rename\"\n}"},
+                {"kind": "diff", "path": "src/lib.rs", "body": "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"}
+            ])
+        );
+    }
+
+    #[test]
+    fn mixed_file_changes_keep_the_encoded_body_lazy_load_boundary() {
+        let diff = format!("@@ -0,0 +1 @@\n+{}\n", "\"".repeat(8_192));
+        let event = mixed_file_change_event(&diff);
+        let item = thread_item_snapshot_from_event(&event);
+        let collapsed = render_collapsed_item_body(&item, 1);
+        assert!(collapsed.contains("data-transcript-body-url=\"/api/history/1/entries/9/body\""));
+        assert!(!collapsed.contains("diff-line-add"));
+        let expanded = render_transcript_event_body(&event).expect("expanded body");
+        assert!(expanded.contains("diff-line-add"));
+        assert!(expanded.contains("&quot;"));
+        assert!(expanded.contains("file-change-section-path\"><code>README.md</code>"));
     }
 
     #[test]

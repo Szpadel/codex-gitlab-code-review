@@ -1,12 +1,12 @@
 use super::diff::{DiffLineKind, classified_diff_lines};
 use super::models::{
-    FileChangeBodyFormat, ThreadItemKind, ThreadItemSnapshot, ThreadSnapshot, TurnSnapshot,
+    FileChangeBody, FileChangeBodySection, ThreadItemKind, ThreadItemSnapshot, ThreadSnapshot,
+    TurnSnapshot,
 };
 use crate::composer_install::COMPOSER_INSTALL_TURN_ID;
 use crate::http::timestamp::UiTimestamp;
 use crate::state::{RunHistoryEventRecord, RunHistoryRecord};
 use crate::text::truncate_with_marker;
-use serde::Serialize;
 use serde_json::Value;
 
 const GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID: &str = "gitlab-discovery-mcp-startup";
@@ -260,12 +260,12 @@ pub(crate) fn thread_item_snapshot_from_event(event: &RunHistoryEventRecord) -> 
                 event_id: event.id,
                 title: "File change".to_string(),
                 preview: summary.preview,
-                body: summary.body,
+                body: None,
                 timestamp: timestamp_text,
                 ui_timestamp: timestamp,
                 kind: ThreadItemKind::FileChange {
                     status: json_string(item.get("status")),
-                    body_format: summary.body_format,
+                    body: summary.body,
                     added_lines: summary.added_lines,
                     removed_lines: summary.removed_lines,
                 },
@@ -430,25 +430,16 @@ fn single_line_preview(value: &Value) -> String {
 
 struct FileChangeSummary {
     preview: Option<String>,
-    body: Option<String>,
-    body_format: FileChangeBodyFormat,
+    body: FileChangeBody,
     added_lines: usize,
     removed_lines: usize,
 }
 
 fn file_change_preview_and_body(changes: Option<&Value>) -> FileChangeSummary {
-    #[derive(Serialize)]
-    struct FileChangeBodySection {
-        kind: &'static str,
-        path: String,
-        body: String,
-    }
-
     let Some(changes) = changes.and_then(Value::as_object) else {
         return FileChangeSummary {
             preview: None,
-            body: None,
-            body_format: FileChangeBodyFormat::Payload,
+            body: FileChangeBody::Payload(None),
             added_lines: 0,
             removed_lines: 0,
         };
@@ -464,14 +455,12 @@ fn file_change_preview_and_body(changes: Option<&Value>) -> FileChangeSummary {
         .iter()
         .map(|(path, value)| {
             if let Some(diff) = value.get("unified_diff").and_then(Value::as_str) {
-                FileChangeBodySection {
-                    kind: "diff",
+                FileChangeBodySection::Diff {
                     path: path.clone(),
                     body: format!("diff --git a/{path} b/{path}\n{diff}"),
                 }
             } else {
-                FileChangeBodySection {
-                    kind: "payload",
+                FileChangeBodySection::Payload {
                     path: path.clone(),
                     body: compact_json(value),
                 }
@@ -481,49 +470,44 @@ fn file_change_preview_and_body(changes: Option<&Value>) -> FileChangeSummary {
 
     let (added_lines, removed_lines) = sections
         .iter()
-        .filter(|section| section.kind == "diff")
-        .map(|section| unified_diff_stats(&section.body))
+        .filter_map(|section| match section {
+            FileChangeBodySection::Diff { body, .. } => Some(unified_diff_stats(body)),
+            FileChangeBodySection::Payload { .. } => None,
+        })
         .fold(
             (0usize, 0usize),
             |(added_acc, removed_acc), (added, removed)| (added_acc + added, removed_acc + removed),
         );
 
-    let has_diff = sections.iter().any(|section| section.kind == "diff");
-    let has_payload = sections.iter().any(|section| section.kind == "payload");
+    let has_diff = sections
+        .iter()
+        .any(|section| matches!(section, FileChangeBodySection::Diff { .. }));
+    let has_payload = sections
+        .iter()
+        .any(|section| matches!(section, FileChangeBodySection::Payload { .. }));
 
-    let (body, body_format) = if has_diff && has_payload {
-        (
-            serde_json::to_string(&sections).ok(),
-            FileChangeBodyFormat::Mixed,
-        )
+    let body = if has_diff && has_payload {
+        FileChangeBody::Mixed(sections)
     } else if has_diff {
-        (
-            Some(
-                sections
-                    .into_iter()
-                    .map(|section| section.body)
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            ),
-            FileChangeBodyFormat::Diff,
+        FileChangeBody::Diff(
+            sections
+                .iter()
+                .map(FileChangeBodySection::body)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
         )
     } else {
-        (
-            Some(
-                sections
-                    .into_iter()
-                    .map(|section| format!("{}\n{}", section.path, section.body))
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            ),
-            FileChangeBodyFormat::Payload,
-        )
+        let body = sections
+            .iter()
+            .map(|section| format!("{}\n{}", section.path(), section.body()))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        FileChangeBody::Payload((!body.is_empty()).then_some(body))
     };
 
     FileChangeSummary {
         preview,
-        body: body.filter(|body| !body.is_empty()),
-        body_format,
+        body,
         added_lines,
         removed_lines,
     }

@@ -2,6 +2,7 @@ mod diff;
 mod models;
 mod parser;
 mod renderer;
+mod serialization;
 
 pub use models::ThreadSnapshot;
 pub(crate) use parser::is_auxiliary_transcript_turn_id;

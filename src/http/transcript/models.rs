@@ -17,18 +17,16 @@ pub struct TurnSnapshot {
     pub items: Vec<ThreadItemSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadItemSnapshot {
     /// Identifies the persisted event for a body request. This is not an upstream item ID.
-    #[serde(skip)]
     pub(crate) event_id: i64,
     pub title: String,
     pub preview: Option<String>,
+    /// Plain text for other item kinds. File changes carry typed bodies in `kind`.
     pub body: Option<String>,
     pub timestamp: Option<String>,
-    #[serde(skip)]
     pub(crate) ui_timestamp: Option<UiTimestamp>,
-    #[serde(flatten)]
     pub kind: ThreadItemKind,
 }
 
@@ -63,8 +61,11 @@ pub enum ThreadItemKind {
     WebSearch,
     FileChange {
         status: Option<String>,
-        #[serde(rename = "bodyFormat")]
-        body_format: FileChangeBodyFormat,
+        #[serde(
+            rename = "bodyFormat",
+            serialize_with = "super::serialization::serialize_file_change_format"
+        )]
+        body: FileChangeBody,
         #[serde(rename = "addedLines")]
         added_lines: usize,
         #[serde(rename = "removedLines")]
@@ -85,6 +86,46 @@ pub enum FileChangeBodyFormat {
     Diff,
     Mixed,
     Payload,
+}
+
+/// Keeps mixed file changes typed until HTML rendering or API serialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileChangeBody {
+    Diff(String),
+    Mixed(Vec<FileChangeBodySection>),
+    Payload(Option<String>),
+}
+
+/// Preserves each path with its diff or formatted upstream payload.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum FileChangeBodySection {
+    Diff { path: String, body: String },
+    Payload { path: String, body: String },
+}
+
+impl FileChangeBody {
+    pub(crate) fn format(&self) -> FileChangeBodyFormat {
+        match self {
+            Self::Diff(_) => FileChangeBodyFormat::Diff,
+            Self::Mixed(_) => FileChangeBodyFormat::Mixed,
+            Self::Payload(_) => FileChangeBodyFormat::Payload,
+        }
+    }
+}
+
+impl FileChangeBodySection {
+    pub(crate) fn path(&self) -> &str {
+        match self {
+            Self::Diff { path, .. } | Self::Payload { path, .. } => path,
+        }
+    }
+
+    pub(crate) fn body(&self) -> &str {
+        match self {
+            Self::Diff { body, .. } | Self::Payload { body, .. } => body,
+        }
+    }
 }
 
 impl ThreadItemSnapshot {
@@ -130,7 +171,7 @@ impl ThreadItemSnapshot {
 
     pub(crate) fn file_change_format(&self) -> Option<FileChangeBodyFormat> {
         match &self.kind {
-            ThreadItemKind::FileChange { body_format, .. } => Some(*body_format),
+            ThreadItemKind::FileChange { body, .. } => Some(body.format()),
             _ => None,
         }
     }
