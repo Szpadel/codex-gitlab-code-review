@@ -13,7 +13,6 @@ mod review_rate_limits;
 mod review_state_repository;
 mod run_history_repository;
 mod security_context_cache_repository;
-mod security_review_debounce_repository;
 mod service_state_repository;
 mod sqlite;
 
@@ -33,7 +32,6 @@ pub use review_state_repository::ReviewStateRepository;
 pub(crate) use run_history_repository::merge_rewritten_turn_events;
 pub use run_history_repository::{RelatedRun, RunHistoryRepository};
 pub use security_context_cache_repository::SecurityContextCacheRepository;
-pub use security_review_debounce_repository::SecurityReviewDebounceRepository;
 pub use service_state_repository::ServiceStateRepository;
 use sqlite::{SqliteCoordinator, ensure_sqlite_file};
 
@@ -72,7 +70,6 @@ pub struct ReviewStateStore {
     pub mention_quota_pending: MentionQuotaPendingRepository,
     pub service_state: ServiceStateRepository,
     pub security_context_cache: SecurityContextCacheRepository,
-    pub security_review_debounce: SecurityReviewDebounceRepository,
     pub review_rate_limit: ReviewRateLimitRepository,
 }
 
@@ -334,14 +331,6 @@ pub struct SecurityReviewContextCacheEntry {
     pub expires_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecurityReviewDebounceEntry {
-    pub repo: String,
-    pub iid: u64,
-    pub last_started_at: i64,
-    pub next_eligible_at: i64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MentionCommandStateKey {
     pub repo: String,
@@ -460,7 +449,6 @@ impl ReviewStateStore {
             mention_quota_pending: MentionQuotaPendingRepository::new(sqlite.clone()),
             service_state: ServiceStateRepository::new(sqlite.clone()),
             security_context_cache: SecurityContextCacheRepository::new(sqlite.clone()),
-            security_review_debounce: SecurityReviewDebounceRepository::new(sqlite.clone()),
             review_rate_limit: ReviewRateLimitRepository::new(sqlite.clone()),
             sqlite,
         })
