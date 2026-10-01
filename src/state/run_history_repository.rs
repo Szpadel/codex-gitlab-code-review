@@ -15,6 +15,15 @@ use crate::run_history_kind::RunHistoryKind;
 
 const MISSING_ERROR_DETAILS: &str =
     "Run finished with result error, but no failure details were recorded.";
+const RECONCILE_INTERRUPTED_RUN_HISTORY_SQL: &str = r"
+    UPDATE run_history
+    SET status = 'done',
+        result = 'cancelled',
+        finished_at = COALESCE(finished_at, ?),
+        updated_at = ?,
+        error = COALESCE(error, ?)
+    WHERE status = 'in_progress'
+    ";
 const UPSERT_RUN_TOKEN_USAGE_SQL: &str = r"
     INSERT INTO run_history_token_usage (
         run_history_id, response_id, thread_id, turn_id, input_tokens,
@@ -131,23 +140,13 @@ impl RunHistoryRepository {
         let now = Utc::now().timestamp();
         self.sqlite
             .write_foreground("reconcile interrupted run history", |pool| async move {
-                let result = sqlx::query(
-                    r"
-                    UPDATE run_history
-                    SET status = 'done',
-                        result = 'cancelled',
-                        finished_at = COALESCE(finished_at, ?),
-                        updated_at = ?,
-                        error = COALESCE(error, ?)
-                    WHERE status = 'in_progress'
-                    ",
-                )
-                .bind(now)
-                .bind(now)
-                .bind(reason)
-                .execute(&pool)
-                .await
-                .context("reconcile interrupted run history")?;
+                let result = sqlx::query(RECONCILE_INTERRUPTED_RUN_HISTORY_SQL)
+                    .bind(now)
+                    .bind(now)
+                    .bind(reason)
+                    .execute(&pool)
+                    .await
+                    .context("reconcile interrupted run history")?;
                 Ok(result.rows_affected())
             })
             .await
@@ -746,21 +745,7 @@ impl RunHistoryRepository {
         &self,
         query: &RunHistoryListQuery,
     ) -> Result<Vec<RunTokenUsageStatistic>> {
-        let mut builder = QueryBuilder::<Sqlite>::new(
-            "SELECT filtered.kind, COUNT(*) AS recorded_runs, \
-             SUM(usage.response_count) AS response_count, SUM(usage.input_tokens) AS input_tokens, \
-             SUM(usage.cached_input_tokens) AS cached_input_tokens, \
-             SUM(usage.cache_write_input_tokens) AS cache_write_input_tokens, \
-             SUM(usage.output_tokens) AS output_tokens, \
-             SUM(usage.reasoning_output_tokens) AS reasoning_output_tokens, \
-             SUM(usage.total_tokens) AS total_tokens \
-             FROM (SELECT id, kind FROM run_history",
-        );
-        append_run_history_filters(&mut builder, query)?;
-        builder.push(
-            ") AS filtered JOIN run_history_token_usage_rollup AS usage \
-             ON usage.run_history_id = filtered.id GROUP BY filtered.kind ORDER BY filtered.kind",
-        );
+        let mut builder = token_usage_statistics_query(query)?;
         let rows = builder
             .build()
             .fetch_all(self.sqlite.read_pool())
@@ -1348,6 +1333,26 @@ fn run_history_kind_label(kind: RunHistoryKind) -> &'static str {
     }
 }
 
+/// Builds aggregate SQL without pagination. Filter conversion errors propagate.
+fn token_usage_statistics_query(query: &RunHistoryListQuery) -> Result<QueryBuilder<Sqlite>> {
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        "SELECT filtered.kind, COUNT(*) AS recorded_runs, \
+         SUM(usage.response_count) AS response_count, SUM(usage.input_tokens) AS input_tokens, \
+         SUM(usage.cached_input_tokens) AS cached_input_tokens, \
+         SUM(usage.cache_write_input_tokens) AS cache_write_input_tokens, \
+         SUM(usage.output_tokens) AS output_tokens, \
+         SUM(usage.reasoning_output_tokens) AS reasoning_output_tokens, \
+         SUM(usage.total_tokens) AS total_tokens \
+         FROM (SELECT id, kind FROM run_history",
+    );
+    append_run_history_filters(&mut builder, query)?;
+    builder.push(
+        ") AS filtered JOIN run_history_token_usage_rollup AS usage \
+         ON usage.run_history_id = filtered.id GROUP BY filtered.kind ORDER BY filtered.kind",
+    );
+    Ok(builder)
+}
+
 fn append_run_history_filters(
     builder: &mut QueryBuilder<Sqlite>,
     query: &RunHistoryListQuery,
@@ -1639,6 +1644,49 @@ fn normalized_run_history_finish_error(result: &str, error: Option<String>) -> O
 mod tests {
     use super::*;
     use crate::state::ReviewStateStore;
+
+    #[tokio::test]
+    async fn history_statistics_plan_uses_kind_covering_index() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let query = token_usage_statistics_query(&RunHistoryListQuery::default())?;
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let rows = sqlx::query(AssertSqlSafe(sql))
+            .fetch_all(store.pool())
+            .await?;
+        let details = rows
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            details.contains("SCAN run_history USING COVERING INDEX idx_run_history_kind"),
+            "{details}"
+        );
+        assert!(!details.contains("TEMP B-TREE FOR GROUP BY"), "{details}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_reconcile_plan_uses_in_progress_index() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        let sql = format!("EXPLAIN QUERY PLAN {RECONCILE_INTERRUPTED_RUN_HISTORY_SQL}");
+        let rows = sqlx::query(AssertSqlSafe(sql))
+            .bind(0_i64)
+            .bind(0_i64)
+            .bind("restart")
+            .fetch_all(store.pool())
+            .await?;
+        let details = rows
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            details.contains("SEARCH run_history USING INDEX idx_run_history_in_progress"),
+            "{details}"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn start_and_finish_run_history_roundtrip() -> Result<()> {
