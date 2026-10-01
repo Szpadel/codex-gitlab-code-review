@@ -73,13 +73,14 @@ pub(crate) async fn history_page(
 pub(crate) async fn mr_history_json(
     State(app_state): State<HttpAppState>,
     Path((repo_key, iid)): Path<(String, u64)>,
+    Query(params): Query<HistoryQueryParams>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     let repo = decode_repo_key(&repo_key)?;
     Ok(Json(
         app_state
             .http_services
             .status
-            .mr_history_snapshot(&repo, iid)
+            .mr_history_snapshot(&repo, iid, params.into_query()?)
             .await?,
     ))
 }
@@ -87,12 +88,13 @@ pub(crate) async fn mr_history_json(
 pub(crate) async fn mr_history_page(
     State(app_state): State<HttpAppState>,
     Path((repo_key, iid)): Path<(String, u64)>,
+    Query(params): Query<HistoryQueryParams>,
 ) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
     let repo = decode_repo_key(&repo_key)?;
     let snapshot = app_state
         .http_services
         .status
-        .mr_history_snapshot(&repo, iid)
+        .mr_history_snapshot(&repo, iid, params.into_query()?)
         .await?;
     Ok(Html(render_mr_history_page(
         &snapshot,

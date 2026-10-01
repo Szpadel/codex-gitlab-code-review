@@ -1,5 +1,5 @@
 use super::super::status::{
-    HistoryQuery, HistoryRunListItem, HistoryRunRecord, HistorySnapshot, MrHistorySnapshot,
+    HistoryQuery, HistoryRunListItem, HistorySnapshot, MrHistorySnapshot,
     TokenUsageStatisticSnapshot,
 };
 use super::html::{
@@ -25,7 +25,7 @@ pub(in crate::http) fn render_history_page(
         render_history_filters(filters),
         render_token_statistics(&snapshot.token_statistics),
         render_history_run_table("All runs", &snapshot.runs),
-        render_history_pagination(snapshot)
+        render_history_pagination(snapshot, "/history")
     );
     render_shell(
         "History",
@@ -42,11 +42,14 @@ pub(in crate::http) fn render_mr_history_page(
     development_enabled: bool,
 ) -> String {
     let body = format!(
-        "<section class=\"hero\"><h1>MR history</h1><p class=\"muted\">{} !{} has {} recorded session(s).</p></section>{}",
+        "<section class=\"hero\"><h1>MR history</h1><p class=\"muted\">Sessions for {} !{}.</p></section>{}{}",
         escape_html(&snapshot.repo),
         snapshot.iid,
-        snapshot.runs.len(),
-        render_record_run_table("Sessions for this MR", &snapshot.runs)
+        render_history_run_table("Sessions for this MR", &snapshot.history.runs),
+        render_history_pagination(
+            &snapshot.history,
+            &mr_history_href(&snapshot.repo, snapshot.iid)
+        )
     );
     render_shell(
         "MR History",
@@ -83,14 +86,14 @@ fn render_history_filters(filters: &HistorySnapshotFilters) -> String {
 
 type HistorySnapshotFilters = HistoryQuery;
 
-fn render_history_pagination(snapshot: &HistorySnapshot) -> String {
+fn render_history_pagination(snapshot: &HistorySnapshot, path: &str) -> String {
     let summary = if snapshot.runs.is_empty() {
         "0 matching runs".to_string()
     } else {
         format!("Showing up to {} matching runs", snapshot.limit)
     };
     let previous = if let Some(cursor) = snapshot.previous_cursor.as_deref() {
-        let href = history_page_href(&snapshot.filters, Some(cursor), None);
+        let href = history_page_href(path, &snapshot.filters, Some(cursor), None);
         format!(
             "<a class=\"pagination-link\" href=\"{}\">Previous</a>",
             escape_html(&href)
@@ -99,7 +102,7 @@ fn render_history_pagination(snapshot: &HistorySnapshot) -> String {
         "<span class=\"pagination-link pagination-link-disabled\">Previous</span>".to_string()
     };
     let next = if let Some(cursor) = snapshot.next_cursor.as_deref() {
-        let href = history_page_href(&snapshot.filters, None, Some(cursor));
+        let href = history_page_href(path, &snapshot.filters, None, Some(cursor));
         format!(
             "<a class=\"pagination-link\" href=\"{}\">Next</a>",
             escape_html(&href)
@@ -116,6 +119,7 @@ fn render_history_pagination(snapshot: &HistorySnapshot) -> String {
 }
 
 fn history_page_href(
+    path: &str,
     filters: &HistorySnapshotFilters,
     before: Option<&str>,
     after: Option<&str>,
@@ -142,7 +146,7 @@ fn history_page_href(
     if let Some(after) = after {
         params.push(format!("after={}", encode(after)));
     }
-    format!("/history?{}", params.join("&"))
+    format!("{path}?{}", params.join("&"))
 }
 
 fn render_kind_options(selected: Option<RunHistoryKind>) -> String {
@@ -233,53 +237,6 @@ fn render_history_run_table(title: &str, runs: &[HistoryRunListItem]) -> String 
 }
 
 fn render_history_run_row(run: &HistoryRunListItem) -> String {
-    format!(
-        "<tr>\
-         <td><span class=\"badge badge-{}\">{}</span></td>\
-         <td>{}</td>\
-         <td><a href=\"{}\">!{}</a></td>\
-         <td><span class=\"badge badge-result\">{}</span></td>\
-         <td>{}</td>\
-         <td class=\"numeric\">{}</td>\
-         <td><a href=\"/history/{}\">{}</a></td>\
-         </tr>",
-        escape_html(run_kind_label(run.kind)),
-        escape_html(run_kind_label(run.kind)),
-        escape_html(&run.repo),
-        mr_history_href(&run.repo, run.iid),
-        run.iid,
-        escape_html(&run_result_label(
-            run.result.as_deref(),
-            &run.status,
-            run.retry.as_ref()
-        )),
-        render_unix_timestamp(run.started_at),
-        render_optional_tokens(run.token_usage.as_ref().map(|usage| usage.total_tokens)),
-        run.id,
-        escape_html(&run_row_preview(
-            run.result.as_deref(),
-            run.preview.as_deref(),
-            run.summary.as_deref(),
-            run.error.as_deref()
-        ))
-    )
-}
-
-fn render_record_run_table(title: &str, runs: &[HistoryRunRecord]) -> String {
-    render_table_section(
-        title,
-        if runs.is_empty() {
-            "<p class=\"empty\">No recorded sessions matched this view.</p>".to_string()
-        } else {
-            let rows = runs.iter().map(render_record_run_row).collect::<String>();
-            format!(
-                "<div class=\"table-scroll\"><table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Result</th><th>Started</th><th class=\"numeric\">Total tokens</th><th>Preview</th></tr></thead><tbody>{rows}</tbody></table></div>"
-            )
-        },
-    )
-}
-
-fn render_record_run_row(run: &HistoryRunRecord) -> String {
     format!(
         "<tr>\
          <td><span class=\"badge badge-{}\">{}</span></td>\

@@ -1,6 +1,62 @@
 use super::*;
 
 #[tokio::test]
+async fn mr_history_paginates_without_request_payloads() -> Result<()> {
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let mut ids = Vec::new();
+    for _ in 0..5 {
+        ids.push(
+            RunFixture::mention("group/repo", 7, "sha")
+                .trigger_note("author", "large request body")
+                .result("pass")
+                .insert(&srv.state)
+                .await?,
+        );
+    }
+    RunFixture::review("other/repo", 7, "sha")
+        .result("pass")
+        .insert(&srv.state)
+        .await?;
+    let path = format!(
+        "/mr/{}/7/history",
+        crate::http::view::encode_repo_key("group/repo")
+    );
+    let first: Value = reqwest::get(format!("http://{}/api{path}?limit=2", srv.address))
+        .await?
+        .json()
+        .await?;
+    assert_eq!(first["runs"].as_array().unwrap().len(), 2);
+    assert_eq!(first["runs"][0]["id"], ids[4]);
+    assert!(first["runs"][0].get("trigger_note_body").is_none());
+    let after = first["next_cursor"].as_str().unwrap();
+    let second: Value = reqwest::get(format!(
+        "http://{}/api{path}?limit=2&after={after}",
+        srv.address
+    ))
+    .await?
+    .json()
+    .await?;
+    assert_eq!(second["runs"][0]["id"], ids[2]);
+    assert_eq!(second["runs"][1]["id"], ids[1]);
+    let before = second["previous_cursor"].as_str().unwrap();
+    let previous: Value = reqwest::get(format!(
+        "http://{}/api{path}?limit=2&before={before}",
+        srv.address
+    ))
+    .await?
+    .json()
+    .await?;
+    assert_eq!(previous["runs"], first["runs"]);
+    let html = reqwest::get(format!("http://{}{path}?limit=2", srv.address))
+        .await?
+        .text()
+        .await?;
+    assert!(html.contains(&format!("{path}?limit=2")));
+    assert!(html.contains("Next</a>"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn history_and_detail_surface_recorded_token_usage_and_kind_statistics() -> Result<()> {
     let srv = HttpTestServerBuilder::new().spawn().await?;
     let run_id = RunFixture::security("group/repo", 70, "token-sha")

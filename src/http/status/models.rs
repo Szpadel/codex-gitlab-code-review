@@ -119,10 +119,10 @@ pub struct TokenUsageStatisticSnapshot {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MrHistorySnapshot {
-    pub generated_at: String,
     pub repo: String,
     pub iid: u64,
-    pub runs: Vec<HistoryRunRecord>,
+    #[serde(flatten)]
+    pub history: HistorySnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

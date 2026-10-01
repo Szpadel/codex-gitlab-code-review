@@ -193,18 +193,19 @@ impl StatusService {
     /// # Errors
     ///
     /// Returns an error if the underlying operation fails.
-    pub async fn mr_history_snapshot(&self, repo: &str, iid: u64) -> Result<MrHistorySnapshot> {
-        let runs = self
-            .state
-            .run_history
-            .list_run_history_for_mr(repo, iid)
-            .await?;
-        let runs = self.with_record_retry_statuses(runs).await?;
+    pub async fn mr_history_snapshot(
+        &self,
+        repo: &str,
+        iid: u64,
+        mut query: HistoryQuery,
+    ) -> Result<MrHistorySnapshot> {
+        query.repo = Some(repo.to_string());
+        query.iid = Some(iid);
+        let history = self.history_snapshot(query).await?;
         Ok(MrHistorySnapshot {
-            generated_at: Utc::now().to_rfc3339(),
             repo: repo.to_string(),
             iid,
-            runs,
+            history,
         })
     }
 
