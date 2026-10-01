@@ -119,15 +119,7 @@ fn render_mcp_entry(item: &ThreadItemSnapshot) -> String {
                 .unwrap_or("No argument preview available."),
         )),
         render_entry_meta(item, &meta),
-        item.body
-            .as_deref()
-            .map(|body| {
-                format!(
-                    "<pre class=\"activity-body mcp-body\">{}</pre>",
-                    escape_html(body)
-                )
-            })
-            .unwrap_or_default(),
+        render_expandable_item_body(item),
     )
 }
 
@@ -155,15 +147,7 @@ fn render_dynamic_tool_entry(item: &ThreadItemSnapshot) -> String {
             item.preview.as_deref().unwrap_or("No preview available."),
         )),
         render_entry_meta(item, &meta),
-        item.body
-            .as_deref()
-            .map(|body| {
-                format!(
-                    "<pre class=\"activity-body tool-body\">{}</pre>",
-                    escape_html(body)
-                )
-            })
-            .unwrap_or_default(),
+        render_expandable_item_body(item),
     )
 }
 
@@ -180,18 +164,16 @@ fn render_reasoning_entry(item: &ThreadItemSnapshot) -> String {
         },
         format!(
             "<span class=\"entry-title reasoning-summary-text\">{}</span>",
-            escape_html(summary.as_deref().unwrap_or(&item.title))
+            escape_html(summary.unwrap_or(&item.title))
         ),
         None,
         render_entry_meta(item, &[]),
-        detail
-            .map(|body| format!("<div class=\"reasoning-body\">{}</div>", escape_html(&body)))
-            .unwrap_or_default(),
+        render_expandable_item_body(item),
     )
 }
 
 fn render_web_search_entry(item: &ThreadItemSnapshot) -> String {
-    if let Some(body) = item.body.as_deref() {
+    if item.body.is_some() {
         return render_expandable_entry(
             ExpandableEntryOptions {
                 entry_class: "web-search-entry",
@@ -205,10 +187,7 @@ fn render_web_search_entry(item: &ThreadItemSnapshot) -> String {
             ),
             None,
             render_entry_meta(item, &[]),
-            format!(
-                "<pre class=\"activity-body compact-activity-body\">{}</pre>",
-                escape_html(body)
-            ),
+            render_expandable_item_body(item),
         );
     }
 
@@ -317,8 +296,30 @@ fn render_file_change_entry(item: &ThreadItemSnapshot) -> String {
             render_meta_pills(&meta),
             render_entry_timestamp(item)
         ),
-        render_file_change_body(item),
+        render_expandable_item_body(item),
     )
+}
+
+fn render_expandable_item_body(item: &ThreadItemSnapshot) -> String {
+    match &item.kind {
+        ThreadItemKind::Reasoning => split_reasoning_content(item.body.as_deref())
+            .1
+            .map(|body| format!("<div class=\"reasoning-body\">{}</div>", escape_html(body)))
+            .unwrap_or_default(),
+        ThreadItemKind::FileChange { .. } => render_file_change_body(item),
+        _ => {
+            let class = match &item.kind {
+                ThreadItemKind::McpToolCall { .. } => "activity-body mcp-body",
+                ThreadItemKind::DynamicToolCall { .. } => "activity-body tool-body",
+                ThreadItemKind::WebSearch => "activity-body compact-activity-body",
+                _ => return String::new(),
+            };
+            item.body
+                .as_deref()
+                .map(|body| format!("<pre class=\"{class}\">{}</pre>", escape_html(body)))
+                .unwrap_or_default()
+        }
+    }
 }
 
 fn render_activity_entry(item: &ThreadItemSnapshot, gitlab_base_url: &str) -> String {
@@ -616,23 +617,20 @@ fn render_mixed_file_change_body(body: &str) -> String {
         .collect::<String>()
 }
 
-fn split_reasoning_content(body: Option<&str>) -> (Option<String>, Option<String>) {
+fn split_reasoning_content(body: Option<&str>) -> (Option<&str>, Option<&str>) {
     let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) else {
         return (None, None);
     };
 
     if let Some((summary, detail)) = body.split_once("\n\n") {
-        return (
-            Some(summary.trim().to_string()),
-            Some(detail.trim().to_string()),
-        );
+        return (Some(summary.trim()), Some(detail.trim()));
     }
 
     let summary = body
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map_or_else(|| body.to_string(), |line| line.trim().to_string());
-    let detail = (summary != body).then(|| body.to_string());
+        .map_or(body, str::trim);
+    let detail = (summary != body).then_some(body);
     (Some(summary), detail)
 }
 
