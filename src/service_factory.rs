@@ -197,6 +197,7 @@ async fn build_normal_runtime(
         &config.docker,
         config.codex.clone(),
         git_base,
+        gitlab_client.clone(),
         Arc::clone(&state),
         gitlab_discovery_mcp.clone(),
         RunnerRuntimeOptions {

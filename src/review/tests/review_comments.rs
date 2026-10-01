@@ -212,6 +212,7 @@ async fn scan_once_with_fake_runtime_runner_posts_review_comment() -> Result<()>
     let runner = DockerCodexRunner::new_with_test_runtime(
         config.codex.clone(),
         url::Url::parse("https://gitlab.example.com").expect("url"),
+        gitlab.clone(),
         Arc::clone(&state),
         None,
         RunnerRuntimeOptions {

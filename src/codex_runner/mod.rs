@@ -2,7 +2,7 @@ use crate::config::FeatureFlagSnapshot;
 use crate::config::{
     BROWSER_MCP_REMOTE_DEBUGGING_PORT, BrowserMcpConfig, CodexConfig, DockerConfig, ExecSandbox,
 };
-use crate::gitlab::{MergeRequest, links::GitLabMarkdownImageUpload};
+use crate::gitlab::{GitLabApi, MergeRequest, links::GitLabMarkdownImageUpload};
 use crate::gitlab_discovery_mcp::{GitLabDiscoveryMcpService, ResolvedGitLabDiscoveryAllowList};
 use crate::review::ReviewLane;
 use crate::review_deduplication::ReviewDiscussionSource;
@@ -382,6 +382,7 @@ pub struct DockerCodexRunner {
     mention_commands_active: bool,
     review_additional_developer_instructions: Option<String>,
     git_base: Url,
+    gitlab: Arc<dyn GitLabApi>,
     gitlab_token: String,
     log_all_json: bool,
     owner_id: String,
@@ -530,6 +531,7 @@ impl DockerCodexRunner {
         docker_cfg: &DockerConfig,
         codex: CodexConfig,
         git_base: Url,
+        gitlab: Arc<dyn GitLabApi>,
         state: Arc<ReviewStateStore>,
         gitlab_discovery_mcp: Option<Arc<GitLabDiscoveryMcpService>>,
         runtime: RunnerRuntimeOptions,
@@ -553,6 +555,7 @@ impl DockerCodexRunner {
             review_additional_developer_instructions: runtime
                 .review_additional_developer_instructions,
             git_base,
+            gitlab,
             gitlab_token: runtime.gitlab_token,
             log_all_json: runtime.log_all_json,
             owner_id: runtime.owner_id,
@@ -565,6 +568,7 @@ impl DockerCodexRunner {
     pub(crate) fn new_with_test_runtime(
         codex: CodexConfig,
         git_base: Url,
+        gitlab: Arc<dyn GitLabApi>,
         state: Arc<ReviewStateStore>,
         gitlab_discovery_mcp: Option<Arc<dyn GitLabDiscoveryHandle>>,
         runtime: RunnerRuntimeOptions,
@@ -582,6 +586,7 @@ impl DockerCodexRunner {
             review_additional_developer_instructions: runtime
                 .review_additional_developer_instructions,
             git_base,
+            gitlab,
             gitlab_token: runtime.gitlab_token,
             log_all_json: runtime.log_all_json,
             owner_id: runtime.owner_id,

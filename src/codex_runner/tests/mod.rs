@@ -442,6 +442,11 @@ async fn test_runner_with_fake_runtime(
     DockerCodexRunner::new_with_test_runtime(
         codex,
         Url::parse("https://gitlab.example.com").expect("url"),
+        Arc::new(
+            crate::gitlab::GitLabClient::new("http://127.0.0.1:9", "token")
+                .expect("gitlab")
+                .with_retry_policy(crate::gitlab::GitLabRetryPolicy::without_delay(1)),
+        ),
         Arc::new(ReviewStateStore::new(":memory:").await.expect("state")),
         gitlab_discovery_mcp,
         RunnerRuntimeOptions {
@@ -473,6 +478,9 @@ fn test_runner_with_codex_and_mentions(
         security_context_builds: Arc::new(Mutex::new(HashMap::new())),
         codex,
         gitlab_discovery_mcp: None,
+        gitlab: Arc::new(
+            crate::gitlab::GitLabClient::new("http://127.0.0.1:9", "token").expect("gitlab"),
+        ),
         mention_commands_active,
         review_additional_developer_instructions: None,
         git_base: Url::parse("https://gitlab.example.com").expect("url"),

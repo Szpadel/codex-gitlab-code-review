@@ -6,9 +6,6 @@ use crate::composer_install::{
     ComposerInstallResult, composer_debug_lines, composer_install_exec_command,
     composer_install_result_from_exec_output, prepare_composer_auth, resolve_composer_auth,
 };
-use crate::gitlab::GitLabClient;
-#[cfg(test)]
-use crate::gitlab::GitLabRetryPolicy;
 
 impl DockerCodexRunner {
     pub(crate) async fn run_composer_install_step(
@@ -93,31 +90,7 @@ impl DockerCodexRunner {
     }
 
     async fn resolve_composer_auth_lookup(&self, project_path: &str) -> ComposerAuthLookup {
-        #[cfg(test)]
-        // Runner tests cover Composer auth lookup behavior separately and must not call live GitLab.
-        let git_base = "http://127.0.0.1:9";
-        #[cfg(not(test))]
-        let git_base = self.git_base.as_str();
-
-        match GitLabClient::new(git_base, &self.gitlab_token) {
-            Ok(gitlab) => {
-                #[cfg(test)]
-                let gitlab = gitlab.with_retry_policy(GitLabRetryPolicy::without_delay(1));
-                resolve_composer_auth(&gitlab, project_path).await
-            }
-            Err(err) => {
-                warn!(
-                    project_path,
-                    error = %err,
-                    "failed to initialize gitlab client for COMPOSER_AUTH lookup; continuing without auth"
-                );
-                ComposerAuthLookup {
-                    value: None,
-                    source: None,
-                    attempts: Vec::new(),
-                }
-            }
-        }
+        resolve_composer_auth(self.gitlab.as_ref(), project_path).await
     }
 
     async fn append_composer_install_result(
@@ -185,6 +158,51 @@ pub(crate) fn composer_install_events(
 mod tests {
     use super::*;
     use crate::composer_install::ComposerInstallMode;
+
+    #[tokio::test]
+    async fn composer_auth_uses_the_shared_gitlab_client() -> anyhow::Result<()> {
+        use std::sync::Arc;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/projects/group%2Frepo/variables/COMPOSER_AUTH",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"key": "COMPOSER_AUTH", "value": "{}", "environment_scope": "*"}),
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let runner = DockerCodexRunner::new_with_test_runtime(
+            crate::config::test_builder::ConfigBuilder::for_review_tests()
+                .build()
+                .codex,
+            url::Url::parse(&server.uri())?,
+            Arc::new(crate::gitlab::GitLabClient::new(&server.uri(), "token")?),
+            Arc::new(crate::state::ReviewStateStore::new(":memory:").await?),
+            None,
+            super::super::RunnerRuntimeOptions {
+                gitlab_token: "token".to_string(),
+                log_all_json: false,
+                owner_id: "composer-test".to_string(),
+                mention_commands_active: false,
+                review_additional_developer_instructions: None,
+            },
+            Arc::new(super::super::test_support::FakeRunnerHarness::default()),
+        );
+
+        for _ in 0..2 {
+            let lookup = runner.resolve_composer_auth_lookup("group/repo").await;
+            assert_eq!(lookup.source.as_deref(), Some("project:group/repo"));
+        }
+        server.verify().await;
+        Ok(())
+    }
 
     #[test]
     fn composer_install_failure_events_create_completed_command_turn() {

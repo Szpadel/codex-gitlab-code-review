@@ -1108,6 +1108,9 @@ fn runner_env_vars_do_not_include_proxy_settings() {
             reasoning_summary: crate::config::ReasoningSummaryOverridesConfig::default(),
         },
         gitlab_discovery_mcp: None,
+        gitlab: Arc::new(
+            crate::gitlab::GitLabClient::new("http://127.0.0.1:9", "token").expect("gitlab"),
+        ),
         mention_commands_active: false,
         review_additional_developer_instructions: None,
         git_base: Url::parse("https://gitlab.example.com").expect("url"),

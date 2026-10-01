@@ -159,6 +159,7 @@ async fn repeated_usage_page_requests_reuse_the_codex_connection() -> Result<()>
     let runner = DockerCodexRunner::new_with_test_runtime(
         config.codex.clone(),
         url::Url::parse(&config.gitlab.base_url)?,
+        Arc::new(crate::gitlab::GitLabClient::new("http://127.0.0.1:9", "")?),
         Arc::new(ReviewStateStore::new(":memory:").await?),
         None,
         RunnerRuntimeOptions {
