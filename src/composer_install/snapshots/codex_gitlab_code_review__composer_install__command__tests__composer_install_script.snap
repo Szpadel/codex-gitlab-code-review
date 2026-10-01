@@ -24,6 +24,8 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+# Give Composer and its children a separate process group for timeout cleanup.
+set -m
 composer_home="$(mktemp -d /tmp/codex-composer-home.XXXXXX)" || {
 echo "failed to create temporary COMPOSER_HOME" >&2
 exit 1
@@ -40,15 +42,18 @@ run_pid="$!"
   if kill -0 "$run_pid" 2>/dev/null; then
     printf 'composer install timed out after 42s
 ' >"$timeout_marker"
-    kill "$run_pid" 2>/dev/null || true
+    kill -- "-$run_pid" 2>/dev/null || true
     sleep 1
-    kill -9 "$run_pid" 2>/dev/null || true
+    kill -9 -- "-$run_pid" 2>/dev/null || true
   fi
 ) &
 watchdog_pid="$!"
 wait "$run_pid"
 status="$?"
-kill "$watchdog_pid" 2>/dev/null || true
+# Keep the watchdog until it sends KILL to children that ignore TERM.
+if [ ! -s "$timeout_marker" ]; then
+  kill -- "-$watchdog_pid" 2>/dev/null || true
+fi
 wait "$watchdog_pid" 2>/dev/null || true
 if [ "$status" -eq 0 ]; then
   tail -n 100 "$log_file"

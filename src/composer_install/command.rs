@@ -57,6 +57,8 @@ fn shell_quote(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
 
     #[test]
     fn composer_install_exec_command_cleans_up_temporary_log_file() {
@@ -105,5 +107,56 @@ mod tests {
 
         assert!(!script.contains("@@"), "{script}");
         insta::assert_snapshot!("composer_install_script", script);
+    }
+
+    #[test]
+    fn composer_timeout_stops_children_that_ignore_termination() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let composer = directory.path().join("composer");
+        let child_pid_file = directory.path().join("child.pid");
+        std::fs::write(directory.path().join("composer.json"), "{}")?;
+        std::fs::write(
+            &composer,
+            "#!/bin/bash\ntrap 'exit 143' TERM\nbash -c 'trap \"\" TERM; exec sleep 30' &\necho \"$!\" >\"$CHILD_PID_FILE\"\nwait\n",
+        )?;
+        std::fs::set_permissions(&composer, std::fs::Permissions::from_mode(0o755))?;
+        let command = composer_install_exec_command(ComposerInstallMode::Full, 1, None);
+        let script = format!(
+            "export PATH={}:\"$PATH\"\n{}",
+            shell_quote(directory.path().to_str().expect("UTF-8 path")),
+            command.last().expect("install script")
+        );
+        let output = Command::new(&command[0])
+            .arg(&command[1])
+            .arg(script)
+            .current_dir(directory.path())
+            .env("CHILD_PID_FILE", &child_pid_file)
+            .output()?;
+        let child_pid = std::fs::read_to_string(child_pid_file)?;
+        let child_pid: u32 = child_pid.trim().parse()?;
+        let child_state = std::fs::read_to_string(format!("/proc/{child_pid}/stat"));
+        // A terminated orphan can remain a zombie until the system reaps it.
+        let child_running = match child_state {
+            Ok(state) => {
+                let status = state.split_once(") ").expect("process state").1;
+                !status.starts_with('Z') && !status.starts_with('X')
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        if child_running {
+            Command::new("kill")
+                .args(["-9", &child_pid.to_string()])
+                .status()?;
+        }
+        assert_eq!(output.status.code(), Some(124), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("composer install timed out after 1s")
+        );
+        assert!(
+            !child_running,
+            "Composer child {child_pid} survived timeout"
+        );
+        Ok(())
     }
 }

@@ -19,6 +19,8 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+# Give Composer and its children a separate process group for timeout cleanup.
+set -m
 @@COMPOSER_HOME_SETUP@@@@COMPOSER_COMMAND@@ >"$log_file" 2>&1 &
 run_pid="$!"
 (
@@ -26,15 +28,18 @@ run_pid="$!"
   if kill -0 "$run_pid" 2>/dev/null; then
     printf 'composer install timed out after @@TIMEOUT_SECONDS@@s
 ' >"$timeout_marker"
-    kill "$run_pid" 2>/dev/null || true
+    kill -- "-$run_pid" 2>/dev/null || true
     sleep 1
-    kill -9 "$run_pid" 2>/dev/null || true
+    kill -9 -- "-$run_pid" 2>/dev/null || true
   fi
 ) &
 watchdog_pid="$!"
 wait "$run_pid"
 status="$?"
-kill "$watchdog_pid" 2>/dev/null || true
+# Keep the watchdog until it sends KILL to children that ignore TERM.
+if [ ! -s "$timeout_marker" ]; then
+  kill -- "-$watchdog_pid" 2>/dev/null || true
+fi
 wait "$watchdog_pid" 2>/dev/null || true
 if [ "$status" -eq 0 ]; then
   tail -n 100 "$log_file"
