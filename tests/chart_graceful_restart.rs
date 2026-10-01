@@ -3,12 +3,42 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
+fn chart_grace_period_covers_review_and_optional_deduplication() {
+    let chart = Path::new(env!("CARGO_MANIFEST_DIR")).join("charts/codex-gitlab-review");
+    for (inline_comments, expected_grace) in [("false", 157), ("true", 194)] {
+        let feature_flag =
+            format!("config.featureFlags.gitlabInlineReviewComments={inline_comments}");
+        let output = Command::new("helm")
+            .args([
+                "template",
+                "codex-gitlab-review",
+                chart.to_str().expect("chart path"),
+                "--set",
+                "config.codex.timeoutSeconds=37",
+                "--set",
+                &feature_flag,
+            ])
+            .output()
+            .expect("run helm template");
+        assert!(
+            output.status.success(),
+            "helm template failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            rendered.contains(&format!("terminationGracePeriodSeconds: {expected_grace}")),
+            "inline comments={inline_comments} must allow {expected_grace} seconds"
+        );
+    }
+}
+
+#[test]
 fn chart_renders_graceful_restart_lifecycle() {
     let chart = Path::new(env!("CARGO_MANIFEST_DIR")).join("charts/codex-gitlab-review");
     let templates = chart.join("templates");
     let deployment =
         fs::read_to_string(templates.join("deployment.yaml")).expect("read deployment template");
-    let values = fs::read_to_string(chart.join("values.yaml")).expect("read values");
 
     assert!(
         deployment.contains(
@@ -24,11 +54,6 @@ fn chart_renders_graceful_restart_lifecycle() {
         deployment.contains("while kill -0 1 2>/dev/null; do"),
         "deployment preStop hook should wait for the main process to exit"
     );
-    assert!(
-        values.contains("graceful restarts can wait for one started Codex run to finish"),
-        "values should document why timeoutSeconds influences graceful shutdown"
-    );
-
     if let Ok(output) = Command::new("helm")
         .args([
             "template",

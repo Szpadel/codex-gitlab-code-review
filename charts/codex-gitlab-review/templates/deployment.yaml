@@ -47,7 +47,11 @@ spec:
         checksum/codex-config: {{ include (print $.Template.BasePath "/codex-auth-configmap.yaml") . | sha256sum }}
         checksum/gitlab-token: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
+{{- if .Values.config.featureFlags.gitlabInlineReviewComments }}
+      terminationGracePeriodSeconds: {{ add (mul (int .Values.config.codex.timeoutSeconds) 2) 120 }}
+{{- else }}
       terminationGracePeriodSeconds: {{ add (int .Values.config.codex.timeoutSeconds) 120 }}
+{{- end }}
       serviceAccountName: {{ include "codex-gitlab-review.serviceAccountName" . }}
       initContainers:
         - name: seed-codex-auth

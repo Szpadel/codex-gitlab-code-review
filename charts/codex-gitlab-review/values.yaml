@@ -74,8 +74,9 @@ config:
       additionalDeveloperInstructions: null
   codex:
     image: "ghcr.io/openai/codex-universal:latest"
-    # The Helm chart derives pod terminationGracePeriodSeconds from this value
-    # (+120s) so graceful restarts can wait for one started Codex run to finish.
+    # The chart allows timeoutSeconds + 120 seconds for graceful shutdown.
+    # With featureFlags.gitlabInlineReviewComments enabled, it allows
+    # 2 * timeoutSeconds + 120 seconds for the review and deduplication runs.
     timeoutSeconds: 1800
     # Leave empty to default to authMountPath.
     # Must be writable to persist refreshed auth.json credentials.
