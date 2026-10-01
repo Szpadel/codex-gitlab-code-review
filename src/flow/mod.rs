@@ -20,6 +20,7 @@ mod comment_text;
 pub(crate) mod mention;
 pub(crate) mod mention_assets;
 pub(crate) mod orchestration;
+pub mod retry;
 pub(crate) mod review;
 pub(crate) mod review_comments;
 mod review_project;

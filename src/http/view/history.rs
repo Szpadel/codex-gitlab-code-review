@@ -6,7 +6,7 @@ use super::html::{
     NavItem, escape_html, format_number, mr_history_href, render_shell, render_table_section,
     render_unix_timestamp, run_kind_label,
 };
-use crate::review::RunRetryStatus;
+use crate::flow::retry::RunRetryStatus;
 use crate::run_history_kind::RunHistoryKind;
 use urlencoding::encode;
 

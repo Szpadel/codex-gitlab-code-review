@@ -7,13 +7,13 @@ use crate::config::TargetSelector;
 use crate::dev_mode::{DevToolsService, MockCodexRunner};
 use crate::flow::award_service::AwardService;
 use crate::flow::mention::{DiscussionParentIndex, contains_mention};
+use crate::flow::retry::{RetryBackoff, RetryKey, RetryWarningAwardService};
 use crate::flow::review::ReviewRunContext;
 use crate::gitlab::{
     AwardEmoji, DiscussionNote, GitLabApi, GitLabUser, GitLabUserDetail, MergeRequest,
     MergeRequestDiff, MergeRequestDiffVersion, MergeRequestDiscussion, Note,
 };
 use crate::lifecycle::ServiceLifecycle;
-use crate::review::retry::{RetryBackoff, RetryKey, RetryWarningAwardService};
 use crate::review_lane::ReviewLane;
 use crate::state::{ReviewRateLimitScope, ReviewStateStore, RunHistoryListQuery};
 use anyhow::{Context, Result};

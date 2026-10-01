@@ -9,7 +9,7 @@ use super::html::{
     render_definition_list, render_optional_unix_timestamp, render_shell, render_unix_timestamp,
     run_kind_label,
 };
-use crate::review::RunRetryStatus;
+use crate::flow::retry::RunRetryStatus;
 use crate::run_history_kind::RunHistoryKind;
 use crate::state::RunHistoryRecord;
 

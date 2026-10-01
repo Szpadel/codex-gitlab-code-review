@@ -7,11 +7,12 @@ use crate::background_tasks::BackgroundTasks;
 use crate::codex_runner::{CodexRunner, DockerCodexRunner, RunnerRuntimeOptions};
 use crate::config::{Config, ValidatedConfig, validate_config};
 use crate::dev_mode::{DevToolsService, MockCodexRunner};
+use crate::flow::retry::RunRetryStatusProvider;
 use crate::gitlab::bot_user::resolve_and_update_bot_user_config;
 use crate::gitlab::{GitLabApi, GitLabClient};
 use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use crate::http::HttpServices;
-use crate::review::{ReviewService, RunRetryStatusProvider};
+use crate::review::ReviewService;
 use crate::state::ReviewStateStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

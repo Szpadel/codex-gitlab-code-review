@@ -1,3 +1,5 @@
+//! In-memory retry state and warning awards for review flows.
+
 use crate::config::Config;
 use crate::flow::award_service::AwardService;
 use crate::review_lane::ReviewLane;
@@ -44,16 +46,20 @@ pub(crate) struct RetryFailure {
     pub(crate) exhausted: bool,
 }
 
+/// Describes a scheduled or exhausted retry for history views.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RunRetryStatus {
     pub retry_number: u32,
     pub max_retries: u32,
+    /// UTC Unix timestamp in seconds. Exhausted retries have no next attempt.
     pub next_retry_at: Option<i64>,
     pub exhausted: bool,
     pub label: String,
 }
 
+/// Supplies current retry display state for persisted run IDs.
 pub trait RunRetryStatusProvider: Send + Sync {
+    /// Omits runs that have no tracked retry.
     fn retry_statuses_for_run_ids(&self, run_ids: &[i64]) -> HashMap<i64, RunRetryStatus>;
 }
 

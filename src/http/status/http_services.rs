@@ -4,7 +4,7 @@ use super::{
 };
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
-use crate::review::RunRetryStatusProvider;
+use crate::flow::retry::RunRetryStatusProvider;
 use crate::skills::SkillsManager;
 use crate::state::ReviewStateStore;
 use std::sync::Arc;
