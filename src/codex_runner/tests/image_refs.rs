@@ -1,4 +1,53 @@
 use super::*;
+
+#[tokio::test]
+async fn sequential_session_image_checks_reuse_the_warmup_pull() -> Result<()> {
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, query_param},
+    };
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(query_param(
+            "fromImage",
+            "ghcr.io/openai/codex-universal:latest",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_string("{\"status\":\"Downloaded\"}\n"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let runner = DockerCodexRunner::new(
+        &DockerConfig { host: server.uri() },
+        test_codex_config(),
+        Url::parse("http://127.0.0.1:9")?,
+        Arc::new(crate::gitlab::GitLabClient::new("http://127.0.0.1:9", "")?),
+        Arc::new(ReviewStateStore::new(":memory:").await?),
+        None,
+        RunnerRuntimeOptions {
+            gitlab_token: String::new(),
+            log_all_json: false,
+            owner_id: "image-test".to_string(),
+            mention_commands_active: false,
+            review_additional_developer_instructions: None,
+        },
+    )?;
+
+    runner.warm_up_images().await?;
+    runner
+        .ensure_image_available("ghcr.io/openai/codex-universal")
+        .await?;
+    runner
+        .ensure_image_available("ghcr.io/openai/codex-universal:latest")
+        .await?;
+
+    server.verify().await;
+    Ok(())
+}
 #[test]
 fn normalize_image_reference_appends_latest_when_missing_tag() {
     let image = "ghcr.io/openai/codex-universal";

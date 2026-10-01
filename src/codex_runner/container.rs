@@ -19,29 +19,31 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone)]
-struct InFlightImagePull {
+struct SharedImagePull {
     id: u64,
     future: Shared<BoxFuture<'static, std::result::Result<(), Arc<String>>>>,
 }
 
 pub(crate) struct ImagePullManager {
-    in_flight: Mutex<HashMap<String, InFlightImagePull>>,
+    // Successful pulls stay cached for the runner lifetime. The configured
+    // Codex and browser image references bound the number of entries.
+    pulls: Mutex<HashMap<String, SharedImagePull>>,
     next_id: AtomicU64,
 }
 
 impl ImagePullManager {
     pub(crate) fn new() -> Self {
         Self {
-            in_flight: Mutex::new(HashMap::new()),
+            pulls: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
 
     async fn pull_with_dedup(&self, docker: &Docker, image: &str) -> Result<()> {
-        let in_flight = {
-            let mut in_flight = self.in_flight.lock().expect("image pull map lock poisoned");
-            if let Some(in_flight) = in_flight.get(image) {
-                in_flight.clone()
+        let shared_pull = {
+            let mut pulls = self.pulls.lock().expect("image pull map lock poisoned");
+            if let Some(pull) = pulls.get(image) {
+                pull.clone()
             } else {
                 let pull_id = self.next_id.fetch_add(1, Ordering::Relaxed);
                 let docker = docker.clone();
@@ -53,21 +55,22 @@ impl ImagePullManager {
                 }
                 .boxed()
                 .shared();
-                let pull = InFlightImagePull {
+                let pull = SharedImagePull {
                     id: pull_id,
                     future,
                 };
-                in_flight.insert(image.to_string(), pull.clone());
+                pulls.insert(image.to_string(), pull.clone());
                 pull
             }
         };
 
-        let result = in_flight.future.await;
+        let result = shared_pull.future.await;
         {
-            let mut pulls = self.in_flight.lock().expect("image pull map lock poisoned");
-            if pulls
-                .get(image)
-                .is_some_and(|current| current.id == in_flight.id)
+            let mut pulls = self.pulls.lock().expect("image pull map lock poisoned");
+            if result.is_err()
+                && pulls
+                    .get(image)
+                    .is_some_and(|current| current.id == shared_pull.id)
             {
                 pulls.remove(image);
             }
@@ -764,4 +767,55 @@ pub(crate) fn auxiliary_git_exec_command(git_args: &[String]) -> Vec<String> {
         .collect::<Vec<_>>()
         .join(" ");
     vec!["bash".to_string(), "-lc".to_string(), git_command]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    #[tokio::test]
+    async fn failed_image_pull_can_retry() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_json(serde_json::json!({"message": "pull failed"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"message": "image not found"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let docker =
+            super::super::connect_docker(&crate::config::DockerConfig { host: server.uri() })?;
+        let pulls = ImagePullManager::new();
+        assert!(
+            pulls
+                .pull_with_dedup(&docker, "image:latest")
+                .await
+                .is_err()
+        );
+        server.verify().await;
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("{\"status\":\"Downloaded\"}\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        pulls.pull_with_dedup(&docker, "image:latest").await?;
+        pulls.pull_with_dedup(&docker, "image:latest").await?;
+
+        server.verify().await;
+        Ok(())
+    }
 }
