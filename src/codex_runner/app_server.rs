@@ -3,6 +3,7 @@ use super::{
     SecondsFormat, SecurityReviewContentFlagged, StreamExt, Utc, Uuid, Value, VecDeque, anyhow,
     debug, info, json, warn,
 };
+use std::sync::{Arc, Mutex};
 
 pub(crate) struct TurnNotificationContext<'a> {
     pub(crate) thread_id: &'a str,
@@ -57,6 +58,7 @@ pub(crate) enum TurnStreamNotificationOutcome {
 pub(crate) struct TurnHistoryCapture {
     pub(crate) next_sequence: i64,
     pub(crate) events: Vec<NewRunHistoryEvent>,
+    pending_on_drop: Option<Arc<Mutex<Vec<NewRunHistoryEvent>>>>,
 }
 
 pub(crate) const GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID: &str = "gitlab-discovery-mcp-startup";
@@ -65,6 +67,14 @@ pub(crate) const GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID: &str = "gitlab-discovery-
 const HISTORY_EVENT_BATCH_SIZE: usize = 32;
 
 impl TurnHistoryCapture {
+    /// Move unflushed events to the outer cleanup when this capture is dropped.
+    pub(crate) fn preserve_pending_on_drop(
+        &mut self,
+        retained_events: Arc<Mutex<Vec<NewRunHistoryEvent>>>,
+    ) {
+        self.pending_on_drop = Some(retained_events);
+    }
+
     pub(crate) fn push(&mut self, turn_id: Option<&str>, event_type: &str, payload: Value) {
         self.next_sequence += 1;
         let payload = annotate_event_payload(payload);
@@ -79,6 +89,17 @@ impl TurnHistoryCapture {
     pub(crate) fn take_pending(&mut self) -> Vec<NewRunHistoryEvent> {
         self.next_sequence = 0;
         std::mem::take(&mut self.events)
+    }
+}
+
+impl Drop for TurnHistoryCapture {
+    fn drop(&mut self) {
+        if let Some(retained_events) = self.pending_on_drop.take() {
+            retained_events
+                .lock()
+                .expect("pending transcript cleanup lock poisoned")
+                .extend(self.take_pending());
+        }
     }
 }
 
@@ -143,8 +164,10 @@ impl AppServerClient {
     }
 
     /// Retains the batch in the client if the persistence future is cancelled.
-    async fn flush_pending_history<FPersist, FPersistFut>(&mut self, persist_events: &mut FPersist)
-    where
+    pub(crate) async fn flush_pending_history<FPersist, FPersistFut>(
+        &mut self,
+        persist_events: &mut FPersist,
+    ) where
         FPersist: FnMut(Vec<NewRunHistoryEvent>) -> FPersistFut,
         FPersistFut: Future<Output = ()>,
     {

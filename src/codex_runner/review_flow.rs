@@ -1,6 +1,6 @@
 use super::review_output::validated_security_min_confidence_score;
 use super::security_context::{
-    ExtraSecurityContextSessionContainer, SECURITY_CONTEXT_PROMPT_VERSION,
+    ExtraSecurityContextSessionCleanup, SECURITY_CONTEXT_PROMPT_VERSION,
     SecurityContextPayloadResolution, SeparateSecurityContextSessionRequest,
 };
 use super::session_runner::{
@@ -282,7 +282,7 @@ impl DockerCodexRunner {
         prepared: &PreparedRunnerSessionComponents,
         repo_path: &str,
         plan: &mut SecurityReviewPlan,
-        extra_session: &ExtraSecurityContextSessionContainer,
+        extra_session: &ExtraSecurityContextSessionCleanup,
     ) {
         if plan.context_resolution.build_guard.is_none() {
             return;
@@ -307,7 +307,7 @@ impl DockerCodexRunner {
                     repo_path,
                     base_branch: base_branch.as_str(),
                     base_head_sha: base_head_sha.as_str(),
-                    extra_session_container: extra_session.clone(),
+                    extra_session_cleanup: extra_session.clone(),
                 },
             )
             .await;
@@ -464,9 +464,17 @@ impl DockerCodexRunner {
 
     async fn cleanup_extra_security_context_session(
         &self,
-        extra_session: &ExtraSecurityContextSessionContainer,
+        extra_session: &ExtraSecurityContextSessionCleanup,
     ) {
-        for container_id in extra_session.take().into_iter().rev() {
+        let pending_events = std::mem::take(
+            &mut *extra_session
+                .pending_events
+                .lock()
+                .expect("pending transcript cleanup lock poisoned"),
+        );
+        self.append_run_history_events(extra_session.run_history_id, &pending_events)
+            .await;
+        for container_id in extra_session.containers.take().into_iter().rev() {
             self.remove_container_best_effort(&container_id).await;
         }
     }
@@ -518,7 +526,8 @@ impl DockerCodexRunner {
         .await;
 
         let run_started_at = Instant::now();
-        let extra_security_context_session = ExtraSecurityContextSessionContainer::default();
+        let extra_security_context_session =
+            ExtraSecurityContextSessionCleanup::new(ctx.run_history_id);
         let app_server_container_id = session.container_id.clone();
         let browser_container_id = session.browser_container_id.clone();
         let browser_mcp = prepared.browser_mcp.clone();

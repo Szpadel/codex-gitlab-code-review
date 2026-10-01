@@ -299,8 +299,13 @@ impl DockerCodexRunner {
     }
 
     pub(crate) async fn close_runner_session(&self, mut session: RunnerSession) {
-        let pending_events = session.client.pending_history.take_pending();
-        self.append_run_history_events(session.run_history_id, &pending_events)
+        let run_history_id = session.run_history_id;
+        session
+            .client
+            .flush_pending_history(&mut |events| async move {
+                self.append_run_history_events(run_history_id, &events)
+                    .await;
+            })
             .await;
         self.unregister_gitlab_discovery_session(session.gitlab_discovery_session.as_ref())
             .await;

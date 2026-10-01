@@ -9,6 +9,8 @@ use super::{
     Utc, Value, anyhow, bail, debug, json, warn,
 };
 use crate::codex_runner::placeholders::render_placeholders;
+use crate::state::NewRunHistoryEvent;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub(super) struct SecurityContextPayloadResolution {
@@ -30,7 +32,24 @@ struct SecurityContextPayloadRequest<'a> {
     base_head_sha: &'a str,
 }
 
-pub(super) type ExtraSecurityContextSessionContainer = ContainerCleanup;
+/// Retain nested-session resources outside the review timeout future.
+#[derive(Clone)]
+pub(super) struct ExtraSecurityContextSessionCleanup {
+    pub(super) run_history_id: Option<i64>,
+    pub(super) containers: ContainerCleanup,
+    /// The nested client's drop handler transfers its unflushed batch here.
+    pub(super) pending_events: Arc<Mutex<Vec<NewRunHistoryEvent>>>,
+}
+
+impl ExtraSecurityContextSessionCleanup {
+    pub(super) fn new(run_history_id: Option<i64>) -> Self {
+        Self {
+            run_history_id,
+            containers: ContainerCleanup::default(),
+            pending_events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
 
 pub(super) struct SeparateSecurityContextSessionRequest<'a> {
     pub(super) account: &'a AuthAccount,
@@ -38,7 +57,7 @@ pub(super) struct SeparateSecurityContextSessionRequest<'a> {
     pub(super) repo_path: &'a str,
     pub(super) base_branch: &'a str,
     pub(super) base_head_sha: &'a str,
-    pub(super) extra_session_container: ExtraSecurityContextSessionContainer,
+    pub(super) extra_session_cleanup: ExtraSecurityContextSessionCleanup,
 }
 
 pub(super) const SECURITY_CONTEXT_PROMPT_VERSION: &str = "security-review-context-v1";
@@ -643,9 +662,13 @@ impl DockerCodexRunner {
                 )
             },
         );
-        launch_request.startup_cleanup = Some(request.extra_session_container.clone());
+        launch_request.startup_cleanup = Some(request.extra_session_cleanup.containers.clone());
         let launch = self.launch_runner_session(launch_request).await?;
         let mut session = launch.session;
+        session
+            .client
+            .pending_history
+            .preserve_pending_on_drop(Arc::clone(&request.extra_session_cleanup.pending_events));
 
         let build_result = async {
             session.client.initialize().await?;
@@ -699,7 +722,7 @@ impl DockerCodexRunner {
         };
 
         self.close_runner_session(session).await;
-        request.extra_session_container.take();
+        request.extra_session_cleanup.containers.take();
 
         build_result
     }
