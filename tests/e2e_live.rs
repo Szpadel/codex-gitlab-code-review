@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use chrono::{Duration, Utc};
 use codex_gitlab_code_review::bootstrap::{BootstrapOptions, bootstrap_runtime_from_config};
 use codex_gitlab_code_review::config::{
-    CodexConfig, Config, DatabaseConfig, DockerConfig, GitLabConfig, GitLabTargets,
+    CodexConfig, Config, DatabaseConfig, DockerConfig, ExecSandbox, GitLabConfig, GitLabTargets,
     McpServerOverridesConfig, ReviewConfig, ReviewMentionCommandsConfig, ReviewSecurityConfig,
     ScheduleConfig, ServerConfig, TargetSelector, validate_config,
 };
@@ -64,7 +64,7 @@ async fn e2e_live_dry_run() -> Result<()> {
             auth_host_path,
             auth_mount_path: "/root/.codex".to_string(),
             session_history_path: None,
-            exec_sandbox: "danger-full-access".to_string(),
+            exec_sandbox: ExecSandbox::DangerFullAccess,
             fallback_auth_accounts: Vec::new(),
             usage_limit_fallback_cooldown_seconds: 3600,
             usage_limit_recheck_seconds: 900,

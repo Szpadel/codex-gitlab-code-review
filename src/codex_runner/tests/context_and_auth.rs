@@ -1030,7 +1030,7 @@ fn build_auth_accounts_keeps_primary_first_then_fallback_order() {
         auth_host_path: "/root/.codex-primary".to_string(),
         auth_mount_path: "/root/.codex".to_string(),
         session_history_path: None,
-        exec_sandbox: "danger-full-access".to_string(),
+        exec_sandbox: ExecSandbox::DangerFullAccess,
         fallback_auth_accounts: vec![
             FallbackAuthAccountConfig {
                 name: "backup-high".to_string(),
@@ -1095,7 +1095,7 @@ fn runner_env_vars_do_not_include_proxy_settings() {
             auth_host_path: "/root/.codex".to_string(),
             auth_mount_path: "/root/.codex".to_string(),
             session_history_path: None,
-            exec_sandbox: "danger-full-access".to_string(),
+            exec_sandbox: ExecSandbox::DangerFullAccess,
             fallback_auth_accounts: Vec::new(),
             usage_limit_fallback_cooldown_seconds: 3600,
             usage_limit_recheck_seconds: 900,

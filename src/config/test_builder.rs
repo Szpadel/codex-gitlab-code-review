@@ -92,7 +92,7 @@ impl ConfigBuilder {
                     auth_host_path: "/tmp/codex".to_string(),
                     auth_mount_path: "/root/.codex".to_string(),
                     session_history_path: None,
-                    exec_sandbox: "danger-full-access".to_string(),
+                    exec_sandbox: super::ExecSandbox::DangerFullAccess,
                     fallback_auth_accounts: vec![],
                     usage_limit_fallback_cooldown_seconds: 3600,
                     usage_limit_recheck_seconds: 900,

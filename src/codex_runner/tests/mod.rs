@@ -407,7 +407,7 @@ fn test_codex_config() -> CodexConfig {
         auth_host_path: "/root/.codex".to_string(),
         auth_mount_path: "/root/.codex".to_string(),
         session_history_path: None,
-        exec_sandbox: "danger-full-access".to_string(),
+        exec_sandbox: ExecSandbox::DangerFullAccess,
         fallback_auth_accounts: Vec::new(),
         usage_limit_fallback_cooldown_seconds: 3600,
         usage_limit_recheck_seconds: 900,

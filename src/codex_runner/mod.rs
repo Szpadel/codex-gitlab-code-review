@@ -1,6 +1,6 @@
 use crate::config::FeatureFlagSnapshot;
 use crate::config::{
-    BROWSER_MCP_REMOTE_DEBUGGING_PORT, BrowserMcpConfig, CodexConfig, DockerConfig,
+    BROWSER_MCP_REMOTE_DEBUGGING_PORT, BrowserMcpConfig, CodexConfig, DockerConfig, ExecSandbox,
 };
 use crate::gitlab::{MergeRequest, links::GitLabMarkdownImageUpload};
 use crate::gitlab_discovery_mcp::{GitLabDiscoveryMcpService, ResolvedGitLabDiscoveryAllowList};
@@ -593,10 +593,10 @@ impl DockerCodexRunner {
 
 impl DockerCodexRunner {
     fn sandbox_mode_value(&self) -> &'static str {
-        match self.codex.exec_sandbox.as_str() {
-            "read-only" => "read-only",
-            "workspace-write" => "workspace-write",
-            _ => "danger-full-access",
+        match self.codex.exec_sandbox {
+            ExecSandbox::ReadOnly => "read-only",
+            ExecSandbox::WorkspaceWrite => "workspace-write",
+            ExecSandbox::DangerFullAccess => "danger-full-access",
         }
     }
 

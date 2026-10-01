@@ -1256,7 +1256,7 @@ fn deduplication_session_override_uses_dedicated_defaults_and_review_summary() {
 #[test]
 fn thread_start_params_include_extra_workspace_write_roots() {
     let mut codex = test_codex_config();
-    codex.exec_sandbox = "workspace-write".to_string();
+    codex.exec_sandbox = ExecSandbox::WorkspaceWrite;
     let runner = test_runner_with_codex(codex);
 
     let params =
@@ -1275,9 +1275,26 @@ fn thread_start_params_include_extra_workspace_write_roots() {
 }
 
 #[test]
+fn thread_start_params_preserve_supported_sandbox_values() -> Result<()> {
+    for sandbox in ["read-only", "workspace-write", "danger-full-access"] {
+        let codex: CodexConfig = serde_json::from_value(json!({
+            "image": "codex-test",
+            "timeout_seconds": 300,
+            "auth_host_path": "/root/.codex",
+            "auth_mount_path": "/root/.codex",
+            "exec_sandbox": sandbox,
+        }))?;
+        let runner = test_runner_with_codex(codex);
+        let params = runner.thread_start_params("/work/repo", None, &[]);
+        assert_eq!(params["sandbox"], sandbox);
+    }
+    Ok(())
+}
+
+#[test]
 fn thread_start_params_preserve_workspace_write_defaults_without_extra_roots() {
     let mut codex = test_codex_config();
-    codex.exec_sandbox = "workspace-write".to_string();
+    codex.exec_sandbox = ExecSandbox::WorkspaceWrite;
     let runner = test_runner_with_codex(codex);
 
     let params = runner.thread_start_params("/work/repo/group/repo", None, &[]);

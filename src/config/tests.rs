@@ -162,6 +162,15 @@ fn defaults_docker_host_when_missing() {
 }
 
 #[test]
+fn errors_on_unknown_exec_sandbox() {
+    let yaml = base_config_yaml("").replace("danger-full-access", "read_only");
+    let error = try_load_from_yaml(&yaml).expect_err("unknown sandbox must fail config load");
+    let message = format!("{error:#}");
+    assert!(message.contains("read_only"), "{message}");
+    assert!(message.contains("exec_sandbox"), "{message}");
+}
+
+#[test]
 fn defaults_docker_host_when_empty() {
     let yaml = base_config_yaml(
         r#"

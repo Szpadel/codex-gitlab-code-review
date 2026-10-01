@@ -208,7 +208,7 @@ pub struct CodexConfig {
     pub auth_mount_path: String,
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub session_history_path: Option<String>,
-    pub exec_sandbox: String,
+    pub exec_sandbox: ExecSandbox,
     #[serde(default)]
     pub fallback_auth_accounts: Vec<FallbackAuthAccountConfig>,
     #[serde(default = "default_usage_limit_fallback_cooldown_seconds")]
@@ -229,6 +229,15 @@ pub struct CodexConfig {
     pub session_overrides: SessionOverridesConfig,
     #[serde(default)]
     pub reasoning_summary: ReasoningSummaryOverridesConfig,
+}
+
+/// Selects Codex execution permissions. Unknown config values fail deserialization.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecSandbox {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
