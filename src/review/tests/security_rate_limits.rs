@@ -77,14 +77,14 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
                 overall_explanation: None,
                 overall_confidence_score: Some(0.93),
                 omitted_duplicate_count: 0,
-                findings: vec![crate::codex_runner::ReviewFinding {
+                findings: vec![crate::review_finding::ReviewFinding {
                     title: "[P1] Missing auth guard".to_string(),
                     body: finding_body,
                     confidence_score: Some(0.93),
                     priority: Some(1),
-                    code_location: crate::codex_runner::ReviewCodeLocation {
+                    code_location: crate::review_finding::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/auth.rs".to_string(),
-                        line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
+                        line_range: crate::review_finding::ReviewLineRange { start: 10, end: 10 },
                     },
                 }],
                 body: "legacy body".to_string(),

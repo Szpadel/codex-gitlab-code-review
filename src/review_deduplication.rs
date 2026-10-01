@@ -1,5 +1,5 @@
-use crate::codex_runner::ReviewFinding;
 use crate::gitlab::{GitLabApi, MergeRequestDiscussion};
+use crate::review_finding::ReviewFinding;
 use anyhow::Result;
 use std::fmt;
 use std::sync::Arc;

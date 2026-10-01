@@ -304,7 +304,7 @@ impl DockerCodexRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex_runner::{ReviewCodeLocation, ReviewFinding, ReviewLineRange};
+    use crate::review_finding::{ReviewCodeLocation, ReviewFinding, ReviewLineRange};
 
     fn comment_with_two_findings() -> ReviewComment {
         ReviewComment {

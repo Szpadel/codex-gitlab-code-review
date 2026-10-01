@@ -95,14 +95,14 @@ async fn published_unclosed_marker_preserves_service_finding_trailer() -> Result
                     overall_explanation: Some(prefix.clone()),
                     overall_confidence_score: None,
                     omitted_duplicate_count: 0,
-                    findings: vec![crate::codex_runner::ReviewFinding {
+                    findings: vec![crate::review_finding::ReviewFinding {
                         title: "Finding".to_string(),
                         body: "Finding text".to_string(),
                         confidence_score: None,
                         priority: None,
-                        code_location: crate::codex_runner::ReviewCodeLocation {
+                        code_location: crate::review_finding::ReviewCodeLocation {
                             absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
-                            line_range: crate::codex_runner::ReviewLineRange { start: 1, end: 1 },
+                            line_range: crate::review_finding::ReviewLineRange { start: 1, end: 1 },
                         },
                     }],
                 },
@@ -294,26 +294,29 @@ async fn inline_review_comments_post_inline_discussions_and_fallback_note() -> R
                 overall_confidence_score: None,
                 omitted_duplicate_count: 0,
                 findings: vec![
-                    crate::codex_runner::ReviewFinding {
+                    crate::review_finding::ReviewFinding {
                         title: "Inline finding".to_string(),
                         body: "Please fix /work/repo/group/repo/src/lib.rs:10 before merging."
                             .to_string(),
                         confidence_score: None,
                         priority: None,
-                        code_location: crate::codex_runner::ReviewCodeLocation {
+                        code_location: crate::review_finding::ReviewCodeLocation {
                             absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
-                            line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
+                            line_range: crate::review_finding::ReviewLineRange {
+                                start: 10,
+                                end: 10,
+                            },
                         },
                     },
-                    crate::codex_runner::ReviewFinding {
+                    crate::review_finding::ReviewFinding {
                         title: "Fallback finding".to_string(),
                         body: "This remains unresolved near /work/repo/group/repo/src/other.rs:8."
                             .to_string(),
                         confidence_score: None,
                         priority: None,
-                        code_location: crate::codex_runner::ReviewCodeLocation {
+                        code_location: crate::review_finding::ReviewCodeLocation {
                             absolute_file_path: "/work/repo/group/repo/src/other.rs".to_string(),
-                            line_range: crate::codex_runner::ReviewLineRange { start: 8, end: 8 },
+                            line_range: crate::review_finding::ReviewLineRange { start: 8, end: 8 },
                         },
                     },
                 ],
@@ -401,15 +404,15 @@ async fn inline_review_comments_fallback_to_plain_note_when_no_diff_anchor_exist
                 overall_explanation: None,
                 overall_confidence_score: None,
                 omitted_duplicate_count: 0,
-                findings: vec![crate::codex_runner::ReviewFinding {
+                findings: vec![crate::review_finding::ReviewFinding {
                     title: "Fallback only".to_string(),
                     body: "See /work/repo/group/repo/src/lib.rs:30 for the broken call."
                         .to_string(),
                     confidence_score: None,
                     priority: None,
-                    code_location: crate::codex_runner::ReviewCodeLocation {
+                    code_location: crate::review_finding::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
-                        line_range: crate::codex_runner::ReviewLineRange { start: 30, end: 30 },
+                        line_range: crate::review_finding::ReviewLineRange { start: 30, end: 30 },
                     },
                 }],
                 body: "legacy body".to_string(),
@@ -766,14 +769,14 @@ async fn inline_review_comments_fallback_when_head_sha_no_longer_matches_latest_
                 overall_explanation: None,
                 overall_confidence_score: None,
                 omitted_duplicate_count: 0,
-                findings: vec![crate::codex_runner::ReviewFinding {
+                findings: vec![crate::review_finding::ReviewFinding {
                     title: "Head moved".to_string(),
                     body: "See /work/repo/group/repo/src/lib.rs:10 before merging.".to_string(),
                     confidence_score: None,
                     priority: None,
-                    code_location: crate::codex_runner::ReviewCodeLocation {
+                    code_location: crate::review_finding::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
-                        line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
+                        line_range: crate::review_finding::ReviewLineRange { start: 10, end: 10 },
                     },
                 }],
                 body: "legacy body".to_string(),
@@ -846,14 +849,14 @@ async fn inline_review_comments_use_matching_diff_version_even_when_not_first() 
                 overall_explanation: None,
                 overall_confidence_score: None,
                 omitted_duplicate_count: 0,
-                findings: vec![crate::codex_runner::ReviewFinding {
+                findings: vec![crate::review_finding::ReviewFinding {
                     title: "Inline finding".to_string(),
                     body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
                     confidence_score: None,
                     priority: None,
-                    code_location: crate::codex_runner::ReviewCodeLocation {
+                    code_location: crate::review_finding::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
-                        line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
+                        line_range: crate::review_finding::ReviewLineRange { start: 10, end: 10 },
                     },
                 }],
                 body: "legacy body".to_string(),
@@ -916,14 +919,14 @@ async fn inline_review_comments_fallback_to_note_when_marker_prefetch_fails() ->
                 overall_explanation: None,
                 overall_confidence_score: None,
                 omitted_duplicate_count: 0,
-                findings: vec![crate::codex_runner::ReviewFinding {
+                findings: vec![crate::review_finding::ReviewFinding {
                     title: "Fallback finding".to_string(),
                     body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
                     confidence_score: None,
                     priority: None,
-                    code_location: crate::codex_runner::ReviewCodeLocation {
+                    code_location: crate::review_finding::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
-                        line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
+                        line_range: crate::review_finding::ReviewLineRange { start: 10, end: 10 },
                     },
                 }],
                 body: "legacy body".to_string(),
@@ -992,14 +995,14 @@ async fn inline_review_comments_fallback_to_note_when_inline_post_fails() -> Res
                 overall_explanation: Some("Overall context.".to_string()),
                 overall_confidence_score: None,
                 omitted_duplicate_count: 0,
-                findings: vec![crate::codex_runner::ReviewFinding {
+                findings: vec![crate::review_finding::ReviewFinding {
                     title: "Fallback finding".to_string(),
                     body: "Fix /work/repo/group/repo/src/lib.rs:10.".to_string(),
                     confidence_score: None,
                     priority: None,
-                    code_location: crate::codex_runner::ReviewCodeLocation {
+                    code_location: crate::review_finding::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
-                        line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
+                        line_range: crate::review_finding::ReviewLineRange { start: 10, end: 10 },
                     },
                 }],
                 body: "legacy body".to_string(),
@@ -1069,14 +1072,14 @@ async fn inline_review_comments_use_source_project_links_for_fork_mrs() -> Resul
                 overall_explanation: Some("See /work/repo/fork/source/src/lib.rs:10.".to_string()),
                 overall_confidence_score: None,
                 omitted_duplicate_count: 0,
-                findings: vec![crate::codex_runner::ReviewFinding {
+                findings: vec![crate::review_finding::ReviewFinding {
                     title: "Fork fallback".to_string(),
                     body: "Fix /work/repo/fork/source/src/lib.rs:10.".to_string(),
                     confidence_score: None,
                     priority: None,
-                    code_location: crate::codex_runner::ReviewCodeLocation {
+                    code_location: crate::review_finding::ReviewCodeLocation {
                         absolute_file_path: "/work/repo/fork/source/src/lib.rs".to_string(),
-                        line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
+                        line_range: crate::review_finding::ReviewLineRange { start: 10, end: 10 },
                     },
                 }],
                 body: "legacy body".to_string(),
@@ -1390,14 +1393,14 @@ async fn inline_review_comments_dedupe_duplicate_findings_in_single_response() -
             too_large: false,
         }],
     ));
-    let finding = crate::codex_runner::ReviewFinding {
+    let finding = crate::review_finding::ReviewFinding {
         title: "Duplicate".to_string(),
         body: "See /work/repo/group/repo/src/lib.rs:10.".to_string(),
         confidence_score: None,
         priority: None,
-        code_location: crate::codex_runner::ReviewCodeLocation {
+        code_location: crate::review_finding::ReviewCodeLocation {
             absolute_file_path: "/work/repo/group/repo/src/lib.rs".to_string(),
-            line_range: crate::codex_runner::ReviewLineRange { start: 10, end: 10 },
+            line_range: crate::review_finding::ReviewLineRange { start: 10, end: 10 },
         },
     };
     let runner = Arc::new(FakeRunner {

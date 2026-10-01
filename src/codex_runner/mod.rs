@@ -5,6 +5,7 @@ use crate::config::{
 use crate::gitlab::{GitLabApi, MergeRequest, links::GitLabMarkdownImageUpload};
 use crate::gitlab_discovery_mcp::{GitLabDiscoveryMcpService, ResolvedGitLabDiscoveryAllowList};
 use crate::review_deduplication::ReviewDiscussionSource;
+use crate::review_finding::ReviewFinding;
 use crate::review_lane::ReviewLane;
 use crate::review_prompt_templates::{
     append_additional_review_instructions, build_base_branch_review_prompt,
@@ -121,27 +122,6 @@ pub struct MentionCommandContext {
     pub(crate) image_uploads: Vec<GitLabMarkdownImageUpload>,
     pub feature_flags: FeatureFlagSnapshot,
     pub run_history_id: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewLineRange {
-    pub start: usize,
-    pub end: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewCodeLocation {
-    pub absolute_file_path: String,
-    pub line_range: ReviewLineRange,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReviewFinding {
-    pub title: String,
-    pub body: String,
-    pub confidence_score: Option<f32>,
-    pub priority: Option<u8>,
-    pub code_location: ReviewCodeLocation,
 }
 
 #[derive(Debug, Clone, PartialEq)]

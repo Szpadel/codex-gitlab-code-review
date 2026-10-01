@@ -1,9 +1,7 @@
 //! Parsing and rendering of Codex review output (structured JSON with rendered-text fallbacks).
 
-use super::{
-    CodexResult, ReviewCodeLocation, ReviewComment, ReviewFinding, ReviewLineRange,
-    SecurityReviewContentFlagged,
-};
+use super::{CodexResult, ReviewComment, SecurityReviewContentFlagged};
+use crate::review_finding::{ReviewCodeLocation, ReviewFinding, ReviewLineRange};
 use crate::review_lane::ReviewLane;
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;

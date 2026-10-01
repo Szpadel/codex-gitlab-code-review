@@ -1,4 +1,4 @@
-use crate::codex_runner::{ReviewComment, ReviewFinding, repo_checkout_root};
+use crate::codex_runner::{ReviewComment, repo_checkout_root};
 use crate::config::Config;
 use crate::flow::comment_text::sanitize_comment_text;
 use crate::flow::review_project::ResolvedReviewProject;
@@ -9,6 +9,7 @@ use crate::gitlab::{
 use crate::review_deduplication::{
     ReviewDiscussionSource, finding_marker, finding_markers_from_text,
 };
+use crate::review_finding::ReviewFinding;
 use crate::review_lane::ReviewLane;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -883,9 +884,9 @@ mod tests {
             body: "Body".to_string(),
             confidence_score: None,
             priority: None,
-            code_location: crate::codex_runner::ReviewCodeLocation {
+            code_location: crate::review_finding::ReviewCodeLocation {
                 absolute_file_path: format!("{worktree_root}/src/lib.rs"),
-                line_range: crate::codex_runner::ReviewLineRange { start: 3, end: 4 },
+                line_range: crate::review_finding::ReviewLineRange { start: 3, end: 4 },
             },
         };
         let head_sha = "0123456789abcdef0123456789abcdef01234567";
@@ -1013,9 +1014,9 @@ mod tests {
             body: "Body".to_string(),
             confidence_score: None,
             priority: None,
-            code_location: crate::codex_runner::ReviewCodeLocation {
+            code_location: crate::review_finding::ReviewCodeLocation {
                 absolute_file_path: format!("{worktree_root}/src/lib.rs"),
-                line_range: crate::codex_runner::ReviewLineRange {
+                line_range: crate::review_finding::ReviewLineRange {
                     start: 1,
                     end: MAX_INLINE_FINDING_LINE_SPAN + 2,
                 },
