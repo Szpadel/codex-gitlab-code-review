@@ -22,6 +22,7 @@ pub(crate) mod mention_assets;
 pub(crate) mod orchestration;
 pub(crate) mod review;
 pub(crate) mod review_comments;
+mod review_project;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ActiveReviewKey {

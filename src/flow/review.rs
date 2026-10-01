@@ -12,6 +12,7 @@ use crate::flow::orchestration::{
 use crate::flow::review_comments::{
     PostReviewCommentRequest, REVIEW_FINDING_MARKER_PREFIX, post_review_comment,
 };
+use crate::flow::review_project::{ResolvedReviewProject, resolve_review_project};
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
 use crate::lifecycle::ServiceLifecycle;
@@ -1239,50 +1240,6 @@ impl ReviewRunContext {
         self.lifecycle.should_cancel_active_work()
     }
 
-    async fn resolve_review_project_path(&self, repo: &str, mr: &MergeRequest) -> String {
-        let Some(source_project_id) = mr.source_project_id else {
-            return repo.to_string();
-        };
-        if mr.target_project_id == Some(source_project_id) {
-            return repo.to_string();
-        }
-
-        match self
-            .gitlab
-            .get_project(&source_project_id.to_string())
-            .await
-        {
-            Ok(project) => {
-                if let Some(path_with_namespace) = project
-                    .path_with_namespace
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    path_with_namespace.to_string()
-                } else {
-                    warn!(
-                        repo,
-                        iid = mr.iid,
-                        source_project_id,
-                        "source project path missing for fork MR; disabling GitLab discovery for this run"
-                    );
-                    String::new()
-                }
-            }
-            Err(err) => {
-                warn!(
-                    repo,
-                    iid = mr.iid,
-                    source_project_id,
-                    error = %err,
-                    "failed to resolve source project path for fork MR; disabling GitLab discovery for this run"
-                );
-                String::new()
-            }
-        }
-    }
-
     async fn remove_eyes_best_effort(&self, repo: &str, iid: u64) {
         if self.config.review.dry_run || !self.uses_awards() {
             info!(repo = repo, iid = iid, "dry run: skipping eyes removal");
@@ -1557,29 +1514,6 @@ impl ReviewRunContext {
         }
     }
 
-    async fn build_codex_review_context_for_run(
-        &self,
-        repo: &str,
-        mr: &MergeRequest,
-        head_sha: &str,
-        feature_flags: FeatureFlagSnapshot,
-        run_history_id: i64,
-    ) -> ReviewContext {
-        let project_path = if self.lane.resolves_review_project_path() {
-            self.resolve_review_project_path(repo, mr).await
-        } else {
-            repo.to_string()
-        };
-        self.build_codex_review_context(
-            repo,
-            mr,
-            head_sha,
-            project_path,
-            feature_flags,
-            run_history_id,
-        )
-    }
-
     async fn record_outcome(
         &self,
         run: &ReviewRunIdentity<'_>,
@@ -1646,7 +1580,7 @@ impl ReviewRunContext {
         run: &ReviewRunIdentity<'_>,
         mr: &MergeRequest,
         inline_review_comments_enabled: bool,
-        review_project_path: &str,
+        review_project: &ResolvedReviewProject,
         discussion_source: Option<&ReviewDiscussionSource>,
         comment: ReviewComment,
     ) -> Result<()> {
@@ -1662,7 +1596,7 @@ impl ReviewRunContext {
                 config: &self.config,
                 gitlab: self.gitlab.as_ref(),
                 bot_user_id: self.bot_user_id,
-                project_path: review_project_path,
+                project: review_project,
                 repo: run.repo,
                 mr,
                 head_sha: run.head_sha,
@@ -1783,10 +1717,16 @@ impl ReviewRunContext {
             .remove_if_no_other_active_retry(self.retry_backoff.as_ref(), &retry_key)
             .await;
         self.add_eyes_best_effort(repo, mr.iid).await;
-        let review_ctx = self
-            .build_codex_review_context_for_run(repo, &mr, head_sha, feature_flags, run_history_id)
-            .await;
-        let review_project_path = review_ctx.project_path.clone();
+        let review_project =
+            resolve_review_project(&self.config, self.gitlab.as_ref(), self.lane, repo, &mr).await;
+        let review_ctx = self.build_codex_review_context(
+            repo,
+            &mr,
+            head_sha,
+            review_project.project_path.clone(),
+            feature_flags,
+            run_history_id,
+        );
         let discussion_source = review_ctx.discussion_source.clone();
 
         if self.bail_if_start_rejected(&run_identity).await? {
@@ -1816,7 +1756,7 @@ impl ReviewRunContext {
                         &run_identity,
                         &mr,
                         inline_review_comments_enabled,
-                        &review_project_path,
+                        &review_project,
                         discussion_source.as_deref(),
                         comment,
                     )

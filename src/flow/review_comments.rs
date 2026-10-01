@@ -1,7 +1,7 @@
 use crate::codex_runner::{ReviewComment, ReviewFinding, repo_checkout_root};
 use crate::config::Config;
 use crate::flow::comment_text::sanitize_comment_text;
-use crate::gitlab::links::gitlab_web_base;
+use crate::flow::review_project::ResolvedReviewProject;
 use crate::gitlab::{
     DiffDiscussionPosition, GitLabApi, MergeRequest, MergeRequestDiff, MergeRequestDiffDiscussion,
     MergeRequestDiffVersion,
@@ -26,13 +26,14 @@ struct ReviewCommentPostingOptions<'a> {
     finding_marker_prefix: &'a str,
 }
 
+/// Uses the project identity resolved before Codex runs. Publication does not resolve it again.
 pub(crate) struct PostReviewCommentRequest<'a> {
     pub inline_review_comments_enabled: bool,
     pub lane: ReviewLane,
     pub config: &'a Config,
     pub gitlab: &'a dyn GitLabApi,
     pub bot_user_id: u64,
-    pub project_path: &'a str,
+    pub project: &'a ResolvedReviewProject,
     pub repo: &'a str,
     pub mr: &'a MergeRequest,
     pub head_sha: &'a str,
@@ -64,11 +65,12 @@ struct DiffFileAnchors {
     anchors_by_new_line: HashMap<usize, DiffAnchor>,
 }
 
+/// Publishes findings and summary text with the prepared source links.
+/// Returns an error if GitLab cannot accept a required comment.
 pub(crate) async fn post_review_comment(request: PostReviewCommentRequest<'_>) -> Result<()> {
     let options = posting_options(request.config, request.lane);
-    let project_web_base =
-        resolve_project_web_base(request.config, request.gitlab, request.repo, request.mr).await;
-    let worktree_root = repo_checkout_root(request.project_path);
+    let project_web_base = &request.project.source_web_base;
+    let worktree_root = repo_checkout_root(&request.project.project_path);
     if !request.inline_review_comments_enabled {
         let full_body = legacy_note_body(options, request.head_sha, &request.comment.body);
         request
@@ -759,39 +761,70 @@ fn blob_url(project_web_base: &str, head_sha: &str, relative_path: &str, line: u
     format!("{project_web_base}/-/blob/{head_sha}/{encoded_path}#L{line}")
 }
 
-async fn resolve_project_web_base(
-    config: &Config,
-    gitlab: &dyn GitLabApi,
-    repo: &str,
-    mr: &MergeRequest,
-) -> String {
-    if let (Some(source_project_id), Some(target_project_id)) =
-        (mr.source_project_id, mr.target_project_id)
-        && source_project_id != target_project_id
-        && let Ok(project) = gitlab.get_project(&source_project_id.to_string()).await
-        && let Some(path_with_namespace) = project.path_with_namespace
-    {
-        return format!(
-            "{}/{}",
-            gitlab_web_base(&config.gitlab.base_url),
-            path_with_namespace
-        );
-    }
-    project_web_base(config, repo, mr)
-}
-
-fn project_web_base(config: &Config, repo: &str, mr: &MergeRequest) -> String {
-    if let Some(web_url) = &mr.web_url
-        && let Some((base, _)) = web_url.split_once("/-/merge_requests/")
-    {
-        return base.to_string();
-    }
-    format!("{}/{}", gitlab_web_base(&config.gitlab.base_url), repo)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn publication_uses_resolved_source_links_without_project_lookup() -> Result<()> {
+        use serde_json::json;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_string_contains, method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/v4/projects/target%2Frepo/merge_requests/50/notes",
+            ))
+            .and(body_string_contains(
+                "https://gitlab.example.com/fork/source/-/blob/head/src/lib.rs#L10",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 1})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gitlab = crate::gitlab::GitLabClient::new(&server.uri(), "token")?;
+        let config = crate::config::test_builder::ConfigBuilder::for_review_tests().build();
+        let mr = serde_json::from_value(json!({
+            "iid": 50, "source_project_id": 123, "target_project_id": 456,
+            "web_url": "https://gitlab.example.com/target/repo/-/merge_requests/50"
+        }))?;
+        let project = ResolvedReviewProject {
+            project_path: "fork/source".to_string(),
+            source_web_base: "https://gitlab.example.com/fork/source".to_string(),
+        };
+        let comment = ReviewComment {
+            summary: "needs changes".to_string(),
+            overall_explanation: Some("See /work/repo/fork/source/src/lib.rs:10.".to_string()),
+            overall_confidence_score: None,
+            findings: Vec::new(),
+            body: "legacy body".to_string(),
+            omitted_duplicate_count: 0,
+        };
+        post_review_comment(PostReviewCommentRequest {
+            inline_review_comments_enabled: true,
+            lane: ReviewLane::General,
+            config: &config,
+            gitlab: &gitlab,
+            bot_user_id: 1,
+            project: &project,
+            repo: "target/repo",
+            mr: &mr,
+            head_sha: "head",
+            comment: &comment,
+            discussion_source: None,
+        })
+        .await?;
+        server.verify().await;
+        Ok(())
+    }
 
     #[test]
     fn parse_hunk_header_extracts_old_and_new_starts() {
@@ -959,14 +992,6 @@ mod tests {
 
         assert!(body.contains("![shot](/uploads/hash/screenshot.png)"));
         assert!(body.contains("<!-- codex-review:sha=sha1 -->"));
-    }
-
-    #[test]
-    fn gitlab_web_base_strips_api_suffix() {
-        assert_eq!(
-            gitlab_web_base("https://gitlab.example.com/api/v4"),
-            "https://gitlab.example.com"
-        );
     }
 
     #[test]
