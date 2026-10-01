@@ -1,7 +1,17 @@
+use super::placeholders::render_placeholders;
 use super::{DockerCodexRunner, MentionCommandContext, Url, shell_quote};
 use serde_json::{Value, json};
 use std::path::Path;
 use tracing::warn;
+
+// Limit attachment storage in each mention command.
+/// Maximum upload download attempts in one mention command.
+pub(crate) const MAX_MENTION_IMAGES: usize = 8;
+/// Maximum retained file size in bytes. The downloader reads one extra byte
+/// to detect larger responses.
+pub(crate) const MAX_MENTION_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+/// The downloader returns this status without retaining an oversized image.
+pub(crate) const MENTION_IMAGE_TOO_LARGE_EXIT_CODE: i64 = 87;
 
 pub(crate) struct PreparedMentionInputs {
     pub(crate) turn_input: Vec<Value>,
@@ -75,36 +85,24 @@ fn gitlab_project_upload_api_url(
     )
 }
 
+/// Returns the size-limit status for oversized responses. Removes partial files
+/// on failure. Reads the GitLab token from the command environment.
 pub(crate) fn mention_image_download_exec_command(destination: &str, url: &str) -> Vec<String> {
     let destination_q = shell_quote(destination);
     let url_q = shell_quote(url);
-    vec![
-        "bash".to_string(),
-        "-lc".to_string(),
-        format!(
-            "set -euo pipefail\n\
-dest={destination_q}\n\
-url={url_q}\n\
-if command -v curl >/dev/null 2>&1; then\n\
-  curl --fail --silent --show-error --location --header \"PRIVATE-TOKEN: $GITLAB_TOKEN\" --output \"$dest\" \"$url\"\n\
-elif command -v python3 >/dev/null 2>&1; then\n\
-  DEST=\"$dest\" URL=\"$url\" python3 - <<'PY'\n\
-import os\n\
-import urllib.request\n\
-\n\
-request = urllib.request.Request(\n\
-    os.environ['URL'],\n\
-    headers={{'PRIVATE-TOKEN': os.environ['GITLAB_TOKEN']}},\n\
-)\n\
-with urllib.request.urlopen(request) as response, open(os.environ['DEST'], 'wb') as handle:\n\
-    handle.write(response.read())\n\
-PY\n\
-else\n\
-  printf 'missing curl and python3' >&2\n\
-  exit 127\n\
-fi"
-        ),
-    ]
+    let max_bytes = MAX_MENTION_IMAGE_BYTES.to_string();
+    let too_large_exit_code = MENTION_IMAGE_TOO_LARGE_EXIT_CODE.to_string();
+    let script = render_placeholders(
+        include_str!("assets/mention_image_download.sh"),
+        &[
+            ("DESTINATION", &destination_q),
+            ("URL", &url_q),
+            ("MAX_BYTES", &max_bytes),
+            ("TOO_LARGE_EXIT_CODE", &too_large_exit_code),
+        ],
+    )
+    .expect("mention download template placeholders are valid");
+    vec!["bash".to_string(), "-lc".to_string(), script]
 }
 
 impl DockerCodexRunner {
@@ -114,7 +112,15 @@ impl DockerCodexRunner {
         repo_dir: &str,
         ctx: &MentionCommandContext,
     ) -> PreparedMentionInputs {
-        let mut prepared = PreparedMentionInputs::text_only(&ctx.prompt);
+        let mut prompt = ctx.prompt.clone();
+        if ctx.image_uploads.len() > MAX_MENTION_IMAGES {
+            prompt.push_str(&format!(
+                "\n\nSkipped image attachments: {}. The limit is {} images per command.",
+                ctx.image_uploads.len() - MAX_MENTION_IMAGES,
+                MAX_MENTION_IMAGES
+            ));
+        }
+        let mut prepared = PreparedMentionInputs::text_only(&prompt);
         if ctx.image_uploads.is_empty() {
             return prepared;
         }
@@ -152,7 +158,12 @@ impl DockerCodexRunner {
             return prepared;
         }
         let mut image_paths = Vec::new();
-        for (index, upload) in ctx.image_uploads.iter().enumerate() {
+        for (index, upload) in ctx
+            .image_uploads
+            .iter()
+            .take(MAX_MENTION_IMAGES)
+            .enumerate()
+        {
             let file_name = sanitized_attachment_filename(upload.filename.as_str(), index);
             let destination = format!("{temp_dir}/{file_name}");
             let url = gitlab_project_upload_api_url(
@@ -161,15 +172,30 @@ impl DockerCodexRunner {
                 upload.secret.as_str(),
                 upload.filename.as_str(),
             );
-            if let Err(err) = self
-                .exec_container_command_with_env(
+            let command = mention_image_download_exec_command(&destination, &url);
+            let download = self
+                .exec_container_command_with_env_allow_failure(
                     container_id,
-                    mention_image_download_exec_command(destination.as_str(), url.as_str()),
+                    command.clone(),
                     Some(repo_dir),
                     Some(vec![format!("GITLAB_TOKEN={}", self.gitlab_token)]),
                 )
-                .await
+                .await;
+            if download
+                .as_ref()
+                .is_ok_and(|output| output.exit_code == MENTION_IMAGE_TOO_LARGE_EXIT_CODE)
             {
+                prompt.push_str(&format!(
+                    "\n\nImage {} was skipped because it exceeds the {}-byte limit.",
+                    index + 1,
+                    MAX_MENTION_IMAGE_BYTES
+                ));
+                continue;
+            }
+            let download = download.and_then(|output| {
+                super::container::validate_container_exec_result(&command, Some(repo_dir), output)
+            });
+            if let Err(err) = download {
                 warn!(
                     repo = ctx.discussion_project_path.as_str(),
                     discussion_id = ctx.discussion_id.as_str(),
@@ -182,10 +208,7 @@ impl DockerCodexRunner {
             }
             image_paths.push(destination);
         }
-        if image_paths.is_empty() {
-            return prepared;
-        }
-        prepared.turn_input = build_mention_turn_input(&ctx.prompt, &image_paths);
+        prepared.turn_input = build_mention_turn_input(&prompt, &image_paths);
         prepared
     }
 }
@@ -194,6 +217,59 @@ impl DockerCodexRunner {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn oversized_mention_image_download_is_skipped() -> anyhow::Result<()> {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        for size in [MAX_MENTION_IMAGE_BYTES + 1, MAX_MENTION_IMAGE_BYTES] {
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0; size]))
+                .expect(2)
+                .mount(&server)
+                .await;
+            for disabled_tool in ["python3", "curl"] {
+                let directory = tempfile::tempdir()?;
+                let destination = directory.path().join("image.png");
+                let command = mention_image_download_exec_command(
+                    destination.to_str().expect("path"),
+                    &server.uri(),
+                );
+                let script = format!(
+                    "command() {{ if [ \"$1\" = '-v' ] && [ \"$2\" = '{disabled_tool}' ]; then return 1; fi; builtin command \"$@\"; }}\n{}",
+                    command[2]
+                );
+                let output = tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("bash")
+                        .arg("-lc")
+                        .arg(script)
+                        .env("GITLAB_TOKEN", "test-token")
+                        .output()
+                })
+                .await??;
+
+                assert_eq!(
+                    output.status.code(),
+                    Some(if size > MAX_MENTION_IMAGE_BYTES {
+                        87
+                    } else {
+                        0
+                    }),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if size > MAX_MENTION_IMAGE_BYTES {
+                    assert!(!destination.exists());
+                } else {
+                    assert_eq!(std::fs::read(destination)?, vec![0; size]);
+                }
+            }
+            server.verify().await;
+            server.reset().await;
+        }
+        Ok(())
+    }
 
     #[test]
     fn build_mention_turn_input_appends_local_images_after_text() {

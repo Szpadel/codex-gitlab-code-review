@@ -338,6 +338,91 @@ async fn prepare_mention_inputs_downloads_images_inside_container() {
 }
 
 #[tokio::test]
+async fn mention_images_enforce_size_and_count_limits() {
+    use super::super::mention_inputs::{
+        MAX_MENTION_IMAGES, MENTION_IMAGE_TOO_LARGE_EXIT_CODE, mention_image_download_exec_command,
+    };
+
+    let repo_dir = repo_checkout_root("group/repo");
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: vec![
+                "mktemp".to_string(),
+                "-d".to_string(),
+                "/tmp/codex-mention-images-XXXXXX".to_string(),
+            ],
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: "/tmp/images\n".to_string(),
+            stderr: String::new(),
+        },
+    );
+    for index in 0..MAX_MENTION_IMAGES {
+        let destination = format!("/tmp/images/{:02}-image-{index}.png", index + 1);
+        let url = format!(
+            "https://gitlab.example.com/api/v4/projects/group%2Frepo/uploads/hash/image-{index}.png"
+        );
+        harness.push_exec_output(
+            ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: mention_image_download_exec_command(&destination, &url),
+                cwd: Some(repo_dir.clone()),
+                env: Some(vec!["GITLAB_TOKEN=token".to_string()]),
+            },
+            ContainerExecOutput {
+                exit_code: if index == 0 {
+                    MENTION_IMAGE_TOO_LARGE_EXIT_CODE
+                } else {
+                    0
+                },
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        );
+    }
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), true, harness.clone(), None).await;
+    let ctx = MentionCommandContext {
+        repo: "group/repo".to_string(),
+        project_path: "group/repo".to_string(),
+        discussion_project_path: "group/repo".to_string(),
+        mr: review_context_with_target_branch(Some("main")).mr,
+        head_sha: "sha1".to_string(),
+        discussion_id: "discussion".to_string(),
+        trigger_note_id: 1,
+        requester_name: "Alice".to_string(),
+        requester_email: "alice@example.com".to_string(),
+        additional_developer_instructions: None,
+        prompt: "Inspect these images".to_string(),
+        image_uploads: (0..=MAX_MENTION_IMAGES)
+            .map(|index| crate::gitlab::links::GitLabMarkdownImageUpload {
+                markdown_path: format!("/uploads/hash/image-{index}.png"),
+                absolute_url: format!("https://gitlab.example.com/uploads/hash/image-{index}.png"),
+                secret: "hash".to_string(),
+                filename: format!("image-{index}.png"),
+            })
+            .collect(),
+        feature_flags: FeatureFlagSnapshot::default(),
+        run_history_id: None,
+    };
+
+    let prepared = runner
+        .prepare_mention_inputs("app-1", &repo_dir, &ctx)
+        .await;
+
+    assert_eq!(harness.exec_requests().len(), MAX_MENTION_IMAGES + 1);
+    assert_eq!(prepared.turn_input.len(), MAX_MENTION_IMAGES);
+    let prompt = prepared.turn_input[0]["text"].as_str().expect("prompt");
+    assert!(prompt.contains("Image 1 was skipped"));
+    assert!(prompt.contains("Skipped image attachments: 1."));
+}
+
+#[tokio::test]
 async fn run_mention_command_with_fake_runtime_initializes_before_composer_install() {
     let repo_dir = repo_checkout_root("group/repo");
     let harness = Arc::new(FakeRunnerHarness::default());
