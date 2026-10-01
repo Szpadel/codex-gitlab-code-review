@@ -43,6 +43,7 @@ pub(super) fn build_scripted_app_client(
         stdout_scan_offset: 0,
         stderr_scan_offset: 0,
         pending_notifications: VecDeque::new(),
+        pending_history: super::super::app_server::TurnHistoryCapture::default(),
         reasoning_buffers: HashMap::new(),
         agent_message_buffers: HashMap::new(),
         command_output_buffers: HashMap::new(),

@@ -60,6 +60,7 @@ fn empty_app_server_client() -> AppServerClient {
         stdout_scan_offset: 0,
         stderr_scan_offset: 0,
         pending_notifications: VecDeque::new(),
+        pending_history: TurnHistoryCapture::default(),
         reasoning_buffers: HashMap::new(),
         agent_message_buffers: HashMap::new(),
         command_output_buffers: HashMap::new(),

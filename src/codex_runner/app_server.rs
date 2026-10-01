@@ -19,6 +19,7 @@ pub(crate) struct AppServerClient {
     pub(crate) stdout_scan_offset: usize,
     pub(crate) stderr_scan_offset: usize,
     pub(crate) pending_notifications: VecDeque<Value>,
+    pub(crate) pending_history: TurnHistoryCapture,
     pub(crate) reasoning_buffers: HashMap<String, ReasoningBuffer>,
     pub(crate) agent_message_buffers: HashMap<String, String>,
     pub(crate) command_output_buffers: HashMap<String, String>,
@@ -59,6 +60,9 @@ pub(crate) struct TurnHistoryCapture {
 }
 
 pub(crate) const GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID: &str = "gitlab-discovery-mcp-startup";
+
+// Bound each SQLite transaction while reducing writes during notification bursts.
+const HISTORY_EVENT_BATCH_SIZE: usize = 32;
 
 impl TurnHistoryCapture {
     pub(crate) fn push(&mut self, turn_id: Option<&str>, event_type: &str, payload: Value) {
@@ -105,6 +109,7 @@ impl AppServerClient {
             stdout_scan_offset: 0,
             stderr_scan_offset: 0,
             pending_notifications: VecDeque::new(),
+            pending_history: TurnHistoryCapture::default(),
             reasoning_buffers: HashMap::new(),
             agent_message_buffers: HashMap::new(),
             command_output_buffers: HashMap::new(),
@@ -137,6 +142,19 @@ impl AppServerClient {
         self.send_json(&json!({ "method": "initialized" })).await
     }
 
+    /// Retains the batch in the client if the persistence future is cancelled.
+    async fn flush_pending_history<FPersist, FPersistFut>(&mut self, persist_events: &mut FPersist)
+    where
+        FPersist: FnMut(Vec<NewRunHistoryEvent>) -> FPersistFut,
+        FPersistFut: Future<Output = ()>,
+    {
+        if self.pending_history.events.is_empty() {
+            return;
+        }
+        persist_events(self.pending_history.events.clone()).await;
+        self.pending_history.take_pending();
+    }
+
     pub(crate) async fn stream_review<FPersist, FGitLab, FPersistFut, FGitLabFut>(
         &mut self,
         thread_id: &str,
@@ -153,11 +171,13 @@ impl AppServerClient {
     {
         let mut review_text = None;
         let mut gitlab_discovery_success_observed = false;
-        let mut history_capture = TurnHistoryCapture::default();
         loop {
             let message = match self.next_notification().await {
                 Ok(message) => message,
-                Err(err) => break Err(err),
+                Err(err) => {
+                    self.flush_pending_history(&mut persist_events).await;
+                    break Err(err);
+                }
             };
             let method = message
                 .get("method")
@@ -168,7 +188,8 @@ impl AppServerClient {
                 continue;
             }
 
-            let outcome = match self.handle_turn_notification(
+            let mut history_capture = std::mem::take(&mut self.pending_history);
+            let outcome = self.handle_turn_notification(
                 method,
                 params,
                 TurnNotificationContext {
@@ -189,22 +210,22 @@ impl AppServerClient {
                         gitlab_discovery_success_observed = true;
                     }
                 },
-            ) {
+            );
+            self.pending_history = history_capture;
+            let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    let pending_events = history_capture.take_pending();
-                    if !pending_events.is_empty() {
-                        persist_events(pending_events).await;
-                    }
+                    self.flush_pending_history(&mut persist_events).await;
                     if gitlab_discovery_success_observed {
                         on_gitlab_discovery_success().await;
                     }
                     break Err(err);
                 }
             };
-            let pending_events = history_capture.take_pending();
-            if !pending_events.is_empty() {
-                persist_events(pending_events).await;
+            if self.pending_history.events.len() >= HISTORY_EVENT_BATCH_SIZE
+                || outcome == TurnStreamNotificationOutcome::TurnCompleted
+            {
+                self.flush_pending_history(&mut persist_events).await;
             }
             if gitlab_discovery_success_observed {
                 on_gitlab_discovery_success().await;
@@ -233,11 +254,13 @@ impl AppServerClient {
         let final_message = RefCell::new(None);
         let message_deltas: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
         let mut gitlab_discovery_success_observed = false;
-        let mut history_capture = TurnHistoryCapture::default();
         loop {
             let message = match self.next_notification().await {
                 Ok(message) => message,
-                Err(err) => break Err(err),
+                Err(err) => {
+                    self.flush_pending_history(&mut persist_events).await;
+                    break Err(err);
+                }
             };
             let method = message
                 .get("method")
@@ -248,7 +271,8 @@ impl AppServerClient {
                 continue;
             }
 
-            let outcome = match self.handle_turn_notification(
+            let mut history_capture = std::mem::take(&mut self.pending_history);
+            let outcome = self.handle_turn_notification(
                 method,
                 params,
                 TurnNotificationContext {
@@ -292,22 +316,22 @@ impl AppServerClient {
                         gitlab_discovery_success_observed = true;
                     }
                 },
-            ) {
+            );
+            self.pending_history = history_capture;
+            let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    let pending_events = history_capture.take_pending();
-                    if !pending_events.is_empty() {
-                        persist_events(pending_events).await;
-                    }
+                    self.flush_pending_history(&mut persist_events).await;
                     if gitlab_discovery_success_observed {
                         on_gitlab_discovery_success().await;
                     }
                     break Err(err);
                 }
             };
-            let pending_events = history_capture.take_pending();
-            if !pending_events.is_empty() {
-                persist_events(pending_events).await;
+            if self.pending_history.events.len() >= HISTORY_EVENT_BATCH_SIZE
+                || outcome == TurnStreamNotificationOutcome::TurnCompleted
+            {
+                self.flush_pending_history(&mut persist_events).await;
             }
             if gitlab_discovery_success_observed {
                 on_gitlab_discovery_success().await;
