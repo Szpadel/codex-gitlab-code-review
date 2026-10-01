@@ -1,7 +1,7 @@
 use crate::codex_runner::docker::{connect_docker, ensure_image, normalize_image_reference};
-use crate::codex_runner::placeholders::render_placeholders;
 use crate::codex_runner::shell_quote;
 use crate::config::{CodexConfig, DockerConfig};
+use crate::placeholders::render_placeholders;
 use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
 use bollard::container::LogOutput;

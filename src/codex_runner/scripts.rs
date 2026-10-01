@@ -6,7 +6,7 @@ use super::{
 use crate::codex_runner::app_server_diagnostics::{
     CODEX_INSTALL_LOG_CHUNK_BYTES, CODEX_INSTALL_LOG_MAX_BYTES, CODEX_INSTALL_LOG_PATH,
 };
-use crate::codex_runner::placeholders::render_placeholders;
+use crate::placeholders::render_placeholders;
 use std::fmt::Write as _;
 
 const MENTION_COMMAND_TEMPLATE: &str = include_str!("assets/mention_command.sh");

@@ -54,7 +54,6 @@ pub(crate) mod duration;
 mod gitlab_discovery;
 mod mention_flow;
 mod mention_inputs;
-pub(crate) mod placeholders;
 mod review_flow;
 mod review_output;
 mod scripts;

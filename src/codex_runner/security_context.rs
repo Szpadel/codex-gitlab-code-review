@@ -8,7 +8,7 @@ use super::{
     SecurityContextBuildCompletionGuard, SecurityContextBuildKey, SecurityContextBuildRegistration,
     Utc, Value, anyhow, bail, debug, json, warn,
 };
-use crate::codex_runner::placeholders::render_placeholders;
+use crate::placeholders::render_placeholders;
 use crate::state::NewRunHistoryEvent;
 use std::sync::{Arc, Mutex};
 

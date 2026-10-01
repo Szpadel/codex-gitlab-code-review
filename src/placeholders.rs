@@ -1,6 +1,11 @@
+//! Strict single-pass rendering of `@@KEY@@` template tokens.
+
 use anyhow::{Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Replaces tokens without scanning replacement values for more tokens.
+/// Returns an error for invalid, duplicate, missing, or unused keys, or an
+/// unclosed token.
 pub(crate) fn render_placeholders(template: &str, replacements: &[(&str, &str)]) -> Result<String> {
     let mut replacements_by_key = BTreeMap::new();
     for (key, value) in replacements {

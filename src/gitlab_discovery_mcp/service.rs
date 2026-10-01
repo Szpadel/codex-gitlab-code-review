@@ -4,13 +4,13 @@ use super::{
     ResolvedGitLabDiscoveryAllowList, resolve_allow_list,
 };
 use crate::codex_runner::docker::connect_docker;
-use crate::codex_runner::placeholders::render_placeholders;
 use crate::composer_install::{
     ComposerCommandOutput, ComposerInstallMode, ComposerInstallPlan, ComposerInstallResult,
     DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS, redact_composer_related_output,
 };
 use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig};
 use crate::gitlab::GitLabClient;
+use crate::placeholders::render_placeholders;
 use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
 use bollard::container::LogOutput;

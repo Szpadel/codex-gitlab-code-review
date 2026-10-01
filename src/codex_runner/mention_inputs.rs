@@ -1,5 +1,5 @@
-use super::placeholders::render_placeholders;
 use super::{DockerCodexRunner, MentionCommandContext, Url, shell_quote};
+use crate::placeholders::render_placeholders;
 use serde_json::{Value, json};
 use std::path::Path;
 use tracing::warn;
