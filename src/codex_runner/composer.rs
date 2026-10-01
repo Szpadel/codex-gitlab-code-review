@@ -18,6 +18,39 @@ impl DockerCodexRunner {
         run_history_id: Option<i64>,
     ) -> Option<ComposerInstallResult> {
         let mode = ComposerInstallMode::for_flags(feature_flags)?;
+        let presence = self
+            .exec_container_command_with_env_allow_failure(
+                container_id,
+                vec![
+                    "test".to_string(),
+                    "-f".to_string(),
+                    "composer.json".to_string(),
+                ],
+                Some(repo_path),
+                None,
+            )
+            .await;
+        let preflight_error = match presence {
+            Ok(output) if output.exit_code == 0 => None,
+            Ok(output) if output.exit_code == 1 => {
+                return Some(ComposerInstallResult::skipped(mode, None));
+            }
+            Ok(output) => Some(format!(
+                "Check composer.json failed with exit code {}: {}",
+                output.exit_code, output.stderr
+            )),
+            Err(err) => Some(format!("Check composer.json failed: {err:#}")),
+        };
+        if let Some(error) = preflight_error {
+            warn!(
+                container_id,
+                repo_path, error, "Composer file check failed. Continue without installation"
+            );
+            let result = ComposerInstallResult::failed(mode, None, error);
+            self.append_composer_install_result(run_history_id, mode.command_label(), &result)
+                .await;
+            return Some(result);
+        }
         let auth_lookup = self.resolve_composer_auth_lookup(project_path).await;
         let composer_auth = auth_lookup.value.clone();
         let prepared_auth = prepare_composer_auth(

@@ -34,8 +34,7 @@ use super::test_support::{
 };
 use super::*;
 use crate::composer_install::{
-    COMPOSER_SKIP_MARKER, ComposerInstallMode, DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
-    composer_install_exec_command,
+    ComposerInstallMode, DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS, composer_install_exec_command,
 };
 use crate::config::{
     DepsConfig, FallbackAuthAccountConfig, GitLabTargets, McpServerOverridesConfig,

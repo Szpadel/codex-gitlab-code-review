@@ -422,6 +422,23 @@ async fn run_review_with_fake_runtime_initializes_before_composer_install() -> R
             })),
         ]),
     ]));
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: vec![
+                "test".to_string(),
+                "-f".to_string(),
+                "composer.json".to_string(),
+            ],
+            cwd: Some(repo_checkout_root("group/repo")),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    );
     let composer_command = composer_install_exec_command(
         ComposerInstallMode::Full,
         DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
@@ -431,12 +448,12 @@ async fn run_review_with_fake_runtime_initializes_before_composer_install() -> R
         ExecContainerCommandRequest {
             container_id: "app-1".to_string(),
             command: composer_command.clone(),
-            cwd: Some("/work/repo".to_string()),
+            cwd: Some(repo_checkout_root("group/repo")),
             env: None,
         },
         ContainerExecOutput {
-            exit_code: 86,
-            stdout: format!("{COMPOSER_SKIP_MARKER}:missing-composer-json\n"),
+            exit_code: 0,
+            stdout: String::new(),
             stderr: String::new(),
         },
     );
@@ -471,10 +488,91 @@ async fn run_review_with_fake_runtime_initializes_before_composer_install() -> R
                     "composer install --no-interaction --no-progress --ignore-platform-reqs",
                 )
         })
-        .expect("composer exec");
+        .unwrap_or_else(|| {
+            panic!(
+                "Composer exec was not recorded: {:?}",
+                harness.exec_requests()
+            )
+        });
     assert!(initialize_index < composer_index);
     assert!(initialized_index < composer_index);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_composer_json_does_not_read_gitlab_variables() -> Result<()> {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let harness = Arc::new(FakeRunnerHarness::default());
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: vec![
+                "test".to_string(),
+                "-f".to_string(),
+                "composer.json".to_string(),
+            ],
+            cwd: Some("/work/repo".to_string()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    );
+    let runner = DockerCodexRunner::new_with_test_runtime(
+        test_codex_config(),
+        Url::parse(&server.uri())?,
+        Arc::new(
+            crate::gitlab::GitLabClient::new(&server.uri(), "token")?
+                .with_retry_policy(crate::gitlab::GitLabRetryPolicy::without_delay(1)),
+        ),
+        Arc::new(ReviewStateStore::new(":memory:").await?),
+        None,
+        RunnerRuntimeOptions {
+            gitlab_token: "token".to_string(),
+            log_all_json: false,
+            owner_id: "composer-test".to_string(),
+            mention_commands_active: false,
+            review_additional_developer_instructions: None,
+        },
+        harness.clone(),
+    );
+
+    let result = runner
+        .run_composer_install_step(
+            "app-1",
+            "/work/repo",
+            "group/repo",
+            &FeatureFlagSnapshot {
+                composer_install: true,
+                ..FeatureFlagSnapshot::default()
+            },
+            60,
+            None,
+        )
+        .await
+        .expect("Composer result");
+
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty()
+    );
+    assert!(!result.attempted);
+    assert!(result.success);
+    assert_eq!(harness.exec_requests().len(), 1);
+    server.verify().await;
     Ok(())
 }
 

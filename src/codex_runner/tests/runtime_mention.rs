@@ -344,6 +344,23 @@ async fn run_mention_command_with_fake_runtime_initializes_before_composer_insta
     harness.push_app_server(ScriptedAppServer::from_requests(vec![
         ScriptedAppRequest::result("initialize", json!({})),
     ]));
+    harness.push_exec_output(
+        ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: vec![
+                "test".to_string(),
+                "-f".to_string(),
+                "composer.json".to_string(),
+            ],
+            cwd: Some(repo_dir.clone()),
+            env: None,
+        },
+        ContainerExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    );
     let composer_command = composer_install_exec_command(
         ComposerInstallMode::Full,
         DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
@@ -357,8 +374,8 @@ async fn run_mention_command_with_fake_runtime_initializes_before_composer_insta
             env: None,
         },
         ContainerExecOutput {
-            exit_code: 86,
-            stdout: format!("{COMPOSER_SKIP_MARKER}:missing-composer-json\n"),
+            exit_code: 0,
+            stdout: String::new(),
             stderr: String::new(),
         },
     );
