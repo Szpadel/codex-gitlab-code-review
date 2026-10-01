@@ -1,6 +1,7 @@
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
 use crate::flow::award_service::AwardService;
+use crate::flow::orchestration::TaskAdmission;
 use crate::gitlab::GitLabApi;
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
@@ -140,6 +141,7 @@ pub(crate) struct FlowShared {
     pub(crate) codex: Arc<dyn CodexRunner>,
     pub(crate) bot_user_id: u64,
     pub(crate) semaphore: Arc<Semaphore>,
+    pub(crate) task_admission: Arc<TaskAdmission>,
     pub(crate) lifecycle: Arc<ServiceLifecycle>,
     pub(crate) active_tasks: Arc<ActiveTaskRegistry>,
 }

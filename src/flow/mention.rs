@@ -1233,7 +1233,8 @@ impl MentionFlow {
                         );
                     }
                 },
-            );
+            )
+            .await;
         }
         Ok(outcome)
     }
@@ -1513,6 +1514,7 @@ mod tests {
                 state,
                 bot_user_id: 1,
                 semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+                task_admission: Arc::new(crate::flow::orchestration::TaskAdmission::new(1)),
                 lifecycle: Arc::new(crate::lifecycle::ServiceLifecycle::default()),
                 active_tasks: Arc::new(crate::flow::ActiveTaskRegistry::default()),
             },

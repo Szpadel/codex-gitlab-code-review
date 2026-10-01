@@ -4,6 +4,7 @@ use crate::flow::ActiveTaskRegistry;
 use crate::flow::FlowShared;
 use crate::flow::award_service::AwardService;
 use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
+use crate::flow::orchestration::TaskAdmission;
 use crate::flow::review::{ReviewFlow, ReviewScheduleOutcome};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
@@ -65,6 +66,7 @@ pub struct ReviewService {
     pub(super) mention_flow: Arc<MentionFlow>,
     lifecycle: Arc<ServiceLifecycle>,
     active_tasks: Arc<ActiveTaskRegistry>,
+    task_admission: Arc<TaskAdmission>,
     retry_backoff: Arc<RetryBackoff>,
     retry_warning_awards: RetryWarningAwardService,
     scan_coordinator: ScanCoordinator,
@@ -81,6 +83,7 @@ impl ReviewService {
         created_after: DateTime<Utc>,
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.review.max_concurrent));
+        let task_admission = Arc::new(TaskAdmission::new(config.review.max_concurrent));
         let mention_branch_locks = Arc::new(Mutex::new(HashMap::new()));
         let retry_backoff = Arc::new(RetryBackoff::new(
             REVIEW_FAILURE_RETRY_BASE_DELAY,
@@ -99,6 +102,7 @@ impl ReviewService {
             codex: Arc::clone(&codex),
             bot_user_id,
             semaphore: Arc::clone(&semaphore),
+            task_admission: Arc::clone(&task_admission),
             lifecycle: Arc::clone(&lifecycle),
             active_tasks: Arc::clone(&active_tasks),
         };
@@ -134,6 +138,7 @@ impl ReviewService {
             mention_flow,
             lifecycle,
             active_tasks,
+            task_admission,
             retry_backoff,
             retry_warning_awards,
             scan_coordinator,
@@ -310,10 +315,12 @@ impl ReviewService {
 
     pub fn request_shutdown(&self) {
         self.lifecycle.request_fast_stop();
+        self.task_admission.close();
     }
 
     pub fn request_graceful_drain(&self) {
         self.lifecycle.request_graceful_drain();
+        self.task_admission.close();
     }
 
     pub async fn wait_for_started_runs(&self) {

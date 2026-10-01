@@ -756,7 +756,7 @@ impl ReviewFlow {
         }
     }
 
-    fn spawn_scheduled_review_task(
+    async fn spawn_scheduled_review_task(
         &self,
         mr: MergeRequest,
         prepared: PreparedReviewRun,
@@ -830,7 +830,8 @@ impl ReviewFlow {
                     warn!(repo = task.repo.as_str(), error = %err, "review failed");
                 }
             },
-        );
+        )
+        .await;
     }
 
     async fn acquire_review_permit_or_abort(
@@ -886,7 +887,8 @@ impl ReviewFlow {
             &acquired_rule_ids,
         )
         .await?;
-        self.spawn_scheduled_review_task(mr, prepared, acquired_rule_ids, tasks);
+        self.spawn_scheduled_review_task(mr, prepared, acquired_rule_ids, tasks)
+            .await;
         Ok(ReviewScheduleOutcome::Scheduled)
     }
 

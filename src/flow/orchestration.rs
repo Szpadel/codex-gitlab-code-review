@@ -5,9 +5,42 @@ use super::{
 use crate::state::{ReviewStateStore, RunHistoryFinish};
 use anyhow::Result;
 use chrono::Utc;
+use futures::future::select_all;
 use std::future::Future;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+use tracing::warn;
+
+pub(crate) struct TaskAdmission {
+    semaphore: Arc<Semaphore>,
+    max_tasks: usize,
+}
+
+impl TaskAdmission {
+    pub(crate) fn new(max_concurrent: usize) -> Self {
+        // Two queued batches let successive incremental scans admit work.
+        let max_tasks = max_concurrent.saturating_mul(3).min(Semaphore::MAX_PERMITS);
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_tasks)),
+            max_tasks,
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.semaphore.close();
+    }
+
+    async fn reap_tasks(&self, tasks: &mut Vec<JoinHandle<()>>) {
+        while tasks.len() >= self.max_tasks {
+            let (result, _, remaining) = select_all(std::mem::take(tasks)).await;
+            *tasks = remaining;
+            if let Err(err) = result {
+                warn!(error = %err, "scheduled task failed to join");
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScheduledTaskContext {
@@ -99,7 +132,7 @@ fn track_active_task(registry: &Arc<ActiveTaskRegistry>, key: ActiveTaskKey) -> 
     }
 }
 
-pub(crate) fn spawn_orchestrated_task<
+pub(crate) async fn spawn_orchestrated_task<
     BeforeAcquire,
     BeforeState,
     OnSemaphoreClosed,
@@ -129,7 +162,19 @@ pub(crate) fn spawn_orchestrated_task<
     let semaphore = Arc::clone(&shared.semaphore);
     let lifecycle = Arc::clone(&shared.lifecycle);
     let active_task = track_active_task(&shared.active_tasks, key);
+    let Ok(admission) = shared
+        .task_admission
+        .semaphore
+        .clone()
+        .acquire_owned()
+        .await
+    else {
+        on_start_rejected(before_acquire.await).await;
+        return;
+    };
+    shared.task_admission.reap_tasks(tasks).await;
     tasks.push(tokio::spawn(async move {
+        let _admission = admission;
         let _active_task = active_task;
         let before_state = before_acquire.await;
         let Ok(_permit) = semaphore.acquire_owned().await else {
