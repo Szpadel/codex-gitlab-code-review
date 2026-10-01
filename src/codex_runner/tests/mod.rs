@@ -57,6 +57,8 @@ fn empty_app_server_client() -> AppServerClient {
         output: Box::pin(futures::stream::empty()),
         stdout_buffer: Vec::new(),
         stderr_buffer: Vec::new(),
+        stdout_scan_offset: 0,
+        stderr_scan_offset: 0,
         pending_notifications: VecDeque::new(),
         reasoning_buffers: HashMap::new(),
         agent_message_buffers: HashMap::new(),

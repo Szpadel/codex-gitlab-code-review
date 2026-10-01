@@ -66,3 +66,38 @@ async fn interleaved_stderr_does_not_corrupt_stdout_json() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn fragmented_long_lines_complete_within_deadline() -> Result<()> {
+    let text = "x".repeat(2 * 1024 * 1024);
+    let expected = json!({"text": text});
+    let stdout = format!("{expected}\n{{\"next\":true}}\n");
+    let stderr = format!("codex-runner-error: {text}\n");
+    let frames = stderr
+        .as_bytes()
+        .chunks(128)
+        .map(|chunk| LogOutput::StdErr {
+            message: chunk.to_vec().into(),
+        })
+        .chain(
+            stdout
+                .as_bytes()
+                .chunks(128)
+                .map(|chunk| LogOutput::StdOut {
+                    message: chunk.to_vec().into(),
+                }),
+        )
+        .collect::<VecDeque<_>>();
+    let mut client = empty_app_server_client();
+    client.output = Box::pin(futures::stream::unfold(frames, |mut frames| async {
+        tokio::task::yield_now().await;
+        frames.pop_front().map(|frame| (Ok(frame), frames))
+    }));
+
+    // A generous deadline rejects repeated scans of multi-megabyte lines.
+    let first = tokio::time::timeout(Duration::from_secs(5), client.next_message()).await??;
+    assert_eq!(first, expected);
+    assert_eq!(client.next_message().await?, json!({"next": true}));
+    assert_eq!(client.recent_runner_errors.len(), 1);
+    Ok(())
+}

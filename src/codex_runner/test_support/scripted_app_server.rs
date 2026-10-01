@@ -40,6 +40,8 @@ pub(super) fn build_scripted_app_client(
         output: Box::pin(output),
         stdout_buffer: Vec::new(),
         stderr_buffer: Vec::new(),
+        stdout_scan_offset: 0,
+        stderr_scan_offset: 0,
         pending_notifications: VecDeque::new(),
         reasoning_buffers: HashMap::new(),
         agent_message_buffers: HashMap::new(),

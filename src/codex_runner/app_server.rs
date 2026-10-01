@@ -16,6 +16,8 @@ pub(crate) struct AppServerClient {
         Pin<Box<dyn futures::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>,
     pub(crate) stdout_buffer: Vec<u8>,
     pub(crate) stderr_buffer: Vec<u8>,
+    pub(crate) stdout_scan_offset: usize,
+    pub(crate) stderr_scan_offset: usize,
     pub(crate) pending_notifications: VecDeque<Value>,
     pub(crate) reasoning_buffers: HashMap<String, ReasoningBuffer>,
     pub(crate) agent_message_buffers: HashMap<String, String>,
@@ -100,6 +102,8 @@ impl AppServerClient {
             output: attach.output,
             stdout_buffer: Vec::new(),
             stderr_buffer: Vec::new(),
+            stdout_scan_offset: 0,
+            stderr_scan_offset: 0,
             pending_notifications: VecDeque::new(),
             reasoning_buffers: HashMap::new(),
             agent_message_buffers: HashMap::new(),
@@ -720,8 +724,9 @@ impl AppServerClient {
 
     pub(crate) async fn next_message(&mut self) -> Result<Value> {
         loop {
-            if let Some(pos) = self.stdout_buffer.iter().position(|byte| *byte == b'\n') {
-                let line = self.stdout_buffer.drain(..=pos).collect::<Vec<u8>>();
+            if let Some(line) =
+                take_output_line(&mut self.stdout_buffer, &mut self.stdout_scan_offset)
+            {
                 let line = String::from_utf8_lossy(&line);
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
@@ -749,10 +754,9 @@ impl AppServerClient {
                     }
                     LogOutput::StdErr { message } => {
                         self.stderr_buffer.extend_from_slice(&message);
-                        while let Some(pos) =
-                            self.stderr_buffer.iter().position(|byte| *byte == b'\n')
+                        while let Some(line) =
+                            take_output_line(&mut self.stderr_buffer, &mut self.stderr_scan_offset)
                         {
-                            let line = self.stderr_buffer.drain(..=pos).collect::<Vec<u8>>();
                             let line = String::from_utf8_lossy(&line);
                             let trimmed = line.trim();
                             if !trimmed.is_empty() && !self.handle_runner_diagnostic(trimmed) {
@@ -802,6 +806,20 @@ impl AppServerClient {
             self.recent_runner_errors.pop_front();
         }
     }
+}
+
+/// Scan only new bytes. Reset the offset after a complete line is consumed.
+fn take_output_line(buffer: &mut Vec<u8>, scan_offset: &mut usize) -> Option<Vec<u8>> {
+    if let Some(position) = buffer[*scan_offset..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+    {
+        let end = *scan_offset + position;
+        *scan_offset = 0;
+        return Some(buffer.drain(..=end).collect());
+    }
+    *scan_offset = buffer.len();
+    None
 }
 
 pub(crate) fn matches_thread_turn(params: Option<&Value>, thread_id: &str, turn_id: &str) -> bool {
