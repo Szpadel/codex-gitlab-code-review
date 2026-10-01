@@ -4,7 +4,7 @@ use super::{
     AppServerClient, Arc, AttachContainerOptionsBuilder, BROWSER_CONTAINER_NAME_PREFIX,
     BrowserMcpConfig, ContainerCreateBody, Context, CreateContainerOptionsBuilder,
     DockerCodexRunner, ExecConfig, HashMap, HostConfig, ListContainersOptionsBuilder, LogOutput,
-    Mount, MountTmpfsOptions, MountTypeEnum, REVIEW_CONTAINER_NAME_PREFIX, REVIEW_OWNER_LABEL_KEY,
+    Mount, MountTmpfsOptions, MountType, REVIEW_CONTAINER_NAME_PREFIX, REVIEW_OWNER_LABEL_KEY,
     RemoveContainerOptionsBuilder, Result, RunnerRuntime, StartContainerOptionsBuilder,
     StartExecOptions, StartExecResults, StartedAppServer, StreamExt, Uuid, anyhow, bail,
     effective_browser_mcp, ensure_image, info, normalize_image_reference, shell_quote, warn,
@@ -96,7 +96,7 @@ impl DockerCodexRunner {
 
         Some(vec![Mount {
             target: Some(Self::WORK_TMPFS_TARGET.to_string()),
-            typ: Some(MountTypeEnum::TMPFS),
+            typ: Some(MountType::TMPFS),
             tmpfs_options: Some(MountTmpfsOptions {
                 size_bytes: self.work_tmpfs_size_bytes(),
                 options: Some(Self::work_tmpfs_mount_options()),

@@ -19,7 +19,7 @@ use bollard::container::LogOutput;
 use bollard::exec::{StartExecOptions, StartExecResults};
 use bollard::models::{
     ContainerCreateBody, ContainerInspectResponse, ExecConfig, HostConfig, Mount,
-    MountTmpfsOptions, MountTypeEnum,
+    MountTmpfsOptions, MountType,
 };
 use bollard::query_parameters::{
     AttachContainerOptionsBuilder, CreateContainerOptionsBuilder, ListContainersOptionsBuilder,

@@ -2,7 +2,7 @@ use crate::config::FeatureFlagSnapshot;
 use crate::review::ReviewLane;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::{AssertSqlSafe, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::collections::HashMap;
 
 use super::{
@@ -759,7 +759,7 @@ impl RunHistoryRepository {
             ORDER BY started_at DESC, id DESC
             "
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(AssertSqlSafe(sql))
             .bind(repo)
             .bind(sqlite_i64_from_u64(iid, "iid")?)
             .fetch_all(self.sqlite.read_pool())
@@ -781,7 +781,7 @@ impl RunHistoryRepository {
             WHERE id = ?
             "
         );
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(AssertSqlSafe(sql))
             .bind(run_id)
             .fetch_optional(self.sqlite.read_pool())
             .await
@@ -1269,12 +1269,12 @@ fn run_history_kind_label(kind: RunHistoryKind) -> &'static str {
     }
 }
 
-fn append_run_history_filters<'args>(
-    builder: &mut QueryBuilder<'args, Sqlite>,
-    query: &'args RunHistoryListQuery,
+fn append_run_history_filters(
+    builder: &mut QueryBuilder<Sqlite>,
+    query: &RunHistoryListQuery,
 ) -> Result<bool> {
     let mut has_where = false;
-    let mut push_where = |builder: &mut QueryBuilder<'args, Sqlite>| {
+    let mut push_where = |builder: &mut QueryBuilder<Sqlite>| {
         if has_where {
             builder.push(" AND ");
         } else {
@@ -1326,7 +1326,7 @@ fn append_run_history_filters<'args>(
 }
 
 fn append_run_history_cursor_clause(
-    builder: &mut QueryBuilder<'_, Sqlite>,
+    builder: &mut QueryBuilder<Sqlite>,
     has_where: &mut bool,
     cursor: RunHistoryCursor,
     direction: CursorDirection,

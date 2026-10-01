@@ -25,7 +25,9 @@ async fn token_usage_rollup_migration_preserves_updates_deletes_and_rollback() -
         env!("CARGO_MANIFEST_DIR"),
         "/migrations/0024_run_history_token_usage_rollup.sql"
     ))?;
-    sqlx::raw_sql(&migration).execute(&pool).await?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(migration))
+        .execute(&pool)
+        .await?;
     let totals =
         sqlx::query("SELECT * FROM run_history_token_usage_rollup WHERE run_history_id = 1")
             .fetch_one(&pool)

@@ -83,7 +83,7 @@ impl DockerCodexRunner {
 
     // Drift note:
     // This mirrors only Codex upstream review target prompt construction from
-    // `codex-rs/core/src/review_prompts.rs` via the synced generated templates.
+    // `codex-rs/prompts/src/review_request.rs` via the synced generated templates.
     // Upstream source metadata is recorded in `generated_review_prompt_templates.rs`.
     //
     // Local alteration:

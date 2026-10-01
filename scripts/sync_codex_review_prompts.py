@@ -2,7 +2,7 @@
 
 """
 Generate `src/generated_review_prompt_templates.rs` from Codex upstream
-`codex-rs/core/src/review_prompts.rs`.
+`codex-rs/prompts/src/review_request.rs`.
 
 This is a manual maintenance tool. Do not call it from the app build: the
 runtime Codex image is the true source of behavior, so build-time downloads do
@@ -22,7 +22,7 @@ from pathlib import Path
 
 
 UPSTREAM_REPO = "openai/codex"
-UPSTREAM_PATH = "codex-rs/core/src/review_prompts.rs"
+UPSTREAM_PATH = "codex-rs/prompts/src/review_request.rs"
 OUTPUT_PATH = Path("src/generated_review_prompt_templates.rs")
 CONSTANT_NAMES = [
     "UNCOMMITTED_PROMPT",
@@ -83,7 +83,7 @@ def extract_constants(source_text: str) -> dict[str, str]:
         )
         match = pattern.search(source_text)
         if not match:
-            raise SystemExit(f"failed to locate {name} in upstream review_prompts.rs")
+            raise SystemExit(f"failed to locate {name} in upstream {UPSTREAM_PATH}")
         raw_value = match.group("value")
         constants[name] = bytes(raw_value, "utf-8").decode("unicode_escape")
     return constants
@@ -106,7 +106,7 @@ def generate_rust_source(source_commit: str, constants: dict[str, str]) -> str:
         f"// - Upstream path: {UPSTREAM_PATH}",
         f"// - Upstream commit/ref: {source_commit}",
         "// - This file mirrors only review target prompt templates, not Codex's",
-        "//   baked review rubric from `codex-rs/core/src/tasks/review.rs`.",
+        "//   baked review rubric from `codex-rs/prompts/templates/review/rubric.md`.",
         "",
         "pub(crate) const SOURCE_REPO: &str = "
         f"{json.dumps(UPSTREAM_REPO)};",

@@ -6,11 +6,11 @@ const LOCAL_BASE_BRANCH_PROMPT_BACKUP: &str = "Review the code changes against t
 
 // Drift note:
 // This module mirrors only Codex upstream review target prompt construction from
-// `codex-rs/core/src/review_prompts.rs`. The synced string templates live in the
+// `codex-rs/prompts/src/review_request.rs`. The synced string templates live in the
 // generated module and should be refreshed with `scripts/sync_codex_review_prompts.py`.
 //
 // We intentionally do not copy Codex's baked review rubric from
-// `codex-rs/core/src/tasks/review.rs`; review mode should keep using the runtime
+// `codex-rs/prompts/templates/review/rubric.md`; review mode should keep using the runtime
 // Codex image's own rubric.
 //
 // Local alterations:
@@ -26,8 +26,8 @@ pub fn build_base_branch_review_prompt(branch: &str, merge_base_sha: Option<&str
         .filter(|value| !value.is_empty())
     {
         BASE_BRANCH_PROMPT
-            .replace("{baseBranch}", branch)
-            .replace("{mergeBaseSha}", merge_base_sha)
+            .replace("{{base_branch}}", branch)
+            .replace("{{merge_base_sha}}", merge_base_sha)
     } else {
         LOCAL_BASE_BRANCH_PROMPT_BACKUP.replace("{branch}", branch)
     }
@@ -37,10 +37,10 @@ pub fn build_commit_review_prompt(sha: &str, title: Option<&str>) -> String {
     let sha = sha.trim();
     if let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) {
         COMMIT_PROMPT_WITH_TITLE
-            .replace("{sha}", sha)
-            .replace("{title}", title)
+            .replace("{{sha}}", sha)
+            .replace("{{title}}", title)
     } else {
-        COMMIT_PROMPT.replace("{sha}", sha)
+        COMMIT_PROMPT.replace("{{sha}}", sha)
     }
 }
 

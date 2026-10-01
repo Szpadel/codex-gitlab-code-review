@@ -31,6 +31,8 @@ const CLONE_REPOSITORY_SCRIPT_TEMPLATE: &str = include_str!("assets/clone_reposi
 #[derive(Clone)]
 pub struct GitLabDiscoveryMcpService {
     config: GitLabDiscoveryMcpConfig,
+    /// Host of `config.advertise_url`. Codex containers send it in the `Host` header.
+    advertised_host: String,
     docker: Docker,
     pub(crate) gitlab: GitLabClient,
     git_base: Url,
@@ -115,7 +117,8 @@ impl ResolvedCheckoutTarget {
 impl GitLabDiscoveryMcpService {
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
+    /// Returns an error if the Docker or GitLab client cannot be created, or if
+    /// `config.advertise_url` has no host.
     pub fn new(
         docker_cfg: DockerConfig,
         gitlab_cfg: &GitLabConfig,
@@ -124,8 +127,18 @@ impl GitLabDiscoveryMcpService {
         let docker = connect_docker(&docker_cfg)?;
         let gitlab = GitLabClient::new(&gitlab_cfg.base_url, &gitlab_cfg.token)?;
         let git_base = gitlab.git_base_url()?;
+        let advertised_host = Url::parse(&config.advertise_url)
+            .ok()
+            .and_then(|url| url.host_str().map(ToOwned::to_owned))
+            .with_context(|| {
+                format!(
+                    "parse codex.gitlab_discovery_mcp.advertise_url host from {}",
+                    config.advertise_url
+                )
+            })?;
         Ok(Self {
             config,
+            advertised_host,
             docker,
             gitlab,
             git_base,
@@ -143,6 +156,10 @@ impl GitLabDiscoveryMcpService {
     #[must_use]
     pub fn advertise_url(&self) -> &str {
         &self.config.advertise_url
+    }
+
+    pub(crate) fn advertised_host(&self) -> &str {
+        &self.advertised_host
     }
 
     #[must_use]
@@ -692,6 +709,7 @@ mod tests {
     fn redact_sensitive_output_removes_gitlab_tokens_from_urls_and_plain_text() {
         let service = GitLabDiscoveryMcpService {
             config: crate::config::GitLabDiscoveryMcpConfig::default(),
+            advertised_host: "host.docker.internal".to_string(),
             docker: crate::codex_runner::docker::connect_docker(
                 &crate::config::DockerConfig::default(),
             )

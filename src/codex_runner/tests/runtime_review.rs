@@ -537,7 +537,7 @@ async fn run_review_with_fake_runtime_mounts_work_tmpfs_when_enabled() -> Result
         .expect("tmpfs mount should be set");
     assert_eq!(mounts.len(), 1);
     assert_eq!(mounts[0].target.as_deref(), Some("/work"));
-    assert_eq!(mounts[0].typ, Some(MountTypeEnum::TMPFS));
+    assert_eq!(mounts[0].typ, Some(MountType::TMPFS));
     let tmpfs_options = mounts[0]
         .tmpfs_options
         .as_ref()
@@ -668,8 +668,7 @@ async fn docker_work_tmpfs_mount_is_visible_in_inspect_mounts_when_enabled() -> 
 
     assert!(
         mounts.iter().any(|mount| {
-            mount.typ == Some(bollard::models::MountPointTypeEnum::TMPFS)
-                && mount.destination.as_deref() == Some("/work")
+            mount.typ.as_deref() == Some("tmpfs") && mount.destination.as_deref() == Some("/work")
         }),
         "expected /work tmpfs in inspect mounts, got {mounts:?}"
     );

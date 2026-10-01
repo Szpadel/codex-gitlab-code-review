@@ -15,7 +15,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use rmcp::handler::server::{router::tool::ToolRouter, tool::Extension, wrapper::Parameters};
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -34,8 +34,8 @@ struct GitLabDiscoveryMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for GitLabDiscoveryMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Browse allowed GitLab paths. Call list_gitlab_paths without a path first to see top-level accessible groups, then call it again with a returned subgroup path to navigate deeper. Each response separates subgroup paths from repository paths. Use inspect_gitlab_repo to inspect an allowed repository and list its branches and tags without cloning. Use clone_gitlab_repo to clone an allowed repository into the current Codex container. Pass checkout_ref for branch or tag checkout, or commit_sha for a detached commit checkout.",
         )
     }
@@ -317,16 +317,21 @@ impl GitLabDiscoveryMcpServer {
     }
 }
 
+/// Builds the MCP router. Only requests whose `Host` matches the host of
+/// `advertise_url` reach the MCP service.
 pub(crate) fn build_router(service: &Arc<GitLabDiscoveryMcpService>) -> Router {
     let server = GitLabDiscoveryMcpServer {
         tool_router: GitLabDiscoveryMcpServer::tool_router(),
         service: Arc::clone(service),
     };
+    // Codex containers send the advertise_url host in the Host header. The rmcp
+    // default accepts only loopback hosts to block DNS rebinding.
+    let allowed_hosts = [service.advertised_host().to_owned()];
     let rmcp_service: StreamableHttpService<GitLabDiscoveryMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(server.clone()),
             Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
+            StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
         );
 
     let protected_mcp =
@@ -412,16 +417,17 @@ fn canonical_peer_ip(ip: IpAddr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        GitLabDiscoveryMcpServer, browse_listing_for_path, build_router, inspect_repo_for_path,
+    use super::{GitLabDiscoveryMcpServer, browse_listing_for_path, inspect_repo_for_path};
+    use crate::config::{
+        DockerConfig, FeatureFlagSnapshot, GitLabConfig, GitLabDiscoveryMcpConfig, GitLabTargets,
     };
-    use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig, GitLabTargets};
     use crate::gitlab::{
         AwardEmoji, GitLabApi, GitLabGroup, GitLabGroupSummary, GitLabProject,
         GitLabProjectSummary, GitLabUser, MergeRequest, Note,
     };
     use crate::gitlab_discovery_mcp::{
-        InspectGitLabRepoResponse, ResolvedGitLabDiscoveryAllowList,
+        GitLabDiscoveryMcpService, GitLabDiscoverySessionBinding, InspectGitLabRepoResponse,
+        ResolvedGitLabDiscoveryAllowList,
     };
     use anyhow::Result;
     use async_trait::async_trait;
@@ -429,9 +435,10 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
-    #[test]
-    fn build_router_does_not_panic() {
-        let service = crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService::new(
+    #[tokio::test]
+    async fn mcp_endpoint_accepts_only_the_advertised_host() -> Result<()> {
+        crate::gitlab::tls::ensure_reqwest_rustls_provider();
+        let service = Arc::new(GitLabDiscoveryMcpService::new(
             DockerConfig::default(),
             &GitLabConfig {
                 base_url: "https://gitlab.example.com".to_string(),
@@ -440,11 +447,47 @@ mod tests {
                 created_after: None,
                 targets: GitLabTargets::default(),
             },
-            GitLabDiscoveryMcpConfig::default(),
-        )
-        .expect("service");
-        let service = Arc::new(service);
-        let _router = build_router(&service);
+            GitLabDiscoveryMcpConfig {
+                advertise_url: "http://host.docker.internal:8091/mcp".to_string(),
+                ..GitLabDiscoveryMcpConfig::default()
+            },
+        )?);
+        service
+            .registry()
+            .register_binding(GitLabDiscoverySessionBinding {
+                run_history_id: 1,
+                container_id: "codex".to_string(),
+                network_container_id: "codex".to_string(),
+                peer_ips: BTreeSet::from(["127.0.0.1".to_string()]),
+                source_repo: "group/repo".to_string(),
+                clone_root: "/work/mcp".to_string(),
+                feature_flags: FeatureFlagSnapshot::default(),
+                allow: ResolvedGitLabDiscoveryAllowList::default(),
+                created_at: chrono::Utc::now(),
+            })
+            .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}/mcp", listener.local_addr()?);
+        tokio::spawn(Arc::clone(&service).run(listener));
+
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let initialize = |host: &'static str| {
+            client
+                .post(&endpoint)
+                .header("Host", host)
+                .header("Accept", "application/json, text/event-stream")
+                .header("Content-Type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#)
+                .send()
+        };
+        let advertised = initialize("host.docker.internal:8091").await?;
+        let rebound = initialize("rebinding.example:8091").await?;
+        service.shutdown();
+
+        assert_eq!(advertised.status(), reqwest::StatusCode::OK);
+        assert!(advertised.headers().contains_key("mcp-session-id"));
+        assert_eq!(rebound.status(), reqwest::StatusCode::FORBIDDEN);
+        Ok(())
     }
 
     #[test]
