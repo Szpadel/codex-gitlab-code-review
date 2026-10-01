@@ -44,6 +44,105 @@ async fn mount_current_bot_user(server: &MockServer) {
 }
 
 #[tokio::test]
+async fn write_confirmation_stops_after_first_matching_page() -> Result<()> {
+    for discussions in [false, true] {
+        let server = MockServer::start().await;
+        mount_current_bot_user(&server).await;
+        let suffix = if discussions { "discussions" } else { "notes" };
+        let endpoint = format!("/api/v4/projects/group%2Frepo/merge_requests/7/{suffix}");
+        Mock::given(method("POST"))
+            .and(path(&endpoint))
+            .respond_with(ResponseTemplate::new(502))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let note = note_json(100, "published", 1);
+        let first_page = if discussions {
+            vec![discussion_json("thread", vec![note])]
+        } else {
+            vec![note]
+        };
+        Mock::given(method("GET"))
+            .and(path(&endpoint))
+            .and(query_param("page", "1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-next-page", "2")
+                    .set_body_json(first_page),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(&endpoint))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = retry_test_client(&server, 2)?;
+        if discussions {
+            client
+                .post_note(
+                    &format!("{}{}", server.uri(), endpoint),
+                    "published",
+                    super::client::GitLabWriteConfirmation::AnyDiscussion {
+                        discussions_url: format!("{}{}", server.uri(), endpoint),
+                        body: "published".to_string(),
+                    },
+                )
+                .await?;
+        } else {
+            client.create_note("group/repo", 7, "published").await?;
+        }
+        server.verify().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reply_confirmation_reads_only_the_target_discussion() -> Result<()> {
+    let server = MockServer::start().await;
+    mount_current_bot_user(&server).await;
+    let endpoint = "/api/v4/projects/group%2Frepo/merge_requests/7/discussions/thread%2F1";
+    Mock::given(method("POST"))
+        .and(path(format!("{endpoint}/notes")))
+        .respond_with(ResponseTemplate::new(502))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(endpoint))
+        .respond_with(ResponseTemplate::new(200).set_body_json(discussion_json(
+            "thread/1",
+            vec![note_json(100, "published", 1)],
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/v4/projects/group%2Frepo/merge_requests/7/discussions",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(vec![discussion_json(
+                "thread/1",
+                vec![note_json(100, "published", 1)],
+            )]),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    retry_test_client(&server, 2)?
+        .create_discussion_note("group/repo", 7, "thread/1", "published")
+        .await?;
+
+    server.verify().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn write_confirmation_rejects_old_or_foreign_identical_notes() -> Result<()> {
     enum WriteTarget {
         MergeRequest,
@@ -76,7 +175,7 @@ async fn write_confirmation_rejects_old_or_foreign_identical_notes() -> Result<(
                 WriteTarget::MergeRequest => ("notes", "notes", vec![note.clone()]),
                 WriteTarget::Discussion => (
                     "discussions/discussion-1/notes",
-                    "discussions",
+                    "discussions/discussion-1",
                     vec![discussion_json("discussion-1", vec![note.clone()])],
                 ),
                 WriteTarget::DiffDiscussion => (
@@ -91,9 +190,14 @@ async fn write_confirmation_rejects_old_or_foreign_identical_notes() -> Result<(
                 .expect(2)
                 .mount(&server)
                 .await;
+            let response_body = if matches!(target, WriteTarget::Discussion) {
+                notes[0].clone()
+            } else {
+                serde_json::json!(notes)
+            };
             Mock::given(method("GET"))
                 .and(path(format!("{base_path}/{get_suffix}")))
-                .respond_with(ResponseTemplate::new(200).set_body_json(notes))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
                 .mount(&server)
                 .await;
             let client = retry_test_client(&server, 2)?;
@@ -1587,17 +1691,15 @@ async fn create_discussion_note_skips_replay_when_body_exists() -> Result<()> {
         .await;
     Mock::given(method("GET"))
         .and(path(
-            "/api/v4/projects/group%2Frepo/merge_requests/3/discussions",
+            "/api/v4/projects/group%2Frepo/merge_requests/3/discussions/discussion-123",
         ))
-        .and(query_param("page", "1"))
-        .and(query_param("per_page", "100"))
         .respond_with(move |_request: &Request| {
             ResponseTemplate::new(200)
                 .append_header("X-Next-Page", "")
-                .set_body_json(vec![discussion_json(
+                .set_body_json(discussion_json(
                     "discussion-123",
                     vec![note_json(777, body, 1)],
-                )])
+                ))
         })
         .expect(1)
         .mount(&server)

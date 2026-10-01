@@ -3,6 +3,31 @@ use anyhow::Result;
 use serde::Deserialize;
 use url::Url;
 
+/// Searches each page and stops at the first match. Propagates read failures.
+pub(crate) async fn any_paginated<T: for<'de> Deserialize<'de> + Send>(
+    client: &GitLabClient,
+    base_url: &str,
+    matches: impl Fn(&T) -> bool + Send,
+) -> Result<bool> {
+    let base = Url::parse(base_url)?;
+    let mut page = 1u32;
+    loop {
+        let mut url = base.clone();
+        url.query_pairs_mut()
+            .append_pair("per_page", "100")
+            .append_pair("page", &page.to_string());
+        let (items, next_page): (Vec<T>, Option<String>) =
+            client.get_paginated_page(url.as_str()).await?;
+        if items.iter().any(&matches) {
+            return Ok(true);
+        }
+        match next_page {
+            Some(next) => page = next.parse::<u32>().unwrap_or(page + 1),
+            None => return Ok(false),
+        }
+    }
+}
+
 pub(crate) async fn get_paginated<T: for<'de> Deserialize<'de> + Send>(
     client: &GitLabClient,
     base_url: &str,

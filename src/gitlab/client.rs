@@ -599,10 +599,10 @@ impl GitLabClient {
         started_at: DateTime<Utc>,
     ) -> Result<bool> {
         // Standalone notes need the same author and timestamp fields as discussion notes.
-        let notes: Vec<DiscussionNote> = self.get_paginated(notes_url).await?;
-        Ok(notes
-            .iter()
-            .any(|note| note_confirms_write(note, body, author_id, started_at)))
+        pagination::any_paginated(self, notes_url, |note: &DiscussionNote| {
+            note_confirms_write(note, body, author_id, started_at)
+        })
+        .await
     }
 
     fn boxed_note_body_exists<'a>(
@@ -623,12 +623,18 @@ impl GitLabClient {
         author_id: u64,
         started_at: DateTime<Utc>,
     ) -> Result<bool> {
-        let discussions: Vec<MergeRequestDiscussion> = self.get_paginated(discussions_url).await?;
-        Ok(discussions
-            .iter()
-            .filter(|discussion| discussion_id.is_none_or(|id| discussion.id == id))
-            .flat_map(|discussion| &discussion.notes)
-            .any(|note| note_confirms_write(note, body, author_id, started_at)))
+        let confirms = |discussion: &MergeRequestDiscussion| {
+            discussion
+                .notes
+                .iter()
+                .any(|note| note_confirms_write(note, body, author_id, started_at))
+        };
+        if let Some(id) = discussion_id {
+            let url = format!("{discussions_url}/{}", urlencoding::encode(id));
+            let discussion: MergeRequestDiscussion = self.get_json(&url).await?;
+            return Ok(confirms(&discussion));
+        }
+        pagination::any_paginated(self, discussions_url, confirms).await
     }
 
     fn boxed_discussion_note_body_exists<'a>(
