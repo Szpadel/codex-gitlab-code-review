@@ -274,6 +274,8 @@ pub(super) struct InlineReviewGitLab {
     pub(super) diffs: Vec<MergeRequestDiff>,
     pub(super) list_discussions_error: Option<String>,
     pub(super) create_diff_discussion_error: Option<String>,
+    pub(super) create_note_error: Option<String>,
+    pub(super) add_award_error: Option<String>,
     pub(super) created_note_bodies: Mutex<Vec<String>>,
     pub(super) created_diff_discussions: Mutex<Vec<MergeRequestDiffDiscussion>>,
 }
@@ -290,6 +292,8 @@ impl InlineReviewGitLab {
             diffs,
             list_discussions_error: None,
             create_diff_discussion_error: None,
+            create_note_error: None,
+            add_award_error: None,
             created_note_bodies: Mutex::new(Vec::new()),
             created_diff_discussions: Mutex::new(Vec::new()),
         }
@@ -364,6 +368,9 @@ impl GitLabApi for InlineReviewGitLab {
     }
 
     async fn add_award(&self, project: &str, iid: u64, name: &str) -> Result<()> {
+        if self.add_award_error.as_deref() == Some(name) {
+            return Err(anyhow!("award publication failed"));
+        }
         self.inner.add_award(project, iid, name).await
     }
 
@@ -376,6 +383,9 @@ impl GitLabApi for InlineReviewGitLab {
     }
 
     async fn create_note(&self, project: &str, iid: u64, body: &str) -> Result<()> {
+        if let Some(error) = &self.create_note_error {
+            return Err(anyhow!(error.clone()));
+        }
         self.created_note_bodies
             .lock()
             .unwrap()

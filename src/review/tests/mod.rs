@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 mod mentions;
+mod publication_failures;
 mod review_comments;
 mod scheduling;
 mod security_rate_limits;

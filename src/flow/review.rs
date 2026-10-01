@@ -1758,19 +1758,25 @@ impl ReviewRunContext {
 
         let status = match result {
             Ok(CodexResult::Pass { summary }) => {
-                self.handle_pass(&run_identity, summary).await?;
+                if let Err(err) = self.handle_pass(&run_identity, summary).await {
+                    self.handle_error(&run_identity, err).await?;
+                }
                 ReviewRunStatus::Completed
             }
             Ok(CodexResult::Comment(comment)) => {
-                self.handle_comment(
-                    &run_identity,
-                    &mr,
-                    inline_review_comments_enabled,
-                    &review_project_path,
-                    discussion_source.as_deref(),
-                    comment,
-                )
-                .await?;
+                if let Err(err) = self
+                    .handle_comment(
+                        &run_identity,
+                        &mr,
+                        inline_review_comments_enabled,
+                        &review_project_path,
+                        discussion_source.as_deref(),
+                        comment,
+                    )
+                    .await
+                {
+                    self.handle_error(&run_identity, err).await?;
+                }
                 ReviewRunStatus::Completed
             }
             Err(err) => {
