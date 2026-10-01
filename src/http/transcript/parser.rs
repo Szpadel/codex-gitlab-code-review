@@ -622,6 +622,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mock_review_transcript_preserves_user_reasoning_and_final_phase() -> anyhow::Result<()>
+    {
+        use crate::codex_runner::{CodexRunner, ReviewContext};
+        use crate::dev_mode::MockCodexRunner;
+        use crate::http::test_support::RunFixture;
+        use crate::review::ReviewLane;
+        use crate::state::ReviewStateStore;
+        use std::sync::Arc;
+
+        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+        let runner = MockCodexRunner::new(Arc::clone(&state));
+        for lane in [ReviewLane::General, ReviewLane::Security] {
+            let fixture = if lane.is_security() {
+                RunFixture::security("group/repo", 1, "abc1234")
+            } else {
+                RunFixture::review("group/repo", 1, "abc1234")
+            };
+            let run_id = fixture.start(&state).await?;
+            runner
+                .run_review(ReviewContext {
+                    lane,
+                    repo: "group/repo".to_string(),
+                    project_path: "group/repo".to_string(),
+                    mr: serde_json::from_value(json!({"iid": 1}))?,
+                    head_sha: "abc1234".to_string(),
+                    feature_flags: FeatureFlagSnapshot::default(),
+                    additional_developer_instructions: None,
+                    min_confidence_score: None,
+                    security_context_ttl_seconds: None,
+                    run_history_id: Some(run_id),
+                    discussion_source: None,
+                })
+                .await?;
+            let run = state
+                .run_history
+                .get_run_history(run_id)
+                .await?
+                .expect("run");
+            let events = state.run_history.list_run_history_events(run_id).await?;
+            let thread = thread_snapshot_from_events(&run, &events).expect("mock transcript");
+            let items = &thread.turns[0].items;
+            let user = items
+                .iter()
+                .find(|item| matches!(item.kind, ThreadItemKind::UserMessage))
+                .expect("mock user message");
+            assert!(
+                user.body
+                    .as_deref()
+                    .expect("user text")
+                    .contains("group/repo !1 for synthetic development-mode validation.")
+            );
+            let reasoning = items
+                .iter()
+                .find(|item| matches!(item.kind, ThreadItemKind::Reasoning))
+                .expect("mock reasoning");
+            assert!(reasoning.body.as_deref().expect("reasoning text").contains(
+                "Using a deterministic mocked Codex transcript for group/repo !1 at abc1234."
+            ));
+            let agent = items
+                .iter()
+                .find(|item| matches!(item.kind, ThreadItemKind::AgentMessage { .. }))
+                .expect("mock agent message");
+            assert_eq!(agent.phase(), Some("final_answer"));
+        }
+        Ok(())
+    }
+
     #[test]
     fn join_reasoning_content_returns_placeholder_for_encrypted_only_reasoning() {
         let item = json!({

@@ -144,23 +144,23 @@ fn push_event(
 
 fn user_message_item(text: &str) -> Value {
     json!({
-        "type": "message",
-        "role": "user",
-        "text": text,
+        "type": "userMessage",
+        "content": [{"type": "text", "text": text}],
     })
 }
 
 fn reasoning_item(text: &str) -> Value {
     json!({
         "type": "reasoning",
-        "text": text,
+        "summary": [text],
+        "content": [text],
     })
 }
 
-fn agent_message_item(text: &str, kind: &str) -> Value {
+fn agent_message_item(text: &str, phase: &str) -> Value {
     json!({
         "type": "agentMessage",
-        "kind": kind,
+        "phase": phase,
         "text": text,
     })
 }
