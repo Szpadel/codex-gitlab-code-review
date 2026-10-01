@@ -1,4 +1,52 @@
 use super::*;
+use crate::state::ReviewStateStore;
+
+#[tokio::test]
+async fn cancelled_backfill_schedule_allows_a_later_request() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let run_id = RunFixture::review("group/repo", 19, "cancelled-write")
+        .thread("thread-cancelled")
+        .turn("turn-cancelled")
+        .insert(&state)
+        .await?;
+    let run = state.run_history.get_run_history(run_id).await?.unwrap();
+    let source_calls = Arc::new(AtomicUsize::new(0));
+    let service = crate::http::status::BackfillService::new(&test_config(), Arc::clone(&state))
+        .with_transcript_backfill_source(Arc::new(StaticTranscriptBackfillSource {
+            events: vec![
+                turn_started_event(1, "turn-cancelled"),
+                agent_message_event(2, "turn-cancelled", "Recovered transcript."),
+                turn_completed_event(3, "turn-cancelled"),
+            ],
+            calls: Arc::clone(&source_calls),
+        }));
+
+    // The memory database has one connection. Hold it to block the state write.
+    let connection = state.pool().acquire().await?;
+    let mut request = Box::pin(service.resolve_transcript_backfill(&run, None));
+    assert!(futures::poll!(&mut request).is_pending());
+    drop(request);
+    drop(connection);
+
+    service.resolve_transcript_backfill(&run, None).await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let run = state.run_history.get_run_history(run_id).await?.unwrap();
+            if run.transcript_backfill_state == TranscriptBackfillState::Complete {
+                return Ok::<_, anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("later request must complete transcript backfill")??;
+    let events = state.run_history.list_run_history_events(run_id).await?;
+    assert!(events.iter().any(|event| {
+        event.payload.get("text").and_then(Value::as_str) == Some("Recovered transcript.")
+    }));
+    Ok(())
+}
+
 #[tokio::test]
 async fn run_transcript_backfill_preserves_all_turns_for_security_shared_thread() -> Result<()> {
     let srv = HttpTestServerBuilder::new().spawn().await?;

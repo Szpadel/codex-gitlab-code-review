@@ -15,7 +15,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -40,8 +40,23 @@ pub struct BackfillService {
     state: Arc<ReviewStateStore>,
     default_transcript_backfill_source: Option<Arc<dyn TranscriptBackfillSource>>,
     account_transcript_backfill_sources: HashMap<String, Arc<dyn TranscriptBackfillSource>>,
-    active_backfills: Arc<Mutex<HashSet<i64>>>,
+    active_backfills: Arc<StdMutex<HashSet<i64>>>,
     backfill_retry_after: Arc<Mutex<HashMap<i64, Instant>>>,
+}
+
+/// Releases a run reservation on cancellation, failure, or worker completion.
+struct ActiveBackfill {
+    run_id: i64,
+    active_backfills: Arc<StdMutex<HashSet<i64>>>,
+}
+
+impl Drop for ActiveBackfill {
+    fn drop(&mut self) {
+        self.active_backfills
+            .lock()
+            .expect("active backfills mutex poisoned")
+            .remove(&self.run_id);
+    }
 }
 
 impl BackfillService {
@@ -62,7 +77,7 @@ impl BackfillService {
             state,
             default_transcript_backfill_source: Some(default_transcript_backfill_source),
             account_transcript_backfill_sources,
-            active_backfills: Arc::new(Mutex::new(HashSet::new())),
+            active_backfills: Arc::new(StdMutex::new(HashSet::new())),
             backfill_retry_after: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -108,7 +123,10 @@ impl BackfillService {
                 .is_some_and(|error| retry::is_final_retry_window_attempt_pending(run, error));
         let cooldown_elapsed = self.backfill_retry_due(run.id).await;
         let backfill_is_active = {
-            let active_backfills = self.active_backfills.lock().await;
+            let active_backfills = self
+                .active_backfills
+                .lock()
+                .expect("active backfills mutex poisoned");
             active_backfills.contains(&run.id)
         };
         if (matches!(
@@ -133,34 +151,36 @@ impl BackfillService {
             return Ok(());
         };
 
-        {
-            let mut active = self.active_backfills.lock().await;
+        let reservation = {
+            let mut active = self
+                .active_backfills
+                .lock()
+                .expect("active backfills mutex poisoned");
             if !active.insert(run.id) {
                 return Ok(());
             }
-        }
+            ActiveBackfill {
+                run_id: run.id,
+                active_backfills: Arc::clone(&self.active_backfills),
+            }
+        };
         self.backfill_retry_after.lock().await.remove(&run.id);
 
-        if let Err(err) = self
-            .state
+        self.state
             .run_history
             .update_run_history_transcript_backfill(
                 run.id,
                 TranscriptBackfillState::InProgress,
                 None,
             )
-            .await
-        {
-            self.active_backfills.lock().await.remove(&run.id);
-            return Err(err);
-        }
+            .await?;
 
         let state = Arc::clone(&self.state);
-        let active_backfills = Arc::clone(&self.active_backfills);
         let backfill_retry_after = Arc::clone(&self.backfill_retry_after);
         let retry_window_open_at_attempt_start =
             retry::missing_history_retry_window_open(&run, Utc::now().timestamp());
         tokio::spawn(async move {
+            let _reservation = reservation;
             let outcome = execution::run_transcript_backfill(
                 state.as_ref(),
                 source.as_ref(),
@@ -215,7 +235,6 @@ impl BackfillService {
                     }
                 }
             }
-            active_backfills.lock().await.remove(&run.id);
         });
 
         Ok(())
