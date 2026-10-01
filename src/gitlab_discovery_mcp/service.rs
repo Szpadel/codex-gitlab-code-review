@@ -6,10 +6,8 @@ use super::{
 use crate::codex_runner::docker::connect_docker;
 use crate::codex_runner::placeholders::render_placeholders;
 use crate::composer_install::{
-    ComposerInstallExecOutput, ComposerInstallMode, ComposerInstallResult,
-    DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS, composer_debug_lines, composer_install_exec_command,
-    composer_install_result_from_exec_output, prepare_composer_auth,
-    redact_composer_related_output, resolve_composer_auth,
+    ComposerCommandOutput, ComposerInstallMode, ComposerInstallPlan, ComposerInstallResult,
+    DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS, redact_composer_related_output,
 };
 use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig};
 use crate::gitlab::GitLabClient;
@@ -366,60 +364,31 @@ impl GitLabDiscoveryMcpService {
         gitlab_repo_path: &str,
     ) -> Option<ComposerInstallResult> {
         let mode = ComposerInstallMode::for_flags(&binding.feature_flags)?;
-        let auth_lookup = resolve_composer_auth(&self.gitlab, gitlab_repo_path).await;
-        let composer_auth = auth_lookup.value.clone();
-        let prepared_auth = prepare_composer_auth(
-            composer_auth.as_deref(),
-            binding.feature_flags.composer_auto_repositories,
-        );
-        let debug_lines = composer_debug_lines(
-            &auth_lookup,
-            &prepared_auth,
-            binding.feature_flags.composer_auto_repositories,
-        );
-        let env = prepared_auth
-            .env_value
-            .as_ref()
-            .map(|value| vec![format!("COMPOSER_AUTH={value}")]);
-        let command = composer_install_exec_command(
+        let plan = ComposerInstallPlan::prepare(
+            &self.gitlab,
+            gitlab_repo_path,
             mode,
+            binding.feature_flags.composer_auto_repositories,
             DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS,
-            prepared_auth.repository_config_json.as_deref(),
-        );
-        match self
-            .exec_container_command_allow_failure(
-                &binding.container_id,
-                command,
-                Some(repo_path),
-                env,
-            )
-            .await
-        {
-            Ok(output) => Some(composer_install_result_from_exec_output(
-                ComposerInstallExecOutput {
-                    mode,
-                    auth_source: auth_lookup.source,
+        )
+        .await;
+        Some(
+            plan.execute(Some(&self.gitlab_token), |command, env| async move {
+                self.exec_container_command_allow_failure(
+                    &binding.container_id,
+                    command,
+                    Some(repo_path),
+                    env,
+                )
+                .await
+                .map(|output| ComposerCommandOutput {
                     exit_code: output.exit_code,
-                    stdout: &output.stdout,
-                    stderr: &output.stderr,
-                    gitlab_token: Some(&self.gitlab_token),
-                    composer_auth: composer_auth.as_deref(),
-                    debug_lines: &debug_lines,
-                },
-            )),
-            Err(err) => Some(composer_install_result_from_exec_output(
-                ComposerInstallExecOutput {
-                    mode,
-                    auth_source: auth_lookup.source,
-                    exit_code: 1,
-                    stdout: "",
-                    stderr: &err.to_string(),
-                    gitlab_token: Some(&self.gitlab_token),
-                    composer_auth: composer_auth.as_deref(),
-                    debug_lines: &debug_lines,
-                },
-            )),
-        }
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            })
+            .await,
+        )
     }
 
     async fn exec_container_command(

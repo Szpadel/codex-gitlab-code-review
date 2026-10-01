@@ -5,6 +5,7 @@ mod auth_lookup_tests;
 mod auth_prepare_tests;
 mod command;
 mod output;
+mod plan;
 
 use crate::config::FeatureFlagSnapshot;
 use rmcp::schemars::JsonSchema;
@@ -20,6 +21,7 @@ pub use output::{
     ComposerInstallExecOutput, composer_install_result_from_exec_output,
     redact_composer_related_output,
 };
+pub(crate) use plan::{ComposerCommandOutput, ComposerInstallPlan};
 
 pub const COMPOSER_AUTH_VARIABLE_KEY: &str = "COMPOSER_AUTH";
 pub const COMPOSER_SKIP_MARKER: &str = "CODEX_COMPOSER_SKIP";

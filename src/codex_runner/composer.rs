@@ -2,9 +2,8 @@ use super::{
     DockerCodexRunner, FeatureFlagSnapshot, NewRunHistoryEvent, annotate_event_payload, json, warn,
 };
 use crate::composer_install::{
-    COMPOSER_INSTALL_TURN_ID, ComposerAuthLookup, ComposerInstallExecOutput, ComposerInstallMode,
-    ComposerInstallResult, composer_debug_lines, composer_install_exec_command,
-    composer_install_result_from_exec_output, prepare_composer_auth, resolve_composer_auth,
+    COMPOSER_INSTALL_TURN_ID, ComposerCommandOutput, ComposerInstallMode, ComposerInstallPlan,
+    ComposerInstallResult,
 };
 
 impl DockerCodexRunner {
@@ -51,58 +50,32 @@ impl DockerCodexRunner {
                 .await;
             return Some(result);
         }
-        let auth_lookup = self.resolve_composer_auth_lookup(project_path).await;
-        let composer_auth = auth_lookup.value.clone();
-        let prepared_auth = prepare_composer_auth(
-            composer_auth.as_deref(),
-            feature_flags.composer_auto_repositories,
-        );
-        let debug_lines = composer_debug_lines(
-            &auth_lookup,
-            &prepared_auth,
-            feature_flags.composer_auto_repositories,
-        );
-        let env = prepared_auth
-            .env_value
-            .as_ref()
-            .map(|value| vec![format!("COMPOSER_AUTH={value}")]);
-        let command = composer_install_exec_command(
+        let plan = ComposerInstallPlan::prepare(
+            self.gitlab.as_ref(),
+            project_path,
             mode,
+            feature_flags.composer_auto_repositories,
             timeout_seconds,
-            prepared_auth.repository_config_json.as_deref(),
-        );
+        )
+        .await;
         let command_label = mode.command_label();
 
-        let result = match self
-            .exec_container_command_with_env_allow_failure(
-                container_id,
-                command,
-                Some(repo_path),
-                env,
-            )
-            .await
-        {
-            Ok(output) => composer_install_result_from_exec_output(ComposerInstallExecOutput {
-                mode,
-                auth_source: auth_lookup.source,
-                exit_code: output.exit_code,
-                stdout: &output.stdout,
-                stderr: &output.stderr,
-                gitlab_token: Some(&self.gitlab_token),
-                composer_auth: composer_auth.as_deref(),
-                debug_lines: &debug_lines,
-            }),
-            Err(err) => composer_install_result_from_exec_output(ComposerInstallExecOutput {
-                mode,
-                auth_source: auth_lookup.source,
-                exit_code: 1,
-                stdout: "",
-                stderr: &err.to_string(),
-                gitlab_token: Some(&self.gitlab_token),
-                composer_auth: composer_auth.as_deref(),
-                debug_lines: &debug_lines,
-            }),
-        };
+        let result = plan
+            .execute(Some(&self.gitlab_token), |command, env| async move {
+                self.exec_container_command_with_env_allow_failure(
+                    container_id,
+                    command,
+                    Some(repo_path),
+                    env,
+                )
+                .await
+                .map(|output| ComposerCommandOutput {
+                    exit_code: output.exit_code,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+            })
+            .await;
 
         if result.attempted {
             if !result.success {
@@ -120,10 +93,6 @@ impl DockerCodexRunner {
         }
 
         Some(result)
-    }
-
-    async fn resolve_composer_auth_lookup(&self, project_path: &str) -> ComposerAuthLookup {
-        resolve_composer_auth(self.gitlab.as_ref(), project_path).await
     }
 
     async fn append_composer_install_result(
@@ -190,10 +159,12 @@ pub(crate) fn composer_install_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::composer_install::ComposerInstallMode;
+    use crate::composer_install::{ComposerInstallMode, composer_install_exec_command};
 
     #[tokio::test]
     async fn composer_auth_uses_the_shared_gitlab_client() -> anyhow::Result<()> {
+        use super::super::container::ContainerExecOutput;
+        use super::super::test_support::{ExecContainerCommandRequest, FakeRunnerHarness};
         use std::sync::Arc;
         use wiremock::{
             Mock, MockServer, ResponseTemplate,
@@ -211,6 +182,7 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
+        let harness = Arc::new(FakeRunnerHarness::default());
         let runner = DockerCodexRunner::new_with_test_runtime(
             crate::config::test_builder::ConfigBuilder::for_review_tests()
                 .build()
@@ -226,12 +198,74 @@ mod tests {
                 mention_commands_active: false,
                 review_additional_developer_instructions: None,
             },
-            Arc::new(super::super::test_support::FakeRunnerHarness::default()),
+            harness.clone(),
         );
 
-        for _ in 0..2 {
-            let lookup = runner.resolve_composer_auth_lookup("group/repo").await;
-            assert_eq!(lookup.source.as_deref(), Some("project:group/repo"));
+        for success in [true, false] {
+            harness.push_exec_output(
+                ExecContainerCommandRequest {
+                    container_id: "app-1".to_string(),
+                    command: vec![
+                        "test".to_string(),
+                        "-f".to_string(),
+                        "composer.json".to_string(),
+                    ],
+                    cwd: Some("/work/repo".to_string()),
+                    env: None,
+                },
+                ContainerExecOutput {
+                    exit_code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+            );
+            let install_request = ExecContainerCommandRequest {
+                container_id: "app-1".to_string(),
+                command: composer_install_exec_command(ComposerInstallMode::Safe, 42, None),
+                cwd: Some("/work/repo".to_string()),
+                env: Some(vec!["COMPOSER_AUTH={}".to_string()]),
+            };
+            if success {
+                harness.push_exec_output(
+                    install_request,
+                    ContainerExecOutput {
+                        exit_code: 0,
+                        stdout: "installed with token".to_string(),
+                        stderr: String::new(),
+                    },
+                );
+            } else {
+                harness.push_exec_error(install_request, "installation failed with token");
+            }
+            let result = runner
+                .run_composer_install_step(
+                    "app-1",
+                    "/work/repo",
+                    "group/repo",
+                    &FeatureFlagSnapshot {
+                        composer_install: true,
+                        composer_safe_install: true,
+                        ..FeatureFlagSnapshot::default()
+                    },
+                    42,
+                    None,
+                )
+                .await
+                .expect("install result");
+            assert_eq!(result.auth_source.as_deref(), Some("project:group/repo"));
+            assert!(result.attempted);
+            assert_eq!(result.success, success);
+            assert!(
+                result
+                    .log_excerpt
+                    .as_deref()
+                    .expect("excerpt")
+                    .contains(if success {
+                        "installed with [REDACTED_GITLAB_TOKEN]"
+                    } else {
+                        "installation failed with [REDACTED_GITLAB_TOKEN]"
+                    })
+            );
         }
         server.verify().await;
         Ok(())
