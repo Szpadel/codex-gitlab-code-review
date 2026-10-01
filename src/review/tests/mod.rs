@@ -26,6 +26,7 @@ mod mentions;
 mod pending_mentions;
 mod publication_failures;
 mod review_comments;
+mod scan_failures;
 mod scheduling;
 mod security_rate_limits;
 mod shutdown_and_recovery;

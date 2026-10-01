@@ -260,6 +260,22 @@ impl RetryBackoff {
         removed
     }
 
+    /// Removes retry state for repositories outside the current scan targets.
+    /// Returns removed keys so the caller can remove their warning awards.
+    pub(crate) fn clear_for_repos_not_in(&self, repos: &[String]) -> Vec<RetryKey> {
+        let repos = repos.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut entries = self.entries.lock().unwrap();
+        let removed = entries
+            .keys()
+            .filter(|key| !repos.contains(key.repo.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &removed {
+            entries.remove(key);
+        }
+        removed
+    }
+
     pub(crate) fn clear_for_mr_other_heads(
         &self,
         lane: ReviewLane,

@@ -229,6 +229,13 @@ impl ReviewService {
             .await;
     }
 
+    /// Removes retries and their warning awards outside the resolved targets.
+    pub(super) async fn clear_review_backoff_retries_outside_targets(&self, repos: &[String]) {
+        let removed = self.retry_backoff.clear_for_repos_not_in(repos);
+        self.remove_retry_warning_awards_for_removed_keys(removed)
+            .await;
+    }
+
     pub(super) async fn clear_stale_review_backoff_retries_for_mr(
         &self,
         repo: &str,

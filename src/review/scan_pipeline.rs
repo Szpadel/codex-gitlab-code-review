@@ -292,6 +292,9 @@ impl<'a> ScanPipeline<'a> {
         }
         self.service.clear_stale_flow_state().await?;
         let repos = self.service.resolve_repos(self.mode).await?;
+        self.service
+            .clear_review_backoff_retries_outside_targets(&repos)
+            .await;
         if repos.is_empty() {
             info!("no gitlab repositories configured");
             return Ok(ScanRunStatus::Completed);
