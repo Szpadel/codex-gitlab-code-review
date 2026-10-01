@@ -1,5 +1,6 @@
 use crate::codex_runner::{ReviewComment, ReviewFinding, repo_checkout_root};
 use crate::config::Config;
+use crate::flow::comment_text::sanitize_comment_text;
 use crate::gitlab::links::gitlab_web_base;
 use crate::gitlab::{
     DiffDiscussionPosition, GitLabApi, MergeRequest, MergeRequestDiff, MergeRequestDiffDiscussion,
@@ -19,6 +20,7 @@ const MAX_INLINE_FINDING_LINE_SPAN: usize = 500;
 
 #[derive(Clone, Copy)]
 struct ReviewCommentPostingOptions<'a> {
+    config: &'a Config,
     review_label: &'a str,
     comment_marker_prefix: &'a str,
     finding_marker_prefix: &'a str,
@@ -257,8 +259,8 @@ fn build_inline_discussion(
     let anchors = anchors_by_path.get(relative_path.as_str())?;
     let anchor = select_anchor(anchors, finding)?;
 
-    let body = format!(
-        "{}\n\n{}\n\n{}",
+    let content = format!(
+        "{}\n\n{}",
         inline_discussion_title(options, finding),
         rewrite_code_references(
             &finding.body,
@@ -267,6 +269,10 @@ fn build_inline_discussion(
             head_sha,
             worktree_root,
         ),
+    );
+    let body = format!(
+        "{}\n\n{}",
+        sanitize_comment_text(options.config, &content),
         finding_marker(options.finding_marker_prefix, head_sha, finding)
     );
 
@@ -430,7 +436,7 @@ fn build_fallback_note_body(
         sections.push(notice);
     }
 
-    let mut body = sections.join("\n\n");
+    let mut body = sanitize_comment_text(options.config, &sections.join("\n\n"));
     if !body.is_empty() {
         body.push_str("\n\n");
     }
@@ -467,6 +473,7 @@ fn legacy_note_body(
     head_sha: &str,
     body: &str,
 ) -> String {
+    let body = sanitize_comment_text(options.config, body);
     if options.review_label == "Review" {
         format!(
             "{body}\n\n{}{} -->",
@@ -597,12 +604,14 @@ async fn load_existing_finding_markers(
 fn posting_options(config: &Config, lane: ReviewLane) -> ReviewCommentPostingOptions<'_> {
     if lane.is_security() {
         ReviewCommentPostingOptions {
+            config,
             review_label: lane.review_label(),
             comment_marker_prefix: &config.review.security.comment_marker_prefix,
             finding_marker_prefix: &config.review.security.finding_marker_prefix,
         }
     } else {
         ReviewCommentPostingOptions {
+            config,
             review_label: lane.review_label(),
             comment_marker_prefix: &config.review.comment_marker_prefix,
             finding_marker_prefix: REVIEW_FINDING_MARKER_PREFIX,
@@ -939,6 +948,7 @@ mod tests {
     fn legacy_note_body_preserves_markdown_images() {
         let body = legacy_note_body(
             ReviewCommentPostingOptions {
+                config: &crate::config::test_builder::ConfigBuilder::for_review_tests().build(),
                 review_label: "Review",
                 comment_marker_prefix: "<!-- codex-review:sha=",
                 finding_marker_prefix: REVIEW_FINDING_MARKER_PREFIX,
@@ -992,6 +1002,7 @@ mod tests {
     #[test]
     fn fallback_note_discloses_duplicate_omissions_without_repeating_findings() {
         let options = ReviewCommentPostingOptions {
+            config: &crate::config::test_builder::ConfigBuilder::for_review_tests().build(),
             review_label: "Review",
             comment_marker_prefix: "<!-- codex-review:sha=",
             finding_marker_prefix: REVIEW_FINDING_MARKER_PREFIX,
@@ -1031,6 +1042,7 @@ mod tests {
         };
         let body = build_fallback_note_body(
             ReviewCommentPostingOptions {
+                config: &crate::config::test_builder::ConfigBuilder::for_review_tests().build(),
                 review_label: "Review",
                 comment_marker_prefix: "<!-- codex-review:sha=",
                 finding_marker_prefix: REVIEW_FINDING_MARKER_PREFIX,

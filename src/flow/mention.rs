@@ -2,6 +2,7 @@ use crate::codex_runner::{
     CodexQuotaExhausted, MentionCommandContext, MentionCommandResult, MentionCommandStatus,
 };
 use crate::config::FeatureFlagSnapshot;
+use crate::flow::comment_text::sanitize_comment_text;
 use crate::flow::mention_assets::collect_note_image_uploads;
 use crate::flow::orchestration::{
     ActiveTaskKey, ScheduledTaskContext, finish_task_run_history, spawn_orchestrated_task,
@@ -750,6 +751,7 @@ impl MentionFlow {
             let gitlab_base_url = gitlab_base_url.clone();
             let requester = prepared.requester;
             let feature_flags = prepared.feature_flags;
+            let config = self.shared.config.clone();
             let run_history_id = task.run_history_id;
             outcome.scheduled += 1;
             outcome.blocks_review = true;
@@ -1062,6 +1064,7 @@ impl MentionFlow {
                         );
                     }
                     let completion_note_posted = if post_status_note {
+                        let status_message = sanitize_comment_text(&config, &status_message);
                         match gitlab
                             .create_discussion_note(
                                 &repo_name,
@@ -1091,6 +1094,7 @@ impl MentionFlow {
                         let fallback_message = format!(
                             "Mention command result for discussion `{discussion_id}`:\n\n{status_message}"
                         );
+                        let fallback_message = sanitize_comment_text(&config, &fallback_message);
                         if let Err(err) = gitlab
                             .create_note(&repo_name, mr_copy.iid, &fallback_message)
                             .await

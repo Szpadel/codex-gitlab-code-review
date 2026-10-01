@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Notify, Semaphore};
 
 pub(crate) mod award_service;
+mod comment_text;
 pub(crate) mod mention;
 pub(crate) mod mention_assets;
 pub(crate) mod orchestration;
