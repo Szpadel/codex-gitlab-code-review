@@ -87,7 +87,7 @@ impl ReviewRateLimitRepository {
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn try_consume_review_rate_limits(
         &self,
-        lane: crate::review::ReviewLane,
+        lane: crate::review_lane::ReviewLane,
         repo: &str,
         iid: u64,
         now: i64,
@@ -133,7 +133,7 @@ impl ReviewRateLimitRepository {
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn upsert_review_rate_limit_pending(
         &self,
-        lane: crate::review::ReviewLane,
+        lane: crate::review_lane::ReviewLane,
         repo: &str,
         iid: u64,
         head_sha: &str,
@@ -150,7 +150,7 @@ impl ReviewRateLimitRepository {
     /// Returns an error if the `SQLite` state operation fails.
     pub async fn clear_review_rate_limit_pending(
         &self,
-        lane: crate::review::ReviewLane,
+        lane: crate::review_lane::ReviewLane,
         repo: &str,
         iid: u64,
     ) -> Result<bool> {

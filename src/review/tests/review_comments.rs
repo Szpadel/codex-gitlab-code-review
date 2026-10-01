@@ -474,7 +474,7 @@ async fn completed_review_state_skips_same_sha_without_note_marker() -> Result<(
     let run_id = state
         .run_history
         .start_run_history(crate::state::NewRunHistory {
-            kind: crate::state::RunHistoryKind::Review,
+            kind: crate::run_history_kind::RunHistoryKind::Review,
             repo: "group/repo".to_string(),
             iid: 44,
             head_sha: "sha44".to_string(),
@@ -549,7 +549,7 @@ async fn legacy_dry_run_comment_history_without_gitlab_markers_does_not_skip_sam
     let run_id = state
         .run_history
         .start_run_history(crate::state::NewRunHistory {
-            kind: crate::state::RunHistoryKind::Review,
+            kind: crate::run_history_kind::RunHistoryKind::Review,
             repo: "group/repo".to_string(),
             iid: 441,
             head_sha: "sha441".to_string(),
@@ -615,7 +615,7 @@ async fn completed_inline_review_state_skips_when_discussion_lookup_fails() -> R
     let run_id = state
         .run_history
         .start_run_history(crate::state::NewRunHistory {
-            kind: crate::state::RunHistoryKind::Review,
+            kind: crate::run_history_kind::RunHistoryKind::Review,
             repo: "group/repo".to_string(),
             iid: 442,
             head_sha: "sha442".to_string(),
@@ -677,7 +677,7 @@ async fn errored_review_state_does_not_skip_same_sha() -> Result<()> {
     let run_id = state
         .run_history
         .start_run_history(crate::state::NewRunHistory {
-            kind: crate::state::RunHistoryKind::Review,
+            kind: crate::run_history_kind::RunHistoryKind::Review,
             repo: "group/repo".to_string(),
             iid: 45,
             head_sha: "sha45".to_string(),

@@ -533,8 +533,8 @@ async fn security_reviews_use_canonical_project_path_for_runner_context() -> Res
         .into_iter()
         .map(|record| record.kind)
         .collect::<Vec<_>>();
-    assert!(run_kinds.contains(&crate::state::RunHistoryKind::Review));
-    assert!(run_kinds.contains(&crate::state::RunHistoryKind::Security));
+    assert!(run_kinds.contains(&crate::run_history_kind::RunHistoryKind::Review));
+    assert!(run_kinds.contains(&crate::run_history_kind::RunHistoryKind::Security));
     Ok(())
 }
 
@@ -734,7 +734,12 @@ async fn scan_keeps_forbidden_error_for_active_project() -> Result<()> {
 #[test]
 fn retry_backoff_uses_five_attempt_policy() {
     let backoff = RetryBackoff::new(Duration::minutes(15), 5);
-    let key = RetryKey::new(crate::review::ReviewLane::General, "group/repo", 1, "sha1");
+    let key = RetryKey::new(
+        crate::review_lane::ReviewLane::General,
+        "group/repo",
+        1,
+        "sha1",
+    );
     let start = Utc
         .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
         .single()

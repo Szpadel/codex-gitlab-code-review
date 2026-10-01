@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::flow::award_service::AwardService;
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;

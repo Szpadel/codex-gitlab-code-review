@@ -13,9 +13,10 @@ use crate::flow::orchestration::{
 use crate::flow::{ActiveMentionKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::links::{extract_root_relative_markdown_urls, gitlab_web_base};
 use crate::gitlab::{DiscussionNote, GitLabUser, MergeRequest, MergeRequestDiscussion};
+use crate::run_history_kind::RunHistoryKind;
 use crate::state::{
     MentionCommandScanState, MentionQuotaPendingUpsert, NewRunHistory, ReviewStateStore,
-    RunHistoryFinish, RunHistoryKind,
+    RunHistoryFinish,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;

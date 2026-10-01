@@ -1,6 +1,6 @@
 use super::super::timestamp::{self, UiTimestamp};
 use super::rate_limits::rate_limits_script;
-use crate::state::RunHistoryKind;
+use crate::run_history_kind::RunHistoryKind;
 use std::fmt::Write as _;
 
 const FEATURE_FLAG_SCRIPT: &str = include_str!("../assets/feature_flag.js");

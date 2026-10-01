@@ -6,10 +6,10 @@ use crate::gitlab::{
     DiffDiscussionPosition, GitLabApi, MergeRequest, MergeRequestDiff, MergeRequestDiffDiscussion,
     MergeRequestDiffVersion,
 };
-use crate::review::ReviewLane;
 use crate::review_deduplication::{
     ReviewDiscussionSource, finding_marker, finding_markers_from_text,
 };
+use crate::review_lane::ReviewLane;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;

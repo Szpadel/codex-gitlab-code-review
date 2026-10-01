@@ -62,7 +62,7 @@ async fn security_context_startup_timeout_removes_nested_containers() -> Result<
     };
     let runner = test_runner_with_fake_runtime(codex, false, Arc::clone(&harness), None).await;
     let mut ctx = review_context_with_target_branch(Some("main"));
-    ctx.lane = crate::review::ReviewLane::Security;
+    ctx.lane = crate::review_lane::ReviewLane::Security;
     ctx.min_confidence_score = Some(0.85);
 
     let error = runner.run_review(ctx).await.expect_err("startup timeout");
@@ -174,7 +174,7 @@ async fn security_context_timeout_preserves_its_partial_transcript() -> Result<(
         })
         .await?;
     let mut ctx = review_context_with_target_branch(Some("main"));
-    ctx.lane = crate::review::ReviewLane::Security;
+    ctx.lane = crate::review_lane::ReviewLane::Security;
     ctx.min_confidence_score = Some(0.85);
     ctx.run_history_id = Some(run_history_id);
 

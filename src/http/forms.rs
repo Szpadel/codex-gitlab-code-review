@@ -157,9 +157,9 @@ impl HistoryQueryParams {
                 .filter(|value| !value.is_empty())
             {
                 Some("all") => None,
-                Some("review") => Some(crate::state::RunHistoryKind::Review),
-                Some("security") => Some(crate::state::RunHistoryKind::Security),
-                Some("mention") => Some(crate::state::RunHistoryKind::Mention),
+                Some("review") => Some(crate::run_history_kind::RunHistoryKind::Review),
+                Some("security") => Some(crate::run_history_kind::RunHistoryKind::Security),
+                Some("mention") => Some(crate::run_history_kind::RunHistoryKind::Mention),
                 Some(other) => anyhow::bail!("invalid kind filter: {other}"),
                 None => None,
             },

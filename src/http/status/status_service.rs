@@ -7,10 +7,10 @@ use super::{
 };
 use crate::config::Config;
 use crate::review::{RunRetryStatus, RunRetryStatusProvider};
+use crate::run_history_kind::RunHistoryKind;
 use crate::service_error::ServiceError;
 use crate::state::{
-    ReviewStateStore, RunHistoryCursor, RunHistoryKind, RunHistoryListQuery, RunHistoryRecord,
-    RunTokenUsageRollup,
+    ReviewStateStore, RunHistoryCursor, RunHistoryListQuery, RunHistoryRecord, RunTokenUsageRollup,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;

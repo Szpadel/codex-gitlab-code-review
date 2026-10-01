@@ -1,4 +1,4 @@
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
 use crate::state::PROJECT_RATE_LIMIT_SUBJECT_IID;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};

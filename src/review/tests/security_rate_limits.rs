@@ -99,13 +99,13 @@ async fn security_inline_review_comments_link_sectioned_references() -> Result<(
             "group/repo",
             25,
             "sha25",
-            crate::review::ReviewLane::Security,
+            crate::review_lane::ReviewLane::Security,
         )
         .await?;
     let award_service = AwardService::new(gitlab.clone(), 1);
     let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
-        lane: crate::review::ReviewLane::Security,
+        lane: crate::review_lane::ReviewLane::Security,
         config,
         gitlab: gitlab.clone(),
         award_service,
@@ -205,13 +205,13 @@ async fn security_review_pass_stays_silent() -> Result<()> {
             "group/repo",
             25,
             "sha25",
-            crate::review::ReviewLane::Security,
+            crate::review_lane::ReviewLane::Security,
         )
         .await?;
     let award_service = AwardService::new(gitlab.clone(), 1);
     let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
-        lane: crate::review::ReviewLane::Security,
+        lane: crate::review_lane::ReviewLane::Security,
         config,
         gitlab: gitlab.clone(),
         award_service,
@@ -322,7 +322,7 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
         .list_review_rate_limit_pending()
         .await?;
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].lane, crate::review::ReviewLane::General);
+    assert_eq!(pending[0].lane, crate::review_lane::ReviewLane::General);
     assert_eq!(pending[0].repo, "group/repo".to_string());
     assert_eq!(pending[0].iid, 26);
     assert_eq!(pending[0].last_seen_head_sha, "sha26-newer".to_string());
@@ -872,7 +872,7 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
             .lock()
             .unwrap()
             .iter()
-            .filter(|ctx| ctx.lane == crate::review::ReviewLane::General)
+            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::General)
             .count(),
         1
     );
@@ -882,7 +882,7 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
             .lock()
             .unwrap()
             .iter()
-            .filter(|ctx| ctx.lane == crate::review::ReviewLane::Security)
+            .filter(|ctx| ctx.lane == crate::review_lane::ReviewLane::Security)
             .count(),
         1
     );

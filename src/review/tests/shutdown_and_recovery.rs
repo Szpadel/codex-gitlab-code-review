@@ -9,7 +9,12 @@ async fn scan_sweeps_all_review_lanes_once() -> Result<()> {
         .await?;
     state
         .review_state
-        .begin_review_for_lane("group/repo", 2, "sha", crate::review::ReviewLane::Security)
+        .begin_review_for_lane(
+            "group/repo",
+            2,
+            "sha",
+            crate::review_lane::ReviewLane::Security,
+        )
         .await?;
     // Keep the rows stale so the trigger can count a repeated sweep.
     sqlx::raw_sql(
@@ -640,7 +645,7 @@ async fn review_marks_cancelled_when_shutdown_requested_after_runner_completes()
     let award_service = AwardService::new(gitlab.clone(), 1);
     let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
-        lane: crate::review::ReviewLane::General,
+        lane: crate::review_lane::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
         award_service,
@@ -736,7 +741,7 @@ async fn review_marks_cancelled_without_starting_runner_when_shutdown_requested_
     let award_service = AwardService::new(gitlab.clone(), 1);
     let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
-        lane: crate::review::ReviewLane::General,
+        lane: crate::review_lane::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
         award_service,
@@ -844,7 +849,7 @@ async fn review_marks_cancelled_when_shutdown_requested_during_eyes_removal() ->
     let award_service = AwardService::new(gitlab.clone(), 1);
     let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
-        lane: crate::review::ReviewLane::General,
+        lane: crate::review_lane::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
         award_service,
@@ -942,7 +947,7 @@ async fn review_finishes_successfully_when_graceful_drain_starts_after_runner_be
     let award_service = AwardService::new(gitlab.clone(), 1);
     let retry_warning_awards = RetryWarningAwardService::new(config.clone(), award_service.clone());
     let review_context = ReviewRunContext {
-        lane: crate::review::ReviewLane::General,
+        lane: crate::review_lane::ReviewLane::General,
         config,
         gitlab: gitlab.clone(),
         award_service,

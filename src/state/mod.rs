@@ -1,5 +1,6 @@
 use crate::config::FeatureFlagSnapshot;
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
+use crate::run_history_kind::RunHistoryKind;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,14 +77,6 @@ pub struct ReviewStateStore {
 pub struct ProjectCatalog {
     pub fetched_at: i64,
     pub projects: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunHistoryKind {
-    Review,
-    Security,
-    Mention,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

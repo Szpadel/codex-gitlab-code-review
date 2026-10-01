@@ -7,7 +7,7 @@ use super::{
     REVIEW_RATE_LIMIT_EPSILON, ReviewRateLimitAcquireOutcome, ReviewRateLimitBucketSnapshot,
     unique_review_rate_limit_rule_ids,
 };
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
 use crate::state::sqlite::SqliteCoordinator;
 use anyhow::{Context, Result};
 use sqlx::{Row, SqlitePool};

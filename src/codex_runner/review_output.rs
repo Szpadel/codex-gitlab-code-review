@@ -4,7 +4,7 @@ use super::{
     CodexResult, ReviewCodeLocation, ReviewComment, ReviewFinding, ReviewLineRange,
     SecurityReviewContentFlagged,
 };
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
 use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
 

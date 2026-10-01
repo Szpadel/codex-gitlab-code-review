@@ -1,5 +1,5 @@
 use crate::config::FeatureFlagSnapshot;
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use sqlx::{AssertSqlSafe, QueryBuilder, Row, Sqlite, SqlitePool};
@@ -7,10 +7,11 @@ use std::collections::HashMap;
 
 use super::{
     NewRunHistory, NewRunHistoryEvent, NewRunTokenUsage, RunHistoryCursor, RunHistoryEventRecord,
-    RunHistoryFinish, RunHistoryKind, RunHistoryListItem, RunHistoryListPage, RunHistoryListQuery,
+    RunHistoryFinish, RunHistoryListItem, RunHistoryListPage, RunHistoryListQuery,
     RunHistoryRecord, RunHistorySessionUpdate, RunTokenUsageRollup, RunTokenUsageStatistic,
     TranscriptBackfillState, sqlite::SqliteCoordinator, sqlite_i64_from_u64,
 };
+use crate::run_history_kind::RunHistoryKind;
 
 const MISSING_ERROR_DETAILS: &str =
     "Run finished with result error, but no failure details were recorded.";

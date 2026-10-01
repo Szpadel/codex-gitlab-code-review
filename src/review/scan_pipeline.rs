@@ -1,9 +1,9 @@
-use super::ReviewLane;
 use super::admission::{ReviewSkipReason, review_skip_reason};
 use super::service::{NO_OPEN_MRS_MARKER, ReviewService, ScanMode, ScanRunStatus};
 use crate::flow::admission::AdmissionHistory;
 use crate::flow::mention::MentionScheduleOutcome;
 use crate::flow::review::ReviewScheduleOutcome;
+use crate::review_lane::ReviewLane;
 use anyhow::Result;
 use chrono::Utc;
 use futures::future::join_all;

@@ -13,8 +13,8 @@ use crate::gitlab::{
     MergeRequestDiff, MergeRequestDiffVersion, MergeRequestDiscussion, Note,
 };
 use crate::lifecycle::ServiceLifecycle;
-use crate::review::ReviewLane;
 use crate::review::retry::{RetryBackoff, RetryKey, RetryWarningAwardService};
+use crate::review_lane::ReviewLane;
 use crate::state::{ReviewRateLimitScope, ReviewStateStore, RunHistoryListQuery};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, TimeZone, Utc};

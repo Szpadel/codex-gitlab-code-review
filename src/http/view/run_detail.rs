@@ -10,7 +10,8 @@ use super::html::{
     run_kind_label,
 };
 use crate::review::RunRetryStatus;
-use crate::state::{RunHistoryKind, RunHistoryRecord};
+use crate::run_history_kind::RunHistoryKind;
+use crate::state::RunHistoryRecord;
 
 pub(in crate::http) fn render_run_detail_page(
     snapshot: &RunDetailSnapshot,
@@ -407,7 +408,8 @@ mod tests {
     use super::*;
     use crate::config::FeatureFlagSnapshot;
     use crate::http::status::{HistoryRunRecord, RunDetailSnapshot, SecurityContextPreview};
-    use crate::state::{RunHistoryKind, RunHistoryRecord, TranscriptBackfillState};
+    use crate::run_history_kind::RunHistoryKind;
+    use crate::state::{RunHistoryRecord, TranscriptBackfillState};
 
     fn sample_run(kind: RunHistoryKind) -> HistoryRunRecord {
         HistoryRunRecord::new(

@@ -1,6 +1,6 @@
+use crate::run_history_kind::RunHistoryKind;
 use crate::state::{
-    NewRunHistory, NewRunHistoryEvent, ReviewStateStore, RunHistoryFinish, RunHistoryKind,
-    RunHistorySessionUpdate,
+    NewRunHistory, NewRunHistoryEvent, ReviewStateStore, RunHistoryFinish, RunHistorySessionUpdate,
 };
 use anyhow::Result;
 use serde_json::{Value, json};

@@ -13,9 +13,9 @@ use crate::http::transcript::{
     thread_snapshot_from_events, thread_snapshot_is_complete,
     thread_snapshot_only_target_turn_is_incomplete,
 };
+use crate::run_history_kind::RunHistoryKind;
 use crate::state::{
-    ReviewStateStore, RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord,
-    TranscriptBackfillState,
+    ReviewStateStore, RunHistoryEventRecord, RunHistoryRecord, TranscriptBackfillState,
 };
 use anyhow::Result;
 

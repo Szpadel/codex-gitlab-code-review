@@ -717,9 +717,8 @@ mod tests {
     use super::*;
     use crate::config::FeatureFlagSnapshot;
     use crate::http::transcript::parser::thread_snapshot_from_events;
-    use crate::state::{
-        RunHistoryEventRecord, RunHistoryKind, RunHistoryRecord, TranscriptBackfillState,
-    };
+    use crate::run_history_kind::RunHistoryKind;
+    use crate::state::{RunHistoryEventRecord, RunHistoryRecord, TranscriptBackfillState};
     use insta::assert_snapshot;
     use serde_json::json;
 

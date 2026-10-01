@@ -539,7 +539,8 @@ fn compact_json(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::config::FeatureFlagSnapshot;
-    use crate::state::{RunHistoryKind, TranscriptBackfillState};
+    use crate::run_history_kind::RunHistoryKind;
+    use crate::state::TranscriptBackfillState;
     use serde_json::json;
 
     fn base_run() -> RunHistoryRecord {
@@ -605,7 +606,7 @@ mod tests {
         use crate::codex_runner::{CodexRunner, ReviewContext};
         use crate::dev_mode::MockCodexRunner;
         use crate::http::test_support::RunFixture;
-        use crate::review::ReviewLane;
+        use crate::review_lane::ReviewLane;
         use crate::state::ReviewStateStore;
         use std::sync::Arc;
 

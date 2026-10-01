@@ -1,10 +1,11 @@
 use crate::codex_runner::CodexUsageSnapshot;
 use crate::review::RunRetryStatus;
+use crate::run_history_kind::RunHistoryKind;
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
     ProjectCatalogSummary, ReviewRateLimitBucketSnapshot, ReviewRateLimitPendingEntry,
-    ReviewRateLimitRule, RunHistoryKind, RunHistoryListItem, RunHistoryRecord, RunTokenUsageRollup,
-    ScanMode, ScanOutcome, ScanState, TranscriptBackfillState,
+    ReviewRateLimitRule, RunHistoryListItem, RunHistoryRecord, RunTokenUsageRollup, ScanMode,
+    ScanOutcome, ScanState, TranscriptBackfillState,
 };
 use serde::Serialize;
 use std::ops::{Deref, DerefMut};

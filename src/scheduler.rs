@@ -810,7 +810,8 @@ mod tests {
 
     #[tokio::test]
     async fn fast_stop_persists_accepted_background_events_and_closes_admission() -> Result<()> {
-        use crate::state::{NewRunHistory, NewRunHistoryEvent, RunHistoryKind};
+        use crate::run_history_kind::RunHistoryKind;
+        use crate::state::{NewRunHistory, NewRunHistoryEvent};
 
         let mut config = test_config();
         apply_dev_mode_profile(&mut config);

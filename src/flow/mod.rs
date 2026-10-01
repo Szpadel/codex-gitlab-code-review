@@ -4,7 +4,7 @@ use crate::flow::award_service::AwardService;
 use crate::flow::orchestration::TaskAdmission;
 use crate::gitlab::GitLabApi;
 use crate::lifecycle::ServiceLifecycle;
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
 use crate::state::ReviewStateStore;
 use anyhow::Result;
 use async_trait::async_trait;

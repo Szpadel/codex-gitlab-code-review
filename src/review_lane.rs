@@ -1,7 +1,7 @@
 //! Review lane identity and its fixed workflow behavior.
 
 use crate::config::{Config, FeatureFlagSnapshot};
-use crate::state::RunHistoryKind;
+use crate::run_history_kind::RunHistoryKind;
 use serde::{Deserialize, Serialize};
 
 /// Selects general or security review behavior and its persisted lane name.

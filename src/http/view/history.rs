@@ -7,7 +7,7 @@ use super::html::{
     render_unix_timestamp, run_kind_label,
 };
 use crate::review::RunRetryStatus;
-use crate::state::RunHistoryKind;
+use crate::run_history_kind::RunHistoryKind;
 use urlencoding::encode;
 
 pub(in crate::http) fn render_history_page(

@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::gitlab::links::gitlab_web_base;
 use crate::gitlab::{GitLabApi, MergeRequest};
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
 use tracing::warn;
 
 /// Carries the lane's checkout path and the source base for finding links.

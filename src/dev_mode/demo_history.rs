@@ -1,8 +1,9 @@
 use crate::config::Config;
+use crate::run_history_kind::RunHistoryKind;
 use crate::service_factory::build_review_state_store;
 use crate::state::{
     NewRunHistory, NewRunHistoryEvent, NewRunTokenUsage, ReviewStateStore, RunHistoryFinish,
-    RunHistoryKind, RunHistoryRecord, RunHistorySessionUpdate,
+    RunHistoryRecord, RunHistorySessionUpdate,
 };
 use anyhow::{Context, Result};
 use chrono::{Duration, SecondsFormat, TimeZone, Utc};

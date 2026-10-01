@@ -1,5 +1,5 @@
 use super::ReviewRateLimitPendingEntry;
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
 use crate::state::{parse_review_lane, sqlite::SqliteCoordinator, sqlite_i64_from_u64};
 use anyhow::{Context, Result};
 use sqlx::{QueryBuilder, Row, Sqlite};

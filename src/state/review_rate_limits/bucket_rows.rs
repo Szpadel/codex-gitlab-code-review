@@ -8,7 +8,7 @@ use super::{
     ReviewRateLimitTargetKind, effective_review_rate_limit_bucket_mode,
     global_review_rate_limit_target, is_global_review_rate_limit_target,
 };
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
 use anyhow::{Context, Result};
 use sqlx::{QueryBuilder, Row, Sqlite};
 use std::collections::HashMap;

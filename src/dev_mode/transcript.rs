@@ -1,4 +1,4 @@
-use crate::review::ReviewLane;
+use crate::review_lane::ReviewLane;
 use crate::state::NewRunHistoryEvent;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};

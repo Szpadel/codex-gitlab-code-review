@@ -16,12 +16,12 @@ use crate::flow::review_project::{ResolvedReviewProject, resolve_review_project}
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::{GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
 use crate::lifecycle::ServiceLifecycle;
-use crate::review::ReviewLane;
 use crate::review::retry::{
     REVIEW_RETRY_BLOCKED_DEFER_SECONDS, RetryBackoff, RetryGateStatus, RetryKey,
     RetryWarningAwardService,
 };
 use crate::review_deduplication::ReviewDiscussionSource;
+use crate::review_lane::ReviewLane;
 use crate::state::{
     NewRunHistory, ReviewRateLimitAcquireOutcome, ReviewStateStore, RunHistoryFinish,
 };

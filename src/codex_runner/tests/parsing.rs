@@ -184,7 +184,7 @@ fn parse_security_review_output_filters_low_confidence_findings() -> Result<()> 
       "overall_confidence_score": 0.84
     }"#;
     let result =
-        parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(0.85))?;
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))?;
     match result {
         CodexResult::Pass { summary } => {
             assert_eq!(summary, "No confirmed security issues after validation.");
@@ -198,7 +198,7 @@ fn parse_security_review_output_filters_low_confidence_findings() -> Result<()> 
 fn parse_security_review_output_rejects_unstructured_text() {
     let err = parse_review_output_for_lane(
         "This patch looks safe.",
-        crate::review::ReviewLane::Security,
+        crate::review_lane::ReviewLane::Security,
         Some(0.85),
     )
     .expect_err("security review should reject prose output");
@@ -211,8 +211,9 @@ fn parse_security_review_output_rejects_unstructured_text() {
 #[test]
 fn parse_security_review_output_preserves_cybersecurity_flag() {
     let text = "This content was flagged for possible cybersecurity risk. If this seems wrong, try rephrasing your request. To get authorized for security work, join the Trusted Access for Cyber program: https://chatgpt.com/cyber";
-    let err = parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(0.85))
-        .expect_err("flagged security review should fail");
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("flagged security review should fail");
 
     assert!(err.downcast_ref::<SecurityReviewContentFlagged>().is_some());
 }
@@ -221,7 +222,7 @@ fn parse_security_review_output_preserves_cybersecurity_flag() {
 fn parse_security_review_output_does_not_flag_text_containing_only_the_first_sentence() {
     let err = parse_review_output_for_lane(
         "This content was flagged for possible cybersecurity risk. unrelated text",
-        crate::review::ReviewLane::Security,
+        crate::review_lane::ReviewLane::Security,
         Some(0.85),
     )
     .expect_err("non-canonical prose should still be rejected");
@@ -242,7 +243,7 @@ fn parse_security_review_output_allows_flag_sentence_inside_structured_output() 
     }"#;
 
     let result =
-        parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(0.85))?;
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))?;
     assert!(matches!(result, CodexResult::Pass { .. }));
     Ok(())
 }
@@ -255,8 +256,9 @@ fn parse_security_review_output_rejects_wrapped_json() {
   "overall_correctness": "patch is correct",
   "overall_explanation": "No confirmed issues."
 }"#;
-    let err = parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(0.85))
-        .expect_err("security review should reject prose-wrapped JSON output");
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("security review should reject prose-wrapped JSON output");
     assert!(
         err.to_string()
             .contains("security review output must be a structured JSON object")
@@ -265,8 +267,9 @@ fn parse_security_review_output_rejects_wrapped_json() {
 
 #[test]
 fn parse_security_review_output_rejects_empty_text() {
-    let err = parse_review_output_for_lane("", crate::review::ReviewLane::Security, Some(0.85))
-        .expect_err("security review should reject empty output");
+    let err =
+        parse_review_output_for_lane("", crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("security review should reject empty output");
     assert!(
         err.to_string()
             .contains("security review output must be a structured JSON object")
@@ -290,8 +293,9 @@ fn parse_security_review_output_rejects_findings_without_confidence() {
       "overall_correctness": "patch is incorrect",
       "overall_explanation": "A security issue was found."
     }"#;
-    let err = parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(0.85))
-        .expect_err("security review should reject findings without confidence");
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("security review should reject findings without confidence");
     assert!(
         err.to_string()
             .contains("security review findings must include confidence_score")
@@ -316,8 +320,9 @@ fn parse_security_review_output_rejects_invalid_confidence_threshold() {
       "overall_correctness": "patch is incorrect",
       "overall_explanation": "A security issue was found."
     }"#;
-    let err = parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(1.5))
-        .expect_err("security review should reject invalid thresholds");
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(1.5))
+            .expect_err("security review should reject invalid thresholds");
     assert!(err.to_string().contains(
         "security review min_confidence_score must be a finite number between 0.0 and 1.0"
     ));
@@ -341,8 +346,9 @@ fn parse_security_review_output_rejects_invalid_finding_confidence_scores() {
       "overall_correctness": "patch is incorrect",
       "overall_explanation": "A security issue was found."
     }"#;
-    let err = parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(0.85))
-        .expect_err("security review should reject invalid finding confidence");
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("security review should reject invalid finding confidence");
     assert!(
         err.to_string().contains(
             "security review findings must use confidence_score values between 0.0 and 1.0"
@@ -359,7 +365,7 @@ fn parse_security_review_output_accepts_nullable_optional_fields() -> Result<()>
       "overall_confidence_score": null
     }"#;
     let result =
-        parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(0.85))?;
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))?;
     match result {
         CodexResult::Pass { summary } => {
             assert_eq!(summary, "no confirmed security issues found");
@@ -435,7 +441,7 @@ Move the tenant authorization check before the early return and add a regression
     })
     .to_string();
     let result =
-        parse_review_output_for_lane(&text, crate::review::ReviewLane::Security, Some(0.85))?;
+        parse_review_output_for_lane(&text, crate::review_lane::ReviewLane::Security, Some(0.85))?;
 
     match result {
         CodexResult::Comment(comment) => {
@@ -464,8 +470,9 @@ fn parse_security_review_output_rejects_incorrect_verdict_without_confirmed_find
       "overall_correctness": "patch is incorrect",
       "overall_explanation": "The patch is unsafe."
     }"#;
-    let err = parse_review_output_for_lane(text, crate::review::ReviewLane::Security, Some(0.85))
-        .expect_err("security review should reject incorrect verdict without findings");
+    let err =
+        parse_review_output_for_lane(text, crate::review_lane::ReviewLane::Security, Some(0.85))
+            .expect_err("security review should reject incorrect verdict without findings");
     assert!(
         err.to_string()
             .contains("security review marked patch incorrect without confirmed findings")

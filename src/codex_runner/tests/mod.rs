@@ -40,7 +40,8 @@ use crate::config::{
     DepsConfig, FallbackAuthAccountConfig, GitLabTargets, McpServerOverridesConfig,
     SessionOverridesConfig, WorkTmpfsConfig,
 };
-use crate::state::{NewRunHistory, RunHistoryKind};
+use crate::run_history_kind::RunHistoryKind;
+use crate::state::NewRunHistory;
 use anyhow::Context;
 use chrono::TimeZone;
 use std::collections::{BTreeMap, BTreeSet};
@@ -229,7 +230,7 @@ mod usage_sessions;
 
 fn review_context_with_target_branch(target_branch: Option<&str>) -> ReviewContext {
     ReviewContext {
-        lane: crate::review::ReviewLane::General,
+        lane: crate::review_lane::ReviewLane::General,
         repo: "group/repo".to_string(),
         project_path: "group/repo".to_string(),
         mr: MergeRequest {

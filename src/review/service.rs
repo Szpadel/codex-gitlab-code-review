@@ -8,7 +8,6 @@ use crate::flow::orchestration::TaskAdmission;
 use crate::flow::review::{ReviewFlow, ReviewScheduleOutcome};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
-use crate::review::ReviewLane;
 use crate::review::admission::review_skip_reason;
 use crate::review::retry::{
     RetryBackoff, RetryKey, RetryWarningAwardService, RunRetryStatus, RunRetryStatusProvider,
@@ -19,6 +18,7 @@ use crate::review::scan_pipeline::{
     run_review_backoff_retry_pipeline, run_scan_pipeline,
 };
 use crate::review::target_resolver::TargetResolver;
+use crate::review_lane::ReviewLane;
 use crate::state::{
     MentionQuotaPendingEntry, MentionQuotaPendingUpsert, ReviewRateLimitPendingEntry,
     ReviewStateStore,
