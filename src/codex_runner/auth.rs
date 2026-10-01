@@ -1,6 +1,6 @@
 use super::{
-    ChronoDuration, CodexConfig, DateTime, DockerCodexRunner, PRIMARY_AUTH_ACCOUNT_NAME,
-    QuotaBlock, Result, Utc, bail, info, warn,
+    ChronoDuration, CodexConfig, DateTime, DockerCodexRunner, QuotaBlock, Result, Utc, bail,
+    configured_auth_accounts, info, warn,
 };
 use crate::codex_runner::app_server::is_app_server_io_failure;
 use crate::codex_runner::app_server_diagnostics::AppServerContainerDiagnosticsContext;
@@ -143,25 +143,18 @@ impl AuthFallbackAction {
 }
 
 impl DockerCodexRunner {
+    /// Adds the runner's logging flag to the shared account descriptors.
     pub(crate) fn build_auth_accounts(codex: &CodexConfig) -> Vec<AuthAccount> {
-        let mut accounts = vec![AuthAccount {
-            name: PRIMARY_AUTH_ACCOUNT_NAME.to_string(),
-            auth_host_path: codex.auth_host_path.clone(),
-            state_key: auth_account_state_key(PRIMARY_AUTH_ACCOUNT_NAME, &codex.auth_host_path),
-            is_primary: true,
-        }];
-        accounts.extend(
-            codex
-                .fallback_auth_accounts
-                .iter()
-                .map(|account| AuthAccount {
-                    name: account.name.clone(),
-                    auth_host_path: account.auth_host_path.clone(),
-                    state_key: auth_account_state_key(&account.name, &account.auth_host_path),
-                    is_primary: false,
-                }),
-        );
-        accounts
+        configured_auth_accounts(codex)
+            .into_iter()
+            .enumerate()
+            .map(|(index, account)| AuthAccount {
+                name: account.name,
+                auth_host_path: account.auth_host_path,
+                state_key: account.state_key,
+                is_primary: index == 0,
+            })
+            .collect()
     }
 
     pub(crate) async fn account_is_temporarily_blocked(
@@ -659,8 +652,4 @@ pub(crate) fn should_clear_limit_reset(
     attempt_started_at: DateTime<Utc>,
 ) -> bool {
     existing_reset_at <= attempt_started_at
-}
-
-pub(crate) fn auth_account_state_key(name: &str, auth_host_path: &str) -> String {
-    format!("{name}::{auth_host_path}")
 }

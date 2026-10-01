@@ -73,12 +73,18 @@ impl CodexRunner for FakeUsageRunner {
 #[tokio::test]
 async fn usage_page_renders_all_accounts_and_all_returned_limits() -> Result<()> {
     let mut config = test_config();
-    config.codex.fallback_auth_accounts = vec![FallbackAuthAccountConfig {
-        name: "backup-high".to_string(),
-        auth_host_path: "/tmp/codex-backup-high".to_string(),
-    }];
+    config.codex.fallback_auth_accounts = vec![
+        FallbackAuthAccountConfig {
+            name: "backup-high".to_string(),
+            auth_host_path: "/tmp/codex-backup-high".to_string(),
+        },
+        FallbackAuthAccountConfig {
+            name: "backup-low".to_string(),
+            auth_host_path: "/tmp/codex-backup-low".to_string(),
+        },
+    ];
     let runner = Arc::new(FakeUsageRunner {
-        read_barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        read_barrier: Some(Arc::new(tokio::sync::Barrier::new(3))),
         ..FakeUsageRunner::default()
     });
     runner.with_snapshot(
@@ -95,13 +101,21 @@ async fn usage_page_renders_all_accounts_and_all_returned_limits() -> Result<()>
         "backup-high",
         usage_snapshot(Some(0), [("codex", weekly_limit(40.0))]),
     );
+    runner.with_snapshot("backup-low", usage_snapshot(Some(0), []));
     let srv = HttpTestServerBuilder::new()
         .with_config(config)
         .with_runner(runner)
         .spawn()
         .await?;
+    srv.state
+        .service_state
+        .set_auth_limit_reset_at(
+            "backup-high::/tmp/codex-backup-high",
+            "2099-03-10T12:00:00Z",
+        )
+        .await?;
 
-    // Both accounts must enter the runner before either read can complete.
+    // All accounts must enter the runner before any read can complete.
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         test_get(format!("http://{}/usage", srv.address)),
@@ -112,12 +126,19 @@ async fn usage_page_renders_all_accounts_and_all_returned_limits() -> Result<()>
     assert!(body.contains("Usage limits"));
     assert!(body.contains("primary"));
     assert!(body.contains("backup-high"));
+    assert!(body.contains("/tmp/codex-backup-high"));
+    assert!(body.contains("/tmp/codex-backup-low"));
+    assert!(body.contains("2099-03-10T12:00:00Z"));
     assert!(
         body.find("<h2>primary</h2>")
             .expect("primary account heading")
             < body
                 .find("<h2>backup-high</h2>")
                 .expect("backup account heading")
+    );
+    assert!(
+        body.find("<h2>backup-high</h2>").expect("first fallback")
+            < body.find("<h2>backup-low</h2>").expect("second fallback")
     );
     assert!(body.contains("codex"));
     assert!(body.contains("codex_other"));

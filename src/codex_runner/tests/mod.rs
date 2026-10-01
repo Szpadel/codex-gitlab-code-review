@@ -9,8 +9,8 @@ use super::app_server_diagnostics::{
     append_bounded_log_bytes,
 };
 use super::auth::{
-    CodexQuotaExhausted, QUOTA_LAST_PROBE_AT_KEY, auth_account_state_key,
-    parse_usage_limit_reset_at, should_clear_limit_reset,
+    CodexQuotaExhausted, QUOTA_LAST_PROBE_AT_KEY, parse_usage_limit_reset_at,
+    should_clear_limit_reset,
 };
 use super::browser_mcp::{
     BrowserContainerDiagnostics, BrowserContainerStateSnapshot, BrowserLaunchConfig,

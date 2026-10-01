@@ -44,6 +44,7 @@ use uuid::Uuid;
 mod app_server;
 mod app_server_diagnostics;
 mod auth;
+mod auth_accounts;
 mod browser_mcp;
 mod composer;
 mod container;
@@ -68,10 +69,13 @@ use self::app_server::{
     AppServerClient, GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID, annotate_event_payload,
 };
 pub use self::auth::CodexQuotaExhausted;
+pub(crate) use self::auth::QUOTA_LAST_PROBE_AT_KEY;
 use self::auth::{AuthAccount, AuthFallbackAction};
 #[cfg(test)]
 use self::auth::{AuthFailureKind, classify_auth_failure, classify_auth_failure_for_account};
-pub(crate) use self::auth::{QUOTA_LAST_PROBE_AT_KEY, auth_account_state_key};
+pub(crate) use self::auth_accounts::{ConfiguredAuthAccount, configured_auth_accounts};
+#[cfg(test)]
+pub(crate) use self::auth_accounts::{PRIMARY_AUTH_ACCOUNT_NAME, auth_account_state_key};
 use self::container::{ImagePullManager, format_command_for_log};
 use self::docker::{connect_docker, ensure_image, normalize_image_reference};
 use self::gitlab_discovery::{
@@ -283,7 +287,6 @@ impl Drop for SecurityContextBuildCompletionGuard {
 const REVIEW_CONTAINER_NAME_PREFIX: &str = "codex-review-";
 const BROWSER_CONTAINER_NAME_PREFIX: &str = "codex-browser-";
 const REVIEW_OWNER_LABEL_KEY: &str = "codex.gitlab.review.owner";
-pub(crate) const PRIMARY_AUTH_ACCOUNT_NAME: &str = "primary";
 const BROWSER_CONTAINER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const BROWSER_CONTAINER_RUNNING_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const BROWSER_CONTAINER_LOG_FETCH_TAIL: &str = "50";

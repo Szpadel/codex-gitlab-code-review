@@ -1,7 +1,7 @@
 use super::{UsageAccountSnapshot, UsagePageSnapshot};
 use crate::codex_runner::{
-    CodexRunner, CodexUsageResetOutcome, PRIMARY_AUTH_ACCOUNT_NAME, QUOTA_LAST_PROBE_AT_KEY,
-    auth_account_state_key,
+    CodexRunner, CodexUsageResetOutcome, ConfiguredAuthAccount, QUOTA_LAST_PROBE_AT_KEY,
+    configured_auth_accounts,
 };
 use crate::config::Config;
 use crate::state::ReviewStateStore;
@@ -13,16 +13,9 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct UsageService {
-    accounts: Vec<ConfiguredUsageAccount>,
+    accounts: Vec<ConfiguredAuthAccount>,
     state: Arc<ReviewStateStore>,
     runner: Option<Arc<dyn CodexRunner>>,
-}
-
-#[derive(Clone)]
-struct ConfiguredUsageAccount {
-    name: String,
-    auth_host_path: String,
-    state_key: String,
 }
 
 impl UsageService {
@@ -32,7 +25,7 @@ impl UsageService {
         state: Arc<ReviewStateStore>,
         runner: Option<Arc<dyn CodexRunner>>,
     ) -> Self {
-        let accounts = configured_usage_accounts(config);
+        let accounts = configured_auth_accounts(&config.codex);
         Self {
             accounts,
             state,
@@ -126,20 +119,4 @@ impl UsageService {
         }
         Ok(outcome)
     }
-}
-
-fn configured_usage_accounts(config: &Config) -> Vec<ConfiguredUsageAccount> {
-    let mut accounts = vec![ConfiguredUsageAccount {
-        name: PRIMARY_AUTH_ACCOUNT_NAME.to_string(),
-        auth_host_path: config.codex.auth_host_path.clone(),
-        state_key: auth_account_state_key(PRIMARY_AUTH_ACCOUNT_NAME, &config.codex.auth_host_path),
-    }];
-    accounts.extend(config.codex.fallback_auth_accounts.iter().map(|account| {
-        ConfiguredUsageAccount {
-            name: account.name.clone(),
-            auth_host_path: account.auth_host_path.clone(),
-            state_key: auth_account_state_key(&account.name, &account.auth_host_path),
-        }
-    }));
-    accounts
 }
