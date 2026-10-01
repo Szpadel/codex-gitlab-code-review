@@ -27,6 +27,8 @@ use tracing::error;
 use url::Url;
 
 const CLONE_REPOSITORY_SCRIPT_TEMPLATE: &str = include_str!("assets/clone_repository.sh");
+// Git runs this helper from the environment without writing the token to config.
+const GITLAB_CREDENTIAL_HELPER: &str = "!f() { if [ \"$1\" = get ]; then printf 'username=oauth2\\npassword=%s\\n' \"$GITLAB_TOKEN\"; fi; }; f";
 
 #[derive(Clone)]
 pub struct GitLabDiscoveryMcpService {
@@ -223,7 +225,7 @@ impl GitLabDiscoveryMcpService {
                 &binding.container_id,
                 vec!["/bin/bash".to_string(), "-lc".to_string(), script],
                 None,
-                Some(vec![format!("GITLAB_TOKEN={}", self.gitlab_token)]),
+                Some(self.git_auth_env()),
             )
             .await?;
         Ok(output.stdout.trim().to_string())
@@ -518,9 +520,7 @@ impl GitLabDiscoveryMcpService {
             return Ok(());
         }
 
-        let fetch_url = self
-            .clone_url_template(gitlab_repo_path)?
-            .replace("${GITLAB_TOKEN}", &self.gitlab_token);
+        let fetch_url = self.clone_url_template(gitlab_repo_path)?;
 
         self.exec_container_command(
             container_id,
@@ -531,7 +531,7 @@ impl GitLabDiscoveryMcpService {
                 commit_sha.to_string(),
             ],
             Some(repo_path),
-            None,
+            Some(self.git_auth_env()),
         )
         .await
         .with_context(|| format!("fetch commit '{commit_sha}' from origin"))?;
@@ -589,13 +589,23 @@ impl GitLabDiscoveryMcpService {
         } else {
             format!("{base_path}/{encoded_path}.git")
         };
+        Ok(format!("{scheme}://{host_port}{repo_path}"))
+    }
+
+    /// Supplies credentials to Git subprocesses without a disk credential helper.
+    fn git_auth_env(&self) -> Vec<String> {
         if self.gitlab_token.is_empty() {
-            Ok(format!("{scheme}://{host_port}{repo_path}"))
-        } else {
-            Ok(format!(
-                "{scheme}://oauth2:${{GITLAB_TOKEN}}@{host_port}{repo_path}"
-            ))
+            return Vec::new();
         }
+        vec![
+            format!("GITLAB_TOKEN={}", self.gitlab_token),
+            "GIT_CONFIG_COUNT=2".to_string(),
+            "GIT_CONFIG_KEY_0=credential.helper".to_string(),
+            "GIT_CONFIG_VALUE_0=".to_string(),
+            "GIT_CONFIG_KEY_1=credential.helper".to_string(),
+            format!("GIT_CONFIG_VALUE_1={GITLAB_CREDENTIAL_HELPER}"),
+            "GIT_TERMINAL_PROMPT=0".to_string(),
+        ]
     }
 
     fn redact_sensitive_output(&self, input: &str, composer_auth: Option<&str>) -> String {
@@ -704,6 +714,123 @@ mod tests {
         resolve_checkout_target,
     };
     use crate::gitlab_discovery_mcp::GitLabCheckoutKind;
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn clone_script_removes_failed_clones_and_keeps_tokens_off_disk() -> anyhow::Result<()> {
+        let service = GitLabDiscoveryMcpService::new(
+            crate::config::DockerConfig::default(),
+            &crate::config::GitLabConfig {
+                base_url: "https://gitlab.example.com".to_string(),
+                token: "secret-clone-token".to_string(),
+                bot_user_id: None,
+                created_after: None,
+                targets: crate::config::GitLabTargets::default(),
+            },
+            crate::config::GitLabDiscoveryMcpConfig {
+                advertise_url: "http://host.docker.internal:8091/mcp".to_string(),
+                ..Default::default()
+            },
+        )?;
+        let temp = tempfile::tempdir()?;
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin)?;
+        let stub = bin.join("git");
+        fs::write(
+            &stub,
+            r#"#!/bin/bash
+set -eu
+case "$1" in
+  clone)
+    mkdir -p "$3/.git"
+    printf '%s\n' "$3" > "$DEST_RECORD"
+    printf '%s\n' "$2" > "$3/.git/config"
+    printf '%s\n' "$2" > "$URL_RECORD"
+    if [ "$FAIL_STAGE" = clone ]; then exit 23; fi
+    ;;
+  fetch)
+    if [ "$FAIL_STAGE" = fetch ] || { [ "$FAIL_STAGE" = tags ] && [ "$2" = --tags ]; }; then
+      printf '%s\n' 'fetch failed' >&2
+      exit 23
+    fi
+    ;;
+  remote)
+    if [ "$2" = get-url ]; then cat .git/config; fi
+    ;;
+esac
+"#,
+        )?;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))?;
+        let dest_record = temp.path().join("destination");
+        let url_record = temp.path().join("clone-url");
+        let git_env = service.git_auth_env();
+        let git_env = git_env
+            .iter()
+            .map(|entry| entry.split_once('=').unwrap())
+            .collect::<Vec<_>>();
+
+        // Exercise Git's credential protocol with the production environment.
+        let mut credential = Command::new("git")
+            .args(["credential", "fill"])
+            .envs(git_env.iter().copied())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        credential
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=gitlab.example.com\n\n")?;
+        let credentials = credential.wait_with_output()?;
+        assert!(credentials.status.success());
+        let credentials = String::from_utf8(credentials.stdout)?;
+        assert!(credentials.contains("username=oauth2\n"));
+        assert!(credentials.contains(&format!("password={}\n", service.gitlab_token)));
+
+        for fail_stage in ["fetch", "clone", "tags", "none"] {
+            let root = temp.path().join(fail_stage);
+            let script = clone_repository_script(
+                root.to_str().unwrap(),
+                "group/repo",
+                &service.clone_url_template("group/repo")?,
+            );
+            let output = Command::new("bash")
+                .args(["-c", &script])
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .envs(git_env.iter().copied())
+                .env("DEST_RECORD", &dest_record)
+                .env("URL_RECORD", &url_record)
+                .env("FAIL_STAGE", fail_stage)
+                .output()?;
+            let destination = fs::read_to_string(&dest_record)?;
+            if fail_stage == "none" {
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(String::from_utf8(output.stdout)?, destination);
+                let config = fs::read_to_string(
+                    std::path::Path::new(destination.trim()).join(".git/config"),
+                )?;
+                assert!(!config.contains(&service.gitlab_token));
+            } else {
+                assert!(!output.status.success());
+                assert!(
+                    !std::path::Path::new(destination.trim()).exists(),
+                    "failed {fail_stage} clone remains on disk"
+                );
+                assert_eq!(fs::read_dir(&root)?.count(), 0);
+            }
+            assert!(
+                !fs::read_to_string(&url_record)?.contains(&service.gitlab_token),
+                "clone URL contains the token"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn redact_sensitive_output_removes_gitlab_tokens_from_urls_and_plain_text() {
@@ -735,7 +862,7 @@ mod tests {
         let script = clone_repository_script(
             "/tmp/gitlab-discovery",
             "group/repo",
-            "https://oauth2:${GITLAB_TOKEN}@gitlab.example.com/group/repo.git",
+            "https://gitlab.example.com/group/repo.git",
         );
 
         assert!(!script.contains("@@"), "{script}");
