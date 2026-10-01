@@ -23,6 +23,7 @@ fn note_json(id: u64, body: &str, author_id: u64) -> serde_json::Value {
     serde_json::json!({
         "id": id,
         "body": body,
+        "created_at": Utc::now().to_rfc3339(),
         "author": { "id": author_id, "username": "botuser", "name": "Bot User" }
     })
 }
@@ -32,6 +33,107 @@ fn discussion_json(id: &str, notes: Vec<serde_json::Value>) -> serde_json::Value
         "id": id,
         "notes": notes
     })
+}
+
+async fn mount_current_bot_user(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/api/v4/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 1})))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn write_confirmation_rejects_old_or_foreign_identical_notes() -> Result<()> {
+    enum WriteTarget {
+        MergeRequest,
+        Discussion,
+        DiffDiscussion,
+    }
+
+    let body = "Mention command failed. Check service logs for details.";
+    let mut old_bot_note = note_json(100, body, 1);
+    old_bot_note["created_at"] =
+        serde_json::json!((Utc::now() - chrono::Duration::minutes(10)).to_rfc3339());
+    let mut recent_foreign_note = note_json(101, body, 2);
+    recent_foreign_note["created_at"] = serde_json::json!(Utc::now().to_rfc3339());
+    let mut undated_bot_note = note_json(102, body, 1);
+    undated_bot_note
+        .as_object_mut()
+        .unwrap()
+        .remove("created_at");
+
+    for note in [old_bot_note, recent_foreign_note, undated_bot_note] {
+        for target in [
+            WriteTarget::MergeRequest,
+            WriteTarget::Discussion,
+            WriteTarget::DiffDiscussion,
+        ] {
+            let server = MockServer::start().await;
+            mount_current_bot_user(&server).await;
+            let base_path = "/api/v4/projects/group%2Frepo/merge_requests/7";
+            let (post_suffix, get_suffix, notes) = match target {
+                WriteTarget::MergeRequest => ("notes", "notes", vec![note.clone()]),
+                WriteTarget::Discussion => (
+                    "discussions/discussion-1/notes",
+                    "discussions",
+                    vec![discussion_json("discussion-1", vec![note.clone()])],
+                ),
+                WriteTarget::DiffDiscussion => (
+                    "discussions",
+                    "discussions",
+                    vec![discussion_json("discussion-1", vec![note.clone()])],
+                ),
+            };
+            Mock::given(method("POST"))
+                .and(path(format!("{base_path}/{post_suffix}")))
+                .respond_with(ResponseTemplate::new(502).set_body_string("write failed"))
+                .expect(2)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("{base_path}/{get_suffix}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(notes))
+                .mount(&server)
+                .await;
+            let client = retry_test_client(&server, 2)?;
+            let result = match target {
+                WriteTarget::MergeRequest => client.create_note("group/repo", 7, body).await,
+                WriteTarget::Discussion => {
+                    client
+                        .create_discussion_note("group/repo", 7, "discussion-1", body)
+                        .await
+                }
+                WriteTarget::DiffDiscussion => {
+                    client
+                        .create_diff_discussion(
+                            "group/repo",
+                            7,
+                            &MergeRequestDiffDiscussion {
+                                body: body.to_string(),
+                                position: DiffDiscussionPosition {
+                                    base_sha: "base".to_string(),
+                                    head_sha: "head".to_string(),
+                                    start_sha: "start".to_string(),
+                                    old_path: "src/lib.rs".to_string(),
+                                    new_path: "src/lib.rs".to_string(),
+                                    old_line: None,
+                                    new_line: Some(1),
+                                    line_range: None,
+                                },
+                            },
+                        )
+                        .await
+                }
+            };
+            let error = result.expect_err("an unrelated note must not confirm the failed write");
+            assert!(
+                error.to_string().contains("status=502 Bad Gateway"),
+                "{error:#}"
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -630,6 +732,7 @@ async fn create_note_json_decode_error_keeps_request_context() -> Result<()> {
 #[tokio::test]
 async fn create_note_treats_retryable_failure_as_success_when_note_already_exists() -> Result<()> {
     let server = MockServer::start().await;
+    mount_current_bot_user(&server).await;
     let post_calls = Arc::new(AtomicUsize::new(0));
     let post_responses = Arc::clone(&post_calls);
     let body = "review result\n\n<!-- codex-review:sha=abc -->";
@@ -648,11 +751,14 @@ async fn create_note_treats_retryable_failure_as_success_when_note_already_exist
         .and(path("/api/v4/projects/group%2Frepo/merge_requests/7/notes"))
         .and(query_param("page", "1"))
         .and(query_param("per_page", "100"))
-        .respond_with(
+        .respond_with(move |_request: &Request| {
+            let mut note = note_json(100, body, 1);
+            note["created_at"] =
+                serde_json::json!((Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
             ResponseTemplate::new(200)
                 .append_header("X-Next-Page", "")
-                .set_body_json(vec![note_json(100, body, 1)]),
-        )
+                .set_body_json(vec![note])
+        })
         .expect(1)
         .mount(&server)
         .await;
@@ -667,6 +773,7 @@ async fn create_note_treats_retryable_failure_as_success_when_note_already_exist
 #[tokio::test]
 async fn create_note_retries_when_confirmation_does_not_find_existing_note() -> Result<()> {
     let server = MockServer::start().await;
+    mount_current_bot_user(&server).await;
     let post_calls = Arc::new(AtomicUsize::new(0));
     let post_responses = Arc::clone(&post_calls);
     let body = "review result\n\n<!-- codex-review:sha=def -->";
@@ -1377,6 +1484,7 @@ async fn create_diff_discussion_json_decode_error_keeps_request_context() -> Res
 #[tokio::test]
 async fn create_diff_discussion_does_not_replay_when_confirmation_finds_note_body() -> Result<()> {
     let server = MockServer::start().await;
+    mount_current_bot_user(&server).await;
     let post_calls = Arc::new(AtomicUsize::new(0));
     let post_responses = Arc::clone(&post_calls);
     let body = "inline review";
@@ -1399,14 +1507,14 @@ async fn create_diff_discussion_does_not_replay_when_confirmation_finds_note_bod
         ))
         .and(query_param("page", "1"))
         .and(query_param("per_page", "100"))
-        .respond_with(
+        .respond_with(move |_request: &Request| {
             ResponseTemplate::new(200)
                 .append_header("X-Next-Page", "")
                 .set_body_json(vec![discussion_json(
                     "discussion-77",
                     vec![note_json(700, body, 1)],
-                )]),
-        )
+                )])
+        })
         .expect(1)
         .mount(&server)
         .await;
@@ -1461,6 +1569,7 @@ async fn create_discussion_note_posts_to_discussion_endpoint() -> Result<()> {
 #[tokio::test]
 async fn create_discussion_note_skips_replay_when_body_exists() -> Result<()> {
     let server = MockServer::start().await;
+    mount_current_bot_user(&server).await;
     let post_calls = Arc::new(AtomicUsize::new(0));
     let post_responses = Arc::clone(&post_calls);
     let body = "working on it";
@@ -1482,14 +1591,14 @@ async fn create_discussion_note_skips_replay_when_body_exists() -> Result<()> {
         ))
         .and(query_param("page", "1"))
         .and(query_param("per_page", "100"))
-        .respond_with(
+        .respond_with(move |_request: &Request| {
             ResponseTemplate::new(200)
                 .append_header("X-Next-Page", "")
                 .set_body_json(vec![discussion_json(
                     "discussion-123",
                     vec![note_json(777, body, 1)],
-                )]),
-        )
+                )])
+        })
         .expect(1)
         .mount(&server)
         .await;

@@ -2,9 +2,10 @@ use super::pagination;
 use super::transport::{
     ensure_success, ensure_success_bytes, ensure_success_empty, is_retryable_gitlab_status,
 };
-use super::types::{MergeRequestDiscussion, Note};
+use super::types::{DiscussionNote, MergeRequestDiscussion};
 use crate::gitlab::tls::ensure_reqwest_rustls_provider;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use reqwest::{Client, RequestBuilder, Response, header};
 use serde::Deserialize;
 use std::future::Future;
@@ -18,6 +19,8 @@ const DEFAULT_GITLAB_RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
 // Stop stalled connections quickly, but allow large diffs and uploads more time.
 const GITLAB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GITLAB_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+// Allow two seconds for differences between the GitLab and service clocks.
+const GITLAB_WRITE_CLOCK_SKEW: chrono::Duration = chrono::Duration::seconds(2);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GitLabRetryPolicy {
@@ -93,6 +96,12 @@ pub(crate) enum GitLabWriteConfirmation {
         discussions_url: String,
         body: String,
     },
+}
+
+/// Keeps the initial write time for confirmation across retries and response reads.
+struct GitLabWriteAttempt<'a> {
+    confirmation: &'a GitLabWriteConfirmation,
+    started_at: DateTime<Utc>,
 }
 
 impl GitLabClient {
@@ -234,6 +243,10 @@ impl GitLabClient {
         body: &str,
         confirmation: GitLabWriteConfirmation,
     ) -> Result<()> {
+        let attempt = GitLabWriteAttempt {
+            confirmation: &confirmation,
+            started_at: Utc::now(),
+        };
         match self
             .send_with_retry(
                 "POST",
@@ -243,12 +256,12 @@ impl GitLabClient {
                         .post(url)
                         .json(&serde_json::json!({ "body": body }))
                 },
-                Some(&confirmation),
+                Some(&attempt),
             )
             .await?
         {
             RetrySendOutcome::Response(response) => {
-                self.ensure_write_json_success(response, "POST", url, &confirmation)
+                self.ensure_write_json_success(response, "POST", url, &attempt)
                     .await
             }
             RetrySendOutcome::Confirmed => Ok(()),
@@ -261,17 +274,21 @@ impl GitLabClient {
         form: &[(String, String)],
         confirmation: GitLabWriteConfirmation,
     ) -> Result<()> {
+        let attempt = GitLabWriteAttempt {
+            confirmation: &confirmation,
+            started_at: Utc::now(),
+        };
         match self
             .send_with_retry(
                 "POST",
                 url,
                 || self.client.post(url).form(form),
-                Some(&confirmation),
+                Some(&attempt),
             )
             .await?
         {
             RetrySendOutcome::Response(response) => {
-                self.ensure_write_json_success(response, "POST", url, &confirmation)
+                self.ensure_write_json_success(response, "POST", url, &attempt)
                     .await
             }
             RetrySendOutcome::Confirmed => Ok(()),
@@ -343,7 +360,7 @@ impl GitLabClient {
         method: &str,
         url: &str,
         build_request: impl Fn() -> RequestBuilder,
-        confirmation: Option<&GitLabWriteConfirmation>,
+        confirmation: Option<&GitLabWriteAttempt<'_>>,
     ) -> Result<RetrySendOutcome> {
         let max_attempts = self.retry_policy.max_attempts();
         let mut attempt = 1;
@@ -471,7 +488,7 @@ impl GitLabClient {
         response: Response,
         method: &str,
         url: &str,
-        confirmation: &GitLabWriteConfirmation,
+        confirmation: &GitLabWriteAttempt<'_>,
     ) -> Result<()> {
         match ensure_success::<serde_json::Value>(response, method, url).await {
             Ok(_) => Ok(()),
@@ -518,14 +535,19 @@ impl GitLabClient {
         &self,
         method: &str,
         url: &str,
-        confirmation: Option<&GitLabWriteConfirmation>,
+        confirmation: Option<&GitLabWriteAttempt<'_>>,
     ) -> Result<bool> {
-        let Some(confirmation) = confirmation else {
+        let Some(attempt) = confirmation else {
             return Ok(false);
         };
-        let published = match confirmation {
+        let author_id = self
+            .current_user_endpoint()
+            .await
+            .with_context(|| format!("resolve author to confirm gitlab {method} {url}"))?
+            .id;
+        let published = match attempt.confirmation {
             GitLabWriteConfirmation::MergeRequest { notes_url, body } => self
-                .boxed_note_body_exists(notes_url, body)
+                .boxed_note_body_exists(notes_url, body, author_id, attempt.started_at)
                 .await
                 .with_context(|| format!("confirm gitlab {method} {url} note publication"))?,
             GitLabWriteConfirmation::Discussion {
@@ -533,7 +555,13 @@ impl GitLabClient {
                 discussion_id,
                 body,
             } => self
-                .boxed_discussion_note_body_exists(discussions_url, Some(discussion_id), body)
+                .boxed_discussion_note_body_exists(
+                    discussions_url,
+                    Some(discussion_id),
+                    body,
+                    author_id,
+                    attempt.started_at,
+                )
                 .await
                 .with_context(|| {
                     format!("confirm gitlab {method} {url} discussion note publication")
@@ -542,7 +570,13 @@ impl GitLabClient {
                 discussions_url,
                 body,
             } => self
-                .boxed_discussion_note_body_exists(discussions_url, None, body)
+                .boxed_discussion_note_body_exists(
+                    discussions_url,
+                    None,
+                    body,
+                    author_id,
+                    attempt.started_at,
+                )
                 .await
                 .with_context(|| {
                     format!("confirm gitlab {method} {url} discussion note publication")
@@ -557,17 +591,28 @@ impl GitLabClient {
         Ok(published)
     }
 
-    async fn note_body_exists(&self, notes_url: &str, body: &str) -> Result<bool> {
-        let notes: Vec<Note> = self.get_paginated(notes_url).await?;
-        Ok(notes.iter().any(|note| note.body == body))
+    async fn note_body_exists(
+        &self,
+        notes_url: &str,
+        body: &str,
+        author_id: u64,
+        started_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        // Standalone notes need the same author and timestamp fields as discussion notes.
+        let notes: Vec<DiscussionNote> = self.get_paginated(notes_url).await?;
+        Ok(notes
+            .iter()
+            .any(|note| note_confirms_write(note, body, author_id, started_at)))
     }
 
     fn boxed_note_body_exists<'a>(
         &'a self,
         notes_url: &'a str,
         body: &'a str,
+        author_id: u64,
+        started_at: DateTime<Utc>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>> {
-        Box::pin(self.note_body_exists(notes_url, body))
+        Box::pin(self.note_body_exists(notes_url, body, author_id, started_at))
     }
 
     async fn discussion_note_body_exists(
@@ -575,13 +620,15 @@ impl GitLabClient {
         discussions_url: &str,
         discussion_id: Option<&str>,
         body: &str,
+        author_id: u64,
+        started_at: DateTime<Utc>,
     ) -> Result<bool> {
         let discussions: Vec<MergeRequestDiscussion> = self.get_paginated(discussions_url).await?;
         Ok(discussions
             .iter()
             .filter(|discussion| discussion_id.is_none_or(|id| discussion.id == id))
             .flat_map(|discussion| &discussion.notes)
-            .any(|note| note.body == body))
+            .any(|note| note_confirms_write(note, body, author_id, started_at)))
     }
 
     fn boxed_discussion_note_body_exists<'a>(
@@ -589,9 +636,33 @@ impl GitLabClient {
         discussions_url: &'a str,
         discussion_id: Option<&'a str>,
         body: &'a str,
+        author_id: u64,
+        started_at: DateTime<Utc>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool>> + Send + 'a>> {
-        Box::pin(self.discussion_note_body_exists(discussions_url, discussion_id, body))
+        Box::pin(self.discussion_note_body_exists(
+            discussions_url,
+            discussion_id,
+            body,
+            author_id,
+            started_at,
+        ))
     }
+}
+
+/// Requires matching text and author, with creation no earlier than the write's
+/// clock-skew threshold.
+/// A note without a creation timestamp cannot confirm publication.
+fn note_confirms_write(
+    note: &DiscussionNote,
+    body: &str,
+    author_id: u64,
+    started_at: DateTime<Utc>,
+) -> bool {
+    note.body == body
+        && note.author.id == author_id
+        && note
+            .created_at
+            .is_some_and(|created_at| created_at >= started_at - GITLAB_WRITE_CLOCK_SKEW)
 }
 
 pub(crate) fn normalize_api_base(base_url: &str) -> Result<String> {
