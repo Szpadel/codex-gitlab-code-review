@@ -7,6 +7,7 @@ use super::{
 };
 use crate::config::Config;
 use crate::review::{RunRetryStatus, RunRetryStatusProvider};
+use crate::service_error::ServiceError;
 use crate::state::{
     ReviewStateStore, RunHistoryCursor, RunHistoryKind, RunHistoryListQuery, RunHistoryRecord,
     RunTokenUsageRollup,
@@ -93,7 +94,7 @@ impl StatusService {
     /// # Errors
     ///
     /// Returns an error if the underlying operation fails.
-    pub async fn snapshot(&self) -> Result<StatusSnapshot> {
+    pub async fn snapshot(&self) -> Result<StatusSnapshot, ServiceError> {
         let created_after = self.state.service_state.get_created_after().await?;
         let scan = self.state.service_state.get_scan_status().await?;
         let feature_flags = self.admin.feature_flag_snapshots().await?;
@@ -143,8 +144,11 @@ impl StatusService {
 
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
-    pub async fn history_snapshot(&self, query: HistoryQuery) -> Result<HistorySnapshot> {
+    /// Rejects malformed cursors as invalid input. Reports state failures as internal errors.
+    pub async fn history_snapshot(
+        &self,
+        query: HistoryQuery,
+    ) -> Result<HistorySnapshot, ServiceError> {
         let list_query = RunHistoryListQuery {
             repo: query.repo.clone(),
             iid: query.iid,
@@ -156,14 +160,18 @@ impl StatusService {
                 .after
                 .as_deref()
                 .map(|cursor| {
-                    RunHistoryCursor::decode(cursor).context("invalid history after cursor")
+                    RunHistoryCursor::decode(cursor)
+                        .context("invalid history after cursor")
+                        .map_err(ServiceError::InvalidInput)
                 })
                 .transpose()?,
             before: query
                 .before
                 .as_deref()
                 .map(|cursor| {
-                    RunHistoryCursor::decode(cursor).context("invalid history before cursor")
+                    RunHistoryCursor::decode(cursor)
+                        .context("invalid history before cursor")
+                        .map_err(ServiceError::InvalidInput)
                 })
                 .transpose()?,
         };
@@ -192,13 +200,13 @@ impl StatusService {
 
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
+    /// Rejects malformed cursors as invalid input. Reports state failures as internal errors.
     pub async fn mr_history_snapshot(
         &self,
         repo: &str,
         iid: u64,
         mut query: HistoryQuery,
-    ) -> Result<MrHistorySnapshot> {
+    ) -> Result<MrHistorySnapshot, ServiceError> {
         query.repo = Some(repo.to_string());
         query.iid = Some(iid);
         let history = self.history_snapshot(query).await?;
@@ -212,7 +220,10 @@ impl StatusService {
     /// # Errors
     ///
     /// Returns an error if the underlying operation fails.
-    pub async fn run_detail_snapshot(&self, run_id: i64) -> Result<Option<RunDetailSnapshot>> {
+    pub async fn run_detail_snapshot(
+        &self,
+        run_id: i64,
+    ) -> Result<Option<RunDetailSnapshot>, ServiceError> {
         let Some(run) = self.state.run_history.get_run_history(run_id).await? else {
             return Ok(None);
         };
@@ -249,7 +260,7 @@ impl StatusService {
         &self,
         run_id: i64,
         event_id: i64,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<String>, ServiceError> {
         let Some(event) = self
             .state
             .run_history

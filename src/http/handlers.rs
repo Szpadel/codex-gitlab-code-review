@@ -12,6 +12,7 @@ use super::view::{
     render_usage_page,
 };
 use crate::dev_mode::DevToolsService;
+use crate::service_error::ServiceError;
 use anyhow::Context;
 use axum::{
     Form, Json,
@@ -49,7 +50,7 @@ pub(crate) async fn history_json(
     let snapshot = app_state
         .http_services
         .status
-        .history_snapshot(params.into_query()?)
+        .history_snapshot(params.into_query().map_err(ServiceError::InvalidInput)?)
         .await?;
     Ok(Json(snapshot))
 }
@@ -61,7 +62,7 @@ pub(crate) async fn history_page(
     let snapshot = app_state
         .http_services
         .status
-        .history_snapshot(params.into_query()?)
+        .history_snapshot(params.into_query().map_err(ServiceError::InvalidInput)?)
         .await?;
     Ok(Html(render_history_page(
         &snapshot,
@@ -80,7 +81,11 @@ pub(crate) async fn mr_history_json(
         app_state
             .http_services
             .status
-            .mr_history_snapshot(&repo, iid, params.into_query()?)
+            .mr_history_snapshot(
+                &repo,
+                iid,
+                params.into_query().map_err(ServiceError::InvalidInput)?,
+            )
             .await?,
     ))
 }
@@ -94,7 +99,11 @@ pub(crate) async fn mr_history_page(
     let snapshot = app_state
         .http_services
         .status
-        .mr_history_snapshot(&repo, iid, params.into_query()?)
+        .mr_history_snapshot(
+            &repo,
+            iid,
+            params.into_query().map_err(ServiceError::InvalidInput)?,
+        )
         .await?;
     Ok(Html(render_mr_history_page(
         &snapshot,
@@ -113,7 +122,7 @@ pub(crate) async fn run_detail_json(
         .run_detail_snapshot(run_id)
         .await?
     else {
-        return Err(StatusHandlerError(anyhow::anyhow!("run not found")));
+        return Err(ServiceError::NotFound(anyhow::anyhow!("run not found")).into());
     };
     Ok(Json(snapshot))
 }
@@ -128,7 +137,7 @@ pub(crate) async fn run_detail_page(
         .run_detail_snapshot(run_id)
         .await?
     else {
-        return Err(StatusHandlerError(anyhow::anyhow!("run not found")));
+        return Err(ServiceError::NotFound(anyhow::anyhow!("run not found")).into());
     };
     Ok(Html(render_run_detail_page(
         &snapshot,
@@ -148,7 +157,7 @@ pub(crate) async fn transcript_entry_body(
         .status
         .transcript_entry_body(run_id, event_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("transcript entry not found"))?;
+        .ok_or_else(|| ServiceError::NotFound(anyhow::anyhow!("transcript entry not found")))?;
     Ok(Html(body))
 }
 
@@ -192,7 +201,7 @@ pub(crate) async fn skill_detail_page(
         .preview_snapshot(&skill_name)
         .await?
     else {
-        return Err(StatusHandlerError(anyhow::anyhow!("skill not found")));
+        return Err(ServiceError::NotFound(anyhow::anyhow!("skill not found")).into());
     };
     Ok(Html(render_skill_detail_page(
         &snapshot,
@@ -283,7 +292,8 @@ pub(crate) async fn create_rate_limit_rule(
         app_state.http_services.admin.admin_csrf_token(),
     )?;
     let upsert = parse_rate_limit_rule_upsert(form)
-        .with_context(|| "invalid create rate limit rule form")?;
+        .with_context(|| "invalid create rate limit rule form")
+        .map_err(ServiceError::InvalidInput)?;
     app_state
         .http_services
         .ratelimit
@@ -302,7 +312,8 @@ pub(crate) async fn update_rate_limit_rule(
         app_state.http_services.admin.admin_csrf_token(),
     )?;
     let mut upsert = parse_rate_limit_rule_upsert(form)
-        .with_context(|| "invalid update rate limit rule form")?;
+        .with_context(|| "invalid update rate limit rule form")
+        .map_err(ServiceError::InvalidInput)?;
     upsert.id = Some(rule_id);
     app_state
         .http_services
@@ -352,14 +363,29 @@ pub(crate) async fn upload_skill(
     let mut csrf_token = None;
     let mut archive_name = None;
     let mut archive_bytes = None;
-    while let Some(field) = multipart.next_field().await.map_err(anyhow::Error::from)? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ServiceError::InvalidInput(error.into()))?
+    {
         match field.name() {
             Some("csrf_token") => {
-                csrf_token = Some(field.text().await.map_err(anyhow::Error::from)?);
+                csrf_token = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|error| ServiceError::InvalidInput(error.into()))?,
+                );
             }
             Some("archive") => {
                 archive_name = field.file_name().map(ToOwned::to_owned);
-                archive_bytes = Some(field.bytes().await.map_err(anyhow::Error::from)?.to_vec());
+                archive_bytes = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|error| ServiceError::InvalidInput(error.into()))?
+                        .to_vec(),
+                );
             }
             _ => {}
         }
@@ -372,8 +398,11 @@ pub(crate) async fn upload_skill(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("upload.zip");
-    let archive_bytes = archive_bytes
-        .ok_or_else(|| anyhow::anyhow!("invalid skill archive: missing upload file"))?;
+    let archive_bytes = archive_bytes.ok_or_else(|| {
+        ServiceError::InvalidInput(anyhow::anyhow!(
+            "invalid skill archive: missing upload file"
+        ))
+    })?;
     let skill_name = app_state
         .http_services
         .skills
@@ -491,22 +520,27 @@ pub(crate) async fn simulate_development_commit(
     Ok(Redirect::to("/development"))
 }
 
-fn dev_tools_service(app_state: &HttpAppState) -> anyhow::Result<Arc<DevToolsService>> {
+fn dev_tools_service(app_state: &HttpAppState) -> Result<Arc<DevToolsService>, ServiceError> {
     app_state
         .dev_tools_service
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("development tools not found"))
+        .ok_or_else(|| ServiceError::NotFound(anyhow::anyhow!("development tools not found")))
 }
 
-fn decode_repo_key(repo_key: &str) -> anyhow::Result<String> {
+/// Rejects keys that are not hexadecimal UTF-8 repository paths.
+fn decode_repo_key(repo_key: &str) -> Result<String, ServiceError> {
     if !repo_key.len().is_multiple_of(2) {
-        anyhow::bail!("invalid repo key");
+        return Err(ServiceError::InvalidInput(anyhow::anyhow!(
+            "invalid repo key"
+        )));
     }
     let mut bytes = Vec::with_capacity(repo_key.len() / 2);
     for chunk in repo_key.as_bytes().as_chunks::<2>().0 {
-        let hex = std::str::from_utf8(chunk)?;
-        let value = u8::from_str_radix(hex, 16)?;
+        let hex =
+            std::str::from_utf8(chunk).map_err(|error| ServiceError::InvalidInput(error.into()))?;
+        let value = u8::from_str_radix(hex, 16)
+            .map_err(|error| ServiceError::InvalidInput(error.into()))?;
         bytes.push(value);
     }
-    Ok(String::from_utf8(bytes)?)
+    String::from_utf8(bytes).map_err(|error| ServiceError::InvalidInput(error.into()))
 }

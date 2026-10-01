@@ -42,6 +42,7 @@ mod run_detail_backfill_fallback;
 mod run_detail_backfill_recovery;
 mod run_detail_backfill_retry;
 mod run_detail_rendering;
+mod service_errors;
 mod skills;
 mod status_page;
 mod usage;

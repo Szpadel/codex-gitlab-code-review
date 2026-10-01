@@ -4,8 +4,9 @@ use crate::codex_runner::{
     configured_auth_accounts,
 };
 use crate::config::Config;
+use crate::service_error::ServiceError;
 use crate::state::ReviewStateStore;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use futures::{StreamExt, TryStreamExt, stream};
 use std::sync::Arc;
@@ -36,7 +37,7 @@ impl UsageService {
     /// # Errors
     ///
     /// Returns an error if reading local usage-limit marker state fails.
-    pub async fn snapshot(&self) -> Result<UsagePageSnapshot> {
+    pub async fn snapshot(&self) -> Result<UsagePageSnapshot, ServiceError> {
         let pending: Vec<_> = self
             .accounts
             .iter()
@@ -71,31 +72,43 @@ impl UsageService {
 
     /// # Errors
     ///
-    /// Returns an error if the account is unknown, the weekly limit is not
-    /// exhausted, the Codex reset RPC fails, or local marker cleanup fails.
-    pub async fn consume_reset(&self, account_name: &str) -> Result<CodexUsageResetOutcome> {
+    /// Rejects unknown accounts, available weekly limits, or missing credits as
+    /// invalid input. Reports RPC and state failures as internal errors.
+    pub async fn consume_reset(
+        &self,
+        account_name: &str,
+    ) -> Result<CodexUsageResetOutcome, ServiceError> {
         let account = self
             .accounts
             .iter()
             .find(|account| account.name == account_name)
-            .ok_or_else(|| anyhow!("invalid usage reset request: unknown auth account"))?;
-        let runner = self
-            .runner
-            .as_ref()
-            .ok_or_else(|| anyhow!("codex usage limits are unavailable: runner not configured"))?;
+            .ok_or_else(|| {
+                ServiceError::InvalidInput(anyhow!(
+                    "invalid usage reset request: unknown auth account"
+                ))
+            })?;
+        let runner = self.runner.as_ref().ok_or_else(|| {
+            ServiceError::Internal(anyhow!(
+                "codex usage limits are unavailable: runner not configured"
+            ))
+        })?;
         let usage = runner
             .read_usage_limits(&account.name)
             .await
             .with_context(|| format!("read usage limits for account {}", account.name))?;
         if !usage.has_exhausted_weekly_limit() {
-            bail!("invalid usage reset request: weekly usage limit is not exhausted");
+            return Err(ServiceError::InvalidInput(anyhow!(
+                "invalid usage reset request: weekly usage limit is not exhausted"
+            )));
         }
         if !usage
             .rate_limit_reset_credits
             .as_ref()
             .is_some_and(|credits| credits.available_count > 0)
         {
-            bail!("invalid usage reset request: no usage reset credits available");
+            return Err(ServiceError::InvalidInput(anyhow!(
+                "invalid usage reset request: no usage reset credits available"
+            )));
         }
 
         let outcome = runner

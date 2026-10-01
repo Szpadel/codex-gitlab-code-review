@@ -7,6 +7,7 @@ use crate::gitlab::{
     MergeRequest, Note,
 };
 use crate::review::DynamicRepoSource;
+use crate::service_error::ServiceError;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -126,8 +127,8 @@ impl DevToolsService {
 
     /// # Errors
     ///
-    /// Returns an error if the synthetic repository catalog cannot be updated.
-    pub async fn create_repo(&self, repo_path: &str) -> Result<()> {
+    /// Rejects an empty repository path as invalid input.
+    pub async fn create_repo(&self, repo_path: &str) -> Result<(), ServiceError> {
         let normalized = normalize_repo_path(repo_path)?;
         let mut state = self.state.write().await;
         if !state.repos.contains_key(&normalized) {
@@ -138,19 +139,24 @@ impl DevToolsService {
 
     /// # Errors
     ///
-    /// Returns an error if the synthetic repository cannot be renamed or the
-    /// backing state cannot be updated.
-    pub async fn update_repo(&self, existing_repo_path: &str, repo_path: &str) -> Result<()> {
+    /// Rejects empty paths, a missing source, or an existing destination.
+    pub async fn update_repo(
+        &self,
+        existing_repo_path: &str,
+        repo_path: &str,
+    ) -> Result<(), ServiceError> {
         let existing = normalize_repo_path(existing_repo_path)?;
         let replacement = normalize_repo_path(repo_path)?;
         let mut state = self.state.write().await;
         let mut repo = state
             .repos
             .remove(&existing)
-            .ok_or_else(|| anyhow!("repo not found: {existing}"))?;
+            .ok_or_else(|| ServiceError::NotFound(anyhow!("repo not found: {existing}")))?;
         if existing != replacement && state.repos.contains_key(&replacement) {
             state.repos.insert(existing, repo);
-            bail!("repo already exists: {replacement}");
+            return Err(ServiceError::Conflict(anyhow!(
+                "repo already exists: {replacement}"
+            )));
         }
         if let Some(active_mr) = repo.active_mr.as_mut() {
             active_mr.title = format!("Synthetic review for {replacement}");
@@ -161,28 +167,28 @@ impl DevToolsService {
 
     /// # Errors
     ///
-    /// Returns an error if the synthetic repository cannot be removed from the
-    /// backing state.
-    pub async fn delete_repo(&self, repo_path: &str) -> Result<()> {
+    /// Rejects an empty path or a missing repository.
+    pub async fn delete_repo(&self, repo_path: &str) -> Result<(), ServiceError> {
         let normalized = normalize_repo_path(repo_path)?;
         let removed = self.state.write().await.repos.remove(&normalized);
         if removed.is_none() {
-            bail!("repo not found: {normalized}");
+            return Err(ServiceError::NotFound(anyhow!(
+                "repo not found: {normalized}"
+            )));
         }
         Ok(())
     }
 
     /// # Errors
     ///
-    /// Returns an error if the synthetic merge request cannot be created or
-    /// persisted.
-    pub async fn simulate_new_mr(&self, repo_path: &str) -> Result<()> {
+    /// Rejects an empty path or a missing repository.
+    pub async fn simulate_new_mr(&self, repo_path: &str) -> Result<(), ServiceError> {
         let normalized = normalize_repo_path(repo_path)?;
         let mut state = self.state.write().await;
         let repo = state
             .repos
             .get_mut(&normalized)
-            .ok_or_else(|| anyhow!("repo not found: {normalized}"))?;
+            .ok_or_else(|| ServiceError::NotFound(anyhow!("repo not found: {normalized}")))?;
         let iid = repo.next_iid;
         repo.next_iid += 1;
         let now = Utc::now();
@@ -204,19 +210,17 @@ impl DevToolsService {
 
     /// # Errors
     ///
-    /// Returns an error if the synthetic repository state cannot be advanced or
-    /// persisted.
-    pub async fn simulate_new_commit(&self, repo_path: &str) -> Result<()> {
+    /// Rejects empty paths, missing repositories, or requests without an active MR.
+    pub async fn simulate_new_commit(&self, repo_path: &str) -> Result<(), ServiceError> {
         let normalized = normalize_repo_path(repo_path)?;
         let mut state = self.state.write().await;
         let repo = state
             .repos
             .get_mut(&normalized)
-            .ok_or_else(|| anyhow!("repo not found: {normalized}"))?;
-        let active_mr = repo
-            .active_mr
-            .as_mut()
-            .ok_or_else(|| anyhow!("invalid repo action: no active synthetic MR"))?;
+            .ok_or_else(|| ServiceError::NotFound(anyhow!("repo not found: {normalized}")))?;
+        let active_mr = repo.active_mr.as_mut().ok_or_else(|| {
+            ServiceError::InvalidInput(anyhow!("invalid repo action: no active synthetic MR"))
+        })?;
         active_mr.revision += 1;
         active_mr.updated_at = Utc::now();
         active_mr.head_sha = synthetic_sha(&normalized, active_mr.iid, active_mr.revision);
@@ -420,10 +424,12 @@ impl DevMergeRequest {
     }
 }
 
-fn normalize_repo_path(repo_path: &str) -> Result<String> {
+fn normalize_repo_path(repo_path: &str) -> Result<String, ServiceError> {
     let normalized = repo_path.trim().trim_matches('/').to_string();
     if normalized.is_empty() {
-        bail!("invalid repo path: must not be empty");
+        return Err(ServiceError::InvalidInput(anyhow!(
+            "invalid repo path: must not be empty"
+        )));
     }
     Ok(normalized)
 }

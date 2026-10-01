@@ -1,4 +1,5 @@
 use super::StatusRateLimitSnapshot;
+use crate::service_error::ServiceError;
 use crate::state::{
     ReviewRateLimitRuleUpsert, ReviewRateLimitTarget, ReviewRateLimitTargetKind, ReviewStateStore,
 };
@@ -29,7 +30,7 @@ impl RateLimitService {
     /// # Errors
     ///
     /// Returns an error if the underlying operation fails.
-    pub async fn snapshot(&self) -> Result<StatusRateLimitSnapshot> {
+    pub async fn snapshot(&self) -> Result<StatusRateLimitSnapshot, ServiceError> {
         let now = Utc::now().timestamp();
         Ok(StatusRateLimitSnapshot {
             rules: self
@@ -53,7 +54,7 @@ impl RateLimitService {
     /// # Errors
     ///
     /// Returns an error if the underlying operation fails.
-    pub async fn target_suggestions(&self) -> Result<Vec<ReviewRateLimitTarget>> {
+    pub async fn target_suggestions(&self) -> Result<Vec<ReviewRateLimitTarget>, ServiceError> {
         let mut suggestions = Vec::new();
         for path in &self.repo_target_paths {
             suggestions.push(ReviewRateLimitTarget {
@@ -88,41 +89,49 @@ impl RateLimitService {
 
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
-    pub async fn create_rule(&self, rule: &ReviewRateLimitRuleUpsert) -> Result<String> {
+    /// Rejects invalid rule input. Reports storage failures as internal errors.
+    pub async fn create_rule(
+        &self,
+        rule: &ReviewRateLimitRuleUpsert,
+    ) -> Result<String, ServiceError> {
         self.state
             .review_rate_limit
             .create_review_rate_limit_rule(rule)
             .await
+            .map_err(ServiceError::from)
     }
 
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
-    pub async fn update_rule(&self, rule: &ReviewRateLimitRuleUpsert) -> Result<()> {
+    /// Rejects invalid input or a missing rule. Reports storage failures as internal errors.
+    pub async fn update_rule(&self, rule: &ReviewRateLimitRuleUpsert) -> Result<(), ServiceError> {
         self.state
             .review_rate_limit
             .update_review_rate_limit_rule(rule)
             .await
+            .map_err(ServiceError::from)
     }
 
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
-    pub async fn delete_rule(&self, rule_id: &str) -> Result<()> {
+    /// Rejects a missing rule. Reports storage failures as internal errors.
+    pub async fn delete_rule(&self, rule_id: &str) -> Result<(), ServiceError> {
         self.state
             .review_rate_limit
             .delete_review_rate_limit_rule(rule_id)
             .await
+            .map_err(ServiceError::from)
     }
 
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
-    pub async fn refund_one_bucket_slot(&self, bucket_id: &str) -> Result<()> {
+    /// Rejects an empty bucket ID. Missing buckets require no change.
+    /// Reports storage failures as internal errors.
+    pub async fn refund_one_bucket_slot(&self, bucket_id: &str) -> Result<(), ServiceError> {
         self.state
             .review_rate_limit
             .refund_review_rate_limit_bucket(bucket_id, Utc::now().timestamp())
             .await
+            .map_err(ServiceError::from)
     }
 }

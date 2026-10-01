@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use std::collections::BTreeSet;
 
 use super::sqlite::SqliteCoordinator;
+use crate::service_error::ServiceError;
 
 mod bucket_rows;
 mod buckets;
@@ -222,7 +223,9 @@ pub(super) fn unique_review_rate_limit_rule_ids(rule_ids: &[String]) -> Result<V
     for rule_id in rule_ids {
         let rule_id = rule_id.trim();
         if rule_id.is_empty() {
-            bail!("runtime review rate limit rule id must not be empty");
+            bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+                "runtime review rate limit rule id must not be empty"
+            )));
         }
         unique.insert(rule_id.to_string());
     }
@@ -234,7 +237,9 @@ pub(super) fn normalize_review_rate_limit_target(
 ) -> Result<ReviewRateLimitTarget> {
     let path = target.path.trim().trim_matches('/').to_string();
     if path.is_empty() {
-        bail!("runtime review rate limit rule target path must not be empty");
+        bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+            "runtime review rate limit rule target path must not be empty"
+        )));
     }
     Ok(ReviewRateLimitTarget {
         kind: target.kind,

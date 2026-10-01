@@ -16,6 +16,7 @@ pub mod review;
 pub(crate) mod review_deduplication;
 pub mod review_prompt_templates;
 mod scheduler;
+pub mod service_error;
 pub mod service_factory;
 pub mod skills;
 pub mod state;

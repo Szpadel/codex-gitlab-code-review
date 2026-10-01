@@ -16,6 +16,7 @@ use uuid::Uuid;
 use zip::ZipArchive;
 
 use crate::config::Config;
+use crate::service_error::ServiceError;
 
 const SKILLS_DIR_NAME: &str = "skills";
 const ROOT_SKILL_MD: &str = "SKILL.md";
@@ -268,7 +269,9 @@ impl SkillsManagerInner {
     fn delete_skill_blocking(&self, name: &str) -> Result<()> {
         validate_skill_name(name)?;
         if is_reserved_skill_name(name) {
-            bail!("invalid skill name: {name}");
+            bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+                "invalid skill name: {name}"
+            )));
         }
         let mut removed_any = false;
         for account in &self.accounts {
@@ -281,7 +284,9 @@ impl SkillsManagerInner {
                 .with_context(|| format!("remove skill {} from {}", name, root.display()))?;
         }
         if !removed_any {
-            bail!("skill not found: {name}");
+            bail!(ServiceError::NotFound(anyhow::anyhow!(
+                "skill not found: {name}"
+            )));
         }
         Ok(())
     }
@@ -339,26 +344,38 @@ impl SkillsManagerInner {
         archive_name: &str,
         bytes: &[u8],
     ) -> Result<PreparedSkillArchive> {
-        let extracted = extract_archive(archive_name, bytes)?;
+        let extracted = extract_archive(archive_name, bytes).map_err(ServiceError::InvalidInput)?;
         if extracted.is_empty() {
-            bail!("invalid skill archive: archive is empty");
+            bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+                "invalid skill archive: archive is empty"
+            )));
         }
         let stripped = strip_common_wrapper(extracted);
-        validate_archive_paths(&stripped)?;
+        validate_archive_paths(&stripped).map_err(ServiceError::InvalidInput)?;
         let skill_md_entry = stripped
             .iter()
             .find(|entry| entry.relative_path == Path::new(ROOT_SKILL_MD))
-            .ok_or_else(|| anyhow::anyhow!("invalid skill archive: root SKILL.md is required"))?;
+            .ok_or_else(|| {
+                ServiceError::InvalidInput(anyhow::anyhow!(
+                    "invalid skill archive: root SKILL.md is required"
+                ))
+            })?;
         let skill_markdown = std::str::from_utf8(&skill_md_entry.bytes)
-            .context("invalid skill archive: SKILL.md must be valid UTF-8")?;
+            .context("invalid skill archive: SKILL.md must be valid UTF-8")
+            .map_err(ServiceError::InvalidInput)?;
         let metadata = parse_skill_metadata(skill_markdown);
-        let resolved_name = resolve_skill_name(archive_name, &metadata, &stripped)?;
+        let resolved_name = resolve_skill_name(archive_name, &metadata, &stripped)
+            .map_err(ServiceError::InvalidInput)?;
         validate_skill_name(&resolved_name)?;
         if is_reserved_skill_name(&resolved_name) {
-            bail!("invalid skill name: {resolved_name}");
+            bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+                "invalid skill name: {resolved_name}"
+            )));
         }
         if self.scan_installed_skills()?.contains_key(&resolved_name) {
-            bail!("skill already exists: {resolved_name}");
+            bail!(ServiceError::Conflict(anyhow::anyhow!(
+                "skill already exists: {resolved_name}"
+            )));
         }
         let staged_root = temp_workspace_root("skill-stage");
         fs::create_dir_all(&staged_root)
@@ -388,7 +405,7 @@ impl SkillsManagerInner {
             if final_path.exists() {
                 return Err(Self::rollback_install(
                     &installed_paths,
-                    anyhow::anyhow!("skill already exists: {name}"),
+                    ServiceError::Conflict(anyhow::anyhow!("skill already exists: {name}")).into(),
                 ));
             }
             let temp_path = skills_root.join(format!(".install-{}-{}", name, Uuid::new_v4()));
@@ -854,22 +871,30 @@ fn archive_stem(archive_name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
-fn validate_skill_name(name: &str) -> Result<()> {
+fn validate_skill_name(name: &str) -> Result<(), ServiceError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        bail!("invalid skill name: empty");
+        return Err(ServiceError::InvalidInput(anyhow::anyhow!(
+            "invalid skill name: empty"
+        )));
     }
     if trimmed.starts_with('.') {
-        bail!("invalid skill name: {name}");
+        return Err(ServiceError::InvalidInput(anyhow::anyhow!(
+            "invalid skill name: {name}"
+        )));
     }
     if trimmed.contains('/') || trimmed.contains('\\') {
-        bail!("invalid skill name: {name}");
+        return Err(ServiceError::InvalidInput(anyhow::anyhow!(
+            "invalid skill name: {name}"
+        )));
     }
     if !trimmed
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     {
-        bail!("invalid skill name: {name}");
+        return Err(ServiceError::InvalidInput(anyhow::anyhow!(
+            "invalid skill name: {name}"
+        )));
     }
     Ok(())
 }

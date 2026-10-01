@@ -12,6 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use uuid::Uuid;
 
+use crate::service_error::ServiceError;
 use crate::state::sqlite::SqliteCoordinator;
 
 #[derive(Clone)]
@@ -141,7 +142,9 @@ impl RuleRepository {
     ) -> Result<()> {
         validate_review_rate_limit_rule_upsert(rule)?;
         let Some(id) = rule.id.clone() else {
-            bail!("runtime review rate limit rule id is required for update");
+            bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+                "runtime review rate limit rule id is required for update"
+            )));
         };
         let rule = rule.clone();
         self.sqlite
@@ -177,7 +180,9 @@ impl RuleRepository {
                     .context("load runtime review rate limit rule before update")?;
                     let Some(existing_row) = existing_row else {
                         tx.rollback().await.context("rollback sqlite transaction")?;
-                        bail!("runtime review rate limit rule not found: {id}");
+                        bail!(ServiceError::NotFound(anyhow::anyhow!(
+                            "runtime review rate limit rule not found: {id}"
+                        )));
                     };
                     let existing_targets_by_rule_id = review_rate_limit_targets_by_rule_id(
                         load_review_rate_limit_targets_by_rule_id_from_executor(tx.as_mut())
@@ -224,7 +229,9 @@ impl RuleRepository {
                     .context("update runtime review rate limit rule")?;
                     if result.rows_affected() == 0 {
                         tx.rollback().await.context("rollback sqlite transaction")?;
-                        bail!("runtime review rate limit rule not found: {id}");
+                        bail!(ServiceError::NotFound(anyhow::anyhow!(
+                            "runtime review rate limit rule not found: {id}"
+                        )));
                     }
                     sqlx::query("DELETE FROM runtime_review_rate_limit_rule_target WHERE rule_id = ?")
                         .bind(&id)
@@ -271,7 +278,9 @@ impl RuleRepository {
                     .context("delete runtime review rate limit rule")?;
                 if result.rows_affected() == 0 {
                     tx.rollback().await.context("rollback sqlite transaction")?;
-                    bail!("runtime review rate limit rule not found: {id}");
+                    bail!(ServiceError::NotFound(anyhow::anyhow!(
+                        "runtime review rate limit rule not found: {id}"
+                    )));
                 }
                 tx.commit().await.context("commit sqlite transaction")?;
                 Ok(())
@@ -282,30 +291,44 @@ impl RuleRepository {
 
 fn validate_review_rate_limit_rule_upsert(rule: &ReviewRateLimitRuleUpsert) -> Result<()> {
     if rule.label.trim().is_empty() {
-        bail!("runtime review rate limit rule label must not be empty");
+        bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+            "runtime review rate limit rule label must not be empty"
+        )));
     }
     let mut unique_targets = BTreeSet::new();
     for target in &rule.targets {
         let normalized = normalize_review_rate_limit_target(target)?;
         if !unique_targets.insert((normalized.kind, normalized.path)) {
-            bail!("runtime review rate limit rule targets must be unique");
+            bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+                "runtime review rate limit rule targets must be unique"
+            )));
         }
     }
     if !rule.applies_to_review && !rule.applies_to_security {
-        bail!("runtime review rate limit rule must cover at least one lane");
+        bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+            "runtime review rate limit rule must cover at least one lane"
+        )));
     }
     if rule.capacity == 0 {
-        bail!("runtime review rate limit rule capacity must be greater than zero");
+        bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+            "runtime review rate limit rule capacity must be greater than zero"
+        )));
     }
     if rule.window_seconds == 0 {
-        bail!("runtime review rate limit rule window_seconds must be greater than zero");
+        bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+            "runtime review rate limit rule window_seconds must be greater than zero"
+        )));
     }
     match rule.scope {
         ReviewRateLimitScope::Project if rule.scope_iid.is_some() => {
-            bail!("project-scoped runtime review rate limit rules cannot set scope_iid")
+            bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+                "project-scoped runtime review rate limit rules cannot set scope_iid"
+            )))
         }
         ReviewRateLimitScope::MergeRequest if rule.scope_iid.is_some() => {
-            bail!("merge-request-scoped runtime review rate limit rules cannot set scope_iid")
+            bail!(ServiceError::InvalidInput(anyhow::anyhow!(
+                "merge-request-scoped runtime review rate limit rules cannot set scope_iid"
+            )))
         }
         _ => Ok(()),
     }

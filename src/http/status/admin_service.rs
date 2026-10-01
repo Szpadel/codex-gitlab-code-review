@@ -2,8 +2,9 @@ use super::StatusFeatureFlagSnapshot;
 use crate::config::{
     FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
 };
+use crate::service_error::ServiceError;
 use crate::state::{ReviewStateStore, ScanMode, ScanOutcome, ScanState};
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -74,17 +75,20 @@ impl AdminService {
 
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
+    /// Rejects unknown or unavailable flags as invalid input. Reports state errors
+    /// as internal failures.
     pub async fn update_runtime_feature_flag(
         &self,
         flag_name: &str,
         enabled: Option<bool>,
-    ) -> Result<StatusFeatureFlagSnapshot> {
+    ) -> Result<StatusFeatureFlagSnapshot, ServiceError> {
         match flag_name {
             "gitlab_discovery_mcp" => {
                 if !self.config.feature_flag_availability.gitlab_discovery_mcp && enabled.is_some()
                 {
-                    bail!("invalid feature flag request: {flag_name} is unavailable");
+                    return Err(ServiceError::InvalidInput(anyhow!(
+                        "invalid feature flag request: {flag_name} is unavailable"
+                    )));
                 }
             }
             "gitlab_inline_review_comments"
@@ -93,7 +97,11 @@ impl AdminService {
             | "composer_install"
             | "composer_auto_repositories"
             | "composer_safe_install" => {}
-            other => bail!("invalid feature flag: {other}"),
+            other => {
+                return Err(ServiceError::InvalidInput(anyhow!(
+                    "invalid feature flag: {other}"
+                )));
+            }
         }
 
         let mut overrides = self
@@ -121,7 +129,9 @@ impl AdminService {
         self.build_feature_flag_snapshots(&overrides)
             .into_iter()
             .find(|flag| flag.name == flag_name)
-            .ok_or_else(|| anyhow::anyhow!("missing feature flag after update: {flag_name}"))
+            .ok_or_else(|| {
+                ServiceError::Internal(anyhow!("missing feature flag after update: {flag_name}"))
+            })
     }
 
     fn build_feature_flag_snapshots(
