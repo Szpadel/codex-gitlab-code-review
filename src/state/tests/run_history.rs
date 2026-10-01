@@ -1,6 +1,38 @@
 use super::*;
 
 #[tokio::test]
+async fn inline_completion_lookup_uses_a_selective_index() -> Result<()> {
+    let store = ReviewStateStore::new(":memory:").await?;
+    let plan = sqlx::query(
+        r#"EXPLAIN QUERY PLAN SELECT 1 FROM run_history
+        WHERE kind = ? AND review_lane = ? AND repo = ? AND iid = ? AND head_sha = ?
+        AND status = 'done' AND result = 'comment'
+        AND feature_flags_json LIKE '%"gitlab_inline_review_comments":true%' LIMIT 1"#,
+    )
+    .bind("review")
+    .bind("general")
+    .bind("group/repo")
+    .bind(7_i64)
+    .bind("sha")
+    .fetch_all(store.pool())
+    .await?;
+    let details = plan
+        .iter()
+        .map(|row| row.try_get::<String, _>("detail"))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join("\n");
+    assert!(details.contains("SEARCH run_history"), "{details}");
+    assert!(details.contains("head_sha=?"), "{details}");
+    assert!(
+        !store
+            .run_history
+            .has_completed_inline_review("group/repo", 7, "sha")
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn clearing_absent_warning_turn_does_not_rewrite_events() -> Result<()> {
     let store = ReviewStateStore::new(":memory:").await?;
     let run_id = store
