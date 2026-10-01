@@ -7,6 +7,7 @@ fn mention_command_script_clones_repo_and_starts_app_server() {
         discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
+            state: Some("opened".to_string()),
             title: Some("Title".to_string()),
             web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/11".to_string()),
             draft: false,
@@ -69,6 +70,7 @@ fn mention_command_script_includes_mcp_server_overrides() {
         discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
+            state: Some("opened".to_string()),
             title: Some("Title".to_string()),
             web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/11".to_string()),
             draft: false,
@@ -117,6 +119,7 @@ fn mention_command_script_includes_reasoning_effort_override() {
         discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
+            state: Some("opened".to_string()),
             title: Some("Title".to_string()),
             web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/11".to_string()),
             draft: false,
@@ -167,6 +170,7 @@ fn mention_command_script_includes_model_override() {
         discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
+            state: Some("opened".to_string()),
             title: Some("Title".to_string()),
             web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/11".to_string()),
             draft: false,
@@ -217,6 +221,7 @@ fn mention_command_script_includes_reasoning_summary_override() {
         discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
+            state: Some("opened".to_string()),
             title: Some("Title".to_string()),
             web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/11".to_string()),
             draft: false,
@@ -267,6 +272,7 @@ fn mention_developer_instructions_require_commit_and_sha_reporting() {
         discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
+            state: Some("opened".to_string()),
             title: Some("Title".to_string()),
             web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/11".to_string()),
             draft: false,
@@ -308,6 +314,7 @@ fn mention_developer_instructions_include_additional_section_when_configured() {
         discussion_project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
+            state: Some("opened".to_string()),
             title: Some("Title".to_string()),
             web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/11".to_string()),
             draft: false,

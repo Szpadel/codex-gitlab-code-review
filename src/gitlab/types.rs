@@ -12,6 +12,8 @@ pub struct GitLabUser {
 #[serde(from = "RawMergeRequest")]
 pub struct MergeRequest {
     pub iid: u64,
+    /// GitLab state, or None if the response did not include a state.
+    pub state: Option<String>,
     pub title: Option<String>,
     pub web_url: Option<String>,
     pub draft: bool,
@@ -32,6 +34,7 @@ pub struct MergeRequest {
 #[derive(Debug, Clone, Deserialize)]
 struct RawMergeRequest {
     pub iid: u64,
+    pub state: Option<String>,
     pub title: Option<String>,
     pub web_url: Option<String>,
     #[serde(default)]
@@ -56,6 +59,7 @@ impl From<RawMergeRequest> for MergeRequest {
     fn from(raw: RawMergeRequest) -> Self {
         Self {
             iid: raw.iid,
+            state: raw.state,
             title: raw.title,
             web_url: raw.web_url,
             draft: raw

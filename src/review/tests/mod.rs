@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 
 mod mentions;
 mod pending_mentions;
+mod pending_reviews;
 mod publication_failures;
 mod review_comments;
 mod scan_failures;

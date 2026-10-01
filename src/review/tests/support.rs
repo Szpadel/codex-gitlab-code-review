@@ -1132,6 +1132,7 @@ pub(super) fn mr(iid: u64, sha: &str) -> MergeRequest {
 pub(super) fn mr_with_created_at(iid: u64, sha: &str, created_at: DateTime<Utc>) -> MergeRequest {
     MergeRequest {
         iid,
+        state: Some("opened".to_string()),
         title: None,
         web_url: None,
         draft: false,

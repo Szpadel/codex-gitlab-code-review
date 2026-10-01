@@ -1419,6 +1419,7 @@ mod tests {
         };
         let mr = MergeRequest {
             iid: 7,
+            state: Some("opened".to_string()),
             title: Some("Demo".to_string()),
             web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/7".to_string()),
             draft: false,

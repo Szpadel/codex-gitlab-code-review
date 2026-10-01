@@ -1,10 +1,12 @@
 use super::ReviewLane;
+use super::admission::{ReviewSkipReason, review_skip_reason};
 use super::service::{NO_OPEN_MRS_MARKER, ReviewService, ScanMode, ScanRunStatus};
 use crate::flow::mention::MentionScheduleOutcome;
 use crate::flow::review::ReviewScheduleOutcome;
 use anyhow::Result;
 use chrono::Utc;
 use futures::future::join_all;
+use std::collections::HashSet;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -40,6 +42,7 @@ pub(super) struct ScanCounters {
     missing_sha: usize,
     skipped_inactive: usize,
     skipped_draft: usize,
+    skipped_closed: usize,
     skipped_created_before: usize,
 }
 
@@ -230,6 +233,7 @@ impl ScanContext {
                     skipped_backoff = self.counters.skipped_backoff,
                     missing_sha = self.counters.missing_sha,
                     skipped_draft = self.counters.skipped_draft,
+                    skipped_closed = self.counters.skipped_closed,
                     skipped_created_before = self.counters.skipped_created_before,
                     "scan complete"
                 );
@@ -259,6 +263,7 @@ impl ScanContext {
                     missing_sha = self.counters.missing_sha,
                     skipped_inactive = self.counters.skipped_inactive,
                     skipped_draft = self.counters.skipped_draft,
+                    skipped_closed = self.counters.skipped_closed,
                     skipped_created_before = self.counters.skipped_created_before,
                     "scan complete"
                 );
@@ -482,36 +487,29 @@ impl<'a> ScanPipeline<'a> {
                 );
                 continue;
             }
-            if mr.draft {
-                self.context.counters.skipped_draft += 1;
+            if let Some(reason) = review_skip_reason(&mr, self.service.created_after) {
                 self.service
                     .clear_review_backoff_retries_for_mr(repo, mr.iid)
                     .await;
-                debug!(repo = repo, iid = mr.iid, "skip: draft MR");
-                continue;
-            }
-            let created_at = if let Some(value) = mr.created_at.as_ref() {
-                value
-            } else {
-                self.context.counters.skipped_created_before += 1;
-                self.service
-                    .clear_review_backoff_retries_for_mr(repo, mr.iid)
-                    .await;
-                warn!(repo = repo, iid = mr.iid, "missing created_at, skipping");
-                continue;
-            };
-            if created_at <= &self.service.created_after {
-                self.context.counters.skipped_created_before += 1;
-                self.service
-                    .clear_review_backoff_retries_for_mr(repo, mr.iid)
-                    .await;
-                debug!(
-                    repo = repo,
-                    iid = mr.iid,
-                    created_at = %created_at,
-                    cutoff = %self.service.created_after,
-                    "skip: MR created before cutoff"
-                );
+                match reason {
+                    ReviewSkipReason::NotOpened => {
+                        self.context.counters.skipped_closed += 1;
+                        debug!(repo, iid = mr.iid, "skip: MR is not opened");
+                    }
+                    ReviewSkipReason::Draft => {
+                        self.context.counters.skipped_draft += 1;
+                        debug!(repo, iid = mr.iid, "skip: draft MR");
+                    }
+                    ReviewSkipReason::MissingCreatedAt => {
+                        self.context.counters.skipped_created_before += 1;
+                        warn!(repo, iid = mr.iid, "missing created_at, skipping");
+                    }
+                    ReviewSkipReason::BeforeCutoff => {
+                        self.context.counters.skipped_created_before += 1;
+                        debug!(repo, iid = mr.iid, created_at = ?mr.created_at,
+                            cutoff = %self.service.created_after, "skip: MR created before cutoff");
+                    }
+                }
                 continue;
             }
             let mr_iid = mr.iid;
@@ -616,6 +614,14 @@ pub(super) async fn run_pending_rate_limit_pipeline(
         }
         service.retry_pending_mention_quota_row(&pending).await?;
     }
+    if due_pending_rows.is_empty() {
+        return Ok(ScanRunStatus::Completed);
+    }
+    let repos: HashSet<String> = service
+        .resolve_repos(ScanMode::Incremental)
+        .await?
+        .into_iter()
+        .collect();
     for pending in due_pending_rows {
         if service.shutdown_requested() {
             info!(
@@ -627,7 +633,7 @@ pub(super) async fn run_pending_rate_limit_pipeline(
             return Ok(ScanRunStatus::Interrupted);
         }
         let outcome = service
-            .retry_pending_review_rate_limit_row(&pending)
+            .retry_pending_review_rate_limit_row(&pending, &repos)
             .await?;
         if matches!(outcome, ReviewScheduleOutcome::Interrupted) {
             return Ok(ScanRunStatus::Interrupted);

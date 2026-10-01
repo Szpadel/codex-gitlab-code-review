@@ -234,6 +234,7 @@ fn review_context_with_target_branch(target_branch: Option<&str>) -> ReviewConte
         project_path: "group/repo".to_string(),
         mr: MergeRequest {
             iid: 11,
+            state: Some("opened".to_string()),
             title: Some("Title".to_string()),
             web_url: Some("https://gitlab.example.com/group/repo/-/merge_requests/11".to_string()),
             draft: false,

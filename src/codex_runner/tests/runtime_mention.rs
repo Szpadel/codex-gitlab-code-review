@@ -194,6 +194,7 @@ async fn run_mention_command_with_fake_runtime_executes_git_helpers_and_returns_
             discussion_project_path: "group/repo".to_string(),
             mr: MergeRequest {
                 iid: 11,
+                state: Some("opened".to_string()),
                 title: Some("Title".to_string()),
                 web_url: None,
                 draft: false,
@@ -287,6 +288,7 @@ async fn prepare_mention_inputs_downloads_images_inside_container() {
                 discussion_project_path: "group/repo".to_string(),
                 mr: MergeRequest {
                     iid: 11,
+                    state: Some("opened".to_string()),
                     title: Some("Title".to_string()),
                     web_url: None,
                     draft: false,
@@ -379,6 +381,7 @@ async fn run_mention_command_with_fake_runtime_initializes_before_composer_insta
             discussion_project_path: "group/repo".to_string(),
             mr: MergeRequest {
                 iid: 11,
+                state: Some("opened".to_string()),
                 title: Some("Title".to_string()),
                 web_url: None,
                 draft: false,
@@ -459,6 +462,7 @@ async fn run_mention_command_with_fake_runtime_surfaces_exec_failures() {
             discussion_project_path: "group/repo".to_string(),
             mr: MergeRequest {
                 iid: 11,
+                state: Some("opened".to_string()),
                 title: Some("Title".to_string()),
                 web_url: None,
                 draft: false,

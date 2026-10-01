@@ -8,6 +8,7 @@ use crate::flow::review::{ReviewFlow, ReviewScheduleOutcome};
 use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::ReviewLane;
+use crate::review::admission::review_skip_reason;
 use crate::review::retry::{
     RetryBackoff, RetryKey, RetryWarningAwardService, RunRetryStatus, RunRetryStatusProvider,
 };
@@ -563,6 +564,7 @@ impl ReviewService {
     pub(super) async fn retry_pending_review_rate_limit_row(
         &self,
         pending: &ReviewRateLimitPendingEntry,
+        repos: &HashSet<String>,
     ) -> Result<ReviewScheduleOutcome> {
         debug!(
             repo = pending.repo.as_str(),
@@ -571,6 +573,15 @@ impl ReviewService {
             next_retry_at = pending.next_retry_at,
             "retrying due pending review rate-limit row"
         );
+        if !repos.contains(&pending.repo) {
+            debug!(
+                repo = pending.repo,
+                iid = pending.iid,
+                "clear pending review: repository is outside targets"
+            );
+            self.clear_pending_review(pending).await?;
+            return Ok(ReviewScheduleOutcome::SkippedCompleted);
+        }
         let mr = match self.gitlab.get_mr(&pending.repo, pending.iid).await {
             Ok(mr) => mr,
             Err(err) if should_clear_pending_retry_after_mr_lookup_error(&err) => {
@@ -581,19 +592,7 @@ impl ReviewService {
                     error = %err,
                     "merge request lookup failed while retrying pending review; clearing pending row"
                 );
-                if self
-                    .state
-                    .review_rate_limit
-                    .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
-                    .await?
-                {
-                    self.remove_pending_awards_after_clear(
-                        pending.lane,
-                        &pending.repo,
-                        pending.iid,
-                    )
-                    .await;
-                }
+                self.clear_pending_review(pending).await?;
                 return Ok(ReviewScheduleOutcome::SkippedCompleted);
             }
             Err(err) => {
@@ -617,6 +616,16 @@ impl ReviewService {
                 return Ok(ReviewScheduleOutcome::SkippedRateLimit);
             }
         };
+        if let Some(reason) = review_skip_reason(&mr, self.created_after) {
+            debug!(
+                repo = pending.repo,
+                iid = pending.iid,
+                ?reason,
+                "clear pending review: MR is not eligible"
+            );
+            self.clear_pending_review(pending).await?;
+            return Ok(ReviewScheduleOutcome::SkippedCompleted);
+        }
         let head_sha = if let Some(value) = mr.head_sha() {
             value
         } else {
@@ -626,15 +635,7 @@ impl ReviewService {
                 lane = pending.lane.as_str(),
                 "missing head sha while retrying pending review; clearing pending row"
             );
-            if self
-                .state
-                .review_rate_limit
-                .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
-                .await?
-            {
-                self.remove_pending_awards_after_clear(pending.lane, &pending.repo, pending.iid)
-                    .await;
-            }
+            self.clear_pending_review(pending).await?;
             return Ok(ReviewScheduleOutcome::SkippedCompleted);
         };
         let outcome = self
@@ -665,7 +666,15 @@ impl ReviewService {
             ReviewScheduleOutcome::SkippedRateLimit
                 | ReviewScheduleOutcome::Interrupted
                 | ReviewScheduleOutcome::SkippedQuota
-        ) && self
+        ) {
+            self.clear_pending_review(pending).await?;
+        }
+        Ok(outcome)
+    }
+
+    /// Clears the pending row, then attempts to remove its quota and rate-limit awards.
+    async fn clear_pending_review(&self, pending: &ReviewRateLimitPendingEntry) -> Result<()> {
+        if self
             .state
             .review_rate_limit
             .clear_review_rate_limit_pending(pending.lane, &pending.repo, pending.iid)
@@ -674,7 +683,7 @@ impl ReviewService {
             self.remove_pending_awards_after_clear(pending.lane, &pending.repo, pending.iid)
                 .await;
         }
-        Ok(outcome)
+        Ok(())
     }
 
     async fn remove_pending_awards_after_clear(&self, lane: ReviewLane, repo: &str, iid: u64) {
@@ -1231,6 +1240,7 @@ mod pending_rate_limit_tests {
     fn test_mr(iid: u64, sha: &str, updated_at: chrono::DateTime<Utc>) -> MergeRequest {
         MergeRequest {
             iid,
+            state: Some("opened".to_string()),
             title: None,
             web_url: None,
             draft: false,

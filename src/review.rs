@@ -1,3 +1,4 @@
+mod admission;
 pub mod lane;
 pub(crate) mod retry;
 mod scan_coordinator;

@@ -399,6 +399,7 @@ impl DevMergeRequest {
     fn as_merge_request(&self, repo_path: &str, project_id: u64) -> MergeRequest {
         MergeRequest {
             iid: self.iid,
+            state: Some("opened".to_string()),
             title: Some(self.title.clone()),
             web_url: Some(format!(
                 "{}/-/merge_requests/{}",
