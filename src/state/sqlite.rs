@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const BACKGROUND_QUEUE_CAPACITY: usize = 256;
+// History scans use a 64 MiB page cache per connection, at most 5 x 64 MiB.
+const FILE_DATABASE_CACHE_SIZE_KIB: i32 = -65536;
 const SQLITE_BUSY_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_millis(25),
     Duration::from_millis(75),
@@ -486,9 +488,12 @@ pub(crate) fn sqlite_connect_options(path: &str, url: &str) -> Result<SqliteConn
     let mut options =
         SqliteConnectOptions::from_str(url).with_context(|| format!("parse sqlite url {url}"))?;
     if path != ":memory:" {
+        // Do not enable mmap_size. SQLite documents SIGBUS on mapped I/O errors.
+        // A page cache avoids that process crash risk on network-backed storage.
         options = options
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal);
+            .synchronous(SqliteSynchronous::Normal)
+            .pragma("cache_size", FILE_DATABASE_CACHE_SIZE_KIB.to_string());
     }
     Ok(options)
 }
@@ -527,6 +532,53 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn startup_optimize_collects_statistics_for_new_indexes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("state.sqlite");
+        let store = crate::state::ReviewStateStore::new(path.to_str().unwrap()).await?;
+        // Simulate an upgrade with populated history and new indexes to analyze.
+        sqlx::raw_sql(
+            "DROP INDEX idx_run_history_kind;
+             DROP INDEX idx_run_history_in_progress;
+             DELETE FROM _sqlx_migrations WHERE version = 27;
+             WITH RECURSIVE runs(id) AS (SELECT 1 UNION ALL SELECT id + 1 FROM runs WHERE id < 1000)
+             INSERT INTO run_history (kind, repo, iid, head_sha, status, started_at, updated_at)
+             SELECT 'review', 'group/repo', id, 'sha', 'done', 0, 0 FROM runs;",
+        )
+        .execute(store.pool())
+        .await?;
+        store.background_tasks().shutdown().await;
+        store.pool().close().await;
+        let upgraded = crate::state::ReviewStateStore::new(path.to_str().unwrap()).await?;
+        let analyzed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_stat1 WHERE idx = 'idx_run_history_kind'",
+        )
+        .fetch_one(upgraded.pool())
+        .await?;
+        assert_eq!(analyzed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_database_startup_uses_64_mib_page_cache() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("state.sqlite");
+        let store = crate::state::ReviewStateStore::new(path.to_str().unwrap()).await?;
+        let cache_size: i64 = sqlx::query_scalar("PRAGMA cache_size")
+            .fetch_one(store.pool())
+            .await?;
+        // The page-cache budget is 64 MiB per connection for file databases.
+        assert_eq!(cache_size, -65536);
+        sqlx::query("PRAGMA optimize").execute(store.pool()).await?;
+        let memory = SqliteCoordinator::connect(":memory:").await?;
+        let memory_cache_size: i64 = sqlx::query_scalar("PRAGMA cache_size")
+            .fetch_one(memory.read_pool())
+            .await?;
+        assert_ne!(memory_cache_size, -65536);
+        Ok(())
+    }
 
     async fn coordinator_with_items_table() -> Result<SqliteCoordinator> {
         let sqlite = SqliteCoordinator::connect(":memory:").await?;

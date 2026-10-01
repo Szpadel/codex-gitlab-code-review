@@ -447,6 +447,14 @@ impl ReviewStateStore {
             return Err(error);
         }
 
+        // Refresh planner statistics after upgrades without delaying availability on failure.
+        if let Err(error) = sqlx::query("PRAGMA optimize")
+            .execute(sqlite.read_pool())
+            .await
+        {
+            tracing::warn!(error = %error, "SQLite planner optimization failed");
+        }
+
         Ok(Self {
             review_state: ReviewStateRepository::new(sqlite.clone()),
             run_history: RunHistoryRepository::new(sqlite.clone()),
