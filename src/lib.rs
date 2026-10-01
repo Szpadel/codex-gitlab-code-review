@@ -6,6 +6,7 @@ pub mod codex_runner;
 pub mod composer_install;
 pub mod config;
 pub mod dev_mode;
+pub mod docker;
 pub mod flow;
 mod generated_review_prompt_templates;
 pub mod gitlab;

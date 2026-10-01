@@ -3,12 +3,12 @@ use super::{
     GitLabCheckoutKind, GitLabDiscoverySessionBinding, GitLabDiscoverySessionRegistry,
     ResolvedGitLabDiscoveryAllowList, resolve_allow_list,
 };
-use crate::codex_runner::docker::connect_docker;
 use crate::composer_install::{
     ComposerCommandOutput, ComposerInstallMode, ComposerInstallPlan, ComposerInstallResult,
     DEFAULT_COMPOSER_INSTALL_TIMEOUT_SECONDS, redact_composer_related_output,
 };
 use crate::config::{DockerConfig, GitLabConfig, GitLabDiscoveryMcpConfig};
+use crate::docker::connect_docker;
 use crate::gitlab::GitLabClient;
 use crate::placeholders::render_placeholders;
 use anyhow::{Context, Result, anyhow, bail};
@@ -830,10 +830,8 @@ esac
         let service = GitLabDiscoveryMcpService {
             config: crate::config::GitLabDiscoveryMcpConfig::default(),
             advertised_host: "host.docker.internal".to_string(),
-            docker: crate::codex_runner::docker::connect_docker(
-                &crate::config::DockerConfig::default(),
-            )
-            .expect("docker client"),
+            docker: crate::docker::connect_docker(&crate::config::DockerConfig::default())
+                .expect("docker client"),
             gitlab: crate::gitlab::GitLabClient::new("https://gitlab.example.com", "secret-token")
                 .expect("gitlab client"),
             git_base: url::Url::parse("https://gitlab.example.com").expect("git base"),

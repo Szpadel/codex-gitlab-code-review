@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use std::time::Duration;
 use tracing::info;
 
-use crate::codex_runner::docker::wait_for_docker_ready;
 use crate::config::{DockerConfig, ValidatedConfig, load_validated_config};
+use crate::docker::wait_for_docker_ready;
 use crate::service_factory::{
     RuntimeMode, ServiceBundle, ServiceFactoryOptions, build_service_bundle,
 };

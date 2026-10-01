@@ -49,7 +49,6 @@ mod browser_mcp;
 mod composer;
 mod container;
 mod deduplication;
-pub mod docker;
 pub(crate) mod duration;
 mod gitlab_discovery;
 mod mention_flow;
@@ -76,7 +75,6 @@ pub(crate) use self::auth_accounts::{ConfiguredAuthAccount, configured_auth_acco
 #[cfg(test)]
 pub(crate) use self::auth_accounts::{PRIMARY_AUTH_ACCOUNT_NAME, auth_account_state_key};
 use self::container::{ImagePullManager, format_command_for_log};
-use self::docker::{connect_docker, ensure_image, normalize_image_reference};
 use self::gitlab_discovery::{
     GitLabDiscoveryHandle, GitLabDiscoveryMcpRuntimeConfig, PreparedGitLabDiscoveryMcp,
     RegisteredGitLabDiscoverySession,
@@ -90,6 +88,7 @@ pub use self::usage::{
     CodexUsageLimitSnapshot, CodexUsageResetCredits, CodexUsageResetOutcome, CodexUsageSnapshot,
     CodexUsageWindow, is_weekly_window_duration,
 };
+use crate::docker::{connect_docker, ensure_image, normalize_image_reference};
 
 #[derive(Debug, Clone)]
 pub struct ReviewContext {

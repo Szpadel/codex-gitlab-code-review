@@ -85,6 +85,7 @@ pub async fn wait_for_docker_ready(
     })
 }
 
+/// Trims whitespace and adds `:latest` when a nonempty image has no tag or digest.
 #[must_use]
 pub fn normalize_image_reference(image: &str) -> String {
     let trimmed = image.trim();
