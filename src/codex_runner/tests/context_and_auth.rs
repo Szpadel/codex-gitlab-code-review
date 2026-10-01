@@ -776,7 +776,7 @@ async fn read_usage_limits_sets_codex_home_to_configured_auth_mount_path() {
             .cmd
             .get(1)
             .expect("script")
-            .contains("export CODEX_HOME=\"/custom/codex-home\""),
+            .contains("export CODEX_HOME='/custom/codex-home'"),
         "{}",
         starts[0].request.cmd.get(1).expect("script")
     );

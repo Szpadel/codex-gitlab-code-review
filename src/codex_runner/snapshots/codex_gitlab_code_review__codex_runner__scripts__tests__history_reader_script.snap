@@ -3,8 +3,8 @@ source: src/codex_runner/scripts.rs
 expression: history_reader
 ---
 set -eu
-mkdir -p "/root/.codex"
-export CODEX_HOME="/root/.codex"
+mkdir -p '/root/.codex'
+export CODEX_HOME='/root/.codex'
 codex_install_log='/tmp/codex-install.log'
 if ! rm -f "$codex_install_log" "${codex_install_log}.tmp"; then
   echo "codex-runner-error: could not prepare codex install log"

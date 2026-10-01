@@ -79,9 +79,9 @@ use self::gitlab_discovery::{
     RegisteredGitLabDiscoverySession,
 };
 use self::review_output::parse_review_output_for_lane;
+pub(crate) use self::scripts::shell_quote;
 use self::scripts::{
     AppServerCommandOptions, effective_browser_mcp, restore_push_remote_url_exec_command,
-    shell_quote,
 };
 pub use self::usage::{
     CodexUsageLimitSnapshot, CodexUsageResetCredits, CodexUsageResetOutcome, CodexUsageSnapshot,

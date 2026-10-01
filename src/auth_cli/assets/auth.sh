@@ -1,6 +1,6 @@
 set -eu
-mkdir -p "@@AUTH_MOUNT_PATH@@"
-export CODEX_HOME="@@AUTH_MOUNT_PATH@@"
+mkdir -p @@AUTH_MOUNT_PATH_Q@@
+export CODEX_HOME=@@AUTH_MOUNT_PATH_Q@@
 # Ensure Codex CLI is available for auth flows.
 if ! command -v codex >/dev/null 2>&1; then
   echo "codex-auth: codex not found, installing"

@@ -1,5 +1,6 @@
 use crate::codex_runner::docker::{connect_docker, ensure_image, normalize_image_reference};
 use crate::codex_runner::placeholders::render_placeholders;
+use crate::codex_runner::shell_quote;
 use crate::config::{CodexConfig, DockerConfig};
 use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
@@ -165,6 +166,7 @@ impl AuthRunner {
 }
 
 fn build_auth_script(auth_mount_path: &str, action: AuthAction) -> String {
+    let auth_mount_path_q = shell_quote(auth_mount_path);
     let action_args = match action {
         AuthAction::Login => "login --device-auth",
         AuthAction::Status => "login status",
@@ -172,7 +174,7 @@ fn build_auth_script(auth_mount_path: &str, action: AuthAction) -> String {
     render_placeholders(
         AUTH_SCRIPT_TEMPLATE,
         &[
-            ("AUTH_MOUNT_PATH", auth_mount_path),
+            ("AUTH_MOUNT_PATH_Q", &auth_mount_path_q),
             ("ACTION_ARGS", action_args),
         ],
     )
@@ -256,5 +258,27 @@ mod tests {
 
         assert!(!script.contains("@@"), "{script}");
         insta::assert_snapshot!("auth_login_script", script);
+    }
+
+    #[test]
+    fn auth_mount_path_stays_literal_in_executed_scripts() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let auth_path = directory.path().join("$HOME/$(printf injected)/auth");
+        let auth_path = auth_path.to_str().expect("UTF-8 path");
+        for script in [
+            build_auth_script(auth_path, AuthAction::Login),
+            build_auth_script(auth_path, AuthAction::Status),
+            crate::codex_runner::DockerCodexRunner::build_history_reader_script(auth_path),
+        ] {
+            let fragment = script.lines().take(3).collect::<Vec<_>>().join("\n");
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{fragment}\nprintf '%s' \"$CODEX_HOME\""))
+                .output()?;
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(String::from_utf8(output.stdout)?, auth_path);
+            assert!(std::path::Path::new(auth_path).is_dir());
+        }
+        Ok(())
     }
 }

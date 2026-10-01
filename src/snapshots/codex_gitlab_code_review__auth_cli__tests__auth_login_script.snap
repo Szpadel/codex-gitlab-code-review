@@ -3,8 +3,8 @@ source: src/auth_cli.rs
 expression: script
 ---
 set -eu
-mkdir -p "/root/.codex"
-export CODEX_HOME="/root/.codex"
+mkdir -p '/root/.codex'
+export CODEX_HOME='/root/.codex'
 # Ensure Codex CLI is available for auth flows.
 if ! command -v codex >/dev/null 2>&1; then
   echo "codex-auth: codex not found, installing"

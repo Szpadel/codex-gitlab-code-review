@@ -312,11 +312,12 @@ impl DockerCodexRunner {
     }
 
     pub(crate) fn build_history_reader_script(auth_mount_path: &str) -> String {
+        let auth_mount_path_q = shell_quote(auth_mount_path);
         let codex_cli_bootstrap = codex_cli_bootstrap_script();
         render_script_template(
             HISTORY_READER_TEMPLATE,
             &[
-                ("AUTH_MOUNT_PATH", auth_mount_path),
+                ("AUTH_MOUNT_PATH_Q", &auth_mount_path_q),
                 ("CODEX_CLI_BOOTSTRAP_SCRIPT", &codex_cli_bootstrap),
             ],
         )
