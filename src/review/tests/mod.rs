@@ -26,6 +26,7 @@ mod bounded_admission;
 mod mention_shutdown;
 mod mentions;
 mod pending_mentions;
+mod pending_retry_concurrency;
 mod pending_reviews;
 mod publication_failures;
 mod review_comments;

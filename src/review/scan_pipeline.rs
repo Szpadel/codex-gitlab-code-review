@@ -7,8 +7,11 @@ use crate::flow::review::ReviewScheduleOutcome;
 use anyhow::Result;
 use chrono::Utc;
 use futures::future::join_all;
+use futures::{StreamExt, stream};
 use std::collections::HashSet;
+use std::future::{Future, ready};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -610,18 +613,14 @@ pub(super) async fn run_pending_rate_limit_pipeline(
         debug!("no pending review rate-limit retries are due");
         return Ok(ScanRunStatus::Completed);
     }
-    for pending in due_pending_mentions {
-        if service.shutdown_requested() {
-            info!(
-                repo = pending.repo.as_str(),
-                iid = pending.iid,
-                discussion_id = pending.discussion_id.as_str(),
-                trigger_note_id = pending.trigger_note_id,
-                "stopping pending mention quota retry processing: shutdown requested"
-            );
-            return Ok(ScanRunStatus::Interrupted);
-        }
-        service.retry_pending_mention_quota_row(&pending).await?;
+    let mention_status =
+        run_pending_retry_batch(service, due_pending_mentions, |pending| async move {
+            service.retry_pending_mention_quota_row(&pending).await?;
+            Ok(ScanRunStatus::Completed)
+        })
+        .await?;
+    if mention_status == ScanRunStatus::Interrupted {
+        return Ok(mention_status);
     }
     if due_pending_rows.is_empty() {
         return Ok(ScanRunStatus::Completed);
@@ -631,24 +630,65 @@ pub(super) async fn run_pending_rate_limit_pipeline(
         .await?
         .into_iter()
         .collect();
-    for pending in due_pending_rows {
-        if service.shutdown_requested() {
-            info!(
-                repo = pending.repo.as_str(),
-                iid = pending.iid,
-                lane = pending.lane.as_str(),
-                "stopping pending retry processing: shutdown requested"
-            );
-            return Ok(ScanRunStatus::Interrupted);
-        }
+    let repos = &repos;
+    run_pending_retry_batch(service, due_pending_rows, |pending| async move {
         let outcome = service
-            .retry_pending_review_rate_limit_row(&pending, &repos)
+            .retry_pending_review_rate_limit_row(&pending, repos)
             .await?;
         if matches!(outcome, ReviewScheduleOutcome::Interrupted) {
             return Ok(ScanRunStatus::Interrupted);
         }
+        Ok(ScanRunStatus::Completed)
+    })
+    .await
+}
+
+/// Stops admission on error or shutdown. Waits for all admitted retries before returning.
+async fn run_pending_retry_batch<Row, Retry, RetryFuture>(
+    service: &ReviewService,
+    rows: Vec<Row>,
+    retry: Retry,
+) -> Result<ScanRunStatus>
+where
+    Retry: Fn(Row) -> RetryFuture,
+    RetryFuture: Future<Output = Result<ScanRunStatus>>,
+{
+    let stop_admission = CancellationToken::new();
+    let retries = stream::iter(rows)
+        .take_while(|_| ready(!stop_admission.is_cancelled() && !service.shutdown_requested()))
+        .map(|row| {
+            let future = retry(row);
+            let stop_admission = &stop_admission;
+            async move {
+                let result = future.await;
+                if !matches!(result, Ok(ScanRunStatus::Completed)) {
+                    stop_admission.cancel();
+                }
+                result
+            }
+        })
+        .buffer_unordered(service.max_concurrent());
+    tokio::pin!(retries);
+    let mut first_error = None;
+    let mut status = ScanRunStatus::Completed;
+    // Finish admitted retries before returning an error or a shutdown status.
+    while let Some(result) = retries.next().await {
+        match result {
+            Ok(ScanRunStatus::Completed) => {}
+            Ok(ScanRunStatus::Interrupted) => status = ScanRunStatus::Interrupted,
+            Err(err) => {
+                first_error.get_or_insert(err);
+            }
+        }
     }
-    Ok(ScanRunStatus::Completed)
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    if service.shutdown_requested() {
+        info!("pending retry stopped: shutdown requested");
+        return Ok(ScanRunStatus::Interrupted);
+    }
+    Ok(status)
 }
 
 #[cfg(test)]

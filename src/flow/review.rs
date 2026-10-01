@@ -898,6 +898,9 @@ impl ReviewFlow {
         mr: MergeRequest,
         head_sha: &str,
     ) -> Result<ReviewScheduleOutcome> {
+        let Ok(_admission) = self.shared.task_admission.acquire().await else {
+            return Ok(ReviewScheduleOutcome::Interrupted);
+        };
         let history = AdmissionHistory::new(self.shared.gitlab.as_ref(), repo, mr.iid);
         let acquired_rule_ids = match self
             .evaluate_review_gate(repo, &mr, head_sha, &history)

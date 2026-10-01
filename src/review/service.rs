@@ -342,6 +342,10 @@ impl ReviewService {
         !self.lifecycle.accepts_new_work()
     }
 
+    pub(super) fn max_concurrent(&self) -> usize {
+        self.config.review.max_concurrent
+    }
+
     pub(super) async fn clear_stale_flow_state(&self) -> Result<()> {
         self.scan_coordinator.clear_stale_flow_state().await
     }

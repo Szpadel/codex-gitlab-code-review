@@ -8,16 +8,18 @@ use chrono::Utc;
 use futures::future::select_all;
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
+/// Shares a task bound across all flows. Slots cover work and its finalization.
 pub(crate) struct TaskAdmission {
     semaphore: Arc<Semaphore>,
     max_tasks: usize,
 }
 
 impl TaskAdmission {
+    /// Allows one running batch and two queued batches of `max_concurrent` tasks.
     pub(crate) fn new(max_concurrent: usize) -> Self {
         // Two queued batches let successive incremental scans admit work.
         let max_tasks = max_concurrent.saturating_mul(3).min(Semaphore::MAX_PERMITS);
@@ -27,8 +29,14 @@ impl TaskAdmission {
         }
     }
 
+    /// Rejects new admission and wakes blocked callers. Existing slots remain valid.
     pub(crate) fn close(&self) {
         self.semaphore.close();
+    }
+
+    /// Waits for a slot. Returns an error after shutdown closes admission.
+    pub(crate) async fn acquire(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
+        self.semaphore.clone().acquire_owned().await
     }
 
     async fn reap_tasks(&self, tasks: &mut Vec<JoinHandle<()>>) {
@@ -162,13 +170,7 @@ pub(crate) async fn spawn_orchestrated_task<
     let semaphore = Arc::clone(&shared.semaphore);
     let lifecycle = Arc::clone(&shared.lifecycle);
     let active_task = track_active_task(&shared.active_tasks, key);
-    let Ok(admission) = shared
-        .task_admission
-        .semaphore
-        .clone()
-        .acquire_owned()
-        .await
-    else {
+    let Ok(admission) = shared.task_admission.acquire().await else {
         on_start_rejected(before_acquire.await).await;
         return;
     };
