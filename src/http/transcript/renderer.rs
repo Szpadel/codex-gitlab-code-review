@@ -1,3 +1,4 @@
+use super::diff::{DiffLineKind, classified_diff_lines};
 use super::models::{FileChangeBodyFormat, ThreadItemKind, ThreadItemSnapshot, ThreadSnapshot};
 use crate::http::markdown::render_safe_markdown;
 use crate::http::timestamp;
@@ -554,19 +555,14 @@ fn render_file_change_stats(item: &ThreadItemSnapshot) -> String {
 }
 
 fn render_colored_diff(body: &str) -> String {
-    let lines = body
-        .lines()
-        .map(|line| {
-            let class_name = if line.starts_with('+') && !is_diff_metadata_line(line) {
-                "diff-line diff-line-add"
-            } else if line.starts_with('-') && !is_diff_metadata_line(line) {
-                "diff-line diff-line-remove"
-            } else if line.starts_with("@@") {
-                "diff-line diff-line-hunk"
-            } else if is_diff_metadata_line(line) {
-                "diff-line diff-line-meta"
-            } else {
-                "diff-line"
+    let lines = classified_diff_lines(body)
+        .map(|(line, kind)| {
+            let class_name = match kind {
+                DiffLineKind::Addition => "diff-line diff-line-add",
+                DiffLineKind::Removal => "diff-line diff-line-remove",
+                DiffLineKind::Hunk => "diff-line diff-line-hunk",
+                DiffLineKind::Metadata => "diff-line diff-line-meta",
+                DiffLineKind::Context => "diff-line",
             };
             format!("<div class=\"{}\">{}</div>", class_name, escape_html(line))
         })
@@ -583,20 +579,6 @@ fn render_file_change_body(item: &ThreadItemSnapshot) -> String {
         Some(FileChangeBodyFormat::Mixed) => render_mixed_file_change_body(body),
         _ => format!("<pre class=\"activity-body\">{}</pre>", escape_html(body)),
     }
-}
-
-fn is_diff_metadata_line(line: &str) -> bool {
-    if line.starts_with("diff --git ") {
-        return true;
-    }
-    let Some(path) = line
-        .strip_prefix("+++ ")
-        .or_else(|| line.strip_prefix("--- "))
-    else {
-        return false;
-    };
-    let path = path.trim();
-    path == "/dev/null" || path.starts_with("a/") || path.starts_with("b/")
 }
 
 #[derive(Deserialize)]
@@ -748,6 +730,49 @@ mod tests {
             transcript_backfill_state: TranscriptBackfillState::NotRequested,
             transcript_backfill_error: None,
         }
+    }
+
+    #[test]
+    fn header_like_hunk_content_counts_as_changes() {
+        let thread = header_like_hunk_thread();
+        let item = &thread.turns[0].items[0];
+        assert_eq!(item.file_change_added_lines(), 1);
+        assert_eq!(item.file_change_removed_lines(), 1);
+    }
+
+    #[test]
+    fn header_like_hunk_content_renders_as_changes() {
+        let html = render_thread_stream(&header_like_hunk_thread(), "https://gitlab.example.com");
+        assert!(html.contains("diff-line-remove\">--- a/old</div>"));
+        assert!(html.contains("diff-line-add\">+++ b/new</div>"));
+        assert!(html.contains("diff-line-meta\">--- a/empty.txt</div>"));
+        assert!(html.contains("diff-line-meta\">+++ b/empty.txt</div>"));
+    }
+
+    fn header_like_hunk_thread() -> ThreadSnapshot {
+        thread_snapshot_from_events(
+            &base_run(),
+            &[RunHistoryEventRecord {
+                id: 1,
+                run_history_id: 1,
+                sequence: 1,
+                turn_id: Some("turn-1".to_string()),
+                event_type: "item_completed".to_string(),
+                payload: json!({
+                    "type": "fileChange",
+                    "changes": {
+                        "content.txt": {
+                            "unified_diff": "--- a/content.txt\n+++ b/content.txt\n@@ -1 +1 @@\n--- a/old\n+++ b/new\n"
+                        },
+                        "empty.txt": {
+                            "unified_diff": "--- a/empty.txt\n+++ b/empty.txt\n@@ -0,0 +0,0 @@\n"
+                        }
+                    }
+                }),
+                created_at: 0,
+            }],
+        )
+        .expect("file change transcript")
     }
 
     #[test]

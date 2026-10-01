@@ -1,3 +1,4 @@
+use super::diff::{DiffLineKind, classified_diff_lines};
 use super::models::{
     FileChangeBodyFormat, ThreadItemKind, ThreadItemSnapshot, ThreadSnapshot, TurnSnapshot,
 };
@@ -518,30 +519,11 @@ fn file_change_preview_and_body(changes: Option<&Value>) -> FileChangeSummary {
 }
 
 fn unified_diff_stats(diff: &str) -> (usize, usize) {
-    diff.lines()
-        .fold((0usize, 0usize), |(added, removed), line| {
-            if line.starts_with('+') && !is_unified_diff_header(line) {
-                (added + 1, removed)
-            } else if line.starts_with('-') && !is_unified_diff_header(line) {
-                (added, removed + 1)
-            } else {
-                (added, removed)
-            }
-        })
-}
-
-fn is_unified_diff_header(line: &str) -> bool {
-    if line.starts_with("diff --git ") || line.starts_with("@@") {
-        return true;
-    }
-    let Some(path) = line
-        .strip_prefix("+++ ")
-        .or_else(|| line.strip_prefix("--- "))
-    else {
-        return false;
-    };
-    let path = path.trim();
-    path == "/dev/null" || path.starts_with("a/") || path.starts_with("b/")
+    classified_diff_lines(diff).fold((0usize, 0usize), |(added, removed), (_, kind)| match kind {
+        DiffLineKind::Addition => (added + 1, removed),
+        DiffLineKind::Removal => (added, removed + 1),
+        _ => (added, removed),
+    })
 }
 
 fn json_string(value: Option<&Value>) -> Option<String> {

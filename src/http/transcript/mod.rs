@@ -1,3 +1,4 @@
+mod diff;
 mod models;
 mod parser;
 mod renderer;
