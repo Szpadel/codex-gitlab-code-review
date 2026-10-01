@@ -24,6 +24,8 @@ pub use types::{
 
 #[cfg(test)]
 pub(crate) use client::{GitLabRetryPolicy, normalize_api_base};
+#[cfg(test)]
+pub(crate) use transport::GitLabHttpError;
 pub(crate) use transport::gitlab_error_has_status;
 
 #[cfg(test)]

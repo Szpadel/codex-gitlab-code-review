@@ -700,7 +700,14 @@ mod tests {
 
         async fn get_project(&self, project: &str) -> Result<GitLabProject> {
             if self.groups.contains(project) {
-                anyhow::bail!("gitlab GET fake response: status=404 Not Found body=not found");
+                return Err(crate::gitlab::GitLabHttpError::new(
+                    "GET",
+                    "fake",
+                    reqwest::StatusCode::NOT_FOUND,
+                    None,
+                    "not found",
+                )
+                .into());
             }
             Ok(self
                 .project_details
@@ -719,7 +726,14 @@ mod tests {
 
         async fn get_group(&self, group: &str) -> Result<GitLabGroup> {
             if !self.groups.contains(group) {
-                anyhow::bail!("gitlab GET fake response: status=404 Not Found body=not found");
+                return Err(crate::gitlab::GitLabHttpError::new(
+                    "GET",
+                    "fake",
+                    reqwest::StatusCode::NOT_FOUND,
+                    None,
+                    "not found",
+                )
+                .into());
             }
             Ok(GitLabGroup {
                 full_path: group.to_string(),

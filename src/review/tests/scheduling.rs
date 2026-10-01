@@ -573,9 +573,14 @@ impl GitLabApi for ForbiddenListOpenGitLab {
 
     async fn list_open_mrs(&self, _project: &str) -> Result<Vec<MergeRequest>> {
         *self.list_open_calls.lock().unwrap() += 1;
-        Err(anyhow::anyhow!(
-            "gitlab GET https://gitlab.example.com/api/v4/projects/group%2Frepo/merge_requests?state=opened&scope=all&per_page=100&page=1 response: status=403 Forbidden content_type=application/json body={{\"message\":\"403 Forbidden\"}}"
-        ))
+        Err(crate::gitlab::GitLabHttpError::new(
+            "GET",
+            "https://gitlab.example.com/api/v4/projects/group%2Frepo/merge_requests?state=opened&scope=all&per_page=100&page=1",
+            reqwest::StatusCode::FORBIDDEN,
+            Some("application/json"),
+            r#"{"message":"403 Forbidden"}"#,
+        )
+        .into())
     }
 
     async fn get_latest_open_mr_activity(&self, project: &str) -> Result<Option<MergeRequest>> {
