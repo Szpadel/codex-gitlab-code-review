@@ -1,4 +1,69 @@
 use super::*;
+
+#[tokio::test]
+async fn scan_sweeps_all_review_lanes_once() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    state
+        .review_state
+        .begin_review("group/repo", 1, "sha")
+        .await?;
+    state
+        .review_state
+        .begin_review_for_lane("group/repo", 2, "sha", crate::review::ReviewLane::Security)
+        .await?;
+    // Keep the rows stale so the trigger can count a repeated sweep.
+    sqlx::raw_sql(
+        "UPDATE review_state SET updated_at = 0;
+        CREATE TABLE sweep_counts (count INTEGER NOT NULL);
+        INSERT INTO sweep_counts VALUES (0);
+        CREATE TRIGGER count_sweeps AFTER UPDATE OF status ON review_state
+        WHEN NEW.status = 'stale'
+        BEGIN
+            UPDATE sweep_counts SET count = count + 1;
+            UPDATE review_state SET status = 'in_progress', updated_at = 0
+            WHERE repo = NEW.repo AND iid = NEW.iid AND lane = NEW.lane;
+        END;",
+    )
+    .execute(state.pool())
+    .await?;
+    let gitlab = Arc::new(FakeGitLab {
+        bot_user: GitLabUser {
+            id: 1,
+            username: None,
+            name: None,
+        },
+        mrs: Mutex::new(Vec::new()),
+        awards: Mutex::new(HashMap::new()),
+        notes: Mutex::new(HashMap::new()),
+        discussions: Mutex::new(HashMap::new()),
+        users: Mutex::new(HashMap::new()),
+        projects: Mutex::new(HashMap::new()),
+        all_projects: Mutex::new(Vec::new()),
+        group_projects: Mutex::new(HashMap::new()),
+        calls: Mutex::new(Vec::new()),
+        list_open_calls: Mutex::new(0),
+        list_projects_calls: Mutex::new(0),
+        list_group_projects_calls: Mutex::new(0),
+        delete_award_fails: false,
+    });
+    let service = ReviewService::new(
+        test_config(),
+        gitlab,
+        state.clone(),
+        Arc::new(FakeRunner {
+            result: Mutex::new(None),
+            calls: Mutex::new(0),
+        }),
+        1,
+        default_created_after(),
+    );
+    service.scan_once().await?;
+    let touched: i64 = sqlx::query_scalar("SELECT count FROM sweep_counts")
+        .fetch_one(state.pool())
+        .await?;
+    assert_eq!(touched, 2, "each lane must be swept once");
+    Ok(())
+}
 #[tokio::test]
 async fn review_finishes_when_eye_removal_fails() -> Result<()> {
     let config = test_config();

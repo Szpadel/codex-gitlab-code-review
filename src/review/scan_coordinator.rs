@@ -89,7 +89,12 @@ impl ScanCoordinator {
     /// Refreshes active claims before clearing stale flow state.
     pub(crate) async fn clear_stale_flow_state(&self) -> Result<()> {
         self.refresh_active_flow_state().await?;
-        for flow in self.flows() {
+        // The review sweep covers both lanes in one database operation.
+        let maintenance_flows: [&dyn MergeRequestFlow; 2] = [
+            self.general_review_flow.as_ref(),
+            self.mention_flow.as_ref(),
+        ];
+        for flow in maintenance_flows {
             flow.clear_stale_in_progress().await?;
         }
         Ok(())
