@@ -15,6 +15,9 @@ use url::Url;
 const DEFAULT_GITLAB_RETRY_MAX_ATTEMPTS: u32 = 10;
 const DEFAULT_GITLAB_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_GITLAB_RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
+// Stop stalled connections quickly, but allow large diffs and uploads more time.
+const GITLAB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GITLAB_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GitLabRetryPolicy {
@@ -93,10 +96,21 @@ pub(crate) enum GitLabWriteConfirmation {
 }
 
 impl GitLabClient {
+    /// Limits connection setup and each complete request. Retries can extend the
+    /// total operation duration.
+    ///
     /// # Errors
     ///
     /// Returns an error if the underlying operation fails.
     pub fn new(base_url: &str, token: &str) -> Result<Self> {
+        Self::new_with_request_timeout(base_url, token, GITLAB_REQUEST_TIMEOUT)
+    }
+
+    fn new_with_request_timeout(
+        base_url: &str,
+        token: &str,
+        request_timeout: Duration,
+    ) -> Result<Self> {
         ensure_reqwest_rustls_provider();
         let api_base = normalize_api_base(base_url)?;
         let mut headers = header::HeaderMap::new();
@@ -113,6 +127,8 @@ impl GitLabClient {
         );
         let client = Client::builder()
             .default_headers(headers)
+            .connect_timeout(GITLAB_CONNECT_TIMEOUT)
+            .timeout(request_timeout)
             .build()
             .context("build gitlab http client")?;
         Ok(Self {
@@ -603,4 +619,44 @@ fn is_retryable_anyhow_read_error(err: &anyhow::Error) -> bool {
             .downcast_ref::<reqwest::Error>()
             .is_some_and(|err| is_retryable_reqwest_error(err) || err.is_body())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GitLabClient, GitLabRetryPolicy};
+    use crate::gitlab::GitLabApi;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn delayed_gitlab_response_returns_request_timeout() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/user"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": 1}))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        let client = GitLabClient::new_with_request_timeout(
+            &server.uri(),
+            "token",
+            Duration::from_millis(50),
+        )?
+        .with_retry_policy(GitLabRetryPolicy::without_delay(1));
+        let result = tokio::time::timeout(Duration::from_secs(3), client.current_user())
+            .await
+            .expect("GitLab must return before the outer deadline");
+        let error = result.expect_err("the delayed response must time out");
+        assert!(
+            error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout),
+            "{error:#}"
+        );
+        Ok(())
+    }
 }
