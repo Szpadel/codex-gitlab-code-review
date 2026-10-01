@@ -585,31 +585,19 @@ impl MentionFlow {
         }
         // GitLab merge request discussions cover both standalone comments
         // (individual_note discussions) and threaded replies.
-        let discussions = match self.shared.gitlab.list_discussions(repo, mr.iid).await {
-            Ok(discussions) => discussions,
-            Err(err) => {
-                warn!(
-                    repo = repo,
-                    iid = mr.iid,
-                    error = %err,
-                    "failed to list MR discussions; skipping mention commands for this MR"
-                );
-                return Ok(outcome);
-            }
-        };
+        let discussions = self
+            .shared
+            .gitlab
+            .list_discussions(repo, mr.iid)
+            .await
+            .with_context(|| {
+                format!(
+                    "load discussions for mention commands in {repo} !{}",
+                    mr.iid
+                )
+            })?;
         let triggers = self.collect_mention_triggers(&discussions, bot_username);
-        let command_repo = match self.resolve_mention_command_repo(repo, mr).await {
-            Ok(path) => path,
-            Err(err) => {
-                warn!(
-                    repo = repo,
-                    iid = mr.iid,
-                    error = %err,
-                    "failed to resolve source repository for mention command; skipping triggers"
-                );
-                return Ok(outcome);
-            }
-        };
+        let command_repo = self.resolve_mention_command_repo(repo, mr).await?;
         let mention_eyes_emoji = self.mention_eyes_emoji();
         let additional_developer_instructions = self
             .shared

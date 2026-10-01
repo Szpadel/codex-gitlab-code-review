@@ -475,8 +475,19 @@ impl ReviewService {
         let outcome = self
             .mention_flow
             .schedule_for_scan(&pending.repo, &mr, &head_sha, &mut tasks)
-            .await?;
+            .await;
         let _ = join_all(tasks).await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let retry_started_at = Utc::now().timestamp();
+                let deferred_until =
+                    retry_started_at.saturating_add(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
+                self.defer_pending_mention_quota_retry(pending, retry_started_at, deferred_until)
+                    .await?;
+                return Err(err);
+            }
+        };
 
         match self
             .state
