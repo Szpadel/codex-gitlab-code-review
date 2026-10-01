@@ -244,6 +244,9 @@ docker:
 database:
   # Required. SQLite database path for persistent state.
   path: "/data/state.sqlite"
+  # Optional. Remove transcript events from finished runs started more than this many days ago.
+  # Must be greater than 0. Run metadata and token usage remain available.
+  transcript_retention_days: 90
 
 server:
   # Required. Health server bind address.

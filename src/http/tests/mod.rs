@@ -46,4 +46,5 @@ mod run_detail_rendering;
 mod service_errors;
 mod skills;
 mod status_page;
+mod transcript_retention;
 mod usage;

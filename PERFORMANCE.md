@@ -67,6 +67,24 @@ The run snapshot still reads all persisted events. The existing run JSON
 endpoint still includes full bodies. Lazy body loads reduce initial HTML, not
 the cost of building that snapshot.
 
+## Transcript retention
+
+`database.transcript_retention_days` defaults to 90 and must be greater than 0.
+The service runs a retention pass five seconds after scheduler startup, then
+every 24 hours. Maintenance runs separately from the scan loop and stops on
+runtime cancellation. Each transaction processes at most ten runs.
+
+Retention removes transcript events only from finished runs whose start time
+is older than the configured age. It marks these transcripts as expired and
+does not restore them through backfill. Run metadata, response token usage,
+and History statistics remain available. The run detail page shows a removal
+notice with the current configured age. Local Codex session files are unchanged.
+
+SQLite reuses freed database pages, but the database file does not shrink.
+To reclaim disk space, an operator can run `VACUUM` during maintenance.
+Stop the service and give the maintenance connection exclusive database access.
+`VACUUM` needs free disk space about equal to the database size.
+
 ## Regression checks
 
 ```sh
@@ -75,6 +93,8 @@ cargo test usage --lib
 cargo test scheduler::tests --lib
 cargo test sparse_stream_events --lib
 cargo test run_detail_loads_large_collapsed_bodies --lib
+cargo test transcript_retention --lib
+cargo test --test chart_session_history
 node --test tests/transcript_body.test.cjs
 ```
 

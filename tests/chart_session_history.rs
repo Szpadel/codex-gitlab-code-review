@@ -3,6 +3,30 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
+fn chart_renders_transcript_retention_default_and_override() {
+    let chart = Path::new(env!("CARGO_MANIFEST_DIR")).join("charts/codex-gitlab-review");
+    for (arguments, expected) in [
+        (vec![], "transcript_retention_days: 90"),
+        (
+            vec!["--set", "config.database.transcriptRetentionDays=17"],
+            "transcript_retention_days: 17",
+        ),
+    ] {
+        let output = Command::new("helm")
+            .args(["template", "retention", chart.to_str().unwrap()])
+            .args(arguments)
+            .output()
+            .expect("run helm template");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+    }
+}
+
+#[test]
 fn chart_mounts_custom_session_history_path() {
     let chart = Path::new(env!("CARGO_MANIFEST_DIR")).join("charts/codex-gitlab-review");
     let templates = chart.join("templates");

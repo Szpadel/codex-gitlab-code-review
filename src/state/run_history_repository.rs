@@ -15,6 +15,8 @@ use crate::run_history_kind::RunHistoryKind;
 
 const MISSING_ERROR_DETAILS: &str =
     "Run finished with result error, but no failure details were recorded.";
+// Release the write coordinator between small batches so scans can persist results.
+const TRANSCRIPT_PRUNE_BATCH_RUNS: i64 = 10;
 const RECONCILE_INTERRUPTED_RUN_HISTORY_SQL: &str = r"
     UPDATE run_history
     SET status = 'done',
@@ -64,6 +66,15 @@ pub struct RelatedRun {
     pub started_at: i64,
 }
 
+/// Counts expired runs and deleted events. Run metadata and token usage remain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TranscriptPruneResult {
+    pub(crate) runs: u64,
+    pub(crate) events: u64,
+    /// Resume the same pass after this ID to avoid repeated scans of expired runs.
+    pub(crate) last_run_id: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorDirection {
     After,
@@ -73,6 +84,82 @@ enum CursorDirection {
 impl RunHistoryRepository {
     pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
         Self { sqlite }
+    }
+
+    /// Expires one small batch of done runs started before the Unix-second cutoff.
+    /// Resume with the previous batch's last ID. Use `None` for a new pass.
+    /// Returns committed deletion counts. SQLite failures propagate.
+    pub(crate) async fn prune_transcripts_batch(
+        &self,
+        cutoff: i64,
+        after_run_id: Option<i64>,
+    ) -> Result<TranscriptPruneResult> {
+        // Read candidates without the write gate. Old metadata can require a long scan.
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT id FROM run_history NOT INDEXED WHERE status = 'done' AND started_at < ",
+        );
+        query
+            .push_bind(cutoff)
+            .push(" AND transcript_backfill_state != 'expired'");
+        // Walk primary keys once per pass, not the growing prefix of expired runs.
+        if let Some(after_run_id) = after_run_id {
+            query.push(" AND id > ").push_bind(after_run_id);
+        }
+        query
+            .push(" ORDER BY id LIMIT ")
+            .push_bind(TRANSCRIPT_PRUNE_BATCH_RUNS);
+        let runs = query
+            .build_query_scalar::<i64>()
+            .fetch_all(self.sqlite.read_pool())
+            .await
+            .context("select expired transcripts")?;
+
+        self.sqlite
+            .write_foreground("prune expired transcripts", move |pool| {
+                let runs = runs.clone();
+                async move {
+                    let mut transaction = pool
+                        .begin()
+                        .await
+                        .context("start transcript retention transaction")?;
+
+                    // Only transcript events expire. Usage and its trigger-maintained totals stay intact.
+                    let mut counts = TranscriptPruneResult::default();
+                    for run_id in runs {
+                        counts.last_run_id = Some(run_id);
+                        // Recheck eligibility because another write can follow candidate selection.
+                        let marked = sqlx::query(
+                            "UPDATE run_history SET transcript_backfill_state = 'expired',
+                             transcript_backfill_error = NULL, updated_at = ? WHERE id = ?
+                             AND status = 'done' AND started_at < ? AND transcript_backfill_state != 'expired'",
+                        )
+                        .bind(Utc::now().timestamp())
+                        .bind(run_id)
+                        .bind(cutoff)
+                        .execute(&mut *transaction)
+                        .await
+                        .context("mark transcript expired")?
+                        .rows_affected();
+                        if marked == 0 {
+                            continue;
+                        }
+                        counts.runs += marked;
+                        counts.events +=
+                            sqlx::query("DELETE FROM run_history_event WHERE run_history_id = ?")
+                                .bind(run_id)
+                                .execute(&mut *transaction)
+                                .await
+                                .context("delete expired transcript events")?
+                                .rows_affected();
+                    }
+                    transaction
+                        .commit()
+                        .await
+                        .context("commit transcript retention transaction")?;
+                    Ok(counts)
+                }
+            })
+            .await
     }
 
     /// # Errors
@@ -391,6 +478,8 @@ impl RunHistoryRepository {
             .await
     }
 
+    /// Expired runs ignore transcript writes.
+    ///
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
@@ -410,6 +499,8 @@ impl RunHistoryRepository {
             .await
     }
 
+    /// Expired runs ignore transcript writes when the queued job executes.
+    ///
     /// # Errors
     ///
     /// Returns an error if the background write cannot be accepted.
@@ -441,6 +532,8 @@ impl RunHistoryRepository {
             .await
     }
 
+    /// Expired runs ignore transcript writes.
+    ///
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
@@ -467,6 +560,8 @@ impl RunHistoryRepository {
             .await
     }
 
+    /// Expired runs ignore transcript writes.
+    ///
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
@@ -501,6 +596,8 @@ impl RunHistoryRepository {
             .await
     }
 
+    /// Expired runs ignore transcript writes when the queued job executes.
+    ///
     /// # Errors
     ///
     /// Returns an error if the background write cannot be accepted.
@@ -548,6 +645,8 @@ impl RunHistoryRepository {
             .await
     }
 
+    /// Expiration is terminal. Expired runs remain unchanged.
+    ///
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
@@ -562,6 +661,8 @@ impl RunHistoryRepository {
             .await
     }
 
+    /// Expiration is terminal. Expired runs remain unchanged.
+    ///
     /// # Errors
     ///
     /// Returns an error if the background write cannot be accepted.
@@ -581,6 +682,8 @@ impl RunHistoryRepository {
             .await
     }
 
+    /// Expired runs ignore transcript writes and remain expired.
+    ///
     /// # Errors
     ///
     /// Returns an error if the background write cannot be accepted.
@@ -616,6 +719,8 @@ impl RunHistoryRepository {
             .await
     }
 
+    /// Returns `false` for an absent or expired run. Expiration is terminal.
+    ///
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
@@ -624,18 +729,18 @@ impl RunHistoryRepository {
         run_id: i64,
         state: TranscriptBackfillState,
         error: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.sqlite
             .write_foreground(
                 "update run history transcript backfill",
                 |pool| async move {
-                    sqlx::query(
+                    let result = sqlx::query(
                         r"
                     UPDATE run_history
                     SET transcript_backfill_state = ?,
                         transcript_backfill_error = ?,
                         updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND transcript_backfill_state != 'expired'
                     ",
                     )
                     .bind(transcript_backfill_state_label(state))
@@ -645,7 +750,7 @@ impl RunHistoryRepository {
                     .execute(&pool)
                     .await
                     .context("update run history transcript backfill state")?;
-                    Ok(())
+                    Ok(result.rows_affected() > 0)
                 },
             )
             .await
@@ -972,6 +1077,13 @@ async fn append_run_history_events_on_pool(
         .begin()
         .await
         .context("start sqlite transaction for run history events")?;
+    // A queued capture or backfill must not restore an expired transcript.
+    if transcript_is_expired(&mut tx, run_history_id).await? {
+        tx.rollback()
+            .await
+            .context("close expired transcript append")?;
+        return Ok(());
+    }
     let sequence_offset = sqlx::query_scalar::<_, i64>(
         r"
         SELECT COALESCE(MAX(sequence), 0)
@@ -1050,6 +1162,13 @@ async fn replace_run_history_events_on_pool(
         .begin()
         .await
         .context("start sqlite transaction for run history event rewrite")?;
+    // Backfill can finish after retention commits. Expiration is terminal.
+    if transcript_is_expired(&mut tx, run_history_id).await? {
+        tx.rollback()
+            .await
+            .context("close expired transcript rewrite")?;
+        return Ok(());
+    }
     sqlx::query("DELETE FROM run_history_event WHERE run_history_id = ?")
         .bind(run_history_id)
         .execute(&mut *tx)
@@ -1099,6 +1218,20 @@ async fn replace_run_history_events_on_pool(
     Ok(())
 }
 
+/// Checks the terminal retention state in the same transaction as event writes.
+async fn transcript_is_expired(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    run_id: i64,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM run_history WHERE id = ? AND transcript_backfill_state = 'expired')",
+    )
+    .bind(run_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .context("check transcript expiration")
+}
+
 async fn mark_run_history_transcript_backfill_complete_on_pool(
     pool: SqlitePool,
     run_id: i64,
@@ -1110,7 +1243,7 @@ async fn mark_run_history_transcript_backfill_complete_on_pool(
             transcript_backfill_state = ?,
             transcript_backfill_error = NULL,
             updated_at = ?
-        WHERE id = ?
+        WHERE id = ? AND transcript_backfill_state != 'expired'
         ",
     )
     .bind(transcript_backfill_state_label(
@@ -1458,6 +1591,7 @@ fn transcript_backfill_state_label(state: TranscriptBackfillState) -> &'static s
         TranscriptBackfillState::InProgress => "in_progress",
         TranscriptBackfillState::Complete => "complete",
         TranscriptBackfillState::Failed => "failed",
+        TranscriptBackfillState::Expired => "expired",
     }
 }
 
@@ -1467,6 +1601,7 @@ fn parse_transcript_backfill_state(value: &str) -> Result<TranscriptBackfillStat
         "in_progress" => Ok(TranscriptBackfillState::InProgress),
         "complete" => Ok(TranscriptBackfillState::Complete),
         "failed" => Ok(TranscriptBackfillState::Failed),
+        "expired" => Ok(TranscriptBackfillState::Expired),
         other => bail!("unknown transcript_backfill state: {other}"),
     }
 }

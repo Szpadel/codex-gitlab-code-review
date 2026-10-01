@@ -8,6 +8,10 @@ pub(super) fn default_refresh_seconds() -> u64 {
     3600
 }
 
+pub(super) fn default_transcript_retention_days() -> u32 {
+    90
+}
+
 pub(crate) fn default_docker_host() -> String {
     "unix:///var/run/docker.sock".to_string()
 }

@@ -11,6 +11,7 @@ mod rate_limits;
 mod run_history;
 mod service_state;
 mod support;
+mod transcript_retention;
 mod workflow_state;
 
 use support::*;

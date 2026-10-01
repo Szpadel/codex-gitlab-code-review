@@ -32,6 +32,7 @@ pub use review_rate_limits::{
     ReviewRateLimitTargetKind,
 };
 pub use review_state_repository::ReviewStateRepository;
+pub(crate) use run_history_repository::TranscriptPruneResult;
 pub(crate) use run_history_repository::merge_rewritten_turn_events;
 pub use run_history_repository::{RelatedRun, RunHistoryRepository};
 pub use security_context_cache_repository::SecurityContextCacheRepository;
@@ -88,6 +89,8 @@ pub enum TranscriptBackfillState {
     InProgress,
     Complete,
     Failed,
+    /// Transcript events were removed by retention. Backfill must not restore them.
+    Expired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

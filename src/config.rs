@@ -22,7 +22,8 @@ use self::defaults::{
     default_security_context_session_override, default_security_review_comment_marker_prefix,
     default_security_review_context_ttl_seconds, default_security_review_finding_marker_prefix,
     default_security_review_min_confidence_score, default_security_review_session_override,
-    default_usage_limit_fallback_cooldown_seconds, default_usage_limit_recheck_seconds,
+    default_transcript_retention_days, default_usage_limit_fallback_cooldown_seconds,
+    default_usage_limit_recheck_seconds,
 };
 pub use self::feature_flags::{
     FeatureFlagAvailability, FeatureFlagDefaults, FeatureFlagSnapshot, RuntimeFeatureFlagOverrides,
@@ -361,6 +362,10 @@ pub struct DockerConfig {
 #[derive(Clone, Debug, Deserialize)]
 pub struct DatabaseConfig {
     pub path: String,
+    /// Retention age in days, measured from run start. Only finished runs expire.
+    /// Defaults to 90. Configuration validation rejects 0.
+    #[serde(default = "default_transcript_retention_days")]
+    pub transcript_retention_days: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]

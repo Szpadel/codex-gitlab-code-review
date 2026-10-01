@@ -201,6 +201,9 @@ config:
     execSandbox: "danger-full-access"
   docker:
     host: "unix:///var/run/docker.sock"
+  database:
+    # Remove finished-run transcript events after this many days. Keep metadata and usage.
+    transcriptRetentionDays: 90
   server:
     bindAddr: "0.0.0.0:8080"
     # Keep this independent from ingress.enabled.

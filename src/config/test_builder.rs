@@ -107,6 +107,7 @@ impl ConfigBuilder {
                 docker: DockerConfig::default(),
                 database: DatabaseConfig {
                     path: ":memory:".to_string(),
+                    transcript_retention_days: super::default_transcript_retention_days(),
                 },
                 server: ServerConfig {
                     bind_addr: "127.0.0.1:0".to_string(),

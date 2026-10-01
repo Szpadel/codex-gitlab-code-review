@@ -31,6 +31,7 @@ pub struct StatusService {
 struct StatusConfig {
     gitlab_base_url: String,
     database_path: String,
+    transcript_retention_days: u32,
     bind_addr: String,
     run_once: bool,
     dry_run: bool,
@@ -60,6 +61,7 @@ impl StatusService {
             config: StatusConfig {
                 gitlab_base_url: config.gitlab.base_url.clone(),
                 database_path: config.database.path.clone(),
+                transcript_retention_days: config.database.transcript_retention_days,
                 bind_addr: config.server.bind_addr.clone(),
                 run_once,
                 dry_run: config.review.dry_run,
@@ -246,6 +248,7 @@ impl StatusService {
         let run = self.with_record_retry_statuses(vec![run]).await?.remove(0);
         Ok(Some(RunDetailSnapshot {
             generated_at: Utc::now().to_rfc3339(),
+            transcript_retention_days: self.config.transcript_retention_days,
             run,
             related_runs,
             security_context_preview,

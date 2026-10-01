@@ -21,6 +21,8 @@ use crate::lifecycle::ServiceLifecycleSignal;
 use crate::review::{ReviewService, ScanRunStatus};
 use crate::state::{ScanMode, ScanOutcome};
 
+mod transcript_retention;
+
 // Give accepted writes 30 seconds to persist without an unbounded exit delay.
 const SQLITE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -160,6 +162,11 @@ async fn run_until_stopped(
         )
         .await?;
     let _startup_warmup = spawn_startup_warmup(runner, &state.background_tasks());
+    let _transcript_retention = transcript_retention::spawn(
+        Arc::clone(&state),
+        config.database.transcript_retention_days,
+        &background_tasks,
+    );
 
     if run_once {
         info!("running single scan");

@@ -43,6 +43,7 @@ pub(in crate::http) fn render_run_detail_page(
             run,
             snapshot.thread.as_ref(),
             snapshot.transcript_backfill.as_ref(),
+            snapshot.transcript_retention_days,
             gitlab_base_url,
         ),
         transcript_script_tag(),
@@ -318,9 +319,11 @@ fn render_thread_card(
     run: &RunHistoryRecord,
     thread: Option<&ThreadSnapshot>,
     transcript_backfill: Option<&TranscriptBackfillSnapshot>,
+    transcript_retention_days: u32,
     gitlab_base_url: &str,
 ) -> String {
-    let backfill_notice = render_transcript_backfill_notice(transcript_backfill);
+    let backfill_notice =
+        render_transcript_backfill_notice(transcript_backfill, transcript_retention_days);
     let security_context_banner = render_security_context_banner(run);
     let Some(thread) = thread else {
         return format!(
@@ -361,6 +364,7 @@ fn render_security_context_banner(run: &RunHistoryRecord) -> String {
 
 fn render_transcript_backfill_notice(
     transcript_backfill: Option<&TranscriptBackfillSnapshot>,
+    transcript_retention_days: u32,
 ) -> String {
     let Some(transcript_backfill) = transcript_backfill else {
         return String::new();
@@ -377,6 +381,9 @@ fn render_transcript_backfill_notice(
                 .as_deref()
                 .map(|error| format!(": {}", escape_html(error)))
                 .unwrap_or_default()
+        ),
+        crate::state::TranscriptBackfillState::Expired => format!(
+            "<div class=\"notice notice-info\" role=\"note\">Transcript removed after {transcript_retention_days} days by the retention policy.</div>"
         ),
         crate::state::TranscriptBackfillState::NotRequested
         | crate::state::TranscriptBackfillState::Complete => String::new(),
@@ -460,6 +467,7 @@ mod tests {
         run.security_context_source_run_id = Some(42);
         let snapshot = RunDetailSnapshot {
             generated_at: "2026-03-23T00:00:00Z".to_string(),
+            transcript_retention_days: 90,
             run,
             related_runs: Vec::new(),
             security_context_preview: None,
@@ -488,6 +496,7 @@ mod tests {
         });
         let snapshot = RunDetailSnapshot {
             generated_at: "2026-03-23T00:00:00Z".to_string(),
+            transcript_retention_days: 90,
             run,
             related_runs: Vec::new(),
             security_context_preview: None,
@@ -508,6 +517,7 @@ mod tests {
         let run = sample_run(RunHistoryKind::Security);
         let snapshot = RunDetailSnapshot {
             generated_at: "2026-03-23T00:00:00Z".to_string(),
+            transcript_retention_days: 90,
             run,
             related_runs: Vec::new(),
             security_context_preview: Some(SecurityContextPreview {
@@ -543,6 +553,7 @@ mod tests {
         run.trigger_note_body = Some("![shot](/uploads/hash/screenshot.png)".to_string());
         let snapshot = RunDetailSnapshot {
             generated_at: "2026-03-23T00:00:00Z".to_string(),
+            transcript_retention_days: 90,
             run,
             related_runs: Vec::new(),
             security_context_preview: None,

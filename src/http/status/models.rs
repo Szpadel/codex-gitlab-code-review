@@ -129,6 +129,8 @@ pub struct MrHistorySnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RunDetailSnapshot {
     pub generated_at: String,
+    /// Current policy age in days, for the expired transcript notice.
+    pub transcript_retention_days: u32,
     pub run: HistoryRunRecord,
     pub related_runs: Vec<crate::state::RelatedRun>,
     pub security_context_preview: Option<SecurityContextPreview>,

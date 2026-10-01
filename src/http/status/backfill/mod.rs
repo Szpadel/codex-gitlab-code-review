@@ -103,6 +103,12 @@ impl BackfillService {
         run: &RunHistoryRecord,
         thread: Option<&super::ThreadSnapshot>,
     ) -> Result<Option<super::TranscriptBackfillSnapshot>> {
+        if run.transcript_backfill_state == TranscriptBackfillState::Expired {
+            return Ok(Some(super::TranscriptBackfillSnapshot {
+                state: TranscriptBackfillState::Expired,
+                error: None,
+            }));
+        }
         if run.status != "done" {
             return Ok(None);
         }
@@ -138,17 +144,20 @@ impl BackfillService {
             && (run.review_thread_id.is_some() || run.thread_id.is_some())
             && !backfill_is_active
         {
-            self.schedule_transcript_backfill(run.clone()).await?;
-            state = TranscriptBackfillState::InProgress;
+            state = self.schedule_transcript_backfill(run.clone()).await?;
             error = None;
         }
 
         Ok(Some(super::TranscriptBackfillSnapshot { state, error }))
     }
 
-    async fn schedule_transcript_backfill(&self, run: RunHistoryRecord) -> Result<()> {
+    /// Returns the reserved state, or Expired if retention won the write race.
+    async fn schedule_transcript_backfill(
+        &self,
+        run: RunHistoryRecord,
+    ) -> Result<TranscriptBackfillState> {
         let Some(source) = self.transcript_backfill_source_for_run(&run) else {
-            return Ok(());
+            return Ok(run.transcript_backfill_state);
         };
 
         let reservation = {
@@ -157,7 +166,7 @@ impl BackfillService {
                 .lock()
                 .expect("active backfills mutex poisoned");
             if !active.insert(run.id) {
-                return Ok(());
+                return Ok(TranscriptBackfillState::InProgress);
             }
             ActiveBackfill {
                 run_id: run.id,
@@ -166,7 +175,9 @@ impl BackfillService {
         };
         self.backfill_retry_after.lock().await.remove(&run.id);
 
-        self.state
+        // Reserve only while the persisted transcript has not expired.
+        let updated = self
+            .state
             .run_history
             .update_run_history_transcript_backfill(
                 run.id,
@@ -174,6 +185,9 @@ impl BackfillService {
                 None,
             )
             .await?;
+        if !updated {
+            return Ok(TranscriptBackfillState::Expired);
+        }
 
         let state = Arc::clone(&self.state);
         let backfill_retry_after = Arc::clone(&self.backfill_retry_after);
@@ -237,7 +251,7 @@ impl BackfillService {
             }
         });
 
-        Ok(())
+        Ok(TranscriptBackfillState::InProgress)
     }
 
     fn transcript_backfill_source_for_run(

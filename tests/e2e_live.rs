@@ -81,6 +81,7 @@ async fn e2e_live_dry_run() -> Result<()> {
         docker: DockerConfig { host: docker_host },
         database: DatabaseConfig {
             path: ":memory:".to_string(),
+            transcript_retention_days: 90,
         },
         server: ServerConfig {
             bind_addr: "127.0.0.1:0".to_string(),

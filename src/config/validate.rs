@@ -39,6 +39,10 @@ impl Deref for ValidatedConfig {
 /// Returns an error if loaded configuration is semantically invalid.
 pub fn validate_config(mut config: Config) -> Result<ValidatedConfig> {
     anyhow::ensure!(
+        config.database.transcript_retention_days > 0,
+        "database.transcript_retention_days must be greater than 0"
+    );
+    anyhow::ensure!(
         config.review.max_concurrent > 0,
         "review.max_concurrent must be greater than 0"
     );

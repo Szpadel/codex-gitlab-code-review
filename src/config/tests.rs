@@ -155,6 +155,26 @@ server:
 }
 
 #[test]
+fn transcript_retention_defaults_to_90_days() {
+    let config = load_from_yaml(&base_config_yaml(""));
+    assert_eq!(config.database.transcript_retention_days, 90);
+}
+
+#[test]
+fn transcript_retention_rejects_zero_days() {
+    let yaml = base_config_yaml("").replace(
+        "path: \"/tmp/state.sqlite\"",
+        "path: \"/tmp/state.sqlite\"\n  transcript_retention_days: 0",
+    );
+    let error = try_load_from_yaml(&yaml).expect_err("zero retention must fail config validation");
+    assert!(
+        error
+            .to_string()
+            .contains("database.transcript_retention_days must be greater than 0")
+    );
+}
+
+#[test]
 fn defaults_docker_host_when_missing() {
     let yaml = base_config_yaml("");
     let config = load_from_yaml(&yaml);

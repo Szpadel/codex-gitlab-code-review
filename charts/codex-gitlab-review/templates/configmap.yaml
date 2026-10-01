@@ -284,6 +284,7 @@ data:
       host: {{ .Values.config.docker.host | quote }}
     database:
       path: "/data/state.sqlite"
+      transcript_retention_days: {{ .Values.config.database.transcriptRetentionDays }}
     server:
       bind_addr: {{ .Values.config.server.bindAddr | quote }}
       status_ui_enabled: {{ .Values.config.server.statusUiEnabled }}
