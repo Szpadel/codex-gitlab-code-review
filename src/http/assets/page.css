@@ -154,6 +154,10 @@ code { font-family: "JetBrains Mono", "SF Mono", Menlo, monospace; font-size: 12
 .turn-divider-first { border-top: 0; padding-top: 0; }
 .turn-divider-label { font-size: 12px; line-height: 16px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
 .transcript-entry { border: 1px solid var(--divider); border-radius: 10px; background: var(--surface); }
+.transcript-lazy-body { padding: 0 16px 16px; color: var(--text-secondary); }
+.transcript-lazy-body[data-load-state="loaded"] { padding: 0; }
+.transcript-lazy-body .secondary-button { display: inline-flex; align-items: center; min-height: 32px; text-decoration: none; }
+.entry-summary:focus-visible, .transcript-lazy-body a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .entry-header-shell, .entry-summary { list-style: none; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: start; padding: 10px 16px 12px; }
 .entry-summary { cursor: pointer; }
 .entry-summary::-webkit-details-marker { display: none; }

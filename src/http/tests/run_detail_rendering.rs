@@ -1,6 +1,169 @@
 use super::*;
 
 #[tokio::test]
+async fn run_detail_loads_large_collapsed_bodies_one_entry_at_a_time() -> Result<()> {
+    // Persist a completed turn with all five verbose entry kinds.
+    let srv = HttpTestServerBuilder::new().spawn().await?;
+    let run_id = RunFixture::review("group/repo", 7, "sha")
+        .thread("thread-1")
+        .turn("turn-1")
+        .result("pass")
+        .insert(&srv.state)
+        .await?;
+    let long_body = format!("{}<script>entry-tail</script>", "x".repeat(64 * 1024));
+    let payloads = [
+        json!({"type": "mcpToolCall", "server": "gitlab", "tool": "get_mr", "arguments": {}, "result": long_body}),
+        json!({"type": "dynamicToolCall", "tool": "inspect", "contentItems": {}, "result": long_body}),
+        json!({"type": "reasoning", "summary": ["Short reasoning summary"], "content": [long_body]}),
+        json!({"type": "fileChange", "changes": {"src/lib.rs": {"unified_diff": format!("--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+{long_body}\n")}}}),
+        json!({"type": "webSearch", "query": "small query", "action": {"output": long_body}}),
+    ];
+    let mut events = vec![turn_started_event(1, "turn-1")];
+    events.extend(payloads.into_iter().enumerate().map(|(index, payload)| {
+        run_event(index as i64 + 2, Some("turn-1"), "item_completed", payload)
+    }));
+    events.extend([
+        reasoning_event(7, "turn-1", "Small summary", "Small detail"),
+        agent_message_event(8, "turn-1", "Visible **message**"),
+        turn_completed_event(9, "turn-1"),
+    ]);
+    insert_run_history_events(&srv.state, run_id, events).await?;
+    // Keep summaries and short entries visible without verbose body markup.
+    let page = test_get(format!("http://{}/history/{run_id}", srv.address))
+        .await?
+        .text()
+        .await?;
+    assert!(
+        !page.contains("entry-tail"),
+        "large collapsed body is absent from the page"
+    );
+    assert!(page.contains("Short reasoning summary"));
+    assert!(page.contains("Small detail"));
+    assert!(page.contains("Visible <strong>message</strong>"));
+    assert_eq!(page.matches("data-transcript-body-url=").count(), 5);
+    let persisted = srv
+        .state
+        .run_history
+        .list_run_history_events(run_id)
+        .await?;
+    // Fetch each body separately and retain escaping and diff markup.
+    for event in &persisted[1..6] {
+        let route = format!("/api/history/{run_id}/entries/{}/body", event.id);
+        assert!(page.contains(&route));
+        let response = test_get(format!("http://{}{route}", srv.address)).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()?
+                .starts_with("text/html")
+        );
+        let body = response.text().await?;
+        assert!(body.contains("entry-tail"));
+        assert!(!body.contains("<script>entry-tail</script>"));
+        assert!(!body.contains("Small detail"));
+        if event.payload["type"] == "fileChange" {
+            assert!(body.contains("diff-line-add"));
+            assert!(body.contains("diff-line-remove"));
+        }
+    }
+    // Keep the existing run JSON response complete.
+    let json: Value = test_get(format!("http://{}/api/history/{run_id}", srv.address))
+        .await?
+        .json()
+        .await?;
+    assert!(
+        json["thread"]["turns"][0]["items"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("entry-tail")
+    );
+    assert!(
+        json["thread"]["turns"][0]["items"][0]
+            .get("event_id")
+            .is_none()
+    );
+
+    // Reject unknown entries, other runs, and non-expandable events.
+    let other_run = RunFixture::review("group/other", 2, "sha")
+        .insert(&srv.state)
+        .await?;
+    for (requested_run, event_id) in [
+        (other_run, persisted[1].id),
+        (run_id, persisted[0].id),
+        (run_id, persisted[7].id),
+        (run_id, i64::MAX),
+    ] {
+        assert_eq!(
+            test_get(format!(
+                "http://{}/api/history/{requested_run}/entries/{event_id}/body",
+                srv.address
+            ))
+            .await?
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    // A body request must not parse an unrelated event from the same run.
+    sqlx::query("UPDATE run_history_event SET payload_json = 'not-json' WHERE id = ?")
+        .bind(persisted[7].id)
+        .execute(srv.state.pool())
+        .await?;
+    assert_eq!(
+        test_get(format!(
+            "http://{}/api/history/{run_id}/entries/{}/body",
+            srv.address, persisted[1].id
+        ))
+        .await?
+        .status(),
+        StatusCode::OK
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn transcript_entry_body_route_is_disabled_with_the_status_ui() -> Result<()> {
+    let mut config = test_config();
+    config.server.status_ui_enabled = false;
+    let srv = HttpTestServerBuilder::new()
+        .with_config(config)
+        .spawn()
+        .await?;
+    let run_id = RunFixture::review("group/repo", 7, "sha")
+        .insert(&srv.state)
+        .await?;
+    insert_run_history_events(
+        &srv.state,
+        run_id,
+        vec![reasoning_event(1, "turn-1", "Summary", "Detail")],
+    )
+    .await?;
+    let event_id = srv
+        .state
+        .run_history
+        .list_run_history_events(run_id)
+        .await?[0]
+        .id;
+    assert!(
+        srv.services
+            .status
+            .transcript_entry_body(run_id, event_id)
+            .await?
+            .is_some()
+    );
+    assert_eq!(
+        test_get(format!(
+            "http://{}/api/history/{run_id}/entries/{event_id}/body",
+            srv.address
+        ))
+        .await?
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_detail_limits_related_sessions_and_links_to_mr_history() -> Result<()> {
     let srv = HttpTestServerBuilder::new().spawn().await?;
     let mut ids = Vec::new();

@@ -19,6 +19,9 @@ pub struct TurnSnapshot {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ThreadItemSnapshot {
+    /// Identifies the persisted event for a body request. This is not an upstream item ID.
+    #[serde(skip)]
+    pub(crate) event_id: i64,
     pub title: String,
     pub preview: Option<String>,
     pub body: Option<String>,

@@ -23,8 +23,8 @@ use handlers::{
     history_json, history_page, mr_history_json, mr_history_page, rate_limits_page,
     regen_rate_limit_bucket_slot, run_detail_json, run_detail_page, simulate_development_commit,
     simulate_development_mr, skill_detail_page, skills_page, status_json, status_page,
-    update_development_repo, update_feature_flag_json, update_rate_limit_rule, upload_skill,
-    usage_page,
+    transcript_entry_body, update_development_repo, update_feature_flag_json,
+    update_rate_limit_rule, upload_skill, usage_page,
 };
 pub use status::{
     AdminService, BackfillService, HistoryQuery, HistorySnapshot, HttpServices, MrHistorySnapshot,
@@ -102,6 +102,10 @@ pub fn app_router_with_dev_tools(
             )
             .route("/api/history", get(history_json))
             .route("/api/history/{run_id}", get(run_detail_json))
+            .route(
+                "/api/history/{run_id}/entries/{event_id}/body",
+                get(transcript_entry_body),
+            )
             .route("/api/mr/{repo_key}/{iid}/history", get(mr_history_json));
         if app_state.development_enabled() {
             router = router

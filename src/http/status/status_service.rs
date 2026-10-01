@@ -243,6 +243,26 @@ impl StatusService {
         }))
     }
 
+    /// Loads only the requested persisted entry and returns its safe body markup.
+    /// Returns `None` for missing or non-expandable entries. Propagates state errors.
+    pub(crate) async fn transcript_entry_body(
+        &self,
+        run_id: i64,
+        event_id: i64,
+    ) -> Result<Option<String>> {
+        let Some(event) = self
+            .state
+            .run_history
+            .get_run_history_event(run_id, event_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(crate::http::transcript::render_transcript_event_body(
+            &event,
+        ))
+    }
+
     async fn with_list_retry_statuses(
         &self,
         runs: Vec<crate::state::RunHistoryListItem>,

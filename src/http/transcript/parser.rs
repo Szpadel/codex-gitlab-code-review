@@ -43,10 +43,7 @@ pub fn thread_snapshot_from_events(
 
         match event.event_type.as_str() {
             "turn_started" => {}
-            "item_completed" => turn.items.push(parse_thread_item_snapshot(
-                &event.payload,
-                extract_item_timestamp(&event.payload),
-            )),
+            "item_completed" => turn.items.push(thread_item_snapshot_from_event(event)),
             "turn_completed" => {
                 turn.status = json_string(event.payload.get("status"))
                     .unwrap_or_else(|| "unknown".to_string());
@@ -144,12 +141,16 @@ fn reasoning_fallback_supports_completeness(item: &ThreadItemSnapshot) -> bool {
         )
 }
 
-fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> ThreadItemSnapshot {
+/// Parses one `item_completed` event without loading the rest of its thread.
+pub(crate) fn thread_item_snapshot_from_event(event: &RunHistoryEventRecord) -> ThreadItemSnapshot {
+    let item = &event.payload;
+    let timestamp = extract_item_timestamp(item);
     let item_type = json_string(item.get("type")).unwrap_or_else(|| "unknown".to_string());
     let timestamp_text = timestamp.as_ref().map(|value| value.fallback_text.clone());
 
     match item_type.as_str() {
         "userMessage" => ThreadItemSnapshot {
+            event_id: event.id,
             title: "User message".to_string(),
             preview: None,
             body: Some(join_user_content(item.get("content"))),
@@ -158,6 +159,7 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
             kind: ThreadItemKind::UserMessage,
         },
         "agentMessage" | "AgentMessage" => ThreadItemSnapshot {
+            event_id: event.id,
             title: "Agent message".to_string(),
             preview: None,
             body: json_string(item.get("text")).or_else(|| {
@@ -171,6 +173,7 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
             },
         },
         "reasoning" => ThreadItemSnapshot {
+            event_id: event.id,
             title: "Reasoning".to_string(),
             preview: None,
             body: Some(join_reasoning_content(item)),
@@ -179,6 +182,7 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
             kind: ThreadItemKind::Reasoning,
         },
         "commandExecution" => ThreadItemSnapshot {
+            event_id: event.id,
             title: json_string(item.get("command")).unwrap_or_else(|| "Command".to_string()),
             preview: None,
             body: json_string(item.get("aggregatedOutput")),
@@ -195,6 +199,7 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
             let server = json_string(item.get("server")).unwrap_or_else(|| "mcp".to_string());
             let tool = json_string(item.get("tool")).unwrap_or_else(|| "tool".to_string());
             ThreadItemSnapshot {
+                event_id: event.id,
                 title: format!("{server}:{tool}"),
                 preview: tool_call_preview(item),
                 body: combine_detail_sections(&[
@@ -215,6 +220,7 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
         "dynamicToolCall" => {
             let tool = json_string(item.get("tool")).unwrap_or_else(|| "Dynamic tool".to_string());
             ThreadItemSnapshot {
+                event_id: event.id,
                 title: tool.clone(),
                 preview: item
                     .get("contentItems")
@@ -236,6 +242,7 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
             }
         }
         "webSearch" => ThreadItemSnapshot {
+            event_id: event.id,
             title: "Web search".to_string(),
             preview: json_string(item.get("query"))
                 .or_else(|| item.get("action").map(single_line_preview)),
@@ -250,6 +257,7 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
         "fileChange" => {
             let summary = file_change_preview_and_body(item.get("changes"));
             ThreadItemSnapshot {
+                event_id: event.id,
                 title: "File change".to_string(),
                 preview: summary.preview,
                 body: summary.body,
@@ -264,6 +272,7 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
             }
         }
         "enteredReviewMode" | "exitedReviewMode" => ThreadItemSnapshot {
+            event_id: event.id,
             title: if item_type == "enteredReviewMode" {
                 "Entered review mode".to_string()
             } else {
@@ -278,6 +287,7 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
             },
         },
         "contextCompaction" => ThreadItemSnapshot {
+            event_id: event.id,
             title: "Context compaction".to_string(),
             preview: None,
             body: None,
@@ -286,6 +296,7 @@ fn parse_thread_item_snapshot(item: &Value, timestamp: Option<UiTimestamp>) -> T
             kind: ThreadItemKind::ContextCompaction,
         },
         _ => ThreadItemSnapshot {
+            event_id: event.id,
             title: "Event".to_string(),
             preview: None,
             body: Some(compact_json(item)),

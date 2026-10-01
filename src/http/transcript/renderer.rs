@@ -1,10 +1,22 @@
 use super::diff::{DiffLineKind, classified_diff_lines};
 use super::models::{FileChangeBodyFormat, ThreadItemKind, ThreadItemSnapshot, ThreadSnapshot};
+use super::parser::thread_item_snapshot_from_event;
 use crate::http::markdown::render_safe_markdown;
 use crate::http::timestamp;
+use crate::state::RunHistoryEventRecord;
 use serde::Deserialize;
 
-pub(crate) fn render_thread_stream(thread: &ThreadSnapshot, gitlab_base_url: &str) -> String {
+// Avoid sending verbose details before readers request them.
+const LAZY_TRANSCRIPT_BODY_THRESHOLD_BYTES: usize = 16 * 1024;
+const TRANSCRIPT_SCRIPT: &str = include_str!("../assets/transcript.js");
+
+/// Keeps summaries, messages, and commands inline. Large collapsed bodies use
+/// run-scoped event URLs instead of body markup.
+pub(crate) fn render_thread_stream(
+    thread: &ThreadSnapshot,
+    gitlab_base_url: &str,
+    run_id: i64,
+) -> String {
     let multiple_turns = thread.turns.len() > 1;
     let items = thread
         .turns
@@ -18,7 +30,7 @@ pub(crate) fn render_thread_stream(thread: &ThreadSnapshot, gitlab_base_url: &st
             rendered.extend(
                 turn.items
                     .iter()
-                    .map(|item| render_thread_item(item, gitlab_base_url)),
+                    .map(|item| render_thread_item(item, gitlab_base_url, run_id)),
             );
             rendered
         })
@@ -31,18 +43,18 @@ pub(crate) fn render_thread_stream(thread: &ThreadSnapshot, gitlab_base_url: &st
     }
 }
 
-fn render_thread_item(item: &ThreadItemSnapshot, gitlab_base_url: &str) -> String {
+fn render_thread_item(item: &ThreadItemSnapshot, gitlab_base_url: &str, run_id: i64) -> String {
     match &item.kind {
         ThreadItemKind::UserMessage => render_message_entry("User", "user", item, gitlab_base_url),
         ThreadItemKind::AgentMessage { .. } => {
             render_message_entry("Agent", "agent", item, gitlab_base_url)
         }
-        ThreadItemKind::Reasoning => render_reasoning_entry(item),
+        ThreadItemKind::Reasoning => render_reasoning_entry(item, run_id),
         ThreadItemKind::CommandExecution { .. } => render_terminal_entry(item),
-        ThreadItemKind::McpToolCall { .. } => render_mcp_entry(item),
-        ThreadItemKind::DynamicToolCall { .. } => render_dynamic_tool_entry(item),
-        ThreadItemKind::FileChange { .. } => render_file_change_entry(item),
-        ThreadItemKind::WebSearch => render_web_search_entry(item),
+        ThreadItemKind::McpToolCall { .. } => render_mcp_entry(item, run_id),
+        ThreadItemKind::DynamicToolCall { .. } => render_dynamic_tool_entry(item, run_id),
+        ThreadItemKind::FileChange { .. } => render_file_change_entry(item, run_id),
+        ThreadItemKind::WebSearch => render_web_search_entry(item, run_id),
         _ => render_activity_entry(item, gitlab_base_url),
     }
 }
@@ -93,7 +105,7 @@ fn render_message_entry(
     )
 }
 
-fn render_mcp_entry(item: &ThreadItemSnapshot) -> String {
+fn render_mcp_entry(item: &ThreadItemSnapshot, run_id: i64) -> String {
     let mut meta = Vec::new();
     if let Some(status) = item.status() {
         meta.push(("status".to_string(), status.to_string()));
@@ -119,11 +131,11 @@ fn render_mcp_entry(item: &ThreadItemSnapshot) -> String {
                 .unwrap_or("No argument preview available."),
         )),
         render_entry_meta(item, &meta),
-        render_expandable_item_body(item),
+        render_collapsed_item_body(item, run_id),
     )
 }
 
-fn render_dynamic_tool_entry(item: &ThreadItemSnapshot) -> String {
+fn render_dynamic_tool_entry(item: &ThreadItemSnapshot, run_id: i64) -> String {
     let mut meta = Vec::new();
     if let Some(status) = item.status() {
         meta.push(("status".to_string(), status.to_string()));
@@ -147,11 +159,11 @@ fn render_dynamic_tool_entry(item: &ThreadItemSnapshot) -> String {
             item.preview.as_deref().unwrap_or("No preview available."),
         )),
         render_entry_meta(item, &meta),
-        render_expandable_item_body(item),
+        render_collapsed_item_body(item, run_id),
     )
 }
 
-fn render_reasoning_entry(item: &ThreadItemSnapshot) -> String {
+fn render_reasoning_entry(item: &ThreadItemSnapshot, run_id: i64) -> String {
     let (summary, detail) = split_reasoning_content(item.body.as_deref());
     let open = detail.is_none();
 
@@ -168,11 +180,15 @@ fn render_reasoning_entry(item: &ThreadItemSnapshot) -> String {
         ),
         None,
         render_entry_meta(item, &[]),
-        render_expandable_item_body(item),
+        if open {
+            String::new()
+        } else {
+            render_collapsed_item_body(item, run_id)
+        },
     )
 }
 
-fn render_web_search_entry(item: &ThreadItemSnapshot) -> String {
+fn render_web_search_entry(item: &ThreadItemSnapshot, run_id: i64) -> String {
     if item.body.is_some() {
         return render_expandable_entry(
             ExpandableEntryOptions {
@@ -187,7 +203,7 @@ fn render_web_search_entry(item: &ThreadItemSnapshot) -> String {
             ),
             None,
             render_entry_meta(item, &[]),
-            render_expandable_item_body(item),
+            render_collapsed_item_body(item, run_id),
         );
     }
 
@@ -271,7 +287,7 @@ fn terminal_exit_failed(exit: Option<&str>) -> bool {
         .is_some_and(|value| value != 0)
 }
 
-fn render_file_change_entry(item: &ThreadItemSnapshot) -> String {
+fn render_file_change_entry(item: &ThreadItemSnapshot, run_id: i64) -> String {
     let mut meta = Vec::new();
     if let Some(status) = item.status() {
         meta.push(("status".to_string(), status.to_string()));
@@ -296,12 +312,40 @@ fn render_file_change_entry(item: &ThreadItemSnapshot) -> String {
             render_meta_pills(&meta),
             render_entry_timestamp(item)
         ),
-        render_expandable_item_body(item),
+        render_collapsed_item_body(item, run_id),
     )
 }
 
-fn render_expandable_item_body(item: &ThreadItemSnapshot) -> String {
-    match &item.kind {
+/// Returns safe body markup for an expandable item, or `None` for other events.
+pub(crate) fn render_transcript_event_body(event: &RunHistoryEventRecord) -> Option<String> {
+    if event.event_type != "item_completed" {
+        return None;
+    }
+    render_expandable_item_body(&thread_item_snapshot_from_event(event))
+}
+
+fn render_collapsed_item_body(item: &ThreadItemSnapshot, run_id: i64) -> String {
+    if item
+        .body
+        .as_ref()
+        .is_none_or(|body| body.len() <= LAZY_TRANSCRIPT_BODY_THRESHOLD_BYTES)
+    {
+        return render_expandable_item_body(item).unwrap_or_default();
+    }
+    let url = format!("/api/history/{run_id}/entries/{}/body", item.event_id);
+    format!(
+        "<div class=\"transcript-lazy-body\" data-transcript-body-url=\"{url}\" aria-live=\"polite\">\
+         <a href=\"{url}\" class=\"secondary-button\">Load entry body</a></div>"
+    )
+}
+
+/// Binds progressive body loads after the page and its shared scripts exist.
+pub(crate) fn transcript_script_tag() -> String {
+    format!("<script>{TRANSCRIPT_SCRIPT}</script>")
+}
+
+fn render_expandable_item_body(item: &ThreadItemSnapshot) -> Option<String> {
+    Some(match &item.kind {
         ThreadItemKind::Reasoning => split_reasoning_content(item.body.as_deref())
             .1
             .map(|body| format!("<div class=\"reasoning-body\">{}</div>", escape_html(body)))
@@ -312,14 +356,14 @@ fn render_expandable_item_body(item: &ThreadItemSnapshot) -> String {
                 ThreadItemKind::McpToolCall { .. } => "activity-body mcp-body",
                 ThreadItemKind::DynamicToolCall { .. } => "activity-body tool-body",
                 ThreadItemKind::WebSearch => "activity-body compact-activity-body",
-                _ => return String::new(),
+                _ => return None,
             };
             item.body
                 .as_deref()
                 .map(|body| format!("<pre class=\"{class}\">{}</pre>", escape_html(body)))
                 .unwrap_or_default()
         }
-    }
+    })
 }
 
 fn render_activity_entry(item: &ThreadItemSnapshot, gitlab_base_url: &str) -> String {
@@ -617,6 +661,8 @@ fn render_mixed_file_change_body(body: &str) -> String {
         .collect::<String>()
 }
 
+/// Uses the first paragraph as the summary and the remainder as detail.
+/// Without a blank line, the first line summarizes the full body.
 fn split_reasoning_content(body: Option<&str>) -> (Option<&str>, Option<&str>) {
     let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) else {
         return (None, None);
@@ -740,7 +786,8 @@ mod tests {
 
     #[test]
     fn header_like_hunk_content_renders_as_changes() {
-        let html = render_thread_stream(&header_like_hunk_thread(), "https://gitlab.example.com");
+        let html =
+            render_thread_stream(&header_like_hunk_thread(), "https://gitlab.example.com", 1);
         assert!(html.contains("diff-line-remove\">--- a/old</div>"));
         assert!(html.contains("diff-line-add\">+++ b/new</div>"));
         assert!(html.contains("diff-line-meta\">--- a/empty.txt</div>"));
@@ -874,7 +921,7 @@ mod tests {
         )
         .expect("thread");
 
-        let html = render_thread_stream(&thread, "https://gitlab.example.com/api/v4");
+        let html = render_thread_stream(&thread, "https://gitlab.example.com/api/v4", 1);
         assert_snapshot!("thread_stream_full", html);
     }
 
@@ -927,7 +974,7 @@ mod tests {
         )
         .expect("thread");
 
-        let html = render_thread_stream(&thread, "https://gitlab.example.com/api/v4");
+        let html = render_thread_stream(&thread, "https://gitlab.example.com/api/v4", 1);
         assert_snapshot!("thread_stream_mixed_file_changes", html);
     }
 
@@ -970,7 +1017,7 @@ mod tests {
         )
         .expect("thread");
 
-        let html = render_thread_stream(&thread, "https://gitlab.example.com/api/v4");
+        let html = render_thread_stream(&thread, "https://gitlab.example.com/api/v4", 1);
         assert_snapshot!("thread_stream_review_markdown", html);
     }
 }

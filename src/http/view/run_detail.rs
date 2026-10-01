@@ -3,7 +3,7 @@ use super::super::status::{
     HistoryRunRecord, RunDetailSnapshot, SecurityContextPreview, ThreadSnapshot,
     TranscriptBackfillSnapshot,
 };
-use super::super::transcript::render_thread_stream;
+use super::super::transcript::{render_thread_stream, transcript_script_tag};
 use super::html::{
     NavItem, bool_label, escape_html, format_number, mr_history_href, pretty_print_json,
     render_definition_list, render_optional_unix_timestamp, render_shell, render_unix_timestamp,
@@ -26,7 +26,7 @@ pub(in crate::http) fn render_run_detail_page(
          <article class=\"card\"><h2>Token usage</h2>{}</article>\
          <article class=\"card\"><h2>Related sessions</h2>{}<p><a href=\"{}\">View MR history</a></p></article>\
          </section>\
-         {}{}{}{}",
+         {}{}{}{}{}",
         run.id,
         escape_html(run_kind_label(run.kind)),
         escape_html(&run.repo),
@@ -44,6 +44,7 @@ pub(in crate::http) fn render_run_detail_page(
             snapshot.transcript_backfill.as_ref(),
             gitlab_base_url,
         ),
+        transcript_script_tag(),
     );
     render_shell(
         "Run Detail",
@@ -341,7 +342,7 @@ fn render_thread_card(
         render_optional_preview_chip(&thread.preview),
         security_context_banner,
         backfill_notice,
-        render_thread_stream(thread, gitlab_base_url),
+        render_thread_stream(thread, gitlab_base_url, run.id),
     )
 }
 

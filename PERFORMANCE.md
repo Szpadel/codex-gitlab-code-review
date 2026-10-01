@@ -43,13 +43,34 @@ container. Cleanup failures are logged and cause an unsuccessful process exit.
 After a forced process termination, the existing startup sweep removes leftover
 managed containers.
 
+## Transcript bodies
+
+The run detail page omits collapsed bodies larger than 16 KiB from its initial
+HTML. Opening an entry loads its rendered body once. Small bodies, summaries,
+messages, and command outputs remain inline. A failed load shows a retry link.
+Without JavaScript, the load link opens the body directly.
+
+`GET /api/history/{run_id}/entries/{event_id}/body` reads only the selected
+persisted event. It returns safe HTML and requires the event to belong to that
+run. Missing or non-expandable entries return HTTP 404. The route is available
+only when the status UI is enabled, within the same trusted admin surface.
+Reload the page if a backfill replaces the event IDs before a body request.
+
+The run snapshot still reads all persisted events. The existing run JSON
+endpoint still includes full bodies. Lazy body loads reduce initial HTML, not
+the cost of building that snapshot.
+
 ## Regression checks
 
 ```sh
 cargo test run_history --lib
 cargo test usage --lib
 cargo test scheduler::tests --lib
+cargo test run_detail_loads_large_collapsed_bodies --lib
+node --test tests/transcript_body.test.cjs
 ```
 
 Usage tests exercise the production worker and HTTP page with a scripted
 app-server transport. They do not measure live Docker or provider latency.
+Transcript checks use real SQLite and HTTP requests. The Node check exercises
+the scripts with simulated browser and fetch boundaries, not a rendered page.

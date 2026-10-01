@@ -661,6 +661,25 @@ impl RunHistoryRepository {
         list_run_history_events_on_pool(self.sqlite.read_pool().clone(), run_history_id).await
     }
 
+    /// Loads one event only when it belongs to the requested run.
+    /// Returns `None` for an absent event. Propagates SQLite and payload parse errors.
+    pub(crate) async fn get_run_history_event(
+        &self,
+        run_history_id: i64,
+        event_id: i64,
+    ) -> Result<Option<RunHistoryEventRecord>> {
+        let row = sqlx::query(
+            "SELECT id, run_history_id, sequence, turn_id, event_type, payload_json, created_at \
+             FROM run_history_event WHERE id = ? AND run_history_id = ?",
+        )
+        .bind(event_id)
+        .bind(run_history_id)
+        .fetch_optional(self.sqlite.read_pool())
+        .await
+        .context("get run history event")?;
+        row.as_ref().map(map_run_history_event_row).transpose()
+    }
+
     /// Records exact usage for one upstream model response.
     ///
     /// # Errors

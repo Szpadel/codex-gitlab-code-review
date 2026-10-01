@@ -138,6 +138,20 @@ pub(crate) async fn run_detail_page(
     )))
 }
 
+/// Returns HTML for one expandable entry. Missing entries return HTTP 404.
+pub(crate) async fn transcript_entry_body(
+    State(app_state): State<HttpAppState>,
+    Path((run_id, event_id)): Path<(i64, i64)>,
+) -> std::result::Result<impl IntoResponse, StatusHandlerError> {
+    let body = app_state
+        .http_services
+        .status
+        .transcript_entry_body(run_id, event_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("transcript entry not found"))?;
+    Ok(Html(body))
+}
+
 pub(crate) async fn update_feature_flag_json(
     State(app_state): State<HttpAppState>,
     Path(flag_name): Path<String>,
