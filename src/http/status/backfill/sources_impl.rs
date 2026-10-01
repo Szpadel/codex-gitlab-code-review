@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tokio::task;
+use tracing::debug;
 
 #[derive(Clone, Debug)]
 pub struct SessionHistoryBackfillSource {
@@ -630,6 +631,9 @@ fn load_review_subagent_events(
         .map(|turn_id| (*turn_id).to_string())
         .collect::<HashSet<_>>();
     for candidate in matching_paths {
+        if !raw_session_file_might_match_review_sibling(&candidate, &child_turn_ids)? {
+            continue;
+        }
         let candidate_modified = fs::metadata(&candidate)
             .and_then(|metadata| metadata.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -637,7 +641,6 @@ fn load_review_subagent_events(
             Ok(Some(parsed)) => parsed,
             Ok(None) => continue,
             Err(err) if err.to_string() == TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR => {
-                let _ = raw_session_file_might_match_review_sibling(&candidate, &child_turn_ids)?;
                 continue;
             }
             Err(err) => return Err(err),
@@ -725,13 +728,39 @@ fn raw_session_file_might_match_review_sibling(
 ) -> Result<bool> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read session file {}", path.display()))?;
-    Ok(raw_session_file_looks_like_review_subagent(&raw)
-        && (child_turn_ids.is_empty()
-            || child_turn_ids.iter().any(|turn_id| raw.contains(turn_id))))
-}
-
-fn raw_session_file_looks_like_review_subagent(raw: &str) -> bool {
-    raw.contains("\"subagent\":\"review\"") || raw.contains("\"subagent\": \"review\"")
+    let mut is_review_subagent = false;
+    let mut has_matching_turn = false;
+    for (line_index, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Identify the sibling from valid records before parsing its full history.
+        let record: Value = match serde_json::from_str(line) {
+            Ok(record) => record,
+            Err(error) => {
+                debug!(
+                    path = %path.display(),
+                    line = line_index + 1,
+                    %error,
+                    "skip invalid session record during sibling identification"
+                );
+                continue;
+            }
+        };
+        let payload = &record["payload"];
+        match record["type"].as_str() {
+            Some("session_meta") => {
+                is_review_subagent = payload["source"]["subagent"].as_str() == Some("review");
+            }
+            Some("turn_context" | "event_msg") => {
+                has_matching_turn |= payload["turn_id"]
+                    .as_str()
+                    .is_some_and(|turn_id| child_turn_ids.contains(&turn_id));
+            }
+            _ => {}
+        }
+    }
+    Ok(is_review_subagent && has_matching_turn)
 }
 
 fn review_session_candidate_is_better(
@@ -1131,3 +1160,6 @@ fn compact_json(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod corrupt_sessions;
