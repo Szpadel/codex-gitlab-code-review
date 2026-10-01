@@ -659,8 +659,11 @@ impl AppServerClient {
                 info!(status, "codex turn completed");
                 if status == "failed" {
                     let error_message = error_message.as_deref().unwrap_or("unknown error");
-                    if SecurityReviewContentFlagged::matches(error_message) {
-                        return Err(SecurityReviewContentFlagged.into());
+                    if turn_error_is_cyber_policy(params) {
+                        return Err(SecurityReviewContentFlagged {
+                            message: error_message.to_string(),
+                        }
+                        .into());
                     }
                     return Err(anyhow!("codex turn failed: {error_message}"));
                 }
@@ -908,6 +911,16 @@ pub(crate) fn turn_id_from_params(params: Option<&Value>) -> Option<&str> {
     params
         .and_then(|value| value.get("turnId"))
         .and_then(|value| value.as_str())
+}
+
+// Codex app-server v2 `TurnError.codexErrorInfo` value for `CodexErrorInfo::CyberPolicy`.
+const CYBER_POLICY_ERROR_INFO: &str = "cyberPolicy";
+
+fn turn_error_is_cyber_policy(params: Option<&Value>) -> bool {
+    params
+        .and_then(|value| value.pointer("/turn/error/codexErrorInfo"))
+        .and_then(Value::as_str)
+        == Some(CYBER_POLICY_ERROR_INFO)
 }
 
 fn turn_completed_error_message(params: Option<&Value>) -> Option<String> {

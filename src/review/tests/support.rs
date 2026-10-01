@@ -550,7 +550,10 @@ impl CodexRunner for CybersecurityFlagRunner {
     async fn run_review(&self, ctx: ReviewContext) -> Result<CodexResult> {
         if ctx.lane.is_security() {
             *self.security_calls.lock().unwrap() += 1;
-            Err(SecurityReviewContentFlagged.into())
+            Err(SecurityReviewContentFlagged {
+                message: "This content was flagged for possible cybersecurity risk.".to_string(),
+            }
+            .into())
         } else {
             Ok(CodexResult::Pass {
                 summary: "ok".to_string(),

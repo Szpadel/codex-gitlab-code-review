@@ -1,6 +1,6 @@
 //! Parsing and rendering of Codex review output (structured JSON with rendered-text fallbacks).
 
-use super::{CodexResult, ReviewComment, SecurityReviewContentFlagged};
+use super::{CodexResult, ReviewComment};
 use crate::review_finding::{ReviewCodeLocation, ReviewFinding, ReviewLineRange};
 use crate::review_lane::ReviewLane;
 use anyhow::{Result, anyhow, bail};
@@ -72,9 +72,6 @@ pub(crate) fn parse_review_output_for_lane(
     }
 
     if lane.is_security() {
-        if SecurityReviewContentFlagged::matches(trimmed) {
-            return Err(SecurityReviewContentFlagged.into());
-        }
         let parsed = serde_json::from_str::<ReviewOutputPayload>(trimmed)
             .map_err(|_| anyhow!("security review output must be a structured JSON object"))?;
         if !review_output_payload_looks_structured(&parsed) {
