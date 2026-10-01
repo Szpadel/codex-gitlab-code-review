@@ -922,6 +922,12 @@ pub(crate) fn enrich_command_execution_item(item: &Value, output: &str) -> Value
 }
 
 pub(crate) fn extract_agent_message_text(item: &Value) -> Option<String> {
+    if let Some(text) = item.get("text").and_then(Value::as_str)
+        && !text.trim().is_empty()
+    {
+        return Some(text.to_string());
+    }
+
     let content = item.get("content")?.as_array()?;
     let mut parts = Vec::new();
     for entry in content {

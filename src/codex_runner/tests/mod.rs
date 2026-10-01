@@ -209,6 +209,7 @@ fn render_browser_wait_script_for_port(port: u16) -> String {
         )
 }
 
+mod app_server;
 mod commands_and_scripts;
 mod container_management;
 mod context_and_auth;
