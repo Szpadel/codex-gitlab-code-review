@@ -1,17 +1,28 @@
 use anyhow::{Context, Result};
 use sqlx::Row;
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
 use tracing::warn;
 
 use super::{SecurityReviewContextCacheEntry, sqlite::SqliteCoordinator};
 
+// Read cleanup is best-effort. Upserts still remove expired rows synchronously.
+const CACHE_READ_CLEANUP_INTERVAL_SECONDS: i64 = 60;
+
 #[derive(Clone)]
 pub struct SecurityContextCacheRepository {
     sqlite: SqliteCoordinator,
+    next_read_cleanup_at: Arc<AtomicI64>,
 }
 
 impl SecurityContextCacheRepository {
     pub(crate) fn new(sqlite: SqliteCoordinator) -> Self {
-        Self { sqlite }
+        Self {
+            sqlite,
+            next_read_cleanup_at: Arc::new(AtomicI64::new(i64::MIN)),
+        }
     }
 
     /// # Errors
@@ -175,6 +186,15 @@ impl SecurityContextCacheRepository {
     }
 
     fn enqueue_delete_expired_security_review_context_cache(&self, now: i64) {
+        if self
+            .next_read_cleanup_at
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (now >= next).then_some(now.saturating_add(CACHE_READ_CLEANUP_INTERVAL_SECONDS))
+            })
+            .is_err()
+        {
+            return;
+        }
         match self.sqlite.try_enqueue_background(
             "delete expired security review context cache",
             move |pool| {
@@ -240,6 +260,68 @@ fn map_security_review_context_cache_entry(
 mod tests {
     use super::*;
     use crate::state::ReviewStateStore;
+
+    #[tokio::test]
+    async fn cache_reads_schedule_one_cleanup_per_minute_across_clones() -> Result<()> {
+        let store = ReviewStateStore::new(":memory:").await?;
+        store
+            .security_context_cache
+            .upsert_security_review_context_cache(&SecurityReviewContextCacheEntry {
+                repo: "group/repo".to_string(),
+                base_branch: "main".to_string(),
+                base_head_sha: "sha".to_string(),
+                prompt_version: "v1".to_string(),
+                payload_json: "{}".to_string(),
+                source_run_history_id: 1,
+                generated_at: 0,
+                expires_at: 100,
+            })
+            .await?;
+        // Keep one expired row so each cleanup attempt remains observable.
+        sqlx::raw_sql(
+            "CREATE TABLE cleanup_counts (count INTEGER NOT NULL);
+            INSERT INTO cleanup_counts VALUES (0);
+            CREATE TRIGGER count_cleanups BEFORE DELETE ON security_review_context_cache
+            BEGIN UPDATE cleanup_counts SET count = count + 1; SELECT RAISE(IGNORE); END;",
+        )
+        .execute(store.pool())
+        .await?;
+        let clone = store.security_context_cache.clone();
+        for now in [100, 101, 120, 159] {
+            assert!(
+                store
+                    .security_context_cache
+                    .get_security_review_context_cache("group/repo", "main", "sha", "v1", now)
+                    .await?
+                    .is_none()
+            );
+            assert!(
+                clone
+                    .get_latest_security_review_context_cache_for_branch(
+                        "group/repo",
+                        "main",
+                        "v1",
+                        now
+                    )
+                    .await?
+                    .is_none()
+            );
+        }
+        store.flush_background_writes().await?;
+        let cleanups: i64 = sqlx::query_scalar("SELECT count FROM cleanup_counts")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(cleanups, 1);
+        clone
+            .get_latest_security_review_context_cache_for_branch("group/repo", "main", "v1", 160)
+            .await?;
+        store.flush_background_writes().await?;
+        let cleanups: i64 = sqlx::query_scalar("SELECT count FROM cleanup_counts")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(cleanups, 2);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn security_context_cache_roundtrip() -> Result<()> {
