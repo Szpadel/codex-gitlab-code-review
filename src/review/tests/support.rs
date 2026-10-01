@@ -276,6 +276,7 @@ pub(super) struct InlineReviewGitLab {
     pub(super) create_diff_discussion_error: Option<String>,
     pub(super) create_note_error: Option<String>,
     pub(super) add_award_error: Option<String>,
+    pub(super) list_open_error_project: Option<String>,
     pub(super) created_note_bodies: Mutex<Vec<String>>,
     pub(super) created_diff_discussions: Mutex<Vec<MergeRequestDiffDiscussion>>,
 }
@@ -294,6 +295,7 @@ impl InlineReviewGitLab {
             create_diff_discussion_error: None,
             create_note_error: None,
             add_award_error: None,
+            list_open_error_project: None,
             created_note_bodies: Mutex::new(Vec::new()),
             created_diff_discussions: Mutex::new(Vec::new()),
         }
@@ -336,6 +338,9 @@ impl GitLabApi for InlineReviewGitLab {
     }
 
     async fn list_open_mrs(&self, project: &str) -> Result<Vec<MergeRequest>> {
+        if self.list_open_error_project.as_deref() == Some(project) {
+            return Err(anyhow!("MR listing failed for {project}"));
+        }
         self.inner.list_open_mrs(project).await
     }
 

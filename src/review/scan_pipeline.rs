@@ -17,6 +17,7 @@ enum RepoScanStatus {
 
 #[derive(Default)]
 pub(super) struct ScanCounters {
+    failed_repos: usize,
     total_mrs: usize,
     scheduled: usize,
     security_scheduled: usize,
@@ -207,6 +208,7 @@ impl ScanContext {
         match mode {
             ScanMode::Full => {
                 info!(
+                    failed_repos = self.counters.failed_repos,
                     total_mrs = self.counters.total_mrs,
                     scheduled = self.counters.scheduled,
                     security_scheduled = self.counters.security_scheduled,
@@ -234,6 +236,7 @@ impl ScanContext {
             }
             ScanMode::Incremental => {
                 info!(
+                    failed_repos = self.counters.failed_repos,
                     total_mrs = self.counters.total_mrs,
                     scheduled = self.counters.scheduled,
                     security_scheduled = self.counters.security_scheduled,
@@ -299,18 +302,30 @@ impl<'a> ScanPipeline<'a> {
             info!("no gitlab repositories configured");
             return Ok(ScanRunStatus::Completed);
         }
+        let mut first_repo_error = None;
         for repo in &repos {
             if self.service.shutdown_requested() {
                 info!("stopping scan early: shutdown requested");
                 self.context.mark_interrupted();
                 break;
             }
-            self.scan_repo(repo).await?;
+            if let Err(err) = self.scan_repo(repo).await {
+                warn!(repo, error = %err, "repository scan failed");
+                self.context.counters.failed_repos += 1;
+                first_repo_error.get_or_insert(err);
+            }
         }
-        if self.await_tasks {
+        // Failed scans retain ownership of tasks until all tasks finish.
+        if self.await_tasks || first_repo_error.is_some() {
             let _ = join_all(std::mem::take(&mut self.context.tasks)).await;
         }
         self.context.log_completion(self.mode);
+        if let Some(err) = first_repo_error {
+            return Err(err.context(format!(
+                "scan failed in {} repositories",
+                self.context.counters.failed_repos
+            )));
+        }
         Ok(self.context.run_status())
     }
 
