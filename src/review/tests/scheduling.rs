@@ -1,6 +1,93 @@
 use super::*;
 use async_trait::async_trait;
 #[tokio::test]
+async fn scan_shares_admission_history_across_lanes_and_mentions() -> Result<()> {
+    let mut config = test_config();
+    config.feature_flags.security_review = true;
+    config.feature_flags.gitlab_inline_review_comments = true;
+    config.review.mention_commands.enabled = true;
+    config.review.mention_commands.bot_username = Some("bot".to_string());
+    let gitlab = Arc::new(InlineReviewGitLab::new(
+        fake_gitlab(vec![mr(7, "sha7")]),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let runner = Arc::new(FakeRunner {
+        result: Mutex::new(None),
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once().await?;
+
+    assert_eq!(*runner.calls.lock().unwrap(), 2);
+    let calls = gitlab.history_reads.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.as_str() == "list_notes:group/repo:7")
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.as_str() == "list_discussions:group/repo:7")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_security_admission_does_not_read_remote_history() -> Result<()> {
+    let mut config = test_config();
+    config.feature_flags.security_review = true;
+    let gitlab = Arc::new(InlineReviewGitLab::new(
+        fake_gitlab(vec![mr(7, "sha7")]),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    state
+        .review_state
+        .begin_review_for_lane("group/repo", 7, "sha7", ReviewLane::Security)
+        .await?;
+    state
+        .review_state
+        .finish_review_for_lane("group/repo", 7, "sha7", ReviewLane::Security, "pass")
+        .await?;
+    let runner = Arc::new(FakeRunner {
+        result: Mutex::new(None),
+        calls: Mutex::new(0),
+    });
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner,
+        1,
+        default_created_after(),
+    );
+
+    service
+        .security_review_flow
+        .run_for_mr("group/repo", mr(7, "sha7"), "sha7")
+        .await?;
+
+    assert!(gitlab.history_reads.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn review_history_insert_failure_releases_review_lock() -> Result<()> {
     let config = test_config();
     let bot_user = GitLabUser {

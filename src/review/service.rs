@@ -62,7 +62,7 @@ pub struct ReviewService {
     award_service: AwardService,
     pub(super) general_review_flow: Arc<ReviewFlow>,
     pub(super) security_review_flow: Arc<ReviewFlow>,
-    mention_flow: Arc<MentionFlow>,
+    pub(super) mention_flow: Arc<MentionFlow>,
     lifecycle: Arc<ServiceLifecycle>,
     active_tasks: Arc<ActiveTaskRegistry>,
     retry_backoff: Arc<RetryBackoff>,

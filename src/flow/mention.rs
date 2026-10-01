@@ -2,6 +2,7 @@ use crate::codex_runner::{
     CodexQuotaExhausted, MentionCommandContext, MentionCommandResult, MentionCommandStatus,
 };
 use crate::config::FeatureFlagSnapshot;
+use crate::flow::admission::AdmissionHistory;
 use crate::flow::award_service::AwardService;
 use crate::flow::comment_text::sanitize_comment_text;
 use crate::flow::mention_assets::collect_note_image_uploads;
@@ -565,6 +566,20 @@ impl MentionFlow {
         head_sha: &str,
         tasks: &mut Vec<JoinHandle<()>>,
     ) -> Result<MentionScheduleOutcome> {
+        let history = AdmissionHistory::new(self.shared.gitlab.as_ref(), repo, mr.iid);
+        self.schedule_with_admission(repo, mr, head_sha, tasks, &history)
+            .await
+    }
+
+    /// Uses the same discussion snapshot as the review lanes during admission.
+    pub(crate) async fn schedule_with_admission(
+        &self,
+        repo: &str,
+        mr: &MergeRequest,
+        head_sha: &str,
+        tasks: &mut Vec<JoinHandle<()>>,
+        history: &AdmissionHistory<'_>,
+    ) -> Result<MentionScheduleOutcome> {
         let mut outcome = MentionScheduleOutcome::default();
         if !self.mention_commands_enabled() {
             return Ok(outcome);
@@ -586,18 +601,13 @@ impl MentionFlow {
         }
         // GitLab merge request discussions cover both standalone comments
         // (individual_note discussions) and threaded replies.
-        let discussions = self
-            .shared
-            .gitlab
-            .list_discussions(repo, mr.iid)
-            .await
-            .with_context(|| {
-                format!(
-                    "load discussions for mention commands in {repo} !{}",
-                    mr.iid
-                )
-            })?;
-        let triggers = self.collect_mention_triggers(&discussions, bot_username);
+        let discussions = history.discussions().await.with_context(|| {
+            format!(
+                "load discussions for mention commands in {repo} !{}",
+                mr.iid
+            )
+        })?;
+        let triggers = self.collect_mention_triggers(discussions, bot_username);
         let command_repo = self.resolve_mention_command_repo(repo, mr).await?;
         let mention_eyes_emoji = self.mention_eyes_emoji();
         let additional_developer_instructions = self

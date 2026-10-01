@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Notify, Semaphore};
 
+pub(crate) mod admission;
 pub(crate) mod award_service;
 mod comment_text;
 pub(crate) mod mention;

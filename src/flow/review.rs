@@ -3,6 +3,7 @@ use crate::codex_runner::{
 };
 use crate::config::Config;
 use crate::config::FeatureFlagSnapshot;
+use crate::flow::admission::AdmissionHistory;
 use crate::flow::award_service::AwardService;
 use crate::flow::orchestration::{
     ActiveTaskKey, ScheduledTaskContext, finish_task_run_history, refund_review_rate_limits,
@@ -233,6 +234,7 @@ impl ReviewFlow {
         repo: &str,
         mr: &MergeRequest,
         head_sha: &str,
+        history: &AdmissionHistory<'_>,
     ) -> Result<ReviewGateOutcome> {
         let feature_flags = self.resolve_feature_flags().await?;
         if !self.is_enabled(&feature_flags) {
@@ -248,7 +250,7 @@ impl ReviewFlow {
         }
         let now = Utc::now().timestamp();
         if let Some(outcome) = self
-            .find_skip_reason(repo, mr, head_sha, &feature_flags)
+            .find_skip_reason(repo, mr, head_sha, &feature_flags, history)
             .await?
         {
             return Ok(ReviewGateOutcome::Decision(outcome));
@@ -262,6 +264,7 @@ impl ReviewFlow {
         mr: &MergeRequest,
         head_sha: &str,
         feature_flags: &FeatureFlagSnapshot,
+        history: &AdmissionHistory<'_>,
     ) -> Result<Option<ReviewScheduleOutcome>> {
         let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
         let retry_was_due = match self.retry_gate_status(&retry_key) {
@@ -271,6 +274,16 @@ impl ReviewFlow {
                 return Ok(Some(ReviewScheduleOutcome::SkippedRetryExhausted));
             }
         };
+        if self
+            .skipped_by_completed_result(repo, mr.iid, head_sha)
+            .await?
+        {
+            if retry_was_due {
+                self.clear_retry_gate_for_terminal_skip(&retry_key, repo, mr.iid)
+                    .await;
+            }
+            return Ok(Some(ReviewScheduleOutcome::SkippedCompleted));
+        }
         if self.skipped_by_thumbs_award(repo, mr.iid).await? {
             if retry_was_due {
                 self.clear_retry_gate_for_terminal_skip(&retry_key, repo, mr.iid)
@@ -278,10 +291,7 @@ impl ReviewFlow {
             }
             return Ok(Some(ReviewScheduleOutcome::SkippedAward));
         }
-        if self
-            .skipped_by_review_marker(repo, mr.iid, head_sha)
-            .await?
-        {
+        if self.skipped_by_review_marker(history, head_sha).await? {
             if retry_was_due {
                 self.clear_retry_gate_for_terminal_skip(&retry_key, repo, mr.iid)
                     .await;
@@ -289,7 +299,7 @@ impl ReviewFlow {
             return Ok(Some(ReviewScheduleOutcome::SkippedMarker));
         }
         if let Some(outcome) = self
-            .skipped_by_inline_markers(repo, mr.iid, head_sha, feature_flags)
+            .skipped_by_inline_markers(repo, mr.iid, head_sha, feature_flags, history)
             .await?
         {
             if retry_was_due {
@@ -371,10 +381,35 @@ impl ReviewFlow {
         Ok(true)
     }
 
-    async fn skipped_by_review_marker(&self, repo: &str, iid: u64, head_sha: &str) -> Result<bool> {
-        let notes = self.shared.gitlab.list_notes(repo, iid).await?;
+    async fn skipped_by_completed_result(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+    ) -> Result<bool> {
+        if !self.lane.skips_completed_review_result() {
+            return Ok(false);
+        }
+        let result = self
+            .shared
+            .state
+            .review_state
+            .review_result_for_lane(repo, iid, head_sha, self.lane)
+            .await?;
+        Ok(result
+            .as_deref()
+            .and_then(ReviewRunResult::parse)
+            .is_some_and(ReviewRunResult::is_completed_review))
+    }
+
+    async fn skipped_by_review_marker(
+        &self,
+        history: &AdmissionHistory<'_>,
+        head_sha: &str,
+    ) -> Result<bool> {
+        let notes = history.notes().await?;
         Ok(has_review_marker(
-            &notes,
+            notes,
             self.shared.bot_user_id,
             self.review_marker_prefix(),
             head_sha,
@@ -387,6 +422,7 @@ impl ReviewFlow {
         iid: u64,
         head_sha: &str,
         feature_flags: &FeatureFlagSnapshot,
+        history: &AdmissionHistory<'_>,
     ) -> Result<Option<ReviewScheduleOutcome>> {
         let completed_inline_review = self
             .shared
@@ -401,11 +437,6 @@ impl ReviewFlow {
             .review_result_for_lane(repo, iid, head_sha, self.lane)
             .await?;
         let parsed_review_result = review_result.as_deref().and_then(ReviewRunResult::parse);
-        if self.lane.skips_completed_review_result()
-            && parsed_review_result.is_some_and(ReviewRunResult::is_completed_review)
-        {
-            return Ok(Some(ReviewScheduleOutcome::SkippedCompleted));
-        }
         let should_check_inline_markers = feature_flags.gitlab_inline_review_comments
             || completed_inline_review
             || review_result.is_some();
@@ -418,6 +449,7 @@ impl ReviewFlow {
             head_sha,
             completed_inline_review,
             parsed_review_result,
+            history,
         )
         .await
     }
@@ -429,11 +461,12 @@ impl ReviewFlow {
         head_sha: &str,
         completed_inline_review: bool,
         parsed_review_result: Option<ReviewRunResult>,
+        history: &AdmissionHistory<'_>,
     ) -> Result<Option<ReviewScheduleOutcome>> {
-        match self.shared.gitlab.list_discussions(repo, iid).await {
+        match history.discussions().await {
             Ok(discussions) => {
                 if has_inline_review_marker(
-                    &discussions,
+                    discussions,
                     self.shared.bot_user_id,
                     head_sha,
                     self.finding_marker_prefix(),
@@ -826,14 +859,19 @@ impl ReviewFlow {
         }
     }
 
+    /// Shares remote history across lanes during one scan admission.
     pub(crate) async fn schedule_for_scan(
         &self,
         repo: &str,
         mr: MergeRequest,
         head_sha: &str,
         tasks: &mut Vec<JoinHandle<()>>,
+        history: &AdmissionHistory<'_>,
     ) -> Result<ReviewScheduleOutcome> {
-        let acquired_rule_ids = match self.evaluate_review_gate(repo, &mr, head_sha).await? {
+        let acquired_rule_ids = match self
+            .evaluate_review_gate(repo, &mr, head_sha, history)
+            .await?
+        {
             ReviewGateOutcome::Decision(decision) => return Ok(decision),
             ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
         };
@@ -858,7 +896,11 @@ impl ReviewFlow {
         mr: MergeRequest,
         head_sha: &str,
     ) -> Result<ReviewScheduleOutcome> {
-        let acquired_rule_ids = match self.evaluate_review_gate(repo, &mr, head_sha).await? {
+        let history = AdmissionHistory::new(self.shared.gitlab.as_ref(), repo, mr.iid);
+        let acquired_rule_ids = match self
+            .evaluate_review_gate(repo, &mr, head_sha, &history)
+            .await?
+        {
             ReviewGateOutcome::Decision(decision) => return Ok(decision),
             ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
         };

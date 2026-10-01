@@ -280,6 +280,7 @@ pub(super) struct InlineReviewGitLab {
     pub(super) stop_on_mr_refresh: Option<Arc<ServiceLifecycle>>,
     pub(super) created_note_bodies: Mutex<Vec<String>>,
     pub(super) created_diff_discussions: Mutex<Vec<MergeRequestDiffDiscussion>>,
+    pub(super) history_reads: Mutex<Vec<String>>,
 }
 
 impl InlineReviewGitLab {
@@ -300,6 +301,7 @@ impl InlineReviewGitLab {
             stop_on_mr_refresh: None,
             created_note_bodies: Mutex::new(Vec::new()),
             created_diff_discussions: Mutex::new(Vec::new()),
+            history_reads: Mutex::new(Vec::new()),
         }
     }
 
@@ -390,6 +392,10 @@ impl GitLabApi for InlineReviewGitLab {
     }
 
     async fn list_notes(&self, project: &str, iid: u64) -> Result<Vec<Note>> {
+        self.history_reads
+            .lock()
+            .unwrap()
+            .push(format!("list_notes:{project}:{iid}"));
         self.inner.list_notes(project, iid).await
     }
 
@@ -430,6 +436,10 @@ impl GitLabApi for InlineReviewGitLab {
         project: &str,
         iid: u64,
     ) -> Result<Vec<MergeRequestDiscussion>> {
+        self.history_reads
+            .lock()
+            .unwrap()
+            .push(format!("list_discussions:{project}:{iid}"));
         if let Some(message) = &self.list_discussions_error {
             return Err(anyhow!(message.clone()));
         }

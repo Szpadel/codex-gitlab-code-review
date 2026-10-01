@@ -1,6 +1,7 @@
 use super::ReviewLane;
 use super::admission::{ReviewSkipReason, review_skip_reason};
 use super::service::{NO_OPEN_MRS_MARKER, ReviewService, ScanMode, ScanRunStatus};
+use crate::flow::admission::AdmissionHistory;
 use crate::flow::mention::MentionScheduleOutcome;
 use crate::flow::review::ReviewScheduleOutcome;
 use anyhow::Result;
@@ -469,9 +470,11 @@ impl<'a> ScanPipeline<'a> {
             self.service
                 .clear_stale_review_backoff_retries_for_mr(repo, mr.iid, &head_sha)
                 .await;
+            let history = AdmissionHistory::new(self.service.gitlab.as_ref(), repo, mr.iid);
             let mention_outcome = self
                 .service
-                .schedule_mention_commands_for_mr(repo, &mr, &head_sha, &mut self.context.tasks)
+                .mention_flow
+                .schedule_with_admission(repo, &mr, &head_sha, &mut self.context.tasks, &history)
                 .await?;
             self.context.record_mention_outcome(mention_outcome);
             if mention_outcome.blocked_pending_work {
@@ -516,7 +519,13 @@ impl<'a> ScanPipeline<'a> {
             let review_outcome = self
                 .service
                 .general_review_flow
-                .schedule_for_scan(repo, mr.clone(), &head_sha, &mut self.context.tasks)
+                .schedule_for_scan(
+                    repo,
+                    mr.clone(),
+                    &head_sha,
+                    &mut self.context.tasks,
+                    &history,
+                )
                 .await?;
             if let Some(status) = self.context.apply_review_outcome(
                 ReviewLane::General,
@@ -530,7 +539,7 @@ impl<'a> ScanPipeline<'a> {
             let security_review_outcome = self
                 .service
                 .security_review_flow
-                .schedule_for_scan(repo, mr, &head_sha, &mut self.context.tasks)
+                .schedule_for_scan(repo, mr, &head_sha, &mut self.context.tasks, &history)
                 .await?;
             if let Some(status) = self.context.apply_review_outcome(
                 ReviewLane::Security,
