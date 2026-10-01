@@ -277,6 +277,7 @@ pub(super) struct InlineReviewGitLab {
     pub(super) create_note_error: Option<String>,
     pub(super) add_award_error: Option<String>,
     pub(super) list_open_error_project: Option<String>,
+    pub(super) stop_on_mr_refresh: Option<Arc<ServiceLifecycle>>,
     pub(super) created_note_bodies: Mutex<Vec<String>>,
     pub(super) created_diff_discussions: Mutex<Vec<MergeRequestDiffDiscussion>>,
 }
@@ -296,6 +297,7 @@ impl InlineReviewGitLab {
             create_note_error: None,
             add_award_error: None,
             list_open_error_project: None,
+            stop_on_mr_refresh: None,
             created_note_bodies: Mutex::new(Vec::new()),
             created_diff_discussions: Mutex::new(Vec::new()),
         }
@@ -349,7 +351,11 @@ impl GitLabApi for InlineReviewGitLab {
     }
 
     async fn get_mr(&self, project: &str, iid: u64) -> Result<MergeRequest> {
-        self.inner.get_mr(project, iid).await
+        let mr = self.inner.get_mr(project, iid).await?;
+        if let Some(lifecycle) = &self.stop_on_mr_refresh {
+            lifecycle.request_fast_stop();
+        }
+        Ok(mr)
     }
 
     async fn list_mr_diff_versions(

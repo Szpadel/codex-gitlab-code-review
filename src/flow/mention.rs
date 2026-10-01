@@ -2,6 +2,7 @@ use crate::codex_runner::{
     CodexQuotaExhausted, MentionCommandContext, MentionCommandResult, MentionCommandStatus,
 };
 use crate::config::FeatureFlagSnapshot;
+use crate::flow::award_service::AwardService;
 use crate::flow::comment_text::sanitize_comment_text;
 use crate::flow::mention_assets::collect_note_image_uploads;
 use crate::flow::orchestration::{
@@ -12,8 +13,8 @@ use crate::flow::{ActiveMentionKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::links::{extract_root_relative_markdown_urls, gitlab_web_base};
 use crate::gitlab::{DiscussionNote, GitLabUser, MergeRequest, MergeRequestDiscussion};
 use crate::state::{
-    MentionCommandScanState, MentionQuotaPendingUpsert, NewRunHistory, RunHistoryFinish,
-    RunHistoryKind,
+    MentionCommandScanState, MentionQuotaPendingUpsert, NewRunHistory, ReviewStateStore,
+    RunHistoryFinish, RunHistoryKind,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -758,6 +759,8 @@ impl MentionFlow {
             let rejected_task = task.clone();
             let rejected_discussion_id = trigger_discussion_id.clone();
             let state_for_rejection = Arc::clone(&state);
+            let awards_for_rejection = award_service.clone();
+            let eyes_for_rejection = eyes_emoji.clone();
             let task_for_run_history = task.clone();
             spawn_orchestrated_task(
                 &self.shared,
@@ -772,27 +775,15 @@ impl MentionFlow {
                     );
                 },
                 move |_branch_guard| async move {
-                    let _ = state_for_rejection
-                        .mention_commands
-                        .finish_mention_command(
-                            &rejected_task.repo,
-                            rejected_task.iid,
-                            &rejected_discussion_id,
-                            trigger_note_id,
-                            &rejected_task.head_sha,
-                            "cancelled",
-                        )
-                        .await;
-                    let _ = finish_task_run_history(
+                    MentionFlow::finalize_rejected_start(
                         &state_for_rejection,
-                        &rejected_task,
-                        task_cancelled_finish(
-                            "cancelled",
-                            format!(
-                                "Mention {} !{} note {}",
-                                rejected_task.repo, rejected_task.iid, trigger_note_id
-                            ),
-                        ),
+                        &awards_for_rejection,
+                        &eyes_for_rejection,
+                        MentionSetupFailureContext {
+                            task: &rejected_task,
+                            discussion_id: &rejected_discussion_id,
+                            trigger_note_id,
+                        },
                     )
                     .await;
                 },
@@ -880,6 +871,20 @@ impl MentionFlow {
                         feature_flags,
                         run_history_id: Some(run_history_id),
                     };
+                    if !lifecycle.accepts_new_work() {
+                        MentionFlow::finalize_rejected_start(
+                            &state,
+                            &award_service,
+                            &eyes_emoji,
+                            MentionSetupFailureContext {
+                                task: &task_for_run_history,
+                                discussion_id: &discussion_id,
+                                trigger_note_id,
+                            },
+                        )
+                        .await;
+                        return;
+                    }
                     let _started_run = lifecycle.track_started_run();
                     let outcome = codex.run_mention_command(command_context).await;
                     let (state_result, status_message, run_history_finish, post_status_note) =
@@ -1208,6 +1213,59 @@ impl MentionFlow {
                 error = %recovery_err,
                 "failed to release mention lock after run history creation error"
             );
+        }
+    }
+
+    /// Attempts to finish the rejected claim, history, and eyes award. Logs each failure.
+    async fn finalize_rejected_start(
+        state: &ReviewStateStore,
+        award_service: &AwardService,
+        eyes_emoji: &str,
+        ctx: MentionSetupFailureContext<'_>,
+    ) {
+        if let Err(err) = state
+            .mention_commands
+            .finish_mention_command(
+                &ctx.task.repo,
+                ctx.task.iid,
+                ctx.discussion_id,
+                ctx.trigger_note_id,
+                &ctx.task.head_sha,
+                "cancelled",
+            )
+            .await
+        {
+            warn!(repo = ctx.task.repo, iid = ctx.task.iid, error = %err,
+                "failed to cancel mention claim after shutdown");
+        }
+        if let Err(err) = finish_task_run_history(
+            state,
+            ctx.task,
+            task_cancelled_finish(
+                "cancelled",
+                format!(
+                    "Mention {} !{} note {}",
+                    ctx.task.repo, ctx.task.iid, ctx.trigger_note_id
+                ),
+            ),
+        )
+        .await
+        {
+            warn!(repo = ctx.task.repo, iid = ctx.task.iid, error = %err,
+                "failed to cancel mention history after shutdown");
+        }
+        if let Err(err) = award_service
+            .remove_discussion_note_award(
+                &ctx.task.repo,
+                ctx.task.iid,
+                ctx.discussion_id,
+                ctx.trigger_note_id,
+                eyes_emoji,
+            )
+            .await
+        {
+            warn!(repo = ctx.task.repo, iid = ctx.task.iid, error = %err,
+                "failed to remove mention eyes award after shutdown");
         }
     }
 

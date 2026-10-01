@@ -22,6 +22,7 @@ use sqlx::Row;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+mod mention_shutdown;
 mod mentions;
 mod pending_mentions;
 mod pending_reviews;
