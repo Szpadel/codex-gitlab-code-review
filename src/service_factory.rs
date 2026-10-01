@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::background_tasks::BackgroundTasks;
 use crate::codex_runner::{CodexRunner, DockerCodexRunner, RunnerRuntimeOptions};
 use crate::config::{Config, ValidatedConfig, validate_config};
 use crate::dev_mode::{DevToolsService, MockCodexRunner};
@@ -89,37 +90,49 @@ pub async fn build_service_bundle(
     );
 
     let state = build_review_state_store(&runtime_config).await?;
-    let created_after = resolve_created_after(&runtime_config, state.as_ref()).await?;
-    info!(
-        created_after = %created_after,
-        "using merge request created_after cutoff"
-    );
+    let background_tasks = state.background_tasks();
+    let result = async {
+        let created_after = resolve_created_after(&runtime_config, state.as_ref()).await?;
+        info!(
+            created_after = %created_after,
+            "using merge request created_after cutoff"
+        );
 
-    let runtime = if matches!(options.runtime_mode, RuntimeMode::Development) {
-        build_dev_runtime(
-            &runtime_config,
-            Arc::clone(&state),
-            options.run_once,
-            created_after,
-        )?
-    } else {
-        build_normal_runtime(
-            &mut runtime_config,
-            Arc::clone(&state),
-            options.run_once,
-            created_after,
-            options.log_all_json,
-        )
-        .await?
-    };
-    let config = validate_config(runtime_config)?;
+        let runtime = if matches!(options.runtime_mode, RuntimeMode::Development) {
+            build_dev_runtime(
+                &runtime_config,
+                Arc::clone(&state),
+                options.run_once,
+                created_after,
+            )?
+        } else {
+            build_normal_runtime(
+                &mut runtime_config,
+                Arc::clone(&state),
+                options.run_once,
+                created_after,
+                options.log_all_json,
+            )
+            .await?
+        };
+        let config = validate_config(runtime_config)?;
 
-    Ok(runtime.into_bundle(config, options.run_once))
+        Ok(runtime.into_bundle(config, options.run_once))
+    }
+    .await;
+    if result.is_err() {
+        background_tasks.shutdown().await;
+    }
+    result
 }
 
 pub(crate) async fn build_review_state_store(config: &Config) -> Result<Arc<ReviewStateStore>> {
     Ok(Arc::new(
-        ReviewStateStore::new(&config.database.path).await?,
+        ReviewStateStore::new_with_background_tasks(
+            &config.database.path,
+            BackgroundTasks::default(),
+        )
+        .await?,
     ))
 }
 
@@ -190,7 +203,20 @@ async fn build_normal_runtime(
     };
     if let Some(service) = gitlab_discovery_mcp.as_ref() {
         let listener = service.bind_listener().await?;
-        tokio::spawn(Arc::clone(service).run(listener));
+        let background_tasks = state.background_tasks();
+        let cancellation = background_tasks.cancellation();
+        let service = Arc::clone(service);
+        background_tasks.spawn(async move {
+            let server = Arc::clone(&service).run(listener);
+            tokio::pin!(server);
+            tokio::select! {
+                () = &mut server => {}
+                () = cancellation.cancelled() => {
+                    service.shutdown();
+                    server.await;
+                }
+            }
+        });
     }
 
     let runner = DockerCodexRunner::new(

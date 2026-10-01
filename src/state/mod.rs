@@ -428,12 +428,28 @@ impl ReviewStateStore {
     /// Returns an error if the `SQLite` database cannot be created, opened,
     /// migrated, or connected.
     pub async fn new(path: &str) -> Result<Self> {
+        Self::new_with_background_tasks(path, crate::background_tasks::BackgroundTasks::default())
+            .await
+    }
+
+    /// Starts the writer under the supplied runtime owner.
+    /// Returns an error if database setup or migration fails.
+    pub(crate) async fn new_with_background_tasks(
+        path: &str,
+        background_tasks: crate::background_tasks::BackgroundTasks,
+    ) -> Result<Self> {
         ensure_sqlite_file(path)?;
-        let sqlite = SqliteCoordinator::connect(path).await?;
-        sqlx::migrate!()
+        let sqlite =
+            SqliteCoordinator::connect_with_background_tasks(path, background_tasks.clone())
+                .await?;
+        if let Err(error) = sqlx::migrate!()
             .run(sqlite.read_pool())
             .await
-            .context("run sqlite migrations")?;
+            .context("run sqlite migrations")
+        {
+            background_tasks.shutdown().await;
+            return Err(error);
+        }
 
         Ok(Self {
             review_state: ReviewStateRepository::new(sqlite.clone()),
@@ -455,6 +471,10 @@ impl ReviewStateStore {
     /// Returns an error if an accepted background write failed.
     pub async fn flush_background_writes(&self) -> Result<()> {
         self.sqlite.flush_background_writes().await
+    }
+
+    pub(crate) fn background_tasks(&self) -> crate::background_tasks::BackgroundTasks {
+        self.sqlite.background_tasks()
     }
 
     #[cfg(test)]

@@ -15,6 +15,7 @@ use axum::{
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use handlers::{
@@ -132,14 +133,11 @@ pub fn app_router_with_dev_tools(
     router.with_state(app_state)
 }
 
-pub async fn run_http_server(bind_addr: String, http_services: Arc<HttpServices>) {
-    run_http_server_with_dev_tools(bind_addr, http_services, None).await;
-}
-
 pub async fn run_http_server_with_dev_tools(
     bind_addr: String,
     http_services: Arc<HttpServices>,
     dev_tools_service: Option<Arc<DevToolsService>>,
+    cancellation: CancellationToken,
 ) {
     match TcpListener::bind(&bind_addr).await {
         Ok(listener) => {
@@ -147,6 +145,7 @@ pub async fn run_http_server_with_dev_tools(
                 listener,
                 app_router_with_dev_tools(http_services, dev_tools_service),
             )
+            .with_graceful_shutdown(cancellation.cancelled_owned())
             .await
             {
                 error!(error = %err, "http server failed");

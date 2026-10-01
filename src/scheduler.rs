@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use crate::background_tasks::BackgroundTasks;
 use crate::bootstrap::BootstrappedRuntime;
 use crate::codex_runner::CodexRunner;
 use crate::dev_mode::DevToolsService;
@@ -54,6 +55,7 @@ pub(crate) trait HttpServerLauncher: Send + Sync {
         bind_addr: String,
         http_services: Arc<HttpServices>,
         dev_tools: Option<Arc<DevToolsService>>,
+        background_tasks: &BackgroundTasks,
     ) -> JoinHandle<()>;
 }
 
@@ -65,11 +67,13 @@ impl HttpServerLauncher for DefaultHttpServerLauncher {
         bind_addr: String,
         http_services: Arc<HttpServices>,
         dev_tools: Option<Arc<DevToolsService>>,
+        background_tasks: &BackgroundTasks,
     ) -> JoinHandle<()> {
-        tokio::spawn(run_http_server_with_dev_tools(
+        background_tasks.spawn(run_http_server_with_dev_tools(
             bind_addr,
             http_services,
             dev_tools,
+            background_tasks.cancellation(),
         ))
     }
 }
@@ -86,7 +90,11 @@ pub(crate) async fn run_with_hooks(
     http_launcher: &dyn HttpServerLauncher,
 ) -> Result<()> {
     let runner = Arc::clone(&runtime.runner);
+    let service = Arc::clone(&runtime.service);
+    let background_tasks = runtime.state.background_tasks();
     let result = run_until_stopped(runtime, signal_source, http_launcher).await;
+    service.request_shutdown();
+    background_tasks.shutdown().await;
     let cleanup = runner.shutdown_usage_sessions().await;
     if let Err(error) = &cleanup {
         warn!(error = %error, "Failed to shut down Usage sessions");
@@ -122,8 +130,9 @@ async fn run_until_stopped(
         config.server.bind_addr.clone(),
         Arc::clone(&http_services),
         dev_tools.clone(),
+        &state.background_tasks(),
     );
-    let _startup_warmup = spawn_startup_warmup(runner);
+    let _startup_warmup = spawn_startup_warmup(runner, &state.background_tasks());
 
     if run_once {
         info!("running single scan");
@@ -163,7 +172,7 @@ async fn run_until_stopped(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let initial_scan_service = Arc::clone(&service);
     let initial_scan_admin_service = Arc::clone(&http_services.admin);
-    let mut initial_scan = tokio::spawn(async move {
+    let mut initial_scan = state.background_tasks().spawn(async move {
         run_tracked_scan(
             initial_scan_admin_service.as_ref(),
             ScanMode::Full,
@@ -212,7 +221,7 @@ async fn run_until_stopped(
 
     let scheduled_service = Arc::clone(&service);
     let scheduled_admin_service = Arc::clone(&http_services.admin);
-    let mut scheduled_loop = tokio::spawn(async move {
+    let mut scheduled_loop = state.background_tasks().spawn(async move {
         run_schedule_loop(
             scheduled_service.as_ref(),
             scheduled_admin_service.as_ref(),
@@ -257,10 +266,19 @@ async fn run_until_stopped(
     }
 }
 
-fn spawn_startup_warmup(runner: Arc<dyn CodexRunner>) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(err) = runner.warm_up_images().await {
-            warn!(error = %err, "startup docker image warm-up failed");
+fn spawn_startup_warmup(
+    runner: Arc<dyn CodexRunner>,
+    background_tasks: &BackgroundTasks,
+) -> JoinHandle<()> {
+    let cancellation = background_tasks.cancellation();
+    background_tasks.spawn(async move {
+        tokio::select! {
+            () = cancellation.cancelled() => {}
+            result = runner.warm_up_images() => {
+                if let Err(err) = result {
+                    warn!(error = %err, "startup docker image warm-up failed");
+                }
+            }
         }
     })
 }
@@ -600,9 +618,10 @@ mod tests {
             _bind_addr: String,
             _http_services: Arc<HttpServices>,
             _dev_tools: Option<Arc<DevToolsService>>,
+            background_tasks: &BackgroundTasks,
         ) -> JoinHandle<()> {
             self.launches.fetch_add(1, Ordering::SeqCst);
-            tokio::spawn(async {})
+            background_tasks.spawn(async {})
         }
     }
 
@@ -667,6 +686,7 @@ mod tests {
             warmup_started: Arc::clone(&warmup_started),
             release_warmup: Arc::clone(&release_warmup),
         });
+        let runner_reference = Arc::downgrade(&runner);
         let runtime =
             runtime_with_recording_sources(Arc::clone(&events), warmup_started, runner).await?;
         let launch_count = Arc::new(AtomicUsize::new(0));
@@ -687,6 +707,10 @@ mod tests {
             vec!["warmup", "resolve_repos", "usage_shutdown"]
         );
         assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+        assert!(
+            runner_reference.upgrade().is_none(),
+            "single scan must cancel and join its background warmup"
+        );
         Ok(())
     }
 

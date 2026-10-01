@@ -1,4 +1,5 @@
 pub mod auth_cli;
+mod background_tasks;
 pub mod bootstrap;
 pub mod cli;
 pub mod codex_runner;

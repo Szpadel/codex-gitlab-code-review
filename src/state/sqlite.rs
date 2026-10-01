@@ -1,3 +1,4 @@
+use crate::background_tasks::BackgroundTasks;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::future::BoxFuture;
 use sqlx::{
@@ -38,6 +39,7 @@ struct BackgroundJob {
 pub(crate) struct SqliteCoordinator {
     inner: Arc<SqliteCoordinatorInner>,
     background_tx: mpsc::Sender<BackgroundJob>,
+    background_tasks: BackgroundTasks,
 }
 
 struct SqliteCoordinatorInner {
@@ -69,7 +71,17 @@ impl SqliteCoordinator {
     /// # Errors
     ///
     /// Returns an error if the `SQLite` database cannot be connected.
+    #[cfg(test)]
     pub(crate) async fn connect(path: &str) -> Result<Self> {
+        Self::connect_with_background_tasks(path, BackgroundTasks::default()).await
+    }
+
+    /// Uses the runtime owner for the background writer.
+    /// Returns an error if the database connection fails.
+    pub(crate) async fn connect_with_background_tasks(
+        path: &str,
+        background_tasks: BackgroundTasks,
+    ) -> Result<Self> {
         let url = sqlite_url(path);
         let max_connections = if path == ":memory:" { 1 } else { 5 };
         let connect_options = sqlite_connect_options(path, &url)?;
@@ -78,10 +90,10 @@ impl SqliteCoordinator {
             .connect_with(connect_options)
             .await
             .with_context(|| format!("connect sqlite database at {path}"))?;
-        Ok(Self::new(pool))
+        Ok(Self::new(pool, background_tasks))
     }
 
-    pub(crate) fn new(pool: SqlitePool) -> Self {
+    fn new(pool: SqlitePool, background_tasks: BackgroundTasks) -> Self {
         let (background_tx, background_rx) = mpsc::channel(BACKGROUND_QUEUE_CAPACITY);
         let inner = Arc::new(SqliteCoordinatorInner {
             pool,
@@ -94,11 +106,16 @@ impl SqliteCoordinator {
             #[cfg(test)]
             background_pause: Arc::new(Mutex::new(())),
         });
-        spawn_background_writer(Arc::clone(&inner), background_rx);
+        spawn_background_writer(Arc::clone(&inner), background_rx, &background_tasks);
         Self {
             inner,
             background_tx,
+            background_tasks,
         }
+    }
+
+    pub(crate) fn background_tasks(&self) -> BackgroundTasks {
+        self.background_tasks.clone()
     }
 
     pub(crate) fn read_pool(&self) -> &SqlitePool {
@@ -244,15 +261,22 @@ impl SqliteCoordinator {
 fn spawn_background_writer(
     inner: Arc<SqliteCoordinatorInner>,
     mut background_rx: mpsc::Receiver<BackgroundJob>,
+    background_tasks: &BackgroundTasks,
 ) {
-    tokio::spawn(async move {
+    let cancellation = background_tasks.cancellation();
+    background_tasks.spawn(async move {
         loop {
             #[cfg(test)]
             {
                 let pause_guard = inner.background_pause.lock().await;
                 drop(pause_guard);
             }
-            let Some(job) = background_rx.recv().await else {
+            let job = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => break,
+                job = background_rx.recv() => job,
+            };
+            let Some(job) = job else {
                 break;
             };
             #[cfg(test)]
