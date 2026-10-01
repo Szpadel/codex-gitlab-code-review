@@ -22,10 +22,10 @@ struct ExpectedExec {
 #[async_trait]
 pub(crate) trait RunnerHarness: Send + Sync {
     async fn ensure_image_available(&self, image: &str) -> Result<()>;
-    async fn remove_container_best_effort(&self, id: &str);
+    async fn remove_container_best_effort(&self, id: &str) -> Result<(), bollard::errors::Error>;
     /// Usage sessions must surface removal failures and retain the cleanup obligation.
     async fn remove_usage_container(&self, id: &str) -> Result<()> {
-        self.remove_container_best_effort(id).await;
+        self.remove_container_best_effort(id).await?;
         Ok(())
     }
     async fn start_app_server_container(
@@ -63,6 +63,7 @@ struct FakeRunnerHarnessState {
     next_browser_container_id: u64,
     ensured_images: Vec<String>,
     removed_containers: Vec<String>,
+    removal_errors: VecDeque<bollard::errors::Error>,
     usage_removal_errors: VecDeque<String>,
     scripted_app_servers: VecDeque<ScriptedAppServer>,
     app_server_starts: Vec<AppServerStartRecord>,
@@ -76,6 +77,10 @@ struct FakeRunnerHarnessState {
 }
 
 impl FakeRunnerHarness {
+    pub(crate) fn push_removal_error(&self, error: bollard::errors::Error) {
+        self.state.lock().unwrap().removal_errors.push_back(error);
+    }
+
     pub(crate) fn push_usage_removal_error(&self, error: &str) {
         self.state
             .lock()
@@ -194,19 +199,20 @@ impl RunnerHarness for FakeRunnerHarness {
         Ok(())
     }
 
-    async fn remove_container_best_effort(&self, id: &str) {
-        self.state
-            .lock()
-            .unwrap()
-            .removed_containers
-            .push(id.to_string());
+    async fn remove_container_best_effort(&self, id: &str) -> Result<(), bollard::errors::Error> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(error) = state.removal_errors.pop_front() {
+            return Err(error);
+        }
+        state.removed_containers.push(id.to_string());
+        Ok(())
     }
 
     async fn remove_usage_container(&self, id: &str) -> Result<()> {
         if let Some(error) = self.state.lock().unwrap().usage_removal_errors.pop_front() {
             bail!(error);
         }
-        self.remove_container_best_effort(id).await;
+        self.remove_container_best_effort(id).await?;
         Ok(())
     }
 

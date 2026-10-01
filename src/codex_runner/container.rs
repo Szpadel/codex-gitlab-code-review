@@ -158,17 +158,26 @@ impl DockerCodexRunner {
     }
 
     pub(crate) async fn remove_container_best_effort(&self, id: &str) {
-        match &self.runtime {
+        let result = match &self.runtime {
             RunnerRuntime::Docker { docker, .. } => {
-                let _ = docker
+                docker
                     .remove_container(
                         id,
                         Some(RemoveContainerOptionsBuilder::new().force(true).build()),
                     )
-                    .await;
+                    .await
             }
             #[cfg(test)]
             RunnerRuntime::Fake(harness) => harness.remove_container_best_effort(id).await,
+        };
+        match result {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(error) => {
+                warn!(container_id = id, error = %error, "failed to remove codex container");
+            }
         }
     }
 
@@ -392,7 +401,7 @@ impl DockerCodexRunner {
                 let Some(id) = container.id.as_deref() else {
                     continue;
                 };
-                harness.remove_container_best_effort(id).await;
+                self.remove_container_best_effort(id).await;
             }
             return;
         }

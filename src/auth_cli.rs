@@ -84,7 +84,7 @@ impl AuthRunner {
             .await
             .with_context(|| format!("start docker container {id}"));
         if let Err(err) = start_result {
-            self.remove_container_best_effort(&id).await;
+            self.remove_container_best_effort(&id, &name).await;
             return Err(err);
         }
 
@@ -106,7 +106,7 @@ impl AuthRunner {
         {
             Ok(attach) => attach,
             Err(err) => {
-                self.remove_container_best_effort(&id).await;
+                self.remove_container_best_effort(&id, &name).await;
                 return Err(err);
             }
         };
@@ -121,7 +121,7 @@ impl AuthRunner {
             .await
             .map_err(|err| anyhow!("auth output task failed: {err}"))?;
 
-        self.remove_container_best_effort(&id).await;
+        self.remove_container_best_effort(&id, &name).await;
         output_result?;
 
         let exit_status = exit_status_result?;
@@ -154,14 +154,25 @@ impl AuthRunner {
         env
     }
 
-    async fn remove_container_best_effort(&self, id: &str) {
-        let _ = self
+    async fn remove_container_best_effort(&self, id: &str, name: &str) {
+        let result = self
             .docker
             .remove_container(
                 id,
                 Some(RemoveContainerOptionsBuilder::new().force(true).build()),
             )
             .await;
+        match result {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {}
+            Err(error) => {
+                tracing::warn!(container_id = id, container_name = name, error = %error, "failed to remove auth container");
+                eprintln!("Warning: Cannot remove auth container {name} ({id}): {error}");
+                eprintln!("Remove it with: docker rm -f {id}");
+            }
+        }
     }
 }
 

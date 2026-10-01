@@ -1,4 +1,51 @@
 use super::*;
+
+#[derive(Clone)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn container_removal_warns_on_failure_but_not_when_already_removed() {
+    use tracing::instrument::WithSubscriber;
+
+    let harness = Arc::new(FakeRunnerHarness::default());
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
+    let log = LogCapture(Arc::new(Mutex::new(Vec::new())));
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+
+    async {
+        for status_code in [500, 404] {
+            harness.push_removal_error(bollard::errors::Error::DockerResponseServerError {
+                status_code,
+                message: "removal failed".to_string(),
+            });
+            runner.remove_container_best_effort("cleanup-id").await;
+        }
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(output.matches("WARN").count(), 1, "{output}");
+    assert!(output.contains("cleanup-id"), "{output}");
+    assert!(output.contains("removal failed"), "{output}");
+}
+
 #[tokio::test]
 async fn stop_active_review_containers_with_fake_runtime_filters_to_owned_managed_names() {
     let harness = Arc::new(FakeRunnerHarness::default());
