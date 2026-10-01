@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tar::Archive;
 use tokio::task;
+use tracing::warn;
 use uuid::Uuid;
 use zip::ZipArchive;
 
@@ -252,15 +253,15 @@ impl SkillsManagerInner {
         let prepared = self.prepare_archive_install(archive_name, bytes)?;
         let resolved_name = prepared.resolved_name.clone();
         let stage_root = prepared.stage_root.clone();
-        let cleanup_result = self.copy_stage_into_accounts(&resolved_name, &stage_root);
-        let cleanup_err = fs::remove_dir_all(&stage_root);
-        if let Err(err) = cleanup_result {
-            if let Err(cleanup) = cleanup_err {
-                return Err(err.context(format!("cleanup staged archive: {cleanup}")));
+        let install_result = self.copy_stage_into_accounts(&resolved_name, &stage_root);
+        let cleanup_result = cleanup_skill_directory(&stage_root);
+        if let Err(err) = install_result {
+            if let Err(cleanup) = cleanup_result {
+                return Err(err.context(format!("{cleanup:#}")));
             }
             return Err(err);
         }
-        cleanup_err.with_context(|| format!("cleanup staged archive {}", stage_root.display()))?;
+        cleanup_result?;
         Ok(resolved_name)
     }
 
@@ -363,8 +364,10 @@ impl SkillsManagerInner {
         fs::create_dir_all(&staged_root)
             .with_context(|| format!("create {}", staged_root.display()))?;
         if let Err(err) = write_archive_entries(&staged_root, &stripped) {
-            let _ = fs::remove_dir_all(&staged_root);
-            return Err(err);
+            return Err(Self::rollback_install(
+                std::slice::from_ref(&staged_root),
+                err,
+            ));
         }
         Ok(PreparedSkillArchive {
             resolved_name,
@@ -379,43 +382,55 @@ impl SkillsManagerInner {
             if let Err(err) = fs::create_dir_all(&skills_root)
                 .with_context(|| format!("create {}", skills_root.display()))
             {
-                Self::rollback_install(&installed_paths);
-                return Err(err);
+                return Err(Self::rollback_install(&installed_paths, err));
             }
             let final_path = skills_root.join(name);
             if final_path.exists() {
-                Self::rollback_install(&installed_paths);
-                bail!("skill already exists: {name}");
+                return Err(Self::rollback_install(
+                    &installed_paths,
+                    anyhow::anyhow!("skill already exists: {name}"),
+                ));
             }
             let temp_path = skills_root.join(format!(".install-{}-{}", name, Uuid::new_v4()));
-            if temp_path.exists() {
-                fs::remove_dir_all(&temp_path)
-                    .with_context(|| format!("cleanup {}", temp_path.display()))?;
+            if temp_path.exists()
+                && let Err(err) = cleanup_skill_directory(&temp_path)
+            {
+                return Err(Self::rollback_install(&installed_paths, err));
             }
             if let Err(err) = copy_dir(stage_root, &temp_path)
                 .with_context(|| format!("stage install into {}", temp_path.display()))
             {
-                let _ = fs::remove_dir_all(&temp_path);
-                Self::rollback_install(&installed_paths);
-                return Err(err);
+                installed_paths.push(temp_path);
+                return Err(Self::rollback_install(&installed_paths, err));
             }
             if let Err(err) = fs::rename(&temp_path, &final_path)
                 .with_context(|| format!("install skill into {}", final_path.display()))
             {
-                let _ = fs::remove_dir_all(&temp_path);
-                Self::rollback_install(&installed_paths);
-                return Err(err);
+                installed_paths.push(temp_path);
+                return Err(Self::rollback_install(&installed_paths, err));
             }
             installed_paths.push(final_path);
         }
         Ok(())
     }
 
-    fn rollback_install(installed_paths: &[PathBuf]) {
+    /// Attempts every removal and preserves the install error as the root cause.
+    fn rollback_install(installed_paths: &[PathBuf], mut error: anyhow::Error) -> anyhow::Error {
         for path in installed_paths {
-            let _ = fs::remove_dir_all(path);
+            if let Err(cleanup) = cleanup_skill_directory(path) {
+                error = error.context(format!("{cleanup:#}"));
+            }
         }
+        error
     }
+}
+
+/// Logs removal failures and includes the path in the returned error.
+fn cleanup_skill_directory(path: &Path) -> Result<()> {
+    fs::remove_dir_all(path).map_err(|error| {
+        warn!(path = %path.display(), %error, "skill cleanup failed");
+        anyhow::Error::new(error).context(format!("cleanup skill directory {}", path.display()))
+    })
 }
 
 impl SkillAggregate {

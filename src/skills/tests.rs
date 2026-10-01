@@ -151,6 +151,41 @@ fn list_skills_reports_synced_missing_and_mismatch_states() {
 }
 
 #[test]
+fn rollback_reports_cleanup_failures_with_residual_paths() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let residual = root.path().join("residual-skill");
+    fs::write(&residual, "not a directory")?;
+    let removable = root.path().join("removable-skill");
+    fs::create_dir(&removable)?;
+    let log_path = root.path().join("cleanup.log");
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(fs::File::create(&log_path)?)
+        .finish();
+
+    let error = tracing::subscriber::with_default(subscriber, || {
+        SkillsManagerInner::rollback_install(
+            &[residual.clone(), removable.clone()],
+            anyhow::anyhow!("original install failure"),
+        )
+    });
+
+    let log = fs::read_to_string(log_path)?;
+    assert!(
+        log.contains("WARN"),
+        "cleanup failure must produce a warning: {log}"
+    );
+    assert!(log.contains(residual.to_str().unwrap()));
+    assert!(error.to_string().contains(residual.to_str().unwrap()));
+    assert_eq!(error.root_cause().to_string(), "original install failure");
+    assert!(residual.exists());
+    assert!(!removable.exists());
+    Ok(())
+}
+
+#[test]
 fn install_archive_copies_skill_into_all_accounts() {
     let primary = TestDir::new("skills-install-primary");
     let backup = TestDir::new("skills-install-backup");
