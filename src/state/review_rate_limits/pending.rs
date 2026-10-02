@@ -65,6 +65,39 @@ impl PendingRepository {
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.
+    pub(super) async fn defer_review_rate_limit_pending_if_unchanged(
+        &self,
+        lane: ReviewLane,
+        repo: &str,
+        iid: u64,
+        observed_next_retry_at: i64,
+        next_retry_at: i64,
+    ) -> Result<bool> {
+        self.sqlite
+            .write_foreground("defer review rate limit pending", |pool| async move {
+                let result = sqlx::query(
+                    r"
+                    UPDATE runtime_review_rate_limit_pending
+                    SET next_retry_at = ?
+                    WHERE lane = ? AND repo = ? AND iid = ? AND next_retry_at = ?
+                    ",
+                )
+                .bind(next_retry_at)
+                .bind(lane.as_str())
+                .bind(repo)
+                .bind(sqlite_i64_from_u64(iid, "iid")?)
+                .bind(observed_next_retry_at)
+                .execute(&pool)
+                .await
+                .context("defer runtime review rate limit pending row")?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
     pub(super) async fn clear_review_rate_limit_pending(
         &self,
         lane: ReviewLane,

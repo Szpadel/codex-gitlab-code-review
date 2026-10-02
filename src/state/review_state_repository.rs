@@ -201,24 +201,6 @@ impl ReviewStateRepository {
             .collect()
     }
 
-    pub(crate) async fn has_in_progress_review(&self, repo: &str, iid: u64) -> Result<bool> {
-        let exists = sqlx::query_scalar::<_, i64>(
-            r"
-            SELECT EXISTS(
-                SELECT 1
-                FROM review_state
-                WHERE repo = ? AND iid = ? AND status = 'in_progress'
-            )
-            ",
-        )
-        .bind(repo)
-        .bind(i64::try_from(iid).context("convert review iid to i64")?)
-        .fetch_one(self.sqlite.read_pool())
-        .await
-        .context("check in-progress review")?;
-        Ok(exists != 0)
-    }
-
     /// # Errors
     ///
     /// Returns an error if stale in-progress review rows cannot be marked.

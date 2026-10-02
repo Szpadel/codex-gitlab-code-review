@@ -85,6 +85,45 @@ impl MentionQuotaPendingRepository {
             .await
     }
 
+    /// Sets `next_retry_at` only while the row still has `pending.next_retry_at`.
+    /// Both values are UTC Unix seconds. Other columns are not compared.
+    /// Returns `false` when another writer changed the retry time or cleared the row first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
+    pub async fn defer_mention_quota_pending_if_unchanged(
+        &self,
+        pending: &MentionQuotaPendingEntry,
+        next_retry_at: i64,
+    ) -> Result<bool> {
+        self.sqlite
+            .write_foreground("defer mention quota pending", |pool| async move {
+                let result = sqlx::query(
+                    r"
+                    UPDATE runtime_mention_quota_pending
+                    SET next_retry_at = ?
+                    WHERE repo = ? AND iid = ? AND discussion_id = ? AND trigger_note_id = ?
+                      AND next_retry_at = ?
+                    ",
+                )
+                .bind(next_retry_at)
+                .bind(&pending.repo)
+                .bind(sqlite_i64_from_u64(pending.iid, "iid")?)
+                .bind(&pending.discussion_id)
+                .bind(sqlite_i64_from_u64(
+                    pending.trigger_note_id,
+                    "trigger_note_id",
+                )?)
+                .bind(pending.next_retry_at)
+                .execute(&pool)
+                .await
+                .context("defer runtime mention quota pending row")?;
+                Ok(result.rows_affected() > 0)
+            })
+            .await
+    }
+
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.

@@ -1,4 +1,3 @@
-mod admission;
 mod scan_coordinator;
 mod scan_pipeline;
 mod service;

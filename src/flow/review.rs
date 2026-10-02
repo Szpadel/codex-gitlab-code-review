@@ -6,8 +6,8 @@ use crate::config::FeatureFlagSnapshot;
 use crate::flow::admission::AdmissionHistory;
 use crate::flow::award_service::AwardService;
 use crate::flow::orchestration::{
-    ActiveTaskKey, ScheduledTaskContext, finish_task_run_history, refund_review_rate_limits,
-    spawn_orchestrated_task, task_cancelled_finish, task_error_finish,
+    ScheduledTaskContext, finish_task_run_history, refund_review_rate_limits,
+    task_cancelled_finish, task_error_finish,
 };
 use crate::flow::retry::{
     REVIEW_RETRY_BLOCKED_DEFER_SECONDS, RetryBackoff, RetryGateStatus, RetryKey,
@@ -17,8 +17,11 @@ use crate::flow::review_comments::{
     PostReviewCommentRequest, REVIEW_FINDING_MARKER_PREFIX, post_review_comment,
 };
 use crate::flow::review_project::{ResolvedReviewProject, resolve_review_project};
+use crate::flow::run_queue::{JobKey, QueueJob, RunningHead};
 use crate::flow::{ActiveReviewKey, FlowShared, MergeRequestFlow};
-use crate::gitlab::{GitLabApi, MergeRequest, MergeRequestDiscussion, Note};
+use crate::gitlab::{
+    GitLabApi, MergeRequest, MergeRequestDiscussion, Note, gitlab_error_has_status,
+};
 use crate::lifecycle::ServiceLifecycle;
 use crate::review_deduplication::ReviewDiscussionSource;
 use crate::review_lane::ReviewLane;
@@ -29,23 +32,109 @@ use anyhow::{Error, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use std::sync::Arc;
-use tokio::sync::OwnedSemaphorePermit;
-use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+/// Error text of the fake GitLab clients in development mode and tests for a missing MR.
+const MR_NOT_FOUND_ERROR: &str = "mr not found";
+
+/// Decision for one lane of one MR, made by a scan or by a queued review when it starts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewScheduleOutcome {
     Scheduled,
     Disabled,
     SkippedBackoff,
     SkippedRetryExhausted,
-    SkippedRateLimit,
     SkippedQuota,
     SkippedAward,
     SkippedMarker,
     SkippedCompleted,
-    SkippedLocked,
     Interrupted,
+}
+
+impl ReviewScheduleOutcome {
+    /// Reports whether a pending rate-limit row must stay for this decision.
+    /// A quota block writes its own retry time, and an interrupted start retries later.
+    const fn keeps_pending_retry(self) -> bool {
+        matches!(self, Self::SkippedQuota | Self::Interrupted)
+    }
+}
+
+/// Why automatic reviews ignore an MR.
+#[derive(Debug)]
+pub(crate) enum ReviewSkipReason {
+    NotOpened,
+    Draft,
+    MissingCreatedAt,
+    BeforeCutoff,
+}
+
+/// Requires an opened, non-draft MR with a creation time after the cutoff.
+pub(crate) fn review_skip_reason(
+    mr: &MergeRequest,
+    created_after: DateTime<Utc>,
+) -> Option<ReviewSkipReason> {
+    if mr.state.as_deref() != Some("opened") {
+        return Some(ReviewSkipReason::NotOpened);
+    }
+    if mr.draft {
+        return Some(ReviewSkipReason::Draft);
+    }
+    let Some(created_at) = mr.created_at else {
+        return Some(ReviewSkipReason::MissingCreatedAt);
+    };
+    if created_at <= created_after {
+        return Some(ReviewSkipReason::BeforeCutoff);
+    }
+    None
+}
+
+/// Reports whether an MR lookup failed because the MR no longer exists.
+pub(crate) fn merge_request_lookup_reports_missing(err: &anyhow::Error) -> bool {
+    gitlab_error_has_status(err, &[404]) || format!("{err:#}").contains(MR_NOT_FOUND_ERROR)
+}
+
+/// MR states that a queued review still reviews when it starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReviewEligibility {
+    /// Opened, non-draft MRs created after the cutoff, as scans require.
+    Automatic,
+    /// Any MR that a caller asked to review. The caller checks the cutoff.
+    Explicit,
+}
+
+/// Review that waits in the run queue. When it starts, it reviews the latest MR head.
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedReview {
+    pub(crate) lane: ReviewLane,
+    pub(crate) repo: String,
+    pub(crate) iid: u64,
+    /// Head that the producer saw. Used only to recognize a running review of this head.
+    pub(crate) head_sha: String,
+    pub(crate) eligibility: ReviewEligibility,
+}
+
+impl QueueJob for QueuedReview {
+    fn key(&self) -> JobKey {
+        JobKey::Review {
+            lane: self.lane,
+            repo: self.repo.clone(),
+            iid: self.iid,
+        }
+    }
+
+    fn head_sha(&self) -> &str {
+        &self.head_sha
+    }
+
+    fn mention_branch(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Scan result for one lane: a job to queue, or the reason why no review is needed.
+pub(crate) enum ReviewAdmission {
+    Queue(QueuedReview),
+    Skip(ReviewScheduleOutcome),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,11 +146,6 @@ pub(crate) enum ReviewRunResult {
     Error,
     Flagged,
     Cancelled,
-}
-
-pub(crate) enum ReviewRunStatus {
-    Completed,
-    QuotaDeferred,
 }
 
 impl ReviewRunResult {
@@ -97,7 +181,11 @@ impl ReviewRunResult {
 
 enum ReviewGateOutcome {
     Ready(ReviewGateReady),
-    Decision(ReviewScheduleOutcome),
+    Skip(ReviewScheduleOutcome),
+    /// Another run holds the claim of this MR and lane. The retry gate is deferred.
+    ClaimBusy,
+    /// A rate limit blocks the review. The gate wrote a pending row.
+    RateLimited,
 }
 
 struct ReviewGateReady {
@@ -230,13 +318,14 @@ impl ReviewFlow {
         Ok(())
     }
 
-    async fn evaluate_review_gate(
+    /// Checks whether this lane must review `head_sha`. Takes no claim and no rate-limit bucket.
+    async fn review_skip_decision(
         &self,
         repo: &str,
         mr: &MergeRequest,
         head_sha: &str,
         history: &AdmissionHistory<'_>,
-    ) -> Result<ReviewGateOutcome> {
+    ) -> Result<Option<ReviewScheduleOutcome>> {
         let feature_flags = self.resolve_feature_flags().await?;
         if !self.is_enabled(&feature_flags) {
             let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
@@ -247,16 +336,27 @@ impl ReviewFlow {
                 self.clear_retry_gate_for_terminal_skip(&retry_key, repo, mr.iid)
                     .await;
             }
-            return Ok(ReviewGateOutcome::Decision(ReviewScheduleOutcome::Disabled));
+            return Ok(Some(ReviewScheduleOutcome::Disabled));
         }
-        let now = Utc::now().timestamp();
+        self.find_skip_reason(repo, mr, head_sha, &feature_flags, history)
+            .await
+    }
+
+    async fn evaluate_review_gate(
+        &self,
+        repo: &str,
+        mr: &MergeRequest,
+        head_sha: &str,
+        history: &AdmissionHistory<'_>,
+    ) -> Result<ReviewGateOutcome> {
         if let Some(outcome) = self
-            .find_skip_reason(repo, mr, head_sha, &feature_flags, history)
+            .review_skip_decision(repo, mr, head_sha, history)
             .await?
         {
-            return Ok(ReviewGateOutcome::Decision(outcome));
+            return Ok(ReviewGateOutcome::Skip(outcome));
         }
-        self.acquire_review_slot(repo, mr, head_sha, now).await
+        self.acquire_review_slot(repo, mr, head_sha, Utc::now().timestamp())
+            .await
     }
 
     async fn find_skip_reason(
@@ -308,17 +408,6 @@ impl ReviewFlow {
                     .await;
             }
             return Ok(Some(outcome));
-        }
-        if self.skipped_by_mention_lock(repo, mr.iid).await? {
-            if retry_was_due {
-                self.defer_retry_gate(
-                    repo,
-                    mr.iid,
-                    head_sha,
-                    Utc::now() + Duration::seconds(REVIEW_RETRY_BLOCKED_DEFER_SECONDS),
-                );
-            }
-            return Ok(Some(ReviewScheduleOutcome::SkippedLocked));
         }
         if self.skipped_by_codex_quota(repo, mr.iid, head_sha).await? {
             return Ok(Some(ReviewScheduleOutcome::SkippedQuota));
@@ -494,14 +583,6 @@ impl ReviewFlow {
         Ok(None)
     }
 
-    async fn skipped_by_mention_lock(&self, repo: &str, iid: u64) -> Result<bool> {
-        self.shared
-            .state
-            .mention_commands
-            .has_in_progress_mention_for_mr(repo, iid)
-            .await
-    }
-
     async fn acquire_review_slot(
         &self,
         repo: &str,
@@ -522,20 +603,13 @@ impl ReviewFlow {
                 head_sha,
                 Utc::now() + Duration::seconds(REVIEW_RETRY_BLOCKED_DEFER_SECONDS),
             );
-            return Ok(ReviewGateOutcome::Decision(
-                ReviewScheduleOutcome::SkippedLocked,
-            ));
+            return Ok(ReviewGateOutcome::ClaimBusy);
         }
-        let acquired_bucket_ids = match self
+        let Some(acquired_bucket_ids) = self
             .consume_review_rate_limits_for_gate(repo, mr.iid, head_sha, now)
             .await?
-        {
-            Some(bucket_ids) => bucket_ids,
-            None => {
-                return Ok(ReviewGateOutcome::Decision(
-                    ReviewScheduleOutcome::SkippedRateLimit,
-                ));
-            }
+        else {
+            return Ok(ReviewGateOutcome::RateLimited);
         };
         if self.shared.shutdown_requested() {
             return self
@@ -635,9 +709,7 @@ impl ReviewFlow {
         if let Some(refund_err) = refund_err {
             return Err(refund_err);
         }
-        Ok(ReviewGateOutcome::Decision(
-            ReviewScheduleOutcome::Interrupted,
-        ))
+        Ok(ReviewGateOutcome::Skip(ReviewScheduleOutcome::Interrupted))
     }
 
     async fn finish_review_slot_as_cancelled(
@@ -757,199 +829,162 @@ impl ReviewFlow {
         }
     }
 
-    async fn spawn_scheduled_review_task(
-        &self,
-        mr: MergeRequest,
-        prepared: PreparedReviewRun,
-        acquired_rule_ids: Vec<String>,
-        tasks: &mut Vec<JoinHandle<()>>,
-    ) {
-        let review_context = Arc::new(self.run_context(acquired_rule_ids));
-        let task = prepared.task.clone();
-        let review_key = ActiveReviewKey {
-            lane: review_context.lane,
-            repo: task.repo.clone(),
-            iid: task.iid,
-            head_sha: task.head_sha.clone(),
-        };
-        let context_for_semaphore_closed = Arc::clone(&review_context);
-        let closed_task = task.clone();
-        let context_for_start_rejected = Arc::clone(&review_context);
-        let rejected_task = task.clone();
-        spawn_orchestrated_task(
-            &self.shared,
-            ActiveTaskKey::Review(review_key),
-            tasks,
-            async {},
-            move |()| async move {
-                let err = Error::msg("review cancelled: semaphore closed");
-                context_for_semaphore_closed
-                    .finalize_setup_failure(
-                        &closed_task.repo,
-                        closed_task.iid,
-                        &closed_task.head_sha,
-                        closed_task.run_history_id,
-                        &err,
-                    )
-                    .await;
-            },
-            move |()| async move {
-                let retry_key = RetryKey::new(
-                    context_for_start_rejected.lane,
-                    &rejected_task.repo,
-                    rejected_task.iid,
-                    &rejected_task.head_sha,
-                );
-                if let Err(err) = context_for_start_rejected
-                    .finalize_cancelled(
-                        &rejected_task.repo,
-                        rejected_task.iid,
-                        &rejected_task.head_sha,
-                        &retry_key,
-                        rejected_task.run_history_id,
-                    )
-                    .await
-                {
-                    warn!(
-                        repo = rejected_task.repo.as_str(),
-                        error = %err,
-                        "failed to cancel queued review after shutdown"
-                    );
-                }
-            },
-            move |()| async move {
-                if let Err(err) = review_context
-                    .run(
-                        &task.repo,
-                        mr,
-                        &task.head_sha,
-                        prepared.feature_flags,
-                        task.run_history_id,
-                    )
-                    .await
-                {
-                    warn!(repo = task.repo.as_str(), error = %err, "review failed");
-                }
-            },
-        )
-        .await;
-    }
-
-    async fn acquire_review_permit_or_abort(
+    /// Decides whether this lane must review `head_sha`. The caller queues the returned job.
+    ///
+    /// Takes no claim and no rate-limit bucket. The job checks again when it starts.
+    pub(crate) async fn admit_for_scan(
         &self,
         repo: &str,
-        iid: u64,
+        mr: &MergeRequest,
         head_sha: &str,
-        run_history_id: i64,
-        acquired_rule_ids: &[String],
-    ) -> Result<OwnedSemaphorePermit> {
-        match self.shared.semaphore.clone().acquire_owned().await {
-            Ok(permit) => Ok(permit),
-            Err(err) => {
-                let err = Error::from(err);
-                self.abort_review_after_setup_failure(
-                    repo,
-                    iid,
-                    head_sha,
-                    run_history_id,
-                    acquired_rule_ids,
-                    &err,
-                )
-                .await;
-                Err(err)
-            }
+        history: &AdmissionHistory<'_>,
+    ) -> Result<ReviewAdmission> {
+        if let Some(outcome) = self
+            .review_skip_decision(repo, mr, head_sha, history)
+            .await?
+        {
+            return Ok(ReviewAdmission::Skip(outcome));
+        }
+        Ok(ReviewAdmission::Queue(QueuedReview {
+            lane: self.lane,
+            repo: repo.to_string(),
+            iid: mr.iid,
+            head_sha: head_sha.to_string(),
+            eligibility: ReviewEligibility::Automatic,
+        }))
+    }
+
+    /// Runs a queued review for the latest head of its MR. Holds a run slot for the whole call.
+    ///
+    /// A failure is logged and makes the next incremental scan read the repository again.
+    pub(crate) async fn run_queued(&self, job: QueuedReview, running_head: RunningHead) {
+        assert_eq!(
+            job.lane, self.lane,
+            "a queued review must run in its own lane"
+        );
+        if let Err(err) = self.start_queued(&job, &running_head).await {
+            warn!(
+                repo = job.repo.as_str(),
+                iid = job.iid,
+                lane = self.lane.as_str(),
+                error = %format!("{err:#}"),
+                "queued review failed"
+            );
+            self.request_rescan(&job);
         }
     }
 
-    /// Shares remote history across lanes during one scan admission.
-    pub(crate) async fn schedule_for_scan(
-        &self,
-        repo: &str,
-        mr: MergeRequest,
-        head_sha: &str,
-        tasks: &mut Vec<JoinHandle<()>>,
-        history: &AdmissionHistory<'_>,
-    ) -> Result<ReviewScheduleOutcome> {
-        let acquired_rule_ids = match self
-            .evaluate_review_gate(repo, &mr, head_sha, history)
-            .await?
+    async fn start_queued(&self, job: &QueuedReview, running_head: &RunningHead) -> Result<()> {
+        let repo = job.repo.as_str();
+        let mr = match self.shared.gitlab.get_mr(repo, job.iid).await {
+            Ok(mr) => mr,
+            Err(err) if merge_request_lookup_reports_missing(&err) => {
+                debug!(
+                    repo,
+                    iid = job.iid,
+                    lane = self.lane.as_str(),
+                    "skip queued review: merge request no longer exists"
+                );
+                return self
+                    .clear_review_rate_limit_pending_if_needed(repo, job.iid)
+                    .await;
+            }
+            Err(err) => return Err(err.context("refresh merge request for queued review")),
+        };
+        if job.eligibility == ReviewEligibility::Automatic
+            && let Some(reason) = review_skip_reason(&mr, self.shared.created_after)
         {
-            ReviewGateOutcome::Decision(decision) => return Ok(decision),
-            ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
-        };
-        let prepared = self
-            .prepare_review_run(repo, mr.iid, head_sha, &acquired_rule_ids)
-            .await?;
-        self.clear_review_rate_limit_pending_or_abort(
-            repo,
-            mr.iid,
-            head_sha,
-            prepared.task.run_history_id,
-            &acquired_rule_ids,
-        )
-        .await?;
-        self.spawn_scheduled_review_task(mr, prepared, acquired_rule_ids, tasks)
-            .await;
-        Ok(ReviewScheduleOutcome::Scheduled)
-    }
-
-    pub(crate) async fn run_for_mr(
-        &self,
-        repo: &str,
-        mr: MergeRequest,
-        head_sha: &str,
-    ) -> Result<ReviewScheduleOutcome> {
-        let Ok(_admission) = self.shared.task_admission.acquire().await else {
-            return Ok(ReviewScheduleOutcome::Interrupted);
-        };
-        let history = AdmissionHistory::new(self.shared.gitlab.as_ref(), repo, mr.iid);
-        let acquired_rule_ids = match self
-            .evaluate_review_gate(repo, &mr, head_sha, &history)
-            .await?
-        {
-            ReviewGateOutcome::Decision(decision) => return Ok(decision),
-            ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
-        };
-        let prepared = self
-            .prepare_review_run(repo, mr.iid, head_sha, &acquired_rule_ids)
-            .await?;
-        let _permit = self
-            .acquire_review_permit_or_abort(
+            debug!(
                 repo,
-                mr.iid,
-                head_sha,
-                prepared.task.run_history_id,
-                &acquired_rule_ids,
-            )
-            .await?;
-        self.clear_review_rate_limit_pending_or_abort(
-            repo,
-            mr.iid,
-            head_sha,
-            prepared.task.run_history_id,
-            &acquired_rule_ids,
-        )
-        .await?;
-        let review_context = self.run_context(acquired_rule_ids.clone());
+                iid = job.iid,
+                lane = self.lane.as_str(),
+                ?reason,
+                "skip queued review: merge request is not eligible"
+            );
+            return self
+                .clear_review_rate_limit_pending_if_needed(repo, job.iid)
+                .await;
+        }
+        let Some(head_sha) = mr.head_sha() else {
+            warn!(
+                repo,
+                iid = job.iid,
+                lane = self.lane.as_str(),
+                "skip queued review: merge request has no head sha"
+            );
+            return Ok(());
+        };
+        running_head.set(&head_sha);
+        if head_sha != job.head_sha {
+            debug!(
+                repo,
+                iid = job.iid,
+                lane = self.lane.as_str(),
+                queued_head_sha = job.head_sha.as_str(),
+                head_sha = head_sha.as_str(),
+                "queued review uses the latest head"
+            );
+        }
+        let history = AdmissionHistory::new(self.shared.gitlab.as_ref(), repo, job.iid);
+        let acquired_rule_ids = match self
+            .evaluate_review_gate(repo, &mr, &head_sha, &history)
+            .await?
+        {
+            ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
+            ReviewGateOutcome::Skip(outcome) => {
+                if !outcome.keeps_pending_retry() {
+                    self.clear_review_rate_limit_pending_if_needed(repo, job.iid)
+                        .await?;
+                }
+                return Ok(());
+            }
+            // Only a run that ended without cleanup leaves a busy claim. Retry after the stale sweep.
+            ReviewGateOutcome::ClaimBusy => {
+                self.request_rescan(job);
+                return Ok(());
+            }
+            ReviewGateOutcome::RateLimited => return Ok(()),
+        };
+        // Heartbeats keep the claim alive while the review runs.
         let _active_review = self.shared.active_tasks.track_review(ActiveReviewKey {
             lane: self.lane,
-            repo: prepared.task.repo.clone(),
-            iid: prepared.task.iid,
-            head_sha: prepared.task.head_sha.clone(),
+            repo: repo.to_string(),
+            iid: job.iid,
+            head_sha: head_sha.clone(),
         });
-        review_context
+        let prepared = self
+            .prepare_review_run(repo, job.iid, &head_sha, &acquired_rule_ids)
+            .await?;
+        self.clear_review_rate_limit_pending_or_abort(
+            repo,
+            job.iid,
+            &head_sha,
+            prepared.task.run_history_id,
+            &acquired_rule_ids,
+        )
+        .await?;
+        self.run_context(acquired_rule_ids)
             .run(
-                &prepared.task.repo,
+                repo,
                 mr,
-                &prepared.task.head_sha,
+                &head_sha,
                 prepared.feature_flags,
                 prepared.task.run_history_id,
             )
             .await
-            .map(|status| match status {
-                ReviewRunStatus::Completed => ReviewScheduleOutcome::Scheduled,
-                ReviewRunStatus::QuotaDeferred => ReviewScheduleOutcome::SkippedQuota,
-            })
+    }
+
+    /// Makes the next incremental scan queue this review again. Delays a due retry of the MR.
+    fn request_rescan(&self, job: &QueuedReview) {
+        self.shared.rescan_requests.request(&job.repo);
+        // A due retry wakes the scheduler at once. Without a delay, a repeating failure would loop.
+        let now = Utc::now();
+        self.retry_backoff.defer_due_for_mr(
+            &job.repo,
+            job.iid,
+            now,
+            now + Duration::seconds(REVIEW_RETRY_BLOCKED_DEFER_SECONDS),
+        );
     }
 
     async fn resolve_feature_flags(&self) -> Result<FeatureFlagSnapshot> {
@@ -1384,67 +1419,6 @@ impl ReviewRunContext {
         Ok(())
     }
 
-    async fn finalize_setup_failure(
-        &self,
-        repo: &str,
-        iid: u64,
-        head_sha: &str,
-        run_history_id: i64,
-        err: &anyhow::Error,
-    ) {
-        if let Err(recovery_err) =
-            refund_review_rate_limits(&self.state, &self.acquired_rate_limit_rule_ids).await
-        {
-            warn!(
-                repo = repo,
-                iid = iid,
-                head_sha = head_sha,
-                error = %recovery_err,
-                "failed to refund rate limit rules after queued review setup error"
-            );
-        }
-        if let Err(recovery_err) = self
-            .state
-            .review_state
-            .finish_review_for_lane(
-                repo,
-                iid,
-                head_sha,
-                self.lane,
-                ReviewRunResult::Error.as_str(),
-            )
-            .await
-        {
-            warn!(
-                repo = repo,
-                iid = iid,
-                head_sha = head_sha,
-                error = %recovery_err,
-                "failed to release review lock after queued review setup error"
-            );
-        }
-        let task = ScheduledTaskContext::new(repo, iid, head_sha, run_history_id);
-        if let Err(recovery_err) = finish_task_run_history(
-            &self.state,
-            &task,
-            task_error_finish(
-                ReviewRunResult::Error.as_str(),
-                self.review_preview(repo, iid),
-                err,
-            ),
-        )
-        .await
-        {
-            warn!(
-                repo = repo,
-                iid = iid,
-                head_sha = head_sha,
-                error = %recovery_err,
-                "failed to finalize run history after queued review setup error"
-            );
-        }
-    }
-
     async fn bail_if_start_rejected(&self, run: &ReviewRunIdentity<'_>) -> Result<bool> {
         if self.should_reject_new_starts() {
             self.finalize_cancelled(
@@ -1699,7 +1673,7 @@ impl ReviewRunContext {
         head_sha: &str,
         feature_flags: FeatureFlagSnapshot,
         run_history_id: i64,
-    ) -> Result<ReviewRunStatus> {
+    ) -> Result<()> {
         let retry_key = RetryKey::new(self.lane, repo, mr.iid, head_sha);
         let run_identity = ReviewRunIdentity {
             repo,
@@ -1710,7 +1684,7 @@ impl ReviewRunContext {
         };
         let inline_review_comments_enabled = feature_flags.gitlab_inline_review_comments;
         if self.bail_if_start_rejected(&run_identity).await? {
-            return Ok(ReviewRunStatus::Completed);
+            return Ok(());
         }
 
         self.retry_warning_awards
@@ -1730,25 +1704,24 @@ impl ReviewRunContext {
         let discussion_source = review_ctx.discussion_source.clone();
 
         if self.bail_if_start_rejected(&run_identity).await? {
-            return Ok(ReviewRunStatus::Completed);
+            return Ok(());
         }
 
         let _started_run = self.lifecycle.track_started_run();
         let result = self.codex.run_review(review_ctx).await;
         if self.bail_if_cancelled(&run_identity).await? {
-            return Ok(ReviewRunStatus::Completed);
+            return Ok(());
         }
         self.remove_eyes_best_effort(repo, mr.iid).await;
         if self.bail_if_cancelled(&run_identity).await? {
-            return Ok(ReviewRunStatus::Completed);
+            return Ok(());
         }
 
-        let status = match result {
+        match result {
             Ok(CodexResult::Pass { summary }) => {
                 if let Err(err) = self.handle_pass(&run_identity, summary).await {
                     self.handle_error(&run_identity, err).await?;
                 }
-                ReviewRunStatus::Completed
             }
             Ok(CodexResult::Comment(comment)) => {
                 if let Err(err) = self
@@ -1764,26 +1737,21 @@ impl ReviewRunContext {
                 {
                     self.handle_error(&run_identity, err).await?;
                 }
-                ReviewRunStatus::Completed
             }
             Err(err) => {
                 if let Some(quota) = err.downcast_ref::<CodexQuotaExhausted>() {
                     let quota = quota.clone();
                     self.handle_quota_exhausted(&run_identity, &quota).await?;
-                    ReviewRunStatus::QuotaDeferred
                 } else if self.lane.is_security()
                     && err.downcast_ref::<SecurityReviewContentFlagged>().is_some()
                 {
                     self.handle_flagged(&run_identity, err).await?;
-                    ReviewRunStatus::Completed
                 } else {
                     self.handle_error(&run_identity, err).await?;
-                    ReviewRunStatus::Completed
                 }
             }
-        };
-
-        Ok(status)
+        }
+        Ok(())
     }
 }
 

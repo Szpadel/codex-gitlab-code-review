@@ -45,7 +45,7 @@ async fn check_pending_mention_failure(discussion_error: Option<&str>) -> Result
         default_created_after(),
     );
 
-    let result = service.process_due_pending_rate_limit_reviews().await;
+    let result = service.process_due_pending_retries().await;
     assert!(result.is_err(), "mention read failures must be reported");
     let pending = state
         .mention_quota_pending

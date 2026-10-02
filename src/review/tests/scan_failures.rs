@@ -128,7 +128,7 @@ async fn scan_continues_after_repository_failure_and_joins_reviews() -> Result<(
 }
 
 #[tokio::test]
-async fn failed_incremental_scan_waits_for_started_reviews() -> Result<()> {
+async fn failed_incremental_scan_returns_while_its_queued_review_runs() -> Result<()> {
     let mut config = test_config();
     config.gitlab.targets.repos =
         TargetSelector::List(vec!["group/a-ok".to_string(), "group/b-fail".to_string()]);
@@ -143,25 +143,29 @@ async fn failed_incremental_scan_waits_for_started_reviews() -> Result<()> {
     tokio::pin!(started);
     started.as_mut().enable();
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    let service = ReviewService::new(
+    let service = Arc::new(ReviewService::new(
         config,
         Arc::new(gitlab),
         state.clone(),
         runner.clone(),
         1,
         default_created_after(),
-    );
-    let mut scan = tokio::spawn(async move { service.scan_once_incremental().await });
+    ));
+    let scan_result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        service.scan_once_incremental(),
+    )
+    .await?;
     tokio::time::timeout(std::time::Duration::from_secs(2), started).await?;
-
-    let returned_early =
-        tokio::time::timeout(std::time::Duration::from_millis(20), &mut scan).await;
+    let running_after_scan = *runner.review_calls.lock().unwrap();
     runner.release_first.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), service.wait_for_idle()).await?;
+
     assert!(
-        returned_early.is_err(),
-        "a failed scan must wait for its review tasks"
+        scan_result.is_err(),
+        "the failed repository must fail the scan"
     );
-    assert!(scan.await?.is_err());
+    assert_eq!(running_after_scan, 1, "the queued review keeps running");
     let history = state
         .run_history
         .list_run_history_for_mr("group/a-ok", 1)

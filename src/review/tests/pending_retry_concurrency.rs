@@ -33,28 +33,11 @@ impl CodexRunner for PendingRetryRunner {
     }
 }
 
-#[tokio::test]
-async fn pending_reviews_start_concurrently_within_the_limit() -> Result<()> {
-    check_pending_review_batch(RetryBatchExit::Complete).await
-}
-
-#[tokio::test]
-async fn pending_review_drain_finishes_started_retries_and_keeps_unadmitted_rows() -> Result<()> {
-    check_pending_review_batch(RetryBatchExit::GracefulDrain).await
-}
-
-enum RetryBatchExit {
-    Complete,
-    GracefulDrain,
-}
-
-async fn check_pending_review_batch(exit: RetryBatchExit) -> Result<()> {
-    let drain = matches!(exit, RetryBatchExit::GracefulDrain);
-    let mut config = test_config();
-    config.review.max_concurrent = 2;
-    let gitlab = fake_gitlab((1..=4).map(|iid| mr(iid, &format!("sha{iid}"))).collect());
-    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-    for iid in 1..=4 {
+async fn due_general_reviews(
+    state: &ReviewStateStore,
+    iids: std::ops::RangeInclusive<u64>,
+) -> Result<()> {
+    for iid in iids {
         state
             .review_rate_limit
             .upsert_review_rate_limit_pending(
@@ -67,7 +50,19 @@ async fn check_pending_review_batch(exit: RetryBatchExit) -> Result<()> {
             )
             .await?;
     }
-    let (started, mut starts) = mpsc::unbounded_channel();
+    Ok(())
+}
+
+fn blocking_service(
+    config: crate::config::Config,
+    gitlab: Arc<FakeGitLab>,
+    state: Arc<ReviewStateStore>,
+) -> (
+    Arc<ReviewService>,
+    mpsc::UnboundedReceiver<u64>,
+    Arc<Semaphore>,
+) {
+    let (started, starts) = mpsc::unbounded_channel();
     let release = Arc::new(Semaphore::new(0));
     let runner = Arc::new(PendingRetryRunner {
         started,
@@ -76,45 +71,44 @@ async fn check_pending_review_batch(exit: RetryBatchExit) -> Result<()> {
     let service = Arc::new(ReviewService::new(
         config,
         gitlab,
-        state.clone(),
+        state,
         runner,
         1,
         default_created_after(),
     ));
-    let retries = {
-        let service = service.clone();
-        tokio::spawn(async move { service.process_due_pending_rate_limit_reviews().await })
-    };
-    let first = tokio::time::timeout(std::time::Duration::from_secs(1), starts.recv()).await?;
-    assert!(first.is_some());
-    let second = tokio::time::timeout(std::time::Duration::from_millis(200), starts.recv()).await;
-    let extra = tokio::time::timeout(std::time::Duration::from_millis(50), starts.recv()).await;
-    if drain {
-        service.request_graceful_drain();
-    }
-    release.add_permits(4);
-    let status = tokio::time::timeout(std::time::Duration::from_secs(5), retries).await???;
+    (service, starts, release)
+}
 
+#[tokio::test]
+async fn pending_wake_returns_before_queued_reviews_finish() -> Result<()> {
+    let mut config = test_config();
+    config.review.max_concurrent = 2;
+    let gitlab = fake_gitlab((1..=4).map(|iid| mr(iid, &format!("sha{iid}"))).collect());
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    due_general_reviews(&state, 1..=4).await?;
+    let (service, mut starts, release) = blocking_service(config, gitlab, state.clone());
+
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        service.queue_due_pending_retries(),
+    )
+    .await??;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(1), starts.recv()).await?;
+    let second = tokio::time::timeout(std::time::Duration::from_secs(1), starts.recv()).await?;
+    let extra = tokio::time::timeout(std::time::Duration::from_millis(50), starts.recv()).await;
+    release.add_permits(4);
+    tokio::time::timeout(std::time::Duration::from_secs(5), service.wait_for_idle()).await?;
+
+    assert_eq!(status, ScanRunStatus::Completed);
+    assert!(first.is_some() && second.is_some());
+    assert!(extra.is_err(), "the third review must wait for a run slot");
     assert!(
-        matches!(second, Ok(Some(_))),
-        "two due pending reviews must start before either completes"
+        state
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?
+            .is_empty()
     );
-    assert!(extra.is_err(), "the third retry must wait for a permit");
-    let pending = state
-        .review_rate_limit
-        .list_review_rate_limit_pending()
-        .await?;
-    if drain {
-        assert_eq!(status, ScanRunStatus::Interrupted);
-        assert_eq!(
-            pending.iter().map(|row| row.iid).collect::<Vec<_>>(),
-            vec![3, 4]
-        );
-        assert!(pending.iter().all(|row| row.next_retry_at == 0));
-    } else {
-        assert_eq!(status, ScanRunStatus::Completed);
-        assert!(pending.is_empty());
-    }
     assert_eq!(
         state
             .run_history
@@ -122,7 +116,52 @@ async fn check_pending_review_batch(exit: RetryBatchExit) -> Result<()> {
             .await?
             .runs
             .len(),
-        if drain { 2 } else { 4 }
+        4
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn graceful_drain_keeps_pending_rows_of_dropped_reviews() -> Result<()> {
+    let mut config = test_config();
+    config.review.max_concurrent = 2;
+    let gitlab = fake_gitlab((1..=4).map(|iid| mr(iid, &format!("sha{iid}"))).collect());
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    due_general_reviews(&state, 1..=4).await?;
+    let (service, mut starts, release) = blocking_service(config, gitlab, state.clone());
+
+    service.queue_due_pending_retries().await?;
+    let mut started = vec![
+        tokio::time::timeout(std::time::Duration::from_secs(1), starts.recv()).await?,
+        tokio::time::timeout(std::time::Duration::from_secs(1), starts.recv()).await?,
+    ];
+    service.request_graceful_drain();
+    release.add_permits(4);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        service.wait_for_active_tasks(),
+    )
+    .await?;
+
+    started.sort();
+    assert_eq!(started, vec![Some(1), Some(2)]);
+    let pending = state
+        .review_rate_limit
+        .list_review_rate_limit_pending()
+        .await?;
+    assert_eq!(
+        pending.iter().map(|row| row.iid).collect::<Vec<_>>(),
+        vec![3, 4],
+        "dropped reviews keep their pending rows for the next process"
+    );
+    assert_eq!(
+        state
+            .run_history
+            .list_run_history(&RunHistoryListQuery::default())
+            .await?
+            .runs
+            .len(),
+        2
     );
     assert!(
         state
@@ -195,8 +234,7 @@ async fn pending_mentions_start_concurrently_on_separate_branches() -> Result<()
         1,
         default_created_after(),
     ));
-    let retries =
-        tokio::spawn(async move { service.process_due_pending_rate_limit_reviews().await });
+    let status = service.queue_due_pending_retries().await?;
     assert!(
         tokio::time::timeout(std::time::Duration::from_secs(1), starts.recv())
             .await?
@@ -204,10 +242,8 @@ async fn pending_mentions_start_concurrently_on_separate_branches() -> Result<()
     );
     let second = tokio::time::timeout(std::time::Duration::from_millis(200), starts.recv()).await;
     release.add_permits(2);
-    assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(5), retries).await???,
-        ScanRunStatus::Completed
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), service.wait_for_idle()).await?;
+    assert_eq!(status, ScanRunStatus::Completed);
     assert!(
         matches!(second, Ok(Some(_))),
         "due mentions on separate branches must start concurrently"
@@ -230,94 +266,112 @@ async fn pending_mentions_start_concurrently_on_separate_branches() -> Result<()
 }
 
 #[tokio::test]
-async fn pending_retry_failure_drains_started_work_and_keeps_unadmitted_rows() -> Result<()> {
+async fn pending_review_start_failure_keeps_its_row_and_requests_a_rescan() -> Result<()> {
     let mut config = test_config();
     config.review.max_concurrent = 2;
     let gitlab = fake_gitlab((1..=3).map(|iid| mr(iid, &format!("sha{iid}"))).collect());
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
     sqlx::query("CREATE TRIGGER reject_first_history BEFORE INSERT ON run_history WHEN NEW.iid = 1 BEGIN SELECT RAISE(FAIL, 'history unavailable'); END")
         .execute(state.pool()).await?;
-    for iid in 1..=3 {
-        state
-            .review_rate_limit
-            .upsert_review_rate_limit_pending(
-                ReviewLane::General,
-                "group/repo",
-                iid,
-                &format!("sha{iid}"),
-                0,
-                0,
-            )
-            .await?;
-    }
-    let (started, mut starts) = mpsc::unbounded_channel();
-    let release = Arc::new(Semaphore::new(0));
-    let service = Arc::new(ReviewService::new(
-        config,
-        gitlab,
-        state.clone(),
-        Arc::new(PendingRetryRunner {
-            started,
-            release: release.clone(),
-        }),
-        1,
-        default_created_after(),
-    ));
-    let retries = {
-        let service = service.clone();
-        tokio::spawn(async move { service.process_due_pending_rate_limit_reviews().await })
-    };
-    assert_eq!(
-        tokio::time::timeout(std::time::Duration::from_secs(1), starts.recv()).await?,
-        Some(2)
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let pending = state
-                .review_rate_limit
-                .list_review_rate_limit_pending()
-                .await?;
-            if pending
-                .iter()
-                .any(|row| row.iid == 1 && row.next_retry_at > Utc::now().timestamp())
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
-    assert!(
-        !retries.is_finished(),
-        "a retry error must not abandon started work"
-    );
-    release.add_permits(1);
-    let error = tokio::time::timeout(std::time::Duration::from_secs(5), retries)
-        .await??
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("history unavailable"));
-    service.wait_for_active_tasks().await;
+    due_general_reviews(&state, 1..=3).await?;
+    let (service, _starts, release) = blocking_service(config, gitlab, state.clone());
+
+    release.add_permits(3);
+    let status = service.process_due_pending_retries().await?;
+
+    assert_eq!(status, ScanRunStatus::Completed);
     let pending = state
         .review_rate_limit
         .list_review_rate_limit_pending()
         .await?;
-    assert_eq!(pending.len(), 2);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].iid, 1);
     assert!(
-        pending
-            .iter()
-            .any(|row| row.iid == 1 && row.next_retry_at > Utc::now().timestamp())
+        pending[0].next_retry_at > Utc::now().timestamp(),
+        "the failed review must wait before its next attempt"
     );
     assert!(
-        pending
-            .iter()
-            .any(|row| row.iid == 3 && row.next_retry_at == 0),
-        "unadmitted work must stay due"
+        service.rescan_requests.pending("group/repo").is_some(),
+        "a start failure must make the next incremental scan read the repository"
     );
     assert!(
         state
             .review_state
             .list_in_progress_reviews()
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_mention_keeps_its_row_while_a_mention_of_its_mr_runs() -> Result<()> {
+    let mut config = test_config();
+    config.review.max_concurrent = 2;
+    config.review.mention_commands.enabled = true;
+    config.review.mention_commands.bot_username = Some("bot".to_string());
+    let gitlab = fake_gitlab(vec![mr(1, "sha1")]);
+    let author = GitLabUser {
+        id: 7,
+        username: Some("alice".to_string()),
+        name: None,
+    };
+    gitlab.discussions.lock().unwrap().insert(
+        ("group/repo".to_string(), 1),
+        vec![MergeRequestDiscussion {
+            id: "discussion".to_string(),
+            individual_note: false,
+            notes: [10, 11]
+                .into_iter()
+                .map(|id| DiscussionNote {
+                    id,
+                    body: "@bot please check".to_string(),
+                    author: author.clone(),
+                    system: false,
+                    in_reply_to_id: None,
+                    created_at: None,
+                })
+                .collect(),
+        }],
+    );
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    for trigger_note_id in [10, 11] {
+        state
+            .mention_quota_pending
+            .upsert_mention_quota_pending(crate::state::MentionQuotaPendingUpsert {
+                repo: "group/repo",
+                iid: 1,
+                discussion_id: "discussion",
+                trigger_note_id,
+                head_sha: "sha1",
+                blocked_at: 0,
+                next_retry_at: 0,
+            })
+            .await?;
+    }
+    let (service, mut starts, release) = blocking_service(config, gitlab, state.clone());
+
+    service.queue_due_pending_retries().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(1), starts.recv()).await?;
+    let second_start =
+        tokio::time::timeout(std::time::Duration::from_millis(50), starts.recv()).await;
+    let waiting_rows = state
+        .mention_quota_pending
+        .list_mention_quota_pending()
+        .await?;
+    release.add_permits(2);
+    tokio::time::timeout(std::time::Duration::from_secs(5), service.wait_for_idle()).await?;
+
+    assert!(
+        second_start.is_err(),
+        "two mentions of one MR never run at the same time"
+    );
+    assert_eq!(waiting_rows.len(), 1, "the waiting mention keeps its row");
+    assert!(waiting_rows[0].next_retry_at > Utc::now().timestamp());
+    assert!(
+        state
+            .mention_quota_pending
+            .list_mention_quota_pending()
             .await?
             .is_empty()
     );

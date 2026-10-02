@@ -338,12 +338,17 @@ impl RetryBackoff {
         deferred
     }
 
-    pub(crate) fn earliest_retry_at(&self) -> Option<DateTime<Utc>> {
+    /// Returns the earliest retry time of retries for which `is_queued` is false.
+    /// A retry whose review already waits or runs must not wake the scheduler.
+    pub(crate) fn earliest_retry_at(
+        &self,
+        is_queued: impl Fn(&RetryKey) -> bool,
+    ) -> Option<DateTime<Utc>> {
         let entries = self.entries.lock().unwrap();
         entries
-            .values()
-            .filter(|state| !state.exhausted)
-            .filter_map(|state| state.next_retry_at)
+            .iter()
+            .filter(|(key, state)| !state.exhausted && !is_queued(key))
+            .filter_map(|(_, state)| state.next_retry_at)
             .min()
     }
 

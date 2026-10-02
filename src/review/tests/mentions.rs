@@ -468,8 +468,12 @@ async fn mention_history_insert_failure_releases_mention_lock() -> Result<()> {
         default_created_after(),
     );
 
-    assert!(service.scan_once().await.is_err());
+    service.scan_once().await?;
     assert_eq!(*runner.mention_calls.lock().unwrap(), 0);
+    assert!(
+        service.rescan_requests.pending("group/repo").is_some(),
+        "the failed start must make the next scan read the repository"
+    );
     assert!(
         state
             .mention_commands
@@ -599,7 +603,7 @@ async fn mention_run_history_uses_refreshed_mr_sha() -> Result<()> {
 }
 
 #[tokio::test]
-async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<()> {
+async fn mentions_snapshot_feature_flags_when_they_start() -> Result<()> {
     let mut config = test_config();
     config.review.max_concurrent = 1;
     config.review.mention_commands.enabled = true;
@@ -749,18 +753,6 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
     };
     tokio::time::timeout(std::time::Duration::from_secs(1), first_started_wait).await?;
 
-    for _ in 0..50 {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM run_history WHERE kind = 'mention'")
-                .fetch_one(state.pool())
-                .await?;
-        if count == 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
     state
         .feature_flags
         .set_runtime_feature_flag_overrides(&crate::config::RuntimeFeatureFlagOverrides {
@@ -773,42 +765,28 @@ async fn queued_mentions_snapshot_feature_flags_before_runner_start() -> Result<
             security_review: None,
         })
         .await?;
-
-    let mut snapshots = Vec::new();
-    for _ in 0..50 {
-        let rows = sqlx::query(
-            "SELECT feature_flags_json FROM run_history WHERE kind = 'mention' ORDER BY trigger_note_id",
-        )
-        .fetch_all(state.pool())
-        .await?;
-        if rows.len() == 2 {
-            snapshots = rows
-                .into_iter()
-                .map(|row| {
-                    let json: String = row.try_get("feature_flags_json")?;
-                    let snapshot =
-                        serde_json::from_str::<crate::config::FeatureFlagSnapshot>(&json)?;
-                    Ok(snapshot)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if snapshots
-                .iter()
-                .all(|snapshot| snapshot.gitlab_discovery_mcp)
-            {
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert_eq!(snapshots.len(), 2);
-    assert!(
-        snapshots
-            .iter()
-            .all(|snapshot| snapshot.gitlab_discovery_mcp)
-    );
-
     release_first.notify_waiters();
     scan_task.await??;
+
+    let snapshots = sqlx::query(
+        "SELECT feature_flags_json FROM run_history WHERE kind = 'mention' ORDER BY trigger_note_id",
+    )
+    .fetch_all(state.pool())
+    .await?
+    .into_iter()
+    .map(|row| {
+        let json: String = row.try_get("feature_flags_json")?;
+        Ok(serde_json::from_str::<crate::config::FeatureFlagSnapshot>(&json)?)
+    })
+    .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.gitlab_discovery_mcp)
+            .collect::<Vec<_>>(),
+        vec![true, false],
+        "each run snapshots the flags when it starts"
+    );
     Ok(())
 }
 

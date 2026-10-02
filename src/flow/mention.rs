@@ -7,9 +7,9 @@ use crate::flow::award_service::AwardService;
 use crate::flow::comment_text::sanitize_comment_text;
 use crate::flow::mention_assets::collect_note_image_uploads;
 use crate::flow::orchestration::{
-    ActiveTaskKey, ScheduledTaskContext, finish_task_run_history, spawn_orchestrated_task,
-    task_cancelled_finish, task_error_finish,
+    ScheduledTaskContext, finish_task_run_history, task_cancelled_finish, task_error_finish,
 };
+use crate::flow::run_queue::{JobKey, QueueJob};
 use crate::flow::{ActiveMentionKey, FlowShared, MergeRequestFlow};
 use crate::gitlab::links::{extract_root_relative_markdown_urls, gitlab_web_base};
 use crate::gitlab::{DiscussionNote, GitLabUser, MergeRequest, MergeRequestDiscussion};
@@ -23,10 +23,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
-use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
-use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -42,13 +39,56 @@ pub(crate) struct RequesterIdentity {
     email: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct MentionScheduleOutcome {
-    pub(crate) scheduled: usize,
+/// Mention command that waits in the run queue.
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedMention {
+    repo: String,
+    /// MR as the scan saw it. The command reads the MR again when it starts.
+    mr: MergeRequest,
+    head_sha: String,
+    trigger: MentionTrigger,
+    command_repo: String,
+    /// Command repository and source branch. Commands with one key push to one branch.
+    branch_key: String,
+}
+
+impl QueuedMention {
+    pub(crate) fn discussion_id(&self) -> &str {
+        &self.trigger.discussion_id
+    }
+
+    pub(crate) fn trigger_note_id(&self) -> u64 {
+        self.trigger.trigger_note.id
+    }
+}
+
+impl QueueJob for QueuedMention {
+    fn key(&self) -> JobKey {
+        JobKey::Mention {
+            repo: self.repo.clone(),
+            iid: self.mr.iid,
+            discussion_id: self.trigger.discussion_id.clone(),
+            trigger_note_id: self.trigger.trigger_note.id,
+        }
+    }
+
+    fn head_sha(&self) -> &str {
+        &self.head_sha
+    }
+
+    fn mention_branch(&self) -> Option<&str> {
+        Some(&self.branch_key)
+    }
+}
+
+/// Mention triggers of one MR found by a scan.
+#[derive(Debug, Default)]
+pub(crate) struct MentionAdmission {
+    pub(crate) jobs: Vec<QueuedMention>,
+    /// Triggers that already run or have finished.
     pub(crate) skipped_processed: usize,
+    /// Triggers that the codex quota blocks. Each one has a pending row.
     pub(crate) quota_blocked: usize,
-    pub(crate) blocks_review: bool,
-    pub(crate) blocked_pending_work: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,66 +100,27 @@ struct MentionSetupFailureContext<'a> {
 
 struct PreparedMentionRun {
     task: ScheduledTaskContext,
-    source_branch_key: String,
     requester: RequesterIdentity,
     feature_flags: FeatureFlagSnapshot,
 }
 
-/// Retains a branch entry through acquisition, execution, and cancellation.
-struct MentionBranchLock {
-    locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
-    key: String,
-    lock: Arc<TokioMutex<()>>,
-    guard: Option<OwnedMutexGuard<()>>,
-}
-
-impl MentionBranchLock {
-    fn new(locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>, key: String) -> Self {
-        let lock = locks
-            .lock()
-            .unwrap()
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(TokioMutex::new(())))
-            .clone();
-        Self {
-            locks,
-            key,
-            lock,
-            guard: None,
-        }
-    }
-
-    async fn acquire(mut self) -> Self {
-        self.guard = Some(self.lock.clone().lock_owned().await);
-        self
-    }
-}
-
-impl Drop for MentionBranchLock {
-    fn drop(&mut self) {
-        self.guard.take();
-        let mut locks = self.locks.lock().unwrap();
-        // Only the map and this holder remain. Waiters retain their own Arc.
-        if Arc::strong_count(&self.lock) == 2 {
-            locks.remove(&self.key);
-        }
-    }
+/// Claimed mention command with everything needed to run it.
+struct MentionExecution {
+    repo: String,
+    command_repo: String,
+    mr: MergeRequest,
+    head_sha: String,
+    trigger: MentionTrigger,
+    prepared: PreparedMentionRun,
 }
 
 pub(crate) struct MentionFlow {
     shared: FlowShared,
-    mention_branch_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
 }
 
 impl MentionFlow {
-    pub(crate) fn new(
-        shared: FlowShared,
-        mention_branch_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
-    ) -> Self {
-        Self {
-            shared,
-            mention_branch_locks,
-        }
+    pub(crate) fn new(shared: FlowShared) -> Self {
+        Self { shared }
     }
 
     pub(crate) async fn clear_stale_in_progress(&self) -> Result<()> {
@@ -380,20 +381,13 @@ impl MentionFlow {
         Ok(path_with_namespace.to_string())
     }
 
-    fn mention_branch_lock(&self, command_repo: &str, source_branch: &str) -> MentionBranchLock {
-        MentionBranchLock::new(
-            Arc::clone(&self.mention_branch_locks),
-            format!("{command_repo}::{source_branch}"),
-        )
-    }
-
     async fn collect_mention_triggers(
         &self,
         repo: &str,
         iid: u64,
         discussions: &[MergeRequestDiscussion],
         bot_username: &str,
-        outcome: &mut MentionScheduleOutcome,
+        skipped_processed: &mut usize,
     ) -> Result<Vec<MentionTrigger>> {
         let mut triggers = Vec::new();
         for discussion in discussions {
@@ -412,14 +406,8 @@ impl MentionFlow {
                     .mention_command_scan_state(repo, iid, &discussion.id, note.id)
                     .await?
                 {
-                    MentionCommandScanState::InProgress => {
-                        outcome.skipped_processed += 1;
-                        outcome.blocks_review = true;
-                        outcome.blocked_pending_work = true;
-                        continue;
-                    }
-                    MentionCommandScanState::Completed => {
-                        outcome.skipped_processed += 1;
+                    MentionCommandScanState::InProgress | MentionCommandScanState::Completed => {
+                        *skipped_processed += 1;
                         continue;
                     }
                     MentionCommandScanState::Ready => {}
@@ -566,12 +554,6 @@ impl MentionFlow {
             }
         };
         let task = ScheduledTaskContext::new(repo, mr.iid, head_sha, run_history_id);
-        let source_branch_key = mr
-            .source_branch
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .unwrap_or("(unknown-source-branch)")
-            .to_string();
         let feature_flags = match self.resolve_feature_flags().await {
             Ok(feature_flags) => feature_flags,
             Err(err) => {
@@ -610,36 +592,24 @@ impl MentionFlow {
             .await;
         Ok(PreparedMentionRun {
             task,
-            source_branch_key,
             requester,
             feature_flags,
         })
     }
 
-    pub(crate) async fn schedule_for_scan(
+    /// Finds unprocessed mention triggers of one MR and returns them as jobs to queue.
+    ///
+    /// Takes no claim. A codex quota block writes a pending row instead of a job.
+    pub(crate) async fn admit_for_scan(
         &self,
         repo: &str,
         mr: &MergeRequest,
         head_sha: &str,
-        tasks: &mut Vec<JoinHandle<()>>,
-    ) -> Result<MentionScheduleOutcome> {
-        let history = AdmissionHistory::new(self.shared.gitlab.as_ref(), repo, mr.iid);
-        self.schedule_with_admission(repo, mr, head_sha, tasks, &history)
-            .await
-    }
-
-    /// Uses the same discussion snapshot as the review lanes during admission.
-    pub(crate) async fn schedule_with_admission(
-        &self,
-        repo: &str,
-        mr: &MergeRequest,
-        head_sha: &str,
-        tasks: &mut Vec<JoinHandle<()>>,
         history: &AdmissionHistory<'_>,
-    ) -> Result<MentionScheduleOutcome> {
-        let mut outcome = MentionScheduleOutcome::default();
+    ) -> Result<MentionAdmission> {
+        let mut admission = MentionAdmission::default();
         if !self.mention_commands_enabled() {
-            return Ok(outcome);
+            return Ok(admission);
         }
         if self.shared.config.review.dry_run {
             info!(
@@ -647,14 +617,14 @@ impl MentionFlow {
                 iid = mr.iid,
                 "dry run: skipping mention-command trigger processing"
             );
-            return Ok(outcome);
+            return Ok(admission);
         }
         let Some(bot_username) = self.mention_bot_username() else {
             warn!("mention commands enabled but bot username unavailable; skipping triggers");
-            return Ok(outcome);
+            return Ok(admission);
         };
         if self.shared.shutdown_requested() {
-            return Ok(outcome);
+            return Ok(admission);
         }
         // GitLab merge request discussions cover both standalone comments
         // (individual_note discussions) and threaded replies.
@@ -665,579 +635,614 @@ impl MentionFlow {
             )
         })?;
         let triggers = self
-            .collect_mention_triggers(repo, mr.iid, discussions, bot_username, &mut outcome)
+            .collect_mention_triggers(
+                repo,
+                mr.iid,
+                discussions,
+                bot_username,
+                &mut admission.skipped_processed,
+            )
             .await?;
         let command_repo = self.resolve_mention_command_repo(repo, mr).await?;
-        let mention_eyes_emoji = self.mention_eyes_emoji();
-        let additional_developer_instructions = self
-            .shared
-            .config
-            .review
-            .mention_commands
-            .additional_developer_instructions
-            .clone();
-        let gitlab_base_url = gitlab_web_base(&self.shared.config.gitlab.base_url);
+        let source_branch = mr
+            .source_branch
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("(unknown-source-branch)");
+        let branch_key = format!("{command_repo}::{source_branch}");
         for trigger in triggers {
             if self.shared.shutdown_requested() {
                 break;
             }
-            let trigger_note_id = trigger.trigger_note.id;
             if self
-                .shared
-                .state
-                .review_state
-                .has_in_progress_review(repo, mr.iid)
+                .record_quota_block(repo, mr.iid, head_sha, &trigger)
                 .await?
-                || self
-                    .shared
-                    .state
-                    .mention_commands
-                    .has_in_progress_mention_for_mr(repo, mr.iid)
-                    .await?
             {
-                outcome.blocks_review = true;
-                outcome.blocked_pending_work = true;
+                admission.quota_blocked += 1;
                 continue;
             }
-            let now = Utc::now();
-            if let Some(block) = self.shared.codex.quota_block(now).await? {
-                self.shared
-                    .state
-                    .mention_quota_pending
-                    .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
-                        repo,
-                        iid: mr.iid,
-                        discussion_id: &trigger.discussion_id,
-                        trigger_note_id,
-                        head_sha,
-                        blocked_at: now.timestamp(),
-                        next_retry_at: block.retry_at.timestamp(),
-                    })
-                    .await?;
-                self.ensure_quota_award_best_effort(
+            admission.jobs.push(QueuedMention {
+                repo: repo.to_string(),
+                mr: mr.clone(),
+                head_sha: head_sha.to_string(),
+                trigger,
+                command_repo: command_repo.clone(),
+                branch_key: branch_key.clone(),
+            });
+        }
+        Ok(admission)
+    }
+
+    /// Runs a queued mention command. Holds a run slot for the whole call.
+    ///
+    /// A failure is logged and makes the next incremental scan read the repository again.
+    pub(crate) async fn run_queued(&self, job: QueuedMention) {
+        let repo = job.repo.clone();
+        let iid = job.mr.iid;
+        let trigger_note_id = job.trigger.trigger_note.id;
+        if let Err(err) = self.start_queued(job).await {
+            warn!(
+                repo = repo.as_str(),
+                iid,
+                trigger_note_id,
+                error = %format!("{err:#}"),
+                "queued mention command failed"
+            );
+            self.shared.rescan_requests.request(&repo);
+        }
+    }
+
+    async fn start_queued(&self, job: QueuedMention) -> Result<()> {
+        let QueuedMention {
+            repo,
+            mr,
+            head_sha,
+            trigger,
+            command_repo,
+            ..
+        } = job;
+        let trigger_note_id = trigger.trigger_note.id;
+        if self
+            .record_quota_block(&repo, mr.iid, &head_sha, &trigger)
+            .await?
+        {
+            return Ok(());
+        }
+        if !self
+            .shared
+            .state
+            .mention_commands
+            .begin_mention_command(
+                &repo,
+                mr.iid,
+                &trigger.discussion_id,
+                trigger_note_id,
+                &head_sha,
+            )
+            .await?
+        {
+            // A finished command or a run that ended without cleanup holds the claim.
+            // The next scan skips a finished trigger and retries after a stale sweep.
+            debug!(
+                repo = repo.as_str(),
+                iid = mr.iid,
+                trigger_note_id,
+                "skip queued mention command: trigger is already claimed"
+            );
+            self.shared.rescan_requests.request(&repo);
+            return Ok(());
+        }
+        // Heartbeats keep the claim alive while the command runs.
+        let _active_mention = self.shared.active_tasks.track_mention(ActiveMentionKey {
+            repo: repo.clone(),
+            iid: mr.iid,
+            discussion_id: trigger.discussion_id.clone(),
+            trigger_note_id,
+            head_sha: head_sha.clone(),
+        });
+        self.clear_quota_pending_at_start(&repo, mr.iid, &trigger)
+            .await;
+        let prepared = self
+            .prepare_mention_run(&repo, &mr, &head_sha, &command_repo, &trigger)
+            .await?;
+        self.execute_mention(MentionExecution {
+            repo,
+            command_repo,
+            mr,
+            head_sha,
+            trigger,
+            prepared,
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Writes a pending row and the quota award when the codex quota blocks the trigger.
+    async fn record_quota_block(
+        &self,
+        repo: &str,
+        iid: u64,
+        head_sha: &str,
+        trigger: &MentionTrigger,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        let Some(block) = self.shared.codex.quota_block(now).await? else {
+            return Ok(false);
+        };
+        let trigger_note_id = trigger.trigger_note.id;
+        self.shared
+            .state
+            .mention_quota_pending
+            .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+                repo,
+                iid,
+                discussion_id: &trigger.discussion_id,
+                trigger_note_id,
+                head_sha,
+                blocked_at: now.timestamp(),
+                next_retry_at: block.retry_at.timestamp(),
+            })
+            .await?;
+        self.ensure_quota_award_best_effort(repo, iid, &trigger.discussion_id, trigger_note_id)
+            .await;
+        Ok(true)
+    }
+
+    async fn clear_quota_pending_at_start(&self, repo: &str, iid: u64, trigger: &MentionTrigger) {
+        let trigger_note_id = trigger.trigger_note.id;
+        match self
+            .shared
+            .state
+            .mention_quota_pending
+            .clear_mention_quota_pending(repo, iid, &trigger.discussion_id, trigger_note_id)
+            .await
+        {
+            Ok(true) => {
+                self.remove_quota_award_best_effort(
                     repo,
-                    mr.iid,
+                    iid,
                     &trigger.discussion_id,
                     trigger_note_id,
                 )
                 .await;
-                outcome.quota_blocked += 1;
-                outcome.blocks_review = true;
-                outcome.blocked_pending_work = true;
-                continue;
             }
-            if !self
-                .shared
-                .state
-                .mention_commands
-                .begin_mention_command(
-                    repo,
-                    mr.iid,
-                    &trigger.discussion_id,
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    repo = repo,
+                    iid = iid,
+                    discussion_id = trigger.discussion_id.as_str(),
                     trigger_note_id,
-                    head_sha,
-                )
-                .await?
-            {
-                outcome.skipped_processed += 1;
-                continue;
+                    error = %err,
+                    "failed to clear mention quota pending row at run start"
+                );
             }
-            match self
-                .shared
-                .state
-                .mention_quota_pending
-                .clear_mention_quota_pending(repo, mr.iid, &trigger.discussion_id, trigger_note_id)
+        }
+    }
+
+    /// Runs a claimed mention command and publishes its result. Logs every failure.
+    async fn execute_mention(&self, run: MentionExecution) {
+        let MentionExecution {
+            repo: repo_name,
+            command_repo: command_repo_name,
+            mr: mr_copy,
+            head_sha: head_sha_copy,
+            trigger,
+            prepared,
+        } = run;
+        let PreparedMentionRun {
+            task: task_for_run_history,
+            requester,
+            feature_flags,
+        } = prepared;
+        let run_history_id = task_for_run_history.run_history_id;
+        let gitlab = &self.shared.gitlab;
+        let codex = &self.shared.codex;
+        let state = &self.shared.state;
+        let lifecycle = &self.shared.lifecycle;
+        let award_service = &self.shared.award_service;
+        let config = &self.shared.config;
+        let eyes_emoji = self.mention_eyes_emoji();
+        let quota_emoji = config.review.quota_emoji.clone();
+        let additional_developer_instructions = config
+            .review
+            .mention_commands
+            .additional_developer_instructions
+            .clone();
+        let gitlab_base_url = gitlab_web_base(&config.gitlab.base_url);
+        let discussion_id = trigger.discussion_id.clone();
+        let trigger_note_id = trigger.trigger_note.id;
+        let effective_mr = match gitlab.get_mr(&repo_name, mr_copy.iid).await {
+            Ok(latest) => latest,
+            Err(err) => {
+                warn!(
+                    repo = repo_name.as_str(),
+                    iid = mr_copy.iid,
+                    discussion_id = discussion_id.as_str(),
+                    trigger_note_id,
+                    error = %err,
+                    "failed to refresh MR before mention command; using scheduled snapshot"
+                );
+                mr_copy.clone()
+            }
+        };
+        let effective_head_sha = effective_mr
+            .head_sha()
+            .unwrap_or_else(|| head_sha_copy.clone());
+        if effective_head_sha != head_sha_copy
+            && let Err(err) = state
+                .run_history
+                .update_run_history_head_sha(run_history_id, &effective_head_sha)
                 .await
-            {
-                Ok(true) => {
-                    self.remove_quota_award_best_effort(
-                        repo,
-                        mr.iid,
-                        &trigger.discussion_id,
-                        trigger_note_id,
-                    )
-                    .await;
-                }
-                Ok(false) => {}
-                Err(err) => {
-                    warn!(
-                        repo = repo,
-                        iid = mr.iid,
-                        discussion_id = trigger.discussion_id.as_str(),
-                        trigger_note_id,
-                        error = %err,
-                        "failed to clear mention quota pending row at run start"
-                    );
-                }
-            }
-            let prepared = self
-                .prepare_mention_run(repo, mr, head_sha, &command_repo, &trigger)
-                .await?;
-            let task = prepared.task.clone();
-            let branch_lock = self.mention_branch_lock(&command_repo, &prepared.source_branch_key);
-            let gitlab = Arc::clone(&self.shared.gitlab);
-            let codex = Arc::clone(&self.shared.codex);
-            let state = Arc::clone(&self.shared.state);
-            let lifecycle = Arc::clone(&self.shared.lifecycle);
-            let award_service = self.shared.award_service.clone();
-            let repo_name = task.repo.clone();
-            let command_repo_name = command_repo.clone();
-            let mr_copy = mr.clone();
-            let head_sha_copy = task.head_sha.clone();
-            let eyes_emoji = mention_eyes_emoji.clone();
-            let quota_emoji = self.shared.config.review.quota_emoji.clone();
-            let additional_developer_instructions = additional_developer_instructions.clone();
-            let gitlab_base_url = gitlab_base_url.clone();
-            let requester = prepared.requester;
-            let feature_flags = prepared.feature_flags;
-            let config = self.shared.config.clone();
-            let run_history_id = task.run_history_id;
-            outcome.scheduled += 1;
-            outcome.blocks_review = true;
-            outcome.blocked_pending_work = true;
-            let mention_iid = task.iid;
-            let trigger_discussion_id = trigger.discussion_id.clone();
-            let trigger_note_id = trigger.trigger_note.id;
-            let mention_key = ActiveMentionKey {
-                repo: repo_name.clone(),
-                iid: mention_iid,
-                discussion_id: trigger_discussion_id.clone(),
+        {
+            warn!(
+                repo = repo_name.as_str(),
+                iid = mr_copy.iid,
+                discussion_id = discussion_id.as_str(),
                 trigger_note_id,
-                head_sha: head_sha_copy.clone(),
-            };
-            let closed_repo = repo_name.clone();
-            let rejected_task = task.clone();
-            let rejected_discussion_id = trigger_discussion_id.clone();
-            let state_for_rejection = Arc::clone(&state);
-            let awards_for_rejection = award_service.clone();
-            let eyes_for_rejection = eyes_emoji.clone();
-            let task_for_run_history = task.clone();
-            spawn_orchestrated_task(
-                &self.shared,
-                ActiveTaskKey::Mention(mention_key),
-                tasks,
-                async move { branch_lock.acquire().await },
-                move |_branch_guard| async move {
+                head_sha = effective_head_sha.as_str(),
+                error = %err,
+                "failed to refresh mention run history head sha"
+            );
+        }
+        let prompt = MentionFlow::build_mention_prompt(
+            &repo_name,
+            &effective_mr,
+            &effective_head_sha,
+            &trigger,
+            &gitlab_base_url,
+        );
+        let image_uploads = collect_note_image_uploads(&trigger.parent_chain, &gitlab_base_url);
+        if let Err(err) = award_service
+            .ensure_discussion_note_award(
+                &repo_name,
+                mr_copy.iid,
+                &discussion_id,
+                trigger_note_id,
+                &eyes_emoji,
+            )
+            .await
+        {
+            let error_chain = format!("{err:#}");
+            warn!(
+                repo = repo_name.as_str(),
+                iid = mr_copy.iid,
+                discussion_id = discussion_id.as_str(),
+                trigger_note_id,
+                error = %err,
+                error_chain = error_chain.as_str(),
+                "failed to add in-progress eyes reaction to mention trigger note"
+            );
+        }
+
+        let command_context = MentionCommandContext {
+            repo: command_repo_name.clone(),
+            project_path: command_repo_name.clone(),
+            discussion_project_path: repo_name.clone(),
+            mr: effective_mr,
+            head_sha: effective_head_sha.clone(),
+            discussion_id: discussion_id.clone(),
+            trigger_note_id,
+            requester_name: requester.name.clone(),
+            requester_email: requester.email.clone(),
+            additional_developer_instructions,
+            prompt,
+            image_uploads,
+            feature_flags,
+            run_history_id: Some(run_history_id),
+        };
+        if !lifecycle.accepts_new_work() {
+            MentionFlow::finalize_rejected_start(
+                state,
+                award_service,
+                &eyes_emoji,
+                MentionSetupFailureContext {
+                    task: &task_for_run_history,
+                    discussion_id: &discussion_id,
+                    trigger_note_id,
+                },
+            )
+            .await;
+            return;
+        }
+        let _started_run = lifecycle.track_started_run();
+        let outcome = codex.run_mention_command(command_context).await;
+        let (state_result, status_message, run_history_finish, post_status_note) = match outcome {
+            Ok(MentionCommandResult {
+                status: MentionCommandStatus::Committed,
+                commit_sha,
+                reply_message,
+            }) => {
+                let mut message = if reply_message.trim().is_empty() {
+                    "Mention command completed.".to_string()
+                } else {
+                    reply_message
+                };
+                if let Some(ref commit_sha) = commit_sha {
+                    let short_sha: String = commit_sha.chars().take(7).collect();
+                    let has_sha = message.contains(commit_sha.as_str())
+                        || (!short_sha.is_empty() && message.contains(short_sha.as_str()));
+                    if !has_sha {
+                        let _ = write!(message, "\n\nCommit SHA: `{commit_sha}`");
+                    }
+                }
+                (
+                    "committed",
+                    message.clone(),
+                    RunHistoryFinish {
+                        result: "committed".to_string(),
+                        preview: Some(format!(
+                            "Mention {} !{} note {}",
+                            repo_name, mr_copy.iid, trigger_note_id
+                        )),
+                        summary: Some(message),
+                        commit_sha,
+                        ..RunHistoryFinish::default()
+                    },
+                    true,
+                )
+            }
+            Ok(MentionCommandResult {
+                status: MentionCommandStatus::NoChanges,
+                reply_message,
+                ..
+            }) => {
+                let message = if reply_message.trim().is_empty() {
+                    "Mention command completed with no code changes.".to_string()
+                } else {
+                    reply_message
+                };
+                (
+                    "no_changes",
+                    message.clone(),
+                    RunHistoryFinish {
+                        result: "no_changes".to_string(),
+                        preview: Some(format!(
+                            "Mention {} !{} note {}",
+                            repo_name, mr_copy.iid, trigger_note_id
+                        )),
+                        summary: Some(message),
+                        ..RunHistoryFinish::default()
+                    },
+                    true,
+                )
+            }
+            Err(err) => {
+                if let Some(quota) = err.downcast_ref::<CodexQuotaExhausted>() {
+                    let quota = quota.clone();
                     warn!(
-                        repo = closed_repo.as_str(),
-                        iid = mention_iid,
-                        "mention command cancelled: semaphore closed"
+                        repo = repo_name.as_str(),
+                        iid = mr_copy.iid,
+                        discussion_id = discussion_id.as_str(),
+                        trigger_note_id,
+                        reset_at = %quota.reset_at,
+                        retry_at = %quota.retry_at,
+                        "mention command deferred because codex quota is exhausted"
                     );
-                },
-                move |_branch_guard| async move {
-                    MentionFlow::finalize_rejected_start(
-                        &state_for_rejection,
-                        &awards_for_rejection,
-                        &eyes_for_rejection,
-                        MentionSetupFailureContext {
-                            task: &rejected_task,
-                            discussion_id: &rejected_discussion_id,
+                    let now = Utc::now();
+                    if let Err(err) = state
+                        .mention_quota_pending
+                        .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+                            repo: &repo_name,
+                            iid: mr_copy.iid,
+                            discussion_id: &discussion_id,
                             trigger_note_id,
-                        },
-                    )
-                    .await;
-                },
-                move |branch_guard| async move {
-                    let _branch_guard = branch_guard;
-                    let discussion_id = trigger.discussion_id.clone();
-                    let trigger_note_id = trigger.trigger_note.id;
-                    let effective_mr = match gitlab.get_mr(&repo_name, mr_copy.iid).await {
-                        Ok(latest) => latest,
-                        Err(err) => {
-                            warn!(
-                                repo = repo_name.as_str(),
-                                iid = mr_copy.iid,
-                                discussion_id = discussion_id.as_str(),
-                                trigger_note_id,
-                                error = %err,
-                                "failed to refresh MR before mention command; using scheduled snapshot"
-                            );
-                            mr_copy.clone()
-                        }
-                    };
-                    let effective_head_sha = effective_mr
-                        .head_sha()
-                        .unwrap_or_else(|| head_sha_copy.clone());
-                    if effective_head_sha != head_sha_copy
-                        && let Err(err) = state
-                            .run_history
-                            .update_run_history_head_sha(run_history_id, &effective_head_sha)
-                            .await
+                            head_sha: &head_sha_copy,
+                            blocked_at: now.timestamp(),
+                            next_retry_at: quota.retry_at.timestamp(),
+                        })
+                        .await
                     {
                         warn!(
                             repo = repo_name.as_str(),
                             iid = mr_copy.iid,
                             discussion_id = discussion_id.as_str(),
                             trigger_note_id,
-                            head_sha = effective_head_sha.as_str(),
                             error = %err,
-                            "failed to refresh mention run history head sha"
+                            "failed to persist mention quota pending row"
                         );
                     }
-                    let prompt = MentionFlow::build_mention_prompt(
-                        &repo_name,
-                        &effective_mr,
-                        &effective_head_sha,
-                        &trigger,
-                        &gitlab_base_url,
-                    );
-                    let image_uploads =
-                        collect_note_image_uploads(&trigger.parent_chain, &gitlab_base_url);
                     if let Err(err) = award_service
                         .ensure_discussion_note_award(
                             &repo_name,
                             mr_copy.iid,
                             &discussion_id,
                             trigger_note_id,
-                            &eyes_emoji,
+                            &quota_emoji,
                         )
                         .await
                     {
-                        let error_chain = format!("{err:#}");
                         warn!(
                             repo = repo_name.as_str(),
                             iid = mr_copy.iid,
                             discussion_id = discussion_id.as_str(),
                             trigger_note_id,
                             error = %err,
-                            error_chain = error_chain.as_str(),
-                            "failed to add in-progress eyes reaction to mention trigger note"
+                            "failed to add mention quota award"
                         );
                     }
-
-                    let command_context = MentionCommandContext {
-                        repo: command_repo_name.clone(),
-                        project_path: command_repo_name.clone(),
-                        discussion_project_path: repo_name.clone(),
-                        mr: effective_mr,
-                        head_sha: effective_head_sha.clone(),
-                        discussion_id: discussion_id.clone(),
+                    let mut finish = task_cancelled_finish(
+                        "cancelled",
+                        format!(
+                            "Mention {} !{} note {}",
+                            repo_name, mr_copy.iid, trigger_note_id
+                        ),
+                    );
+                    finish.summary = Some(format!(
+                        "deferred: codex quota exhausted until {}",
+                        quota.reset_at
+                    ));
+                    ("cancelled", String::new(), finish, false)
+                } else {
+                    let error_chain = format!("{err:#}");
+                    warn!(
+                        repo = repo_name.as_str(),
+                        iid = mr_copy.iid,
+                        discussion_id = discussion_id.as_str(),
                         trigger_note_id,
-                        requester_name: requester.name.clone(),
-                        requester_email: requester.email.clone(),
-                        additional_developer_instructions,
-                        prompt,
-                        image_uploads,
-                        feature_flags,
-                        run_history_id: Some(run_history_id),
-                    };
-                    if !lifecycle.accepts_new_work() {
-                        MentionFlow::finalize_rejected_start(
-                            &state,
-                            &award_service,
-                            &eyes_emoji,
-                            MentionSetupFailureContext {
-                                task: &task_for_run_history,
-                                discussion_id: &discussion_id,
-                                trigger_note_id,
-                            },
-                        )
-                        .await;
-                        return;
-                    }
-                    let _started_run = lifecycle.track_started_run();
-                    let outcome = codex.run_mention_command(command_context).await;
-                    let (state_result, status_message, run_history_finish, post_status_note) =
-                        match outcome {
-                            Ok(MentionCommandResult {
-                                status: MentionCommandStatus::Committed,
-                                commit_sha,
-                                reply_message,
-                            }) => {
-                                let mut message = if reply_message.trim().is_empty() {
-                                    "Mention command completed.".to_string()
-                                } else {
-                                    reply_message
-                                };
-                                if let Some(ref commit_sha) = commit_sha {
-                                    let short_sha: String = commit_sha.chars().take(7).collect();
-                                    let has_sha = message.contains(commit_sha.as_str())
-                                        || (!short_sha.is_empty()
-                                            && message.contains(short_sha.as_str()));
-                                    if !has_sha {
-                                        let _ = write!(message, "\n\nCommit SHA: `{commit_sha}`");
-                                    }
-                                }
-                                (
-                                    "committed",
-                                    message.clone(),
-                                    RunHistoryFinish {
-                                        result: "committed".to_string(),
-                                        preview: Some(format!(
-                                            "Mention {} !{} note {}",
-                                            repo_name, mr_copy.iid, trigger_note_id
-                                        )),
-                                        summary: Some(message),
-                                        commit_sha,
-                                        ..RunHistoryFinish::default()
-                                    },
-                                    true,
-                                )
-                            }
-                            Ok(MentionCommandResult {
-                                status: MentionCommandStatus::NoChanges,
-                                reply_message,
-                                ..
-                            }) => {
-                                let message = if reply_message.trim().is_empty() {
-                                    "Mention command completed with no code changes.".to_string()
-                                } else {
-                                    reply_message
-                                };
-                                (
-                                    "no_changes",
-                                    message.clone(),
-                                    RunHistoryFinish {
-                                        result: "no_changes".to_string(),
-                                        preview: Some(format!(
-                                            "Mention {} !{} note {}",
-                                            repo_name, mr_copy.iid, trigger_note_id
-                                        )),
-                                        summary: Some(message),
-                                        ..RunHistoryFinish::default()
-                                    },
-                                    true,
-                                )
-                            }
-                            Err(err) => {
-                                if let Some(quota) = err.downcast_ref::<CodexQuotaExhausted>() {
-                                    let quota = quota.clone();
-                                    warn!(
-                                        repo = repo_name.as_str(),
-                                        iid = mr_copy.iid,
-                                        discussion_id = discussion_id.as_str(),
-                                        trigger_note_id,
-                                        reset_at = %quota.reset_at,
-                                        retry_at = %quota.retry_at,
-                                        "mention command deferred because codex quota is exhausted"
-                                    );
-                                    let now = Utc::now();
-                                    if let Err(err) = state
-                                        .mention_quota_pending
-                                        .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
-                                            repo: &repo_name,
-                                            iid: mr_copy.iid,
-                                            discussion_id: &discussion_id,
-                                            trigger_note_id,
-                                            head_sha: &head_sha_copy,
-                                            blocked_at: now.timestamp(),
-                                            next_retry_at: quota.retry_at.timestamp(),
-                                        })
-                                        .await
-                                    {
-                                        warn!(
-                                            repo = repo_name.as_str(),
-                                            iid = mr_copy.iid,
-                                            discussion_id = discussion_id.as_str(),
-                                            trigger_note_id,
-                                            error = %err,
-                                            "failed to persist mention quota pending row"
-                                        );
-                                    }
-                                    if let Err(err) = award_service
-                                        .ensure_discussion_note_award(
-                                            &repo_name,
-                                            mr_copy.iid,
-                                            &discussion_id,
-                                            trigger_note_id,
-                                            &quota_emoji,
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            repo = repo_name.as_str(),
-                                            iid = mr_copy.iid,
-                                            discussion_id = discussion_id.as_str(),
-                                            trigger_note_id,
-                                            error = %err,
-                                            "failed to add mention quota award"
-                                        );
-                                    }
-                                    let mut finish = task_cancelled_finish(
-                                        "cancelled",
-                                        format!(
-                                            "Mention {} !{} note {}",
-                                            repo_name, mr_copy.iid, trigger_note_id
-                                        ),
-                                    );
-                                    finish.summary = Some(format!(
-                                        "deferred: codex quota exhausted until {}",
-                                        quota.reset_at
-                                    ));
-                                    ("cancelled", String::new(), finish, false)
-                                } else {
-                                    let error_chain = format!("{err:#}");
-                                    warn!(
-                                        repo = repo_name.as_str(),
-                                        iid = mr_copy.iid,
-                                        discussion_id = discussion_id.as_str(),
-                                        trigger_note_id,
-                                        error = %err,
-                                        error_chain = error_chain.as_str(),
-                                        "mention command execution failed"
-                                    );
-                                    (
-                                        "error",
-                                        "Mention command failed. Check service logs for details."
-                                            .to_string(),
-                                        task_error_finish(
-                                            "error",
-                                            format!(
-                                                "Mention {} !{} note {}",
-                                                repo_name, mr_copy.iid, trigger_note_id
-                                            ),
-                                            &err,
-                                        ),
-                                        true,
-                                    )
-                                }
-                            }
-                        };
-                    if let Err(err) =
-                        finish_task_run_history(&state, &task_for_run_history, run_history_finish)
-                            .await
-                    {
-                        warn!(
-                            repo = repo_name.as_str(),
-                            iid = mr_copy.iid,
-                            discussion_id = discussion_id.as_str(),
-                            trigger_note_id,
-                            error = %err,
-                            "failed to persist mention run history"
-                        );
-                    }
-                    let completion_note_posted = if post_status_note {
-                        let status_message = sanitize_comment_text(&config, &status_message);
-                        match gitlab
-                            .create_discussion_note(
-                                &repo_name,
-                                mr_copy.iid,
-                                &discussion_id,
-                                &status_message,
-                            )
-                            .await
-                        {
-                            Ok(()) => true,
-                            Err(err) => {
-                                warn!(
-                                    repo = repo_name.as_str(),
-                                    iid = mr_copy.iid,
-                                    discussion_id = discussion_id.as_str(),
-                                    trigger_note_id,
-                                    error = %err,
-                                    "failed to post mention-command completion status"
-                                );
-                                false
-                            }
-                        }
-                    } else {
-                        true
-                    };
-                    if post_status_note && !completion_note_posted {
-                        let fallback_message = format!(
-                            "Mention command result for discussion `{discussion_id}`:\n\n{status_message}"
-                        );
-                        let fallback_message = sanitize_comment_text(&config, &fallback_message);
-                        if let Err(err) = gitlab
-                            .create_note(&repo_name, mr_copy.iid, &fallback_message)
-                            .await
-                        {
-                            warn!(
-                                repo = repo_name.as_str(),
-                                iid = mr_copy.iid,
-                                discussion_id = discussion_id.as_str(),
-                                trigger_note_id,
-                                error = %err,
-                                "failed to post fallback MR note for mention-command completion"
-                            );
-                        }
-                    }
-                    let persisted_result = state_result;
-                    let mut mention_state_persisted = false;
-                    for attempt in 1..=3 {
-                        match state
-                            .mention_commands
-                            .finish_mention_command(
-                                &repo_name,
-                                mr_copy.iid,
-                                &discussion_id,
-                                trigger_note_id,
-                                &head_sha_copy,
-                                persisted_result,
-                            )
-                            .await
-                        {
-                            Ok(()) => {
-                                mention_state_persisted = true;
-                                break;
-                            }
-                            Err(err) => {
-                                if attempt == 3 {
-                                    warn!(
-                                        repo = repo_name.as_str(),
-                                        iid = mr_copy.iid,
-                                        discussion_id = discussion_id.as_str(),
-                                        trigger_note_id,
-                                        error = %err,
-                                        "failed to persist mention-command state"
-                                    );
-                                } else {
-                                    warn!(
-                                        repo = repo_name.as_str(),
-                                        iid = mr_copy.iid,
-                                        discussion_id = discussion_id.as_str(),
-                                        trigger_note_id,
-                                        attempt,
-                                        error = %err,
-                                        "failed to persist mention-command state; retrying"
-                                    );
-                                    tokio::time::sleep(std::time::Duration::from_millis(
-                                        100 * u64::try_from(attempt).ok().unwrap_or(u64::MAX),
-                                    ))
-                                    .await;
-                                }
-                            }
-                        }
-                    }
-                    if !mention_state_persisted {
-                        let _ = state
-                            .mention_commands
-                            .finish_mention_command(
-                                &repo_name,
-                                mr_copy.iid,
-                                &discussion_id,
-                                trigger_note_id,
-                                &head_sha_copy,
-                                "error",
-                            )
-                            .await;
-                    }
-                    if let Err(err) = award_service
-                        .remove_discussion_note_award(
-                            &repo_name,
-                            mr_copy.iid,
-                            &discussion_id,
-                            trigger_note_id,
-                            &eyes_emoji,
-                        )
-                        .await
-                    {
-                        let error_chain = format!("{err:#}");
-                        warn!(
-                            repo = repo_name.as_str(),
-                            iid = mr_copy.iid,
-                            discussion_id = discussion_id.as_str(),
-                            trigger_note_id,
-                            error = %err,
-                            error_chain = error_chain.as_str(),
-                            "failed to remove in-progress eyes reaction from mention trigger note"
-                        );
-                    }
-                },
-            )
-            .await;
+                        error = %err,
+                        error_chain = error_chain.as_str(),
+                        "mention command execution failed"
+                    );
+                    (
+                        "error",
+                        "Mention command failed. Check service logs for details.".to_string(),
+                        task_error_finish(
+                            "error",
+                            format!(
+                                "Mention {} !{} note {}",
+                                repo_name, mr_copy.iid, trigger_note_id
+                            ),
+                            &err,
+                        ),
+                        true,
+                    )
+                }
+            }
+        };
+        if let Err(err) =
+            finish_task_run_history(state, &task_for_run_history, run_history_finish).await
+        {
+            warn!(
+                repo = repo_name.as_str(),
+                iid = mr_copy.iid,
+                discussion_id = discussion_id.as_str(),
+                trigger_note_id,
+                error = %err,
+                "failed to persist mention run history"
+            );
         }
-        Ok(outcome)
+        let completion_note_posted = if post_status_note {
+            let status_message = sanitize_comment_text(config, &status_message);
+            match gitlab
+                .create_discussion_note(&repo_name, mr_copy.iid, &discussion_id, &status_message)
+                .await
+            {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(
+                        repo = repo_name.as_str(),
+                        iid = mr_copy.iid,
+                        discussion_id = discussion_id.as_str(),
+                        trigger_note_id,
+                        error = %err,
+                        "failed to post mention-command completion status"
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if post_status_note && !completion_note_posted {
+            let fallback_message = format!(
+                "Mention command result for discussion `{discussion_id}`:\n\n{status_message}"
+            );
+            let fallback_message = sanitize_comment_text(config, &fallback_message);
+            if let Err(err) = gitlab
+                .create_note(&repo_name, mr_copy.iid, &fallback_message)
+                .await
+            {
+                warn!(
+                    repo = repo_name.as_str(),
+                    iid = mr_copy.iid,
+                    discussion_id = discussion_id.as_str(),
+                    trigger_note_id,
+                    error = %err,
+                    "failed to post fallback MR note for mention-command completion"
+                );
+            }
+        }
+        let persisted_result = state_result;
+        let mut mention_state_persisted = false;
+        for attempt in 1..=3 {
+            match state
+                .mention_commands
+                .finish_mention_command(
+                    &repo_name,
+                    mr_copy.iid,
+                    &discussion_id,
+                    trigger_note_id,
+                    &head_sha_copy,
+                    persisted_result,
+                )
+                .await
+            {
+                Ok(()) => {
+                    mention_state_persisted = true;
+                    break;
+                }
+                Err(err) => {
+                    if attempt == 3 {
+                        warn!(
+                            repo = repo_name.as_str(),
+                            iid = mr_copy.iid,
+                            discussion_id = discussion_id.as_str(),
+                            trigger_note_id,
+                            error = %err,
+                            "failed to persist mention-command state"
+                        );
+                    } else {
+                        warn!(
+                            repo = repo_name.as_str(),
+                            iid = mr_copy.iid,
+                            discussion_id = discussion_id.as_str(),
+                            trigger_note_id,
+                            attempt,
+                            error = %err,
+                            "failed to persist mention-command state; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            100 * u64::try_from(attempt).ok().unwrap_or(u64::MAX),
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+        if !mention_state_persisted
+            && let Err(err) = state
+                .mention_commands
+                .finish_mention_command(
+                    &repo_name,
+                    mr_copy.iid,
+                    &discussion_id,
+                    trigger_note_id,
+                    &head_sha_copy,
+                    "error",
+                )
+                .await
+        {
+            warn!(
+                repo = repo_name.as_str(),
+                iid = mr_copy.iid,
+                discussion_id = discussion_id.as_str(),
+                trigger_note_id,
+                error = %err,
+                "failed to mark mention-command state as error after persistence failures"
+            );
+        }
+        if let Err(err) = award_service
+            .remove_discussion_note_award(
+                &repo_name,
+                mr_copy.iid,
+                &discussion_id,
+                trigger_note_id,
+                &eyes_emoji,
+            )
+            .await
+        {
+            let error_chain = format!("{err:#}");
+            warn!(
+                repo = repo_name.as_str(),
+                iid = mr_copy.iid,
+                discussion_id = discussion_id.as_str(),
+                trigger_note_id,
+                error = %err,
+                error_chain = error_chain.as_str(),
+                "failed to remove in-progress eyes reaction from mention trigger note"
+            );
+        }
     }
 
     async fn release_mention_lock_after_history_failure(
@@ -1493,6 +1498,7 @@ pub(crate) fn sanitize_email_local_part(input: &str) -> String {
 mod tests {
     use super::*;
     use crate::gitlab::DiffRefs;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn processed_mentions_have_no_collected_parent_chains() -> Result<()> {
@@ -1506,21 +1512,18 @@ mod tests {
             .finish_mention_command("group/repo", 1, "discussion", 2, "sha1", "committed")
             .await?;
         let gitlab = Arc::new(crate::gitlab::GitLabClient::new("http://127.0.0.1:9", "")?);
-        let flow = MentionFlow::new(
-            FlowShared {
-                config: crate::config::test_builder::ConfigBuilder::for_review_tests().build(),
-                gitlab: gitlab.clone(),
-                award_service: AwardService::new(gitlab, 1),
-                codex: Arc::new(crate::dev_mode::MockCodexRunner::new(state.clone())),
-                state,
-                bot_user_id: 1,
-                semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
-                task_admission: Arc::new(crate::flow::orchestration::TaskAdmission::new(1)),
-                lifecycle: Arc::new(crate::lifecycle::ServiceLifecycle::default()),
-                active_tasks: Arc::new(crate::flow::ActiveTaskRegistry::default()),
-            },
-            Arc::new(Mutex::new(HashMap::new())),
-        );
+        let flow = MentionFlow::new(FlowShared {
+            config: crate::config::test_builder::ConfigBuilder::for_review_tests().build(),
+            gitlab: gitlab.clone(),
+            award_service: AwardService::new(gitlab, 1),
+            codex: Arc::new(crate::dev_mode::MockCodexRunner::new(state.clone())),
+            state,
+            bot_user_id: 1,
+            created_after: chrono::DateTime::UNIX_EPOCH,
+            lifecycle: Arc::new(crate::lifecycle::ServiceLifecycle::default()),
+            active_tasks: Arc::new(crate::flow::ActiveTaskRegistry::default()),
+            rescan_requests: Arc::default(),
+        });
         let discussions = vec![MergeRequestDiscussion {
             id: "discussion".to_string(),
             individual_note: true,
@@ -1538,55 +1541,14 @@ mod tests {
             }],
         }];
 
-        let mut outcome = MentionScheduleOutcome::default();
+        let mut skipped_processed = 0;
         let triggers = flow
-            .collect_mention_triggers("group/repo", 1, &discussions, "bot", &mut outcome)
+            .collect_mention_triggers("group/repo", 1, &discussions, "bot", &mut skipped_processed)
             .await?;
 
         assert!(triggers.is_empty());
-        assert_eq!(outcome.skipped_processed, 1);
+        assert_eq!(skipped_processed, 1);
         Ok(())
-    }
-
-    #[tokio::test]
-    async fn branch_waiters_share_one_lock_until_the_last_release() {
-        let locks = Arc::new(Mutex::new(HashMap::new()));
-        let first = MentionBranchLock::new(locks.clone(), "repo::branch".to_string())
-            .acquire()
-            .await;
-        let mut waiter =
-            Box::pin(MentionBranchLock::new(locks.clone(), "repo::branch".to_string()).acquire());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
-                .await
-                .is_err()
-        );
-        drop(first);
-        assert_eq!(locks.lock().unwrap().len(), 1);
-        let second = waiter.await;
-        let third = MentionBranchLock::new(locks.clone(), "repo::branch".to_string());
-        assert!(Arc::ptr_eq(&second.lock, &third.lock));
-        drop(third);
-        drop(second);
-        assert!(locks.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn cancelled_branch_waiter_does_not_retain_an_entry() {
-        let locks = Arc::new(Mutex::new(HashMap::new()));
-        let first = MentionBranchLock::new(locks.clone(), "repo::branch".to_string())
-            .acquire()
-            .await;
-        let mut waiter =
-            Box::pin(MentionBranchLock::new(locks.clone(), "repo::branch".to_string()).acquire());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
-                .await
-                .is_err()
-        );
-        drop(first);
-        drop(waiter);
-        assert!(locks.lock().unwrap().is_empty());
     }
 
     #[test]

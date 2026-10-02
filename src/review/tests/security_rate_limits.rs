@@ -287,34 +287,29 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
         .await?;
     let service = ReviewService::new(
         config,
-        gitlab,
+        gitlab.clone(),
         state.clone(),
         runner.clone(),
         1,
         default_created_after(),
     );
 
-    let first = service
-        .general_review_flow
-        .run_for_mr("group/repo", mr(26, "sha26-old"), "sha26-old")
-        .await?;
-    let second = service
-        .general_review_flow
-        .run_for_mr("group/repo", mr(26, "sha26-new"), "sha26-new")
-        .await?;
-    let third = service
-        .general_review_flow
-        .run_for_mr("group/repo", mr(26, "sha26-newer"), "sha26-newer")
-        .await?;
+    review_mr_now(&service, &gitlab, ReviewLane::General, mr(26, "sha26-old")).await;
+    let runs_after_first = runner.review_contexts.lock().unwrap().len();
+    review_mr_now(&service, &gitlab, ReviewLane::General, mr(26, "sha26-new")).await;
+    review_mr_now(
+        &service,
+        &gitlab,
+        ReviewLane::General,
+        mr(26, "sha26-newer"),
+    )
+    .await;
 
-    assert_eq!(first, crate::flow::review::ReviewScheduleOutcome::Scheduled);
+    assert_eq!(runs_after_first, 1);
     assert_eq!(
-        second,
-        crate::flow::review::ReviewScheduleOutcome::SkippedRateLimit
-    );
-    assert_eq!(
-        third,
-        crate::flow::review::ReviewScheduleOutcome::SkippedRateLimit
+        runner.review_contexts.lock().unwrap().len(),
+        1,
+        "the rate limit blocks later heads"
     );
 
     let pending = state
@@ -337,14 +332,13 @@ async fn runtime_rate_limit_blocks_same_mr_and_clears_pending_after_success() ->
         )
         .await?;
 
-    let fourth = service
-        .general_review_flow
-        .run_for_mr("group/repo", mr(26, "sha26-final"), "sha26-final")
-        .await?;
-    assert_eq!(
-        fourth,
-        crate::flow::review::ReviewScheduleOutcome::Scheduled
-    );
+    review_mr_now(
+        &service,
+        &gitlab,
+        ReviewLane::General,
+        mr(26, "sha26-final"),
+    )
+    .await;
     assert!(
         state
             .review_rate_limit
@@ -398,15 +392,8 @@ async fn runtime_rate_limit_block_adds_configured_mr_award() -> Result<()> {
         default_created_after(),
     );
 
-    let outcome = service
-        .general_review_flow
-        .run_for_mr("group/repo", mr(27, "sha27"), "sha27")
-        .await?;
+    review_mr_now(&service, &gitlab, ReviewLane::General, mr(27, "sha27")).await;
 
-    assert_eq!(
-        outcome,
-        crate::flow::review::ReviewScheduleOutcome::SkippedRateLimit
-    );
     assert!(
         gitlab
             .calls
@@ -441,15 +428,8 @@ async fn codex_quota_block_adds_fuelpump_award_and_pending_row() -> Result<()> {
         default_created_after(),
     );
 
-    let outcome = service
-        .general_review_flow
-        .run_for_mr("group/repo", mr(30, "sha30"), "sha30")
-        .await?;
+    review_mr_now(&service, &gitlab, ReviewLane::General, mr(30, "sha30")).await;
 
-    assert_eq!(
-        outcome,
-        crate::flow::review::ReviewScheduleOutcome::SkippedQuota
-    );
     assert_eq!(*runner.review_calls.lock().unwrap(), 0);
     let pending = state
         .review_rate_limit
@@ -496,15 +476,8 @@ async fn codex_quota_error_cancels_review_and_requeues_without_failure_backoff()
         default_created_after(),
     );
 
-    let outcome = service
-        .general_review_flow
-        .run_for_mr("group/repo", mr(31, "sha31"), "sha31")
-        .await?;
+    review_mr_now(&service, &gitlab, ReviewLane::General, mr(31, "sha31")).await;
 
-    assert_eq!(
-        outcome,
-        crate::flow::review::ReviewScheduleOutcome::SkippedQuota
-    );
     assert_eq!(*runner.review_calls.lock().unwrap(), 1);
     assert_eq!(
         state
@@ -605,20 +578,22 @@ async fn runtime_rate_limit_block_skips_duplicate_mr_award_when_bot_already_has_
     let service = ReviewService::new(
         config,
         gitlab.clone(),
-        state,
+        state.clone(),
         runner,
         1,
         default_created_after(),
     );
 
-    let outcome = service
-        .general_review_flow
-        .run_for_mr("group/repo", mr(28, "sha28"), "sha28")
-        .await?;
+    review_mr_now(&service, &gitlab, ReviewLane::General, mr(28, "sha28")).await;
 
     assert_eq!(
-        outcome,
-        crate::flow::review::ReviewScheduleOutcome::SkippedRateLimit
+        state
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?
+            .len(),
+        1,
+        "the review must reach the rate-limit gate"
     );
     assert!(
         gitlab
@@ -729,15 +704,8 @@ async fn runtime_rate_limit_clear_removes_configured_mr_award_before_review_resu
         default_created_after(),
     );
 
-    let outcome = service
-        .general_review_flow
-        .run_for_mr("group/repo", mr(29, "sha29"), "sha29")
-        .await?;
+    review_mr_now(&service, &gitlab, ReviewLane::General, mr(29, "sha29")).await;
 
-    assert_eq!(
-        outcome,
-        crate::flow::review::ReviewScheduleOutcome::Scheduled
-    );
     assert!(
         gitlab
             .calls
@@ -826,20 +794,14 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
         .await?;
     let service = ReviewService::new(
         config,
-        gitlab,
+        gitlab.clone(),
         state.clone(),
         runner.clone(),
         1,
         default_created_after(),
     );
 
-    assert_eq!(
-        service
-            .general_review_flow
-            .run_for_mr("group/repo", mr(30, "sha30"), "sha30")
-            .await?,
-        crate::flow::review::ReviewScheduleOutcome::Scheduled
-    );
+    review_mr_now(&service, &gitlab, ReviewLane::General, mr(30, "sha30")).await;
     let mut active_rule_ids = state
         .review_rate_limit
         .list_active_review_rate_limit_buckets(Utc::now().timestamp())
@@ -850,13 +812,7 @@ async fn runtime_rate_limit_applies_general_security_and_shared_rules() -> Resul
     active_rule_ids.sort();
     assert_eq!(active_rule_ids, vec![general_only.clone(), shared.clone()]);
 
-    assert_eq!(
-        service
-            .security_review_flow
-            .run_for_mr("group/repo", mr(31, "sha31"), "sha31")
-            .await?,
-        crate::flow::review::ReviewScheduleOutcome::Scheduled
-    );
+    review_mr_now(&service, &gitlab, ReviewLane::Security, mr(31, "sha31")).await;
     let mut active_rule_ids = state
         .review_rate_limit
         .list_active_review_rate_limit_buckets(Utc::now().timestamp())
@@ -921,19 +877,18 @@ async fn runtime_rate_limit_refunds_on_startup_failure() -> Result<()> {
         .await?;
     let service = ReviewService::new(
         config,
-        gitlab,
+        gitlab.clone(),
         state.clone(),
         runner.clone(),
         1,
         default_created_after(),
     );
 
+    review_mr_now(&service, &gitlab, ReviewLane::General, mr(32, "sha32")).await;
+
     assert!(
-        service
-            .general_review_flow
-            .run_for_mr("group/repo", mr(32, "sha32"), "sha32")
-            .await
-            .is_err()
+        service.rescan_requests.pending("group/repo").is_some(),
+        "the failed start must request a rescan"
     );
     assert!(
         state
@@ -961,7 +916,7 @@ async fn runtime_rate_limit_refunds_on_startup_failure() -> Result<()> {
 }
 
 #[tokio::test]
-async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<()> {
+async fn reviews_snapshot_feature_flags_when_they_start() -> Result<()> {
     let mut config = test_config();
     config.review.max_concurrent = 1;
     config.codex.gitlab_discovery_mcp.enabled = true;
@@ -1028,18 +983,6 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
     };
     tokio::time::timeout(std::time::Duration::from_secs(1), first_started_wait).await?;
 
-    for _ in 0..50 {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM run_history WHERE kind = 'review'")
-                .fetch_one(state.pool())
-                .await?;
-        if count == 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
     state
         .feature_flags
         .set_runtime_feature_flag_overrides(&crate::config::RuntimeFeatureFlagOverrides {
@@ -1052,41 +995,29 @@ async fn queued_reviews_snapshot_feature_flags_before_runner_start() -> Result<(
             security_review: None,
         })
         .await?;
-
-    let mut snapshots = Vec::new();
-    for _ in 0..50 {
-        let rows = sqlx::query(
-            "SELECT feature_flags_json FROM run_history WHERE kind = 'review' ORDER BY iid",
-        )
-        .fetch_all(state.pool())
-        .await?;
-        if rows.len() == 2 {
-            snapshots = rows
-                .into_iter()
-                .map(|row| {
-                    let json: String = row.try_get("feature_flags_json")?;
-                    let snapshot =
-                        serde_json::from_str::<crate::config::FeatureFlagSnapshot>(&json)?;
-                    Ok(snapshot)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if snapshots
-                .iter()
-                .all(|snapshot| snapshot.gitlab_discovery_mcp)
-            {
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert_eq!(snapshots.len(), 2);
-    assert!(
-        snapshots
-            .iter()
-            .all(|snapshot| snapshot.gitlab_discovery_mcp)
-    );
-
     release_first.notify_waiters();
     scan_task.await??;
+
+    let snapshots = sqlx::query(
+        "SELECT feature_flags_json FROM run_history WHERE kind = 'review' ORDER BY iid",
+    )
+    .fetch_all(state.pool())
+    .await?
+    .into_iter()
+    .map(|row| {
+        let json: String = row.try_get("feature_flags_json")?;
+        Ok(serde_json::from_str::<crate::config::FeatureFlagSnapshot>(
+            &json,
+        )?)
+    })
+    .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.gitlab_discovery_mcp)
+            .collect::<Vec<_>>(),
+        vec![true, false],
+        "each run snapshots the flags when it starts"
+    );
     Ok(())
 }

@@ -1,39 +1,32 @@
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
-use crate::flow::ActiveTaskRegistry;
-use crate::flow::FlowShared;
+use crate::flow::admission::AdmissionHistory;
 use crate::flow::award_service::AwardService;
-use crate::flow::mention::{MentionFlow, MentionScheduleOutcome};
-use crate::flow::orchestration::TaskAdmission;
+use crate::flow::mention::MentionFlow;
 use crate::flow::retry::{
     RetryBackoff, RetryKey, RetryWarningAwardService, RunRetryStatus, RunRetryStatusProvider,
 };
-use crate::flow::review::{ReviewFlow, ReviewScheduleOutcome};
-use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
-use crate::lifecycle::ServiceLifecycle;
-use crate::review::admission::review_skip_reason;
-use crate::review::scan_coordinator::ScanCoordinator;
-use crate::review::scan_pipeline::{
-    run_incremental_scan_pipeline_waiting_for_tasks, run_pending_rate_limit_pipeline,
-    run_review_backoff_retry_pipeline, run_scan_pipeline,
+use crate::flow::review::{
+    QueuedReview, ReviewEligibility, ReviewFlow, merge_request_lookup_reports_missing,
+    review_skip_reason,
 };
+use crate::flow::run_queue::{EnqueueOutcome, JobKey, RunJob, RunQueue};
+use crate::flow::{ActiveTaskRegistry, FlowJob, FlowShared, RescanRequests};
+use crate::gitlab::{GitLabApi, gitlab_error_has_status};
+use crate::lifecycle::ServiceLifecycle;
+use crate::review::scan_coordinator::ScanCoordinator;
+use crate::review::scan_pipeline::{run_pending_retry_pipeline, run_scan_pipeline};
 use crate::review::target_resolver::TargetResolver;
 use crate::review_lane::ReviewLane;
-use crate::state::{
-    MentionQuotaPendingEntry, MentionQuotaPendingUpsert, ReviewRateLimitPendingEntry,
-    ReviewStateStore,
-};
+use crate::state::{MentionQuotaPendingEntry, ReviewRateLimitPendingEntry, ReviewStateStore};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use futures::future::join_all;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use tokio::sync::Semaphore;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 pub(super) const NO_OPEN_MRS_MARKER: &str = "__no_open_mrs__";
-const MR_NOT_FOUND_ERROR: &str = "mr not found";
 const PENDING_RETRY_LOOKUP_BACKOFF_SECONDS: i64 = 60;
 const REVIEW_FAILURE_RETRY_BASE_DELAY: Duration = Duration::minutes(15);
 const REVIEW_FAILURE_MAX_RETRIES: u32 = 5;
@@ -65,8 +58,8 @@ pub struct ReviewService {
     pub(super) security_review_flow: Arc<ReviewFlow>,
     pub(super) mention_flow: Arc<MentionFlow>,
     lifecycle: Arc<ServiceLifecycle>,
-    active_tasks: Arc<ActiveTaskRegistry>,
-    task_admission: Arc<TaskAdmission>,
+    run_queue: Arc<RunQueue<FlowJob>>,
+    pub(super) rescan_requests: Arc<RescanRequests>,
     retry_backoff: Arc<RetryBackoff>,
     retry_warning_awards: RetryWarningAwardService,
     scan_coordinator: ScanCoordinator,
@@ -82,15 +75,13 @@ impl ReviewService {
         bot_user_id: u64,
         created_after: DateTime<Utc>,
     ) -> Self {
-        let semaphore = Arc::new(Semaphore::new(config.review.max_concurrent));
-        let task_admission = Arc::new(TaskAdmission::new(config.review.max_concurrent));
-        let mention_branch_locks = Arc::new(Mutex::new(HashMap::new()));
         let retry_backoff = Arc::new(RetryBackoff::new(
             REVIEW_FAILURE_RETRY_BASE_DELAY,
             REVIEW_FAILURE_MAX_RETRIES,
         ));
         let lifecycle = Arc::new(ServiceLifecycle::default());
         let active_tasks = Arc::new(ActiveTaskRegistry::default());
+        let rescan_requests = Arc::new(RescanRequests::default());
         let award_service = AwardService::new(Arc::clone(&gitlab), bot_user_id);
         let retry_warning_awards =
             RetryWarningAwardService::new(config.clone(), award_service.clone());
@@ -101,12 +92,12 @@ impl ReviewService {
             state: Arc::clone(&state),
             codex: Arc::clone(&codex),
             bot_user_id,
-            semaphore: Arc::clone(&semaphore),
-            task_admission: Arc::clone(&task_admission),
+            created_after,
             lifecycle: Arc::clone(&lifecycle),
             active_tasks: Arc::clone(&active_tasks),
+            rescan_requests: Arc::clone(&rescan_requests),
         };
-        let mention_flow = Arc::new(MentionFlow::new(flow_shared.clone(), mention_branch_locks));
+        let mention_flow = Arc::new(MentionFlow::new(flow_shared.clone()));
         let general_review_flow = Arc::new(ReviewFlow::new(
             flow_shared.clone(),
             Arc::clone(&retry_backoff),
@@ -117,6 +108,10 @@ impl ReviewService {
             Arc::clone(&retry_backoff),
             ReviewLane::Security,
         ));
+        let run_queue = RunQueue::new(
+            config.review.max_concurrent,
+            flow_job_runner(&general_review_flow, &security_review_flow, &mention_flow),
+        );
         let scan_coordinator = ScanCoordinator::new(
             Arc::clone(&state),
             Arc::clone(&active_tasks),
@@ -137,8 +132,8 @@ impl ReviewService {
             security_review_flow,
             mention_flow,
             lifecycle,
-            active_tasks,
-            task_admission,
+            run_queue,
+            rescan_requests,
             retry_backoff,
             retry_warning_awards,
             scan_coordinator,
@@ -156,29 +151,56 @@ impl ReviewService {
         self
     }
 
+    /// Scans all repositories, queues the needed runs, and waits until the queue is empty.
+    /// Waits also when a repository scan fails, so started runs finish before the error returns.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
+    /// Returns the first repository scan error.
     pub async fn scan_once(&self) -> Result<ScanRunStatus> {
-        self.scan(ScanMode::Full).await
+        let result = run_scan_pipeline(self, ScanMode::Full).await;
+        self.run_queue.wait_for_idle().await;
+        result
     }
 
+    /// Scans all repositories and queues the needed runs. Does not wait for the runs.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
+    /// Returns the first repository scan error.
+    pub async fn queue_full_scan(&self) -> Result<ScanRunStatus> {
+        run_scan_pipeline(self, ScanMode::Full).await
+    }
+
+    /// Scans repositories with new MR activity or due retries and queues the needed runs.
+    /// Does not wait for the runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first repository scan error.
     pub async fn scan_once_incremental(&self) -> Result<ScanRunStatus> {
-        self.scan(ScanMode::Incremental).await
+        run_scan_pipeline(self, ScanMode::Incremental).await
     }
 
-    /// # Errors
-    ///
-    /// Returns an error if the underlying operation fails.
-    pub async fn scan_once_incremental_waiting_for_tasks(&self) -> Result<ScanRunStatus> {
-        run_incremental_scan_pipeline_waiting_for_tasks(self).await
+    /// Waits until no run waits in the queue and no run is active.
+    pub async fn wait_for_idle(&self) {
+        self.run_queue.wait_for_idle().await;
+    }
+
+    /// Returns when a run finished after the previous call returned. Runs change retry and
+    /// pending times, so the scheduler computes its next wake again.
+    pub(crate) async fn wait_for_run_finished(&self) {
+        self.run_queue.wait_for_job_finished().await;
     }
 
     pub(crate) fn next_review_backoff_retry_at(&self) -> Option<DateTime<Utc>> {
-        self.retry_backoff.earliest_retry_at()
+        self.retry_backoff.earliest_retry_at(|key| {
+            self.run_queue.contains(&JobKey::Review {
+                lane: key.lane,
+                repo: key.repo.clone(),
+                iid: key.iid,
+            })
+        })
     }
 
     pub(super) fn repo_has_due_review_backoff_retry(&self, repo: &str, now: DateTime<Utc>) -> bool {
@@ -209,18 +231,24 @@ impl ReviewService {
         })
     }
 
+    /// Queues the reviews and mention commands whose pending rows are due.
+    /// Does not wait for the runs.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
-    pub async fn process_due_pending_rate_limit_reviews(&self) -> Result<ScanRunStatus> {
-        run_pending_rate_limit_pipeline(self).await
+    /// Returns the first error after all due rows were handled.
+    pub async fn queue_due_pending_retries(&self) -> Result<ScanRunStatus> {
+        run_pending_retry_pipeline(self).await
     }
 
+    /// Scans repositories with due review retries and queues the reviews.
+    /// Does not wait for the runs.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
-    pub async fn process_due_review_backoff_retries(&self) -> Result<ScanRunStatus> {
-        run_review_backoff_retry_pipeline(self).await
+    /// Returns the first repository scan error.
+    pub async fn queue_due_review_backoff_retries(&self) -> Result<ScanRunStatus> {
+        run_scan_pipeline(self, ScanMode::Incremental).await
     }
 
     pub(super) async fn clear_review_backoff_retries_for_closed_mrs(
@@ -267,21 +295,25 @@ impl ReviewService {
             .await;
     }
 
-    pub(super) fn defer_due_review_backoff_retries_for_mr(&self, repo: &str, iid: u64) {
-        let now = Utc::now();
-        let next_retry_at = now + Duration::seconds(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
-        let deferred = self
-            .retry_backoff
-            .defer_due_for_mr(repo, iid, now, next_retry_at);
-        if deferred > 0 {
-            debug!(
-                repo = repo,
-                iid = iid,
-                deferred = deferred,
-                retry_at = %next_retry_at,
-                "deferred in-memory review retries because same-MR work blocks scheduling"
-            );
-        }
+    /// Queues due pending rows, then waits until the queue is empty.
+    #[cfg(test)]
+    pub(super) async fn process_due_pending_retries(&self) -> Result<ScanRunStatus> {
+        let result = self.queue_due_pending_retries().await;
+        self.wait_for_idle().await;
+        result
+    }
+
+    /// Queues one explicit review of the MR's current head, then waits until the queue is empty.
+    #[cfg(test)]
+    pub(super) async fn review_lane_now(&self, lane: ReviewLane, repo: &str, iid: u64) {
+        self.enqueue(FlowJob::Review(QueuedReview {
+            lane,
+            repo: repo.to_string(),
+            iid,
+            head_sha: String::new(),
+            eligibility: ReviewEligibility::Explicit,
+        }));
+        self.wait_for_idle().await;
     }
 
     #[cfg(test)]
@@ -313,22 +345,25 @@ impl ReviewService {
         }
     }
 
+    /// Stops new runs, drops waiting runs, and asks running runs to cancel.
     pub fn request_shutdown(&self) {
         self.lifecycle.request_fast_stop();
-        self.task_admission.close();
+        self.run_queue.close();
     }
 
+    /// Stops new runs and drops waiting runs. Running runs finish.
     pub fn request_graceful_drain(&self) {
         self.lifecycle.request_graceful_drain();
-        self.task_admission.close();
+        self.run_queue.close();
     }
 
     pub async fn wait_for_started_runs(&self) {
         self.lifecycle.wait_for_started_runs().await;
     }
 
+    /// Waits until no queued job runs, including jobs that have not reached their codex run.
     pub async fn wait_for_active_tasks(&self) {
-        self.active_tasks.wait_for_idle().await;
+        self.run_queue.wait_for_running().await;
     }
 
     /// # Errors
@@ -342,24 +377,13 @@ impl ReviewService {
         !self.lifecycle.accepts_new_work()
     }
 
-    pub(super) fn max_concurrent(&self) -> usize {
-        self.config.review.max_concurrent
+    /// Adds a job to the run queue. Returns `false` when shutdown closed the queue.
+    pub(super) fn enqueue(&self, job: FlowJob) -> bool {
+        self.run_queue.enqueue(job) != EnqueueOutcome::Closed
     }
 
     pub(super) async fn clear_stale_flow_state(&self) -> Result<()> {
         self.scan_coordinator.clear_stale_flow_state().await
-    }
-
-    pub(super) async fn schedule_mention_commands_for_mr(
-        &self,
-        repo: &str,
-        mr: &MergeRequest,
-        head_sha: &str,
-        tasks: &mut Vec<tokio::task::JoinHandle<()>>,
-    ) -> Result<MentionScheduleOutcome> {
-        self.mention_flow
-            .schedule_for_scan(repo, mr, head_sha, tasks)
-            .await
     }
 
     fn review_flow_for_lane(&self, lane: ReviewLane) -> &ReviewFlow {
@@ -369,47 +393,8 @@ impl ReviewService {
         }
     }
 
-    async fn defer_pending_review_rate_limit_retry(
-        &self,
-        pending: &ReviewRateLimitPendingEntry,
-        head_sha: &str,
-        retry_started_at: i64,
-        deferred_until: i64,
-    ) -> Result<()> {
-        self.state
-            .review_rate_limit
-            .upsert_review_rate_limit_pending(
-                pending.lane,
-                &pending.repo,
-                pending.iid,
-                head_sha,
-                retry_started_at,
-                deferred_until,
-            )
-            .await
-    }
-
-    async fn defer_pending_mention_quota_retry(
-        &self,
-        pending: &MentionQuotaPendingEntry,
-        retry_started_at: i64,
-        deferred_until: i64,
-    ) -> Result<()> {
-        self.state
-            .mention_quota_pending
-            .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
-                repo: &pending.repo,
-                iid: pending.iid,
-                discussion_id: &pending.discussion_id,
-                trigger_note_id: pending.trigger_note_id,
-                head_sha: &pending.last_seen_head_sha,
-                blocked_at: retry_started_at,
-                next_retry_at: deferred_until,
-            })
-            .await
-    }
-
-    pub(super) async fn retry_pending_mention_quota_row(
+    /// Queues the mention command of a due pending row. Clears rows whose trigger is gone.
+    pub(super) async fn queue_pending_mention_row(
         &self,
         pending: &MentionQuotaPendingEntry,
     ) -> Result<()> {
@@ -419,11 +404,11 @@ impl ReviewService {
             discussion_id = pending.discussion_id.as_str(),
             trigger_note_id = pending.trigger_note_id,
             next_retry_at = pending.next_retry_at,
-            "retrying due pending mention quota row"
+            "queueing due pending mention quota row"
         );
         let mr = match self.gitlab.get_mr(&pending.repo, pending.iid).await {
             Ok(mr) => mr,
-            Err(err) if should_clear_pending_retry_after_mr_lookup_error(&err) => {
+            Err(err) if merge_request_lookup_reports_missing(&err) => {
                 warn!(
                     repo = pending.repo.as_str(),
                     iid = pending.iid,
@@ -432,21 +417,7 @@ impl ReviewService {
                     error = %err,
                     "merge request lookup failed while retrying pending mention; clearing pending row"
                 );
-                if self
-                    .state
-                    .mention_quota_pending
-                    .clear_mention_quota_pending(
-                        &pending.repo,
-                        pending.iid,
-                        &pending.discussion_id,
-                        pending.trigger_note_id,
-                    )
-                    .await?
-                {
-                    self.remove_mention_quota_award_after_pending_clear(pending)
-                        .await;
-                }
-                return Ok(());
+                return self.clear_pending_mention(pending).await;
             }
             Err(err) => {
                 warn!(
@@ -457,11 +428,7 @@ impl ReviewService {
                     error = %err,
                     "merge request lookup failed while retrying pending mention; deferring retry"
                 );
-                let retry_started_at = Utc::now().timestamp();
-                let deferred_until =
-                    retry_started_at.saturating_add(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
-                self.defer_pending_mention_quota_retry(pending, retry_started_at, deferred_until)
-                    .await?;
+                self.defer_pending_mention(pending).await?;
                 return Ok(());
             }
         };
@@ -473,41 +440,36 @@ impl ReviewService {
                 trigger_note_id = pending.trigger_note_id,
                 "missing head sha while retrying pending mention; clearing pending row"
             );
-            if self
-                .state
-                .mention_quota_pending
-                .clear_mention_quota_pending(
-                    &pending.repo,
-                    pending.iid,
-                    &pending.discussion_id,
-                    pending.trigger_note_id,
-                )
-                .await?
-            {
-                self.remove_mention_quota_award_after_pending_clear(pending)
-                    .await;
-            }
-            return Ok(());
+            return self.clear_pending_mention(pending).await;
         };
-
-        let mut tasks = Vec::new();
-        let outcome = self
+        let history = AdmissionHistory::new(self.gitlab.as_ref(), &pending.repo, pending.iid);
+        let admission = match self
             .mention_flow
-            .schedule_for_scan(&pending.repo, &mr, &head_sha, &mut tasks)
-            .await;
-        let _ = join_all(tasks).await;
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
+            .admit_for_scan(&pending.repo, &mr, &head_sha, &history)
+            .await
+        {
+            Ok(admission) => admission,
             Err(err) => {
-                let retry_started_at = Utc::now().timestamp();
-                let deferred_until =
-                    retry_started_at.saturating_add(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
-                self.defer_pending_mention_quota_retry(pending, retry_started_at, deferred_until)
-                    .await?;
+                self.defer_pending_mention(pending).await?;
                 return Err(err);
             }
         };
-
+        let pending_job_found = admission.jobs.iter().any(|job| {
+            job.discussion_id() == pending.discussion_id
+                && job.trigger_note_id() == pending.trigger_note_id
+        });
+        if pending_job_found {
+            // The job clears or rewrites the row when it starts. Deferring first lets that write win.
+            self.defer_pending_mention(pending).await?;
+        }
+        for job in admission.jobs {
+            if !self.enqueue(FlowJob::Mention(Box::new(job))) {
+                return Ok(());
+            }
+        }
+        if pending_job_found || self.shutdown_requested() {
+            return Ok(());
+        }
         match self
             .state
             .mention_commands
@@ -520,23 +482,14 @@ impl ReviewService {
             .await?
         {
             crate::state::MentionCommandScanState::Completed => {
-                if self
-                    .state
-                    .mention_quota_pending
-                    .clear_mention_quota_pending(
-                        &pending.repo,
-                        pending.iid,
-                        &pending.discussion_id,
-                        pending.trigger_note_id,
-                    )
-                    .await?
-                {
-                    self.remove_mention_quota_award_after_pending_clear(pending)
-                        .await;
-                }
+                self.clear_pending_mention(pending).await?;
+            }
+            crate::state::MentionCommandScanState::InProgress => {
+                self.defer_pending_mention(pending).await?;
             }
             crate::state::MentionCommandScanState::Ready => {
-                let now = Utc::now().timestamp();
+                // A quota block during admission wrote a later retry time. A row that is still
+                // due has no trigger left: the note was deleted or no longer mentions the bot.
                 let still_due = self
                     .state
                     .mention_quota_pending
@@ -545,42 +498,57 @@ impl ReviewService {
                         pending.iid,
                         &pending.discussion_id,
                         pending.trigger_note_id,
-                        now,
+                        Utc::now().timestamp(),
                     )
                     .await?;
-                if still_due
-                    && !outcome.blocked_pending_work
-                    && self
-                        .state
-                        .mention_quota_pending
-                        .clear_mention_quota_pending(
-                            &pending.repo,
-                            pending.iid,
-                            &pending.discussion_id,
-                            pending.trigger_note_id,
-                        )
-                        .await?
-                {
-                    self.remove_mention_quota_award_after_pending_clear(pending)
-                        .await;
+                if still_due {
+                    self.clear_pending_mention(pending).await?;
                 }
             }
-            crate::state::MentionCommandScanState::InProgress => {}
         }
         Ok(())
     }
 
-    pub(super) async fn retry_pending_review_rate_limit_row(
+    async fn clear_pending_mention(&self, pending: &MentionQuotaPendingEntry) -> Result<()> {
+        if self
+            .state
+            .mention_quota_pending
+            .clear_mention_quota_pending(
+                &pending.repo,
+                pending.iid,
+                &pending.discussion_id,
+                pending.trigger_note_id,
+            )
+            .await?
+        {
+            self.remove_mention_quota_award_after_pending_clear(pending)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn defer_pending_mention(&self, pending: &MentionQuotaPendingEntry) -> Result<bool> {
+        let next_retry_at = Utc::now()
+            .timestamp()
+            .saturating_add(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
+        self.state
+            .mention_quota_pending
+            .defer_mention_quota_pending_if_unchanged(pending, next_retry_at)
+            .await
+    }
+
+    /// Queues the review of a due pending row. Clears rows that no longer need a review.
+    pub(super) async fn queue_pending_review_row(
         &self,
         pending: &ReviewRateLimitPendingEntry,
         repos: &HashSet<String>,
-    ) -> Result<ReviewScheduleOutcome> {
+    ) -> Result<()> {
         debug!(
             repo = pending.repo.as_str(),
             iid = pending.iid,
             lane = pending.lane.as_str(),
             next_retry_at = pending.next_retry_at,
-            "retrying due pending review rate-limit row"
+            "queueing due pending review rate-limit row"
         );
         if !repos.contains(&pending.repo) {
             debug!(
@@ -588,12 +556,11 @@ impl ReviewService {
                 iid = pending.iid,
                 "clear pending review: repository is outside targets"
             );
-            self.clear_pending_review(pending).await?;
-            return Ok(ReviewScheduleOutcome::SkippedCompleted);
+            return self.clear_pending_review(pending).await;
         }
         let mr = match self.gitlab.get_mr(&pending.repo, pending.iid).await {
             Ok(mr) => mr,
-            Err(err) if should_clear_pending_retry_after_mr_lookup_error(&err) => {
+            Err(err) if merge_request_lookup_reports_missing(&err) => {
                 warn!(
                     repo = pending.repo.as_str(),
                     iid = pending.iid,
@@ -601,8 +568,7 @@ impl ReviewService {
                     error = %err,
                     "merge request lookup failed while retrying pending review; clearing pending row"
                 );
-                self.clear_pending_review(pending).await?;
-                return Ok(ReviewScheduleOutcome::SkippedCompleted);
+                return self.clear_pending_review(pending).await;
             }
             Err(err) => {
                 warn!(
@@ -612,17 +578,8 @@ impl ReviewService {
                     error = %err,
                     "merge request lookup failed while retrying pending review; deferring retry"
                 );
-                let retry_started_at = Utc::now().timestamp();
-                let deferred_until =
-                    retry_started_at.saturating_add(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
-                self.defer_pending_review_rate_limit_retry(
-                    pending,
-                    &pending.last_seen_head_sha,
-                    retry_started_at,
-                    deferred_until,
-                )
-                .await?;
-                return Ok(ReviewScheduleOutcome::SkippedRateLimit);
+                self.defer_pending_review(pending).await?;
+                return Ok(());
             }
         };
         if let Some(reason) = review_skip_reason(&mr, self.created_after) {
@@ -632,53 +589,46 @@ impl ReviewService {
                 ?reason,
                 "clear pending review: MR is not eligible"
             );
-            self.clear_pending_review(pending).await?;
-            return Ok(ReviewScheduleOutcome::SkippedCompleted);
+            return self.clear_pending_review(pending).await;
         }
-        let head_sha = if let Some(value) = mr.head_sha() {
-            value
-        } else {
+        let Some(head_sha) = mr.head_sha() else {
             warn!(
                 repo = pending.repo.as_str(),
                 iid = pending.iid,
                 lane = pending.lane.as_str(),
                 "missing head sha while retrying pending review; clearing pending row"
             );
-            self.clear_pending_review(pending).await?;
-            return Ok(ReviewScheduleOutcome::SkippedCompleted);
+            return self.clear_pending_review(pending).await;
         };
-        let outcome = self
-            .review_flow_for_lane(pending.lane)
-            .run_for_mr(&pending.repo, mr, &head_sha)
-            .await
-            .map_err(|err| {
-                let retry_started_at = Utc::now().timestamp();
-                let deferred_until =
-                    retry_started_at.saturating_add(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
-                (err, retry_started_at, deferred_until)
-            });
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err((err, retry_started_at, deferred_until)) => {
-                self.defer_pending_review_rate_limit_retry(
-                    pending,
-                    &head_sha,
-                    retry_started_at,
-                    deferred_until,
-                )
-                .await?;
-                return Err(err);
-            }
-        };
-        if !matches!(
-            outcome,
-            ReviewScheduleOutcome::SkippedRateLimit
-                | ReviewScheduleOutcome::Interrupted
-                | ReviewScheduleOutcome::SkippedQuota
-        ) {
-            self.clear_pending_review(pending).await?;
+        // The job clears or rewrites the row when it starts. Deferring first lets that write win.
+        // A failed defer means that another writer already changed the row.
+        if !self.defer_pending_review(pending).await? {
+            return Ok(());
         }
-        Ok(outcome)
+        self.enqueue(FlowJob::Review(QueuedReview {
+            lane: pending.lane,
+            repo: pending.repo.clone(),
+            iid: pending.iid,
+            head_sha,
+            eligibility: ReviewEligibility::Automatic,
+        }));
+        Ok(())
+    }
+
+    async fn defer_pending_review(&self, pending: &ReviewRateLimitPendingEntry) -> Result<bool> {
+        let next_retry_at = Utc::now()
+            .timestamp()
+            .saturating_add(PENDING_RETRY_LOOKUP_BACKOFF_SECONDS);
+        self.state
+            .review_rate_limit
+            .defer_review_rate_limit_pending_if_unchanged(
+                pending.lane,
+                &pending.repo,
+                pending.iid,
+                pending.next_retry_at,
+                next_retry_at,
+            )
+            .await
     }
 
     /// Clears the pending row, then attempts to remove its quota and rate-limit awards.
@@ -805,10 +755,6 @@ impl ReviewService {
         Ok(())
     }
 
-    async fn scan(&self, mode: ScanMode) -> Result<ScanRunStatus> {
-        run_scan_pipeline(self, mode).await
-    }
-
     pub(super) async fn load_latest_mr_activity_marker(&self, repo: &str) -> Option<String> {
         match self.gitlab.get_latest_open_mr_activity(repo).await {
             Ok(Some(mr)) => {
@@ -871,84 +817,89 @@ impl ReviewService {
         self.target_resolver.resolve_repos(mode).await
     }
 
+    /// Queues the mention commands and both review lanes of one MR, then waits until the
+    /// queue is empty. Reviews also drafts. MRs created before the cutoff get no review.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the underlying operation fails.
+    /// Returns an error if the MR or its discussions cannot be loaded.
     pub async fn review_mr(&self, repo: &str, iid: u64) -> Result<()> {
         if self.shutdown_requested() {
             info!(repo = repo, iid = iid, "skip: shutdown requested");
             return Ok(());
         }
         self.clear_stale_flow_state().await?;
-        let mut mr = self.gitlab.get_mr(repo, iid).await?;
-        let mut head_sha = if let Some(value) = mr.head_sha() {
-            value
-        } else {
+        let mr = self.gitlab.get_mr(repo, iid).await?;
+        let Some(head_sha) = mr.head_sha() else {
             warn!(repo = repo, iid = iid, "missing head sha, skipping");
             return Ok(());
         };
-        let mut mention_tasks = Vec::new();
-        let mention_outcome = self
-            .schedule_mention_commands_for_mr(repo, &mr, &head_sha, &mut mention_tasks)
+        let history = AdmissionHistory::new(self.gitlab.as_ref(), repo, iid);
+        let mentions = self
+            .mention_flow
+            .admit_for_scan(repo, &mr, &head_sha, &history)
             .await?;
-        let _ = join_all(mention_tasks).await;
-        if mention_outcome.blocks_review && mention_outcome.scheduled == 0 {
-            debug!(
+        for job in mentions.jobs {
+            self.enqueue(FlowJob::Mention(Box::new(job)));
+        }
+        match mr.created_at {
+            None => warn!(
                 repo = repo,
                 iid = iid,
-                "skip review scheduling in this request: same-MR mention work is already in progress"
-            );
-            return Ok(());
-        }
-        if mention_outcome.scheduled > 0 {
-            mr = self.gitlab.get_mr(repo, iid).await?;
-            head_sha = if let Some(value) = mr.head_sha() {
-                value
-            } else {
-                warn!(
-                    repo = repo,
-                    iid = iid,
-                    "missing head sha after mention commands, skipping review"
-                );
-                return Ok(());
-            };
-        }
-        let created_at = if let Some(value) = mr.created_at.as_ref() {
-            value
-        } else {
-            warn!(repo = repo, iid = iid, "missing created_at, skipping");
-            return Ok(());
-        };
-        if created_at <= &self.created_after {
-            debug!(
+                "missing created_at, skipping review"
+            ),
+            Some(created_at) if created_at <= self.created_after => debug!(
                 repo = repo,
                 iid = iid,
                 created_at = %created_at,
                 cutoff = %self.created_after,
                 "skip: MR created before cutoff"
-            );
-            return Ok(());
+            ),
+            Some(_) => {
+                for lane in [ReviewLane::General, ReviewLane::Security] {
+                    self.enqueue(FlowJob::Review(QueuedReview {
+                        lane,
+                        repo: repo.to_string(),
+                        iid,
+                        head_sha: head_sha.clone(),
+                        eligibility: ReviewEligibility::Explicit,
+                    }));
+                }
+            }
         }
-        let _ = self
-            .general_review_flow
-            .run_for_mr(repo, mr.clone(), &head_sha)
-            .await?;
-        let _ = self
-            .security_review_flow
-            .run_for_mr(repo, mr, &head_sha)
-            .await?;
+        self.wait_for_idle().await;
         Ok(())
     }
+}
+
+/// Starts each queued job in the flow that owns it.
+fn flow_job_runner(
+    general_review_flow: &Arc<ReviewFlow>,
+    security_review_flow: &Arc<ReviewFlow>,
+    mention_flow: &Arc<MentionFlow>,
+) -> RunJob<FlowJob> {
+    let general_review_flow = Arc::clone(general_review_flow);
+    let security_review_flow = Arc::clone(security_review_flow);
+    let mention_flow = Arc::clone(mention_flow);
+    Arc::new(move |job, running_head| match job {
+        FlowJob::Review(review) => {
+            let flow = match review.lane {
+                ReviewLane::General => Arc::clone(&general_review_flow),
+                ReviewLane::Security => Arc::clone(&security_review_flow),
+            };
+            Box::pin(async move { flow.run_queued(review, running_head).await })
+        }
+        FlowJob::Mention(mention) => {
+            let flow = Arc::clone(&mention_flow);
+            Box::pin(async move { flow.run_queued(*mention).await })
+        }
+    })
 }
 
 impl RunRetryStatusProvider for ReviewService {
     fn retry_statuses_for_run_ids(&self, run_ids: &[i64]) -> HashMap<i64, RunRetryStatus> {
         self.retry_backoff.statuses_for_run_ids(run_ids, Utc::now())
     }
-}
-
-fn should_clear_pending_retry_after_mr_lookup_error(err: &anyhow::Error) -> bool {
-    gitlab_error_has_status(err, &[404]) || format!("{err:#}").contains(MR_NOT_FOUND_ERROR)
 }
 
 #[cfg(test)]
@@ -959,7 +910,8 @@ mod pending_rate_limit_tests {
         ReviewContext,
     };
     use crate::config::test_builder::ConfigBuilder;
-    use crate::gitlab::GitLabUser;
+    use crate::gitlab::{GitLabUser, MergeRequest};
+    use crate::state::MentionQuotaPendingUpsert;
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use chrono::TimeZone;
@@ -1072,7 +1024,7 @@ mod pending_rate_limit_tests {
                 .unwrap()
                 .get(&iid)
                 .cloned()
-                .ok_or_else(|| anyhow!(MR_NOT_FOUND_ERROR))
+                .ok_or_else(|| anyhow!("mr not found"))
         }
 
         async fn get_project(&self, project: &str) -> Result<crate::gitlab::GitLabProject> {
@@ -1478,7 +1430,7 @@ mod pending_rate_limit_tests {
             Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         );
 
-        service.process_due_pending_rate_limit_reviews().await?;
+        service.process_due_pending_retries().await?;
 
         {
             let mention_contexts = runner.mention_contexts.lock().unwrap();
@@ -1497,60 +1449,6 @@ mod pending_rate_limit_tests {
         assert!(gitlab.calls.lock().unwrap().iter().any(|call| {
             call == "delete_discussion_note_award:group/repo:80:discussion-80:980:9800"
         }));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn pending_mention_quota_retry_preserves_row_when_same_mr_work_is_active() -> Result<()> {
-        let gitlab = Arc::new(TestGitLab::new(Vec::new()));
-        gitlab.insert_mr(test_mr(
-            81,
-            "sha81-new",
-            Utc.with_ymd_and_hms(2025, 1, 2, 0, 5, 0).unwrap(),
-        ));
-        gitlab.insert_discussions(
-            "group/repo",
-            81,
-            vec![mention_discussion("discussion-81", 981)],
-        );
-        let state = Arc::new(ReviewStateStore::new(":memory:").await?);
-        state
-            .mention_commands
-            .begin_mention_command("group/repo", 81, "other-discussion", 1981, "sha81-new")
-            .await?;
-        state
-            .mention_quota_pending
-            .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
-                repo: "group/repo",
-                iid: 81,
-                discussion_id: "discussion-81",
-                trigger_note_id: 981,
-                head_sha: "sha81-old",
-                blocked_at: 100,
-                next_retry_at: 0,
-            })
-            .await?;
-        let runner = Arc::new(CapturingRunner::default());
-        let service = ReviewService::new(
-            mention_test_config(),
-            gitlab,
-            state.clone(),
-            runner.clone(),
-            1,
-            Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
-        );
-
-        service.process_due_pending_rate_limit_reviews().await?;
-
-        assert!(runner.mention_contexts.lock().unwrap().is_empty());
-        let pending = state
-            .mention_quota_pending
-            .list_mention_quota_pending()
-            .await?;
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].iid, 81);
-        assert_eq!(pending[0].discussion_id, "discussion-81");
-        assert_eq!(pending[0].trigger_note_id, 981);
         Ok(())
     }
 
@@ -1585,7 +1483,7 @@ mod pending_rate_limit_tests {
             Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         );
 
-        service.process_due_pending_rate_limit_reviews().await?;
+        service.process_due_pending_retries().await?;
 
         {
             let review_contexts = runner.review_contexts.lock().unwrap();
@@ -1636,7 +1534,7 @@ mod pending_rate_limit_tests {
             Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         );
 
-        service.process_due_pending_rate_limit_reviews().await?;
+        service.process_due_pending_retries().await?;
 
         assert!(runner.review_contexts.lock().unwrap().is_empty());
         assert!(
@@ -1683,7 +1581,7 @@ mod pending_rate_limit_tests {
             Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         );
 
-        service.process_due_pending_rate_limit_reviews().await?;
+        service.process_due_pending_retries().await?;
 
         assert!(runner.review_contexts.lock().unwrap().is_empty());
         let pending = state
@@ -1697,7 +1595,7 @@ mod pending_rate_limit_tests {
     }
 
     #[tokio::test]
-    async fn pending_rate_limit_wake_defers_rows_when_review_start_errors() -> Result<()> {
+    async fn pending_review_start_error_keeps_the_row_deferred() -> Result<()> {
         let gitlab = Arc::new(TestGitLab::new(Vec::new()));
         gitlab.insert_mr(test_mr(
             93,
@@ -1730,22 +1628,22 @@ mod pending_rate_limit_tests {
             Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap(),
         );
 
-        let err = service
-            .process_due_pending_rate_limit_reviews()
-            .await
-            .expect_err("pending retry should surface setup failure");
-        assert!(
-            err.to_string()
-                .contains("deserialize feature flag overrides")
-        );
+        service.process_due_pending_retries().await?;
+
         let pending = state
             .review_rate_limit
             .list_review_rate_limit_pending()
             .await?;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].iid, 93);
-        assert_eq!(pending[0].last_seen_head_sha, "sha93-new");
-        assert!(pending[0].next_retry_at > 0);
+        assert!(
+            pending[0].next_retry_at > Utc::now().timestamp(),
+            "the row waits before the next attempt"
+        );
+        assert!(
+            service.rescan_requests.pending("group/repo").is_some(),
+            "the failed start must make the next scan read the repository"
+        );
         Ok(())
     }
 }

@@ -1138,6 +1138,26 @@ pub(super) fn default_created_at() -> DateTime<Utc> {
         .expect("valid datetime")
 }
 
+/// Puts `merge_request` into the fake and replaces an MR with the same iid.
+pub(super) fn put_mr(gitlab: &FakeGitLab, merge_request: MergeRequest) {
+    let mut mrs = gitlab.mrs.lock().unwrap();
+    mrs.retain(|existing| existing.iid != merge_request.iid);
+    mrs.push(merge_request);
+}
+
+/// Puts `merge_request` into the fake, runs one explicit review in `lane`, and waits
+/// until the queue is empty. The queued job reads the MR from the fake when it starts.
+pub(super) async fn review_mr_now(
+    service: &ReviewService,
+    gitlab: &FakeGitLab,
+    lane: ReviewLane,
+    merge_request: MergeRequest,
+) {
+    let iid = merge_request.iid;
+    put_mr(gitlab, merge_request);
+    service.review_lane_now(lane, "group/repo", iid).await;
+}
+
 pub(super) fn default_created_after() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0)
         .single()

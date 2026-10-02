@@ -65,7 +65,7 @@ async fn check_ineligible_pending_review(case: IneligibleReview) -> Result<()> {
             default_created_after(),
         );
 
-        service.process_due_pending_rate_limit_reviews().await?;
+        service.process_due_pending_retries().await?;
 
         assert_eq!(
             *runner.calls.lock().unwrap(),

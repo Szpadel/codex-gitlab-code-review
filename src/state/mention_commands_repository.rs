@@ -225,28 +225,6 @@ impl MentionCommandsRepository {
             .collect()
     }
 
-    pub(crate) async fn has_in_progress_mention_for_mr(
-        &self,
-        repo: &str,
-        iid: u64,
-    ) -> Result<bool> {
-        let exists = sqlx::query_scalar::<_, i64>(
-            r"
-            SELECT EXISTS(
-                SELECT 1
-                FROM mention_command_state
-                WHERE repo = ? AND iid = ? AND status = 'in_progress'
-            )
-            ",
-        )
-        .bind(repo)
-        .bind(sqlite_i64_from_u64(iid, "iid")?)
-        .fetch_one(self.sqlite.read_pool())
-        .await
-        .context("check in-progress mention command")?;
-        Ok(exists != 0)
-    }
-
     pub(crate) async fn mention_command_scan_state(
         &self,
         repo: &str,

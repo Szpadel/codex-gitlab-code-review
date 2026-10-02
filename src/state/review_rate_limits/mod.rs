@@ -145,6 +145,32 @@ impl ReviewRateLimitRepository {
             .await
     }
 
+    /// Sets `next_retry_at` only while the row still has `observed_next_retry_at`.
+    /// Both values are UTC Unix seconds. Other columns are not compared.
+    /// Returns `false` when another writer changed the retry time or cleared the row first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `SQLite` state operation fails.
+    pub async fn defer_review_rate_limit_pending_if_unchanged(
+        &self,
+        lane: crate::review_lane::ReviewLane,
+        repo: &str,
+        iid: u64,
+        observed_next_retry_at: i64,
+        next_retry_at: i64,
+    ) -> Result<bool> {
+        self.pending
+            .defer_review_rate_limit_pending_if_unchanged(
+                lane,
+                repo,
+                iid,
+                observed_next_retry_at,
+                next_retry_at,
+            )
+            .await
+    }
+
     /// # Errors
     ///
     /// Returns an error if the `SQLite` state operation fails.

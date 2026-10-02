@@ -996,7 +996,7 @@ async fn review_finishes_successfully_when_graceful_drain_starts_after_runner_be
 }
 
 #[tokio::test]
-async fn graceful_drain_cancels_queued_review_without_starting_second_codex_run() -> Result<()> {
+async fn graceful_drain_drops_waiting_review_without_starting_second_codex_run() -> Result<()> {
     let mut config = test_config();
     config.review.max_concurrent = 1;
     let bot_user = GitLabUser {
@@ -1062,7 +1062,8 @@ async fn graceful_drain_cancels_queued_review_without_starting_second_codex_run(
     assert_eq!(*runner.review_calls.lock().unwrap(), 1);
     assert_eq!(
         state.review_state.list_in_progress_reviews().await?.len(),
-        2
+        1,
+        "the waiting review holds no claim"
     );
 
     service.request_graceful_drain();
@@ -1092,9 +1093,15 @@ async fn graceful_drain_cancels_queued_review_without_starting_second_codex_run(
         sqlx::query_as("SELECT iid, result FROM review_state ORDER BY iid")
             .fetch_all(state.pool())
             .await?;
+    assert_eq!(results, vec![(90, "pass".to_string())]);
+    let dropped_review_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM run_history WHERE iid = ?")
+            .bind(91_i64)
+            .fetch_one(state.pool())
+            .await?;
     assert_eq!(
-        results,
-        vec![(90, "pass".to_string()), (91, "cancelled".to_string())]
+        dropped_review_rows, 0,
+        "a dropped waiting review leaves no history"
     );
     Ok(())
 }

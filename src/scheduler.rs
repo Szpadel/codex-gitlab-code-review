@@ -109,7 +109,13 @@ pub(crate) async fn run_with_hooks(
     let state = Arc::clone(&runtime.state);
     let background_tasks = runtime.state.background_tasks();
     let result = run_until_stopped(runtime, signal_source, http_launcher).await;
+    // Scans do not wait for their runs, so runs can still be active on every exit path.
+    // Stop them and wait for their cleanup before the runner and the state store close.
     service.request_shutdown();
+    if let Err(err) = service.recover_in_progress_reviews().await {
+        warn!(error = %err, "shutdown recovery of interrupted reviews failed");
+    }
+    service.wait_for_active_tasks().await;
     let cleanup = runner.shutdown_usage_sessions().await;
     if let Err(error) = &cleanup {
         warn!(error = %error, "Failed to shut down Usage sessions");
@@ -203,6 +209,16 @@ async fn run_until_stopped(
     };
     tokio::pin!(shutdown_signal);
 
+    // The startup scan queues runs and returns. Parse the schedule first, so a bad
+    // schedule stops startup before any run starts.
+    let tz = parse_timezone(config.schedule.timezone.as_deref())?;
+    let schedule = Schedule::from_str(&config.schedule.cron).with_context(|| {
+        format!(
+            "invalid cron expression '{}'. Expected 6 fields (sec min hour day month dow) like '0 */10 * * * *' or a shorthand like '@hourly'",
+            config.schedule.cron
+        )
+    })?;
+
     info!("starting scan loop");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let initial_scan_service = Arc::clone(&service);
@@ -211,7 +227,7 @@ async fn run_until_stopped(
         run_tracked_scan(
             initial_scan_admin_service.as_ref(),
             ScanMode::Full,
-            initial_scan_service.scan_once(),
+            initial_scan_service.queue_full_scan(),
         )
         .await
     });
@@ -244,14 +260,6 @@ async fn run_until_stopped(
             }
         }
     }
-
-    let tz = parse_timezone(config.schedule.timezone.as_deref())?;
-    let schedule = Schedule::from_str(&config.schedule.cron).with_context(|| {
-        format!(
-            "invalid cron expression '{}'. Expected 6 fields (sec min hour day month dow) like '0 */10 * * * *' or a shorthand like '@hourly'",
-            config.schedule.cron
-        )
-    })?;
 
     let scheduled_service = Arc::clone(&service);
     let scheduled_admin_service = Arc::clone(&http_services.admin);
@@ -375,6 +383,8 @@ async fn run_schedule_loop(
 
         tokio::select! {
             () = &mut sleep => {}
+            // A finished run can add an earlier retry or pending time.
+            () = service.wait_for_run_finished() => continue,
             changed = shutdown_rx.changed() => match changed {
                 Ok(()) if *shutdown_rx.borrow() => {
                     if let Err(err) = admin_service.clear_next_scan_at().await {
@@ -401,7 +411,7 @@ async fn run_schedule_loop(
                 run_tracked_scan(
                     admin_service,
                     ScanMode::Incremental,
-                    service.scan_once_incremental_waiting_for_tasks(),
+                    service.scan_once_incremental(),
                 )
                 .await
             }
@@ -409,7 +419,7 @@ async fn run_schedule_loop(
                 run_tracked_scan(
                     admin_service,
                     ScanMode::Incremental,
-                    service.process_due_pending_rate_limit_reviews(),
+                    service.queue_due_pending_retries(),
                 )
                 .await
             }
@@ -417,7 +427,7 @@ async fn run_schedule_loop(
                 run_tracked_scan(
                     admin_service,
                     ScanMode::Incremental,
-                    service.process_due_review_backoff_retries(),
+                    service.queue_due_review_backoff_retries(),
                 )
                 .await
             }

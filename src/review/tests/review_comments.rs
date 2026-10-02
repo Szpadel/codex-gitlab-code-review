@@ -118,13 +118,7 @@ async fn published_unclosed_marker_preserves_service_finding_trailer() -> Result
             1,
             default_created_after(),
         );
-        let flow = match lane {
-            ReviewLane::General => &service.general_review_flow,
-            ReviewLane::Security => &service.security_review_flow,
-        };
-
-        flow.run_for_mr("group/repo", mr(1, head_sha), head_sha)
-            .await?;
+        service.review_lane_now(lane, "group/repo", 1).await;
 
         let notes = gitlab.created_note_bodies();
         assert_eq!(notes.len(), 1);
