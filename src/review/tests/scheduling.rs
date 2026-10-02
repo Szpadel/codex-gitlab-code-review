@@ -347,9 +347,8 @@ async fn draft_mr_clears_retry_warning_award() -> Result<()> {
 }
 
 #[tokio::test]
-async fn completed_award_clears_due_retry_warning_award() -> Result<()> {
+async fn completed_review_clears_due_retry_warning_award() -> Result<()> {
     let config = test_config();
-    let thumbs_emoji = config.review.thumbs_emoji.clone();
     let gitlab = fake_gitlab(vec![mr(6, "sha1")]);
     let runner = Arc::new(FailingRunner {
         calls: Mutex::new(0),
@@ -358,7 +357,7 @@ async fn completed_award_clears_due_retry_warning_award() -> Result<()> {
     let service = ReviewService::new(
         config,
         gitlab.clone(),
-        state,
+        Arc::clone(&state),
         runner.clone(),
         1,
         default_created_after(),
@@ -374,19 +373,14 @@ async fn completed_award_clears_due_retry_warning_award() -> Result<()> {
     );
     gitlab.awards.lock().unwrap().insert(
         ("group/repo".to_string(), 6),
-        vec![
-            AwardEmoji {
-                id: 88,
-                name: "warning".to_string(),
-                user: gitlab.bot_user.clone(),
-            },
-            AwardEmoji {
-                id: 89,
-                name: thumbs_emoji,
-                user: gitlab.bot_user.clone(),
-            },
-        ],
+        vec![AwardEmoji {
+            id: 88,
+            name: "warning".to_string(),
+            user: gitlab.bot_user.clone(),
+        }],
     );
+    // The head passed in a run outside this scan.
+    record_general_pass(&state, 6, "sha1").await?;
 
     service.scan_once().await?;
 

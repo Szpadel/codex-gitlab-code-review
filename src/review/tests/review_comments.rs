@@ -1103,36 +1103,17 @@ async fn inline_review_comments_use_source_project_links_for_fork_mrs() -> Resul
 }
 
 #[tokio::test]
-async fn skips_when_thumbsup_exists() -> Result<()> {
+async fn bot_thumbs_award_does_not_block_a_review_and_is_removed_when_queued() -> Result<()> {
     let config = test_config();
-    let bot_user = GitLabUser {
-        id: 1,
-        username: None,
-        name: None,
-    };
-    let gitlab = Arc::new(FakeGitLab {
-        bot_user: bot_user.clone(),
-        mrs: Mutex::new(vec![mr(1, "sha1")]),
-        awards: Mutex::new(HashMap::from([(
-            ("group/repo".to_string(), 1),
-            vec![AwardEmoji {
-                id: 10,
-                name: "thumbsup".to_string(),
-                user: bot_user,
-            }],
-        )])),
-        notes: Mutex::new(HashMap::new()),
-        discussions: Mutex::new(HashMap::new()),
-        users: Mutex::new(HashMap::new()),
-        projects: Mutex::new(HashMap::new()),
-        all_projects: Mutex::new(Vec::new()),
-        group_projects: Mutex::new(HashMap::new()),
-        calls: Mutex::new(Vec::new()),
-        list_open_calls: Mutex::new(0),
-        list_projects_calls: Mutex::new(0),
-        list_group_projects_calls: Mutex::new(0),
-        delete_award_fails: false,
-    });
+    let gitlab = fake_gitlab(vec![mr(1, "sha1")]);
+    gitlab.awards.lock().unwrap().insert(
+        ("group/repo".to_string(), 1),
+        vec![AwardEmoji {
+            id: 10,
+            name: "thumbsup".to_string(),
+            user: gitlab.bot_user.clone(),
+        }],
+    );
     let runner = Arc::new(FakeRunner {
         result: Mutex::new(Some(CodexResult::Pass {
             summary: "ok".to_string(),
@@ -1140,6 +1121,41 @@ async fn skips_when_thumbsup_exists() -> Result<()> {
         calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once().await?;
+
+    assert_eq!(*runner.calls.lock().unwrap(), 1);
+    assert!(
+        gitlab
+            .calls
+            .lock()
+            .unwrap()
+            .contains(&"delete_award:group/repo:1:10".to_string()),
+        "a queued review withdraws the thumbs award of an earlier head"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stored_pass_skips_the_same_head_again() -> Result<()> {
+    let config = test_config();
+    let gitlab = fake_gitlab(vec![mr(1, "sha1")]);
+    let runner = Arc::new(FakeRunner {
+        result: Mutex::new(Some(CodexResult::Pass {
+            summary: "ok".to_string(),
+        })),
+        calls: Mutex::new(0),
+    });
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    record_general_pass(&state, 1, "sha1").await?;
     let service = ReviewService::new(
         config,
         gitlab.clone(),

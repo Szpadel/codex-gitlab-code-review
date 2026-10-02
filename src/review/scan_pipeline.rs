@@ -25,7 +25,6 @@ pub(super) struct ScanCounters {
     scheduled: usize,
     security_scheduled: usize,
     mention_scheduled: usize,
-    skipped_award: usize,
     skipped_marker: usize,
     skipped_completed: usize,
     skipped_quota: usize,
@@ -111,10 +110,6 @@ impl ScanContext {
                     "skip: codex quota exhausted for security review"
                 );
             }
-            (ReviewLane::General, ReviewScheduleOutcome::SkippedAward) => {
-                self.counters.skipped_award += 1;
-                debug!(repo = repo, iid = iid, "skip: thumbs up already present");
-            }
             (ReviewLane::General, ReviewScheduleOutcome::SkippedMarker) => {
                 self.counters.skipped_marker += 1;
                 debug!(
@@ -150,13 +145,6 @@ impl ScanContext {
             (_, ReviewScheduleOutcome::Interrupted) => {
                 return Some(RepoScanStatus::Interrupted);
             }
-            (ReviewLane::Security, ReviewScheduleOutcome::SkippedAward) => {
-                debug!(
-                    repo = repo,
-                    iid = iid,
-                    "skip: security review returned award outcome"
-                );
-            }
         }
         None
     }
@@ -182,7 +170,6 @@ impl ScanContext {
                     scheduled = self.counters.scheduled,
                     security_scheduled = self.counters.security_scheduled,
                     mention_scheduled = self.counters.mention_scheduled,
-                    skipped_award = self.counters.skipped_award,
                     skipped_marker = self.counters.skipped_marker,
                     skipped_completed = self.counters.skipped_completed,
                     skipped_quota = self.counters.skipped_quota,
@@ -207,7 +194,6 @@ impl ScanContext {
                     scheduled = self.counters.scheduled,
                     security_scheduled = self.counters.security_scheduled,
                     mention_scheduled = self.counters.mention_scheduled,
-                    skipped_award = self.counters.skipped_award,
                     skipped_marker = self.counters.skipped_marker,
                     skipped_completed = self.counters.skipped_completed,
                     skipped_quota = self.counters.skipped_quota,
@@ -473,7 +459,7 @@ impl<'a> ScanPipeline<'a> {
                 let outcome = match flow.admit_for_scan(repo, &mr, &head_sha, &history).await? {
                     ReviewAdmission::Skip(outcome) => outcome,
                     ReviewAdmission::Queue(job) => {
-                        if self.service.enqueue(FlowJob::Review(job)) {
+                        if self.service.queue_review(job).await {
                             ReviewScheduleOutcome::Scheduled
                         } else {
                             ReviewScheduleOutcome::Interrupted

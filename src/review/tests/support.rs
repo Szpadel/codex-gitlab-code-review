@@ -1138,6 +1138,22 @@ pub(super) fn default_created_at() -> DateTime<Utc> {
         .expect("valid datetime")
 }
 
+/// Records a passed general review of `head_sha`, so scans do not review that head again.
+pub(super) async fn record_general_pass(
+    state: &ReviewStateStore,
+    iid: u64,
+    head_sha: &str,
+) -> Result<()> {
+    state
+        .review_state
+        .begin_review_for_lane("group/repo", iid, head_sha, ReviewLane::General)
+        .await?;
+    state
+        .review_state
+        .finish_review_for_lane("group/repo", iid, head_sha, ReviewLane::General, "pass")
+        .await
+}
+
 /// Puts `merge_request` into the fake and replaces an MR with the same iid.
 pub(super) fn put_mr(gitlab: &FakeGitLab, merge_request: MergeRequest) {
     let mut mrs = gitlab.mrs.lock().unwrap();

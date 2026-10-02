@@ -83,7 +83,8 @@ impl ReviewLane {
         }
     }
 
-    /// Uses completed state to deduplicate security reviews, which may finish silently.
+    /// Uses any completed state to deduplicate security reviews, which may finish silently.
+    /// General reviews count only a stored pass. Their comments count through GitLab markers.
     pub(crate) const fn skips_completed_review_result(self) -> bool {
         matches!(self, Self::Security)
     }

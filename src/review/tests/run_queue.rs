@@ -446,3 +446,46 @@ async fn busy_claim_requests_a_rescan_instead_of_dropping_the_review() -> Result
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn queued_review_withdraws_the_thumbs_award_before_it_starts() -> Result<()> {
+    let gitlab = fake_gitlab(vec![mr(1, "a1"), mr(2, "b1")]);
+    gitlab.awards.lock().unwrap().insert(
+        ("group/repo".to_string(), 2),
+        vec![AwardEmoji {
+            id: 20,
+            name: "thumbsup".to_string(),
+            user: gitlab.bot_user.clone(),
+        }],
+    );
+    let runner = OrderRecordingRunner::new();
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let mut config = test_config();
+    config.review.max_concurrent = 1;
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state,
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.scan_once_incremental().await?;
+    runner.wait_for_first_start().await;
+    let starts_while_waiting = runner.starts().len();
+    let withdrawn_while_waiting = gitlab
+        .calls
+        .lock()
+        .unwrap()
+        .contains(&"delete_award:group/repo:2:20".to_string());
+    runner.release_first.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), service.wait_for_idle()).await?;
+
+    assert_eq!(starts_while_waiting, 1, "the review of MR 2 still waits");
+    assert!(
+        withdrawn_while_waiting,
+        "queueing a review withdraws the thumbs award at once"
+    );
+    Ok(())
+}

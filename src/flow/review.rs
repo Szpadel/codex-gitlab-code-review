@@ -45,7 +45,6 @@ pub(crate) enum ReviewScheduleOutcome {
     SkippedBackoff,
     SkippedRetryExhausted,
     SkippedQuota,
-    SkippedAward,
     SkippedMarker,
     SkippedCompleted,
     Interrupted,
@@ -385,13 +384,6 @@ impl ReviewFlow {
             }
             return Ok(Some(ReviewScheduleOutcome::SkippedCompleted));
         }
-        if self.skipped_by_thumbs_award(repo, mr.iid).await? {
-            if retry_was_due {
-                self.clear_retry_gate_for_terminal_skip(&retry_key, repo, mr.iid)
-                    .await;
-            }
-            return Ok(Some(ReviewScheduleOutcome::SkippedAward));
-        }
         if self.skipped_by_review_marker(history, head_sha).await? {
             if retry_was_due {
                 self.clear_retry_gate_for_terminal_skip(&retry_key, repo, mr.iid)
@@ -439,16 +431,6 @@ impl ReviewFlow {
             .await
     }
 
-    async fn skipped_by_thumbs_award(&self, repo: &str, iid: u64) -> Result<bool> {
-        if !self.uses_awards() {
-            return Ok(false);
-        }
-        self.shared
-            .award_service
-            .has_award(repo, iid, &self.shared.config.review.thumbs_emoji)
-            .await
-    }
-
     async fn skipped_by_codex_quota(&self, repo: &str, iid: u64, head_sha: &str) -> Result<bool> {
         let now = Utc::now();
         let Some(block) = self.shared.codex.quota_block(now).await? else {
@@ -471,15 +453,14 @@ impl ReviewFlow {
         Ok(true)
     }
 
+    /// Skips a head whose stored result completes this lane's review. A stored pass always
+    /// counts, because a pass publishes only the thumbs award, which names no head.
     async fn skipped_by_completed_result(
         &self,
         repo: &str,
         iid: u64,
         head_sha: &str,
     ) -> Result<bool> {
-        if !self.lane.skips_completed_review_result() {
-            return Ok(false);
-        }
         let result = self
             .shared
             .state
@@ -489,7 +470,10 @@ impl ReviewFlow {
         Ok(result
             .as_deref()
             .and_then(ReviewRunResult::parse)
-            .is_some_and(ReviewRunResult::is_completed_review))
+            .is_some_and(|result| {
+                result == ReviewRunResult::Pass
+                    || (self.lane.skips_completed_review_result() && result.is_completed_review())
+            }))
     }
 
     async fn skipped_by_review_marker(
@@ -1075,6 +1059,27 @@ impl ReviewFlow {
         }
     }
 
+    /// Removes the bot's thumbs award, which says that the bot accepts the MR in its latest
+    /// form. Lanes without awards and dry runs do nothing. A failure is logged.
+    pub(crate) async fn withdraw_pass_award(&self, repo: &str, iid: u64) {
+        if self.shared.config.review.dry_run || !self.uses_awards() {
+            return;
+        }
+        if let Err(err) = self
+            .shared
+            .award_service
+            .remove_award(repo, iid, &self.shared.config.review.thumbs_emoji)
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                error = %err,
+                "failed to withdraw thumbs award from MR that needs a review"
+            );
+        }
+    }
+
     async fn remove_rate_limit_award_best_effort(&self, repo: &str, iid: u64) {
         if self.shared.config.review.dry_run || !self.uses_awards() {
             return;
@@ -1290,6 +1295,24 @@ impl ReviewRunContext {
                 iid = iid,
                 error = %err,
                 "failed to remove eyes award"
+            );
+        }
+    }
+
+    async fn withdraw_pass_award(&self, repo: &str, iid: u64) {
+        if self.config.review.dry_run || !self.uses_awards() {
+            return;
+        }
+        if let Err(err) = self
+            .award_service
+            .remove_award(repo, iid, &self.config.review.thumbs_emoji)
+            .await
+        {
+            warn!(
+                repo = repo,
+                iid = iid,
+                error = %err,
+                "failed to withdraw thumbs award before review"
             );
         }
     }
@@ -1521,7 +1544,7 @@ impl ReviewRunContext {
             );
         } else {
             self.award_service
-                .create_award(run.repo, run.iid, &self.config.review.thumbs_emoji)
+                .ensure_award(run.repo, run.iid, &self.config.review.thumbs_emoji)
                 .await?;
         }
         let result = if self.config.review.dry_run {
@@ -1690,6 +1713,9 @@ impl ReviewRunContext {
         self.retry_warning_awards
             .remove_if_no_other_active_retry(self.retry_backoff.as_ref(), &retry_key)
             .await;
+        // A run of an earlier head can pass after this review was queued. This review
+        // decides the award for the latest head.
+        self.withdraw_pass_award(repo, mr.iid).await;
         self.add_eyes_best_effort(repo, mr.iid).await;
         let review_project =
             resolve_review_project(&self.config, self.gitlab.as_ref(), self.lane, repo, &mr).await;

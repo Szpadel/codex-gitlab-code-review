@@ -308,13 +308,14 @@ impl ReviewService {
     /// Queues one explicit review of the MR's current head, then waits until the queue is empty.
     #[cfg(test)]
     pub(super) async fn review_lane_now(&self, lane: ReviewLane, repo: &str, iid: u64) {
-        self.enqueue(FlowJob::Review(QueuedReview {
+        self.queue_review(QueuedReview {
             lane,
             repo: repo.to_string(),
             iid,
             head_sha: String::new(),
             eligibility: ReviewEligibility::Explicit,
-        }));
+        })
+        .await;
         self.wait_for_idle().await;
     }
 
@@ -382,6 +383,27 @@ impl ReviewService {
     /// Adds a job to the run queue. Returns `false` when shutdown closed the queue.
     pub(super) fn enqueue(&self, job: FlowJob) -> bool {
         self.run_queue.enqueue(job) != EnqueueOutcome::Closed
+    }
+
+    /// Queues a review. Returns `false` when shutdown closed the queue.
+    ///
+    /// The thumbs award says that the bot accepts the MR in its latest form. A review that
+    /// the queue takes as new work withdraws it at once. A review of a head that already
+    /// runs keeps it, because that run decides the award.
+    pub(super) async fn queue_review(&self, job: QueuedReview) -> bool {
+        let lane = job.lane;
+        let repo = job.repo.clone();
+        let iid = job.iid;
+        match self.run_queue.enqueue(FlowJob::Review(job)) {
+            EnqueueOutcome::Queued | EnqueueOutcome::Replaced => {
+                self.review_flow_for_lane(lane)
+                    .withdraw_pass_award(&repo, iid)
+                    .await;
+                true
+            }
+            EnqueueOutcome::AlreadyRunning => true,
+            EnqueueOutcome::Closed => false,
+        }
     }
 
     pub(super) async fn clear_stale_flow_state(&self) -> Result<()> {
@@ -607,13 +629,14 @@ impl ReviewService {
         if !self.defer_pending_review(pending).await? {
             return Ok(());
         }
-        self.enqueue(FlowJob::Review(QueuedReview {
+        self.queue_review(QueuedReview {
             lane: pending.lane,
             repo: pending.repo.clone(),
             iid: pending.iid,
             head_sha,
             eligibility: ReviewEligibility::Automatic,
-        }));
+        })
+        .await;
         Ok(())
     }
 
@@ -859,13 +882,14 @@ impl ReviewService {
             ),
             Some(_) => {
                 for lane in [ReviewLane::General, ReviewLane::Security] {
-                    self.enqueue(FlowJob::Review(QueuedReview {
+                    self.queue_review(QueuedReview {
                         lane,
                         repo: repo.to_string(),
                         iid,
                         head_sha: head_sha.clone(),
                         eligibility: ReviewEligibility::Explicit,
-                    }));
+                    })
+                    .await;
                 }
             }
         }

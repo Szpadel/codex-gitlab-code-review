@@ -271,14 +271,7 @@ async fn scan_runs_mention_command_for_triggered_discussion_note() -> Result<()>
     let gitlab = Arc::new(FakeGitLab {
         bot_user: bot_user.clone(),
         mrs: Mutex::new(vec![mr(30, "sha30")]),
-        awards: Mutex::new(HashMap::from([(
-            ("group/repo".to_string(), 30),
-            vec![AwardEmoji {
-                id: 301,
-                name: "thumbsup".to_string(),
-                user: bot_user,
-            }],
-        )])),
+        awards: Mutex::new(HashMap::new()),
         notes: Mutex::new(HashMap::new()),
         discussions: Mutex::new(HashMap::from([(
             ("group/repo".to_string(), 30),
@@ -331,6 +324,7 @@ async fn scan_runs_mention_command_for_triggered_discussion_note() -> Result<()>
         mention_calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    record_general_pass(&state, 30, "sha30").await?;
     let service = ReviewService::new(
         config,
         gitlab.clone(),
@@ -396,14 +390,7 @@ async fn mention_history_insert_failure_releases_mention_lock() -> Result<()> {
     let gitlab = Arc::new(FakeGitLab {
         bot_user: bot_user.clone(),
         mrs: Mutex::new(vec![mr(41, "sha41")]),
-        awards: Mutex::new(HashMap::from([(
-            ("group/repo".to_string(), 41),
-            vec![AwardEmoji {
-                id: 411,
-                name: "thumbsup".to_string(),
-                user: bot_user,
-            }],
-        )])),
+        awards: Mutex::new(HashMap::new()),
         notes: Mutex::new(HashMap::new()),
         discussions: Mutex::new(HashMap::from([(
             ("group/repo".to_string(), 41),
@@ -456,6 +443,7 @@ async fn mention_history_insert_failure_releases_mention_lock() -> Result<()> {
         mention_calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    record_general_pass(&state, 41, "sha41").await?;
     sqlx::query("DROP TABLE run_history")
         .execute(state.pool())
         .await?;
@@ -515,14 +503,7 @@ async fn mention_run_history_uses_refreshed_mr_sha() -> Result<()> {
     let inner_gitlab = Arc::new(FakeGitLab {
         bot_user: bot_user.clone(),
         mrs: Mutex::new(vec![mr(42, "sha-old")]),
-        awards: Mutex::new(HashMap::from([(
-            ("group/repo".to_string(), 42),
-            vec![AwardEmoji {
-                id: 421,
-                name: "thumbsup".to_string(),
-                user: bot_user,
-            }],
-        )])),
+        awards: Mutex::new(HashMap::new()),
         notes: Mutex::new(HashMap::new()),
         discussions: Mutex::new(HashMap::from([(
             ("group/repo".to_string(), 42),
@@ -579,6 +560,7 @@ async fn mention_run_history_uses_refreshed_mr_sha() -> Result<()> {
         mention_calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    record_general_pass(&state, 42, "sha-old").await?;
     let service = ReviewService::new(
         config,
         gitlab,
@@ -628,24 +610,7 @@ async fn mentions_snapshot_feature_flags_when_they_start() -> Result<()> {
     let gitlab = Arc::new(FakeGitLab {
         bot_user: bot_user.clone(),
         mrs: Mutex::new(vec![mr(52, "sha52"), mr(53, "sha53")]),
-        awards: Mutex::new(HashMap::from([
-            (
-                ("group/repo".to_string(), 52),
-                vec![AwardEmoji {
-                    id: 521,
-                    name: "thumbsup".to_string(),
-                    user: bot_user.clone(),
-                }],
-            ),
-            (
-                ("group/repo".to_string(), 53),
-                vec![AwardEmoji {
-                    id: 531,
-                    name: "thumbsup".to_string(),
-                    user: bot_user.clone(),
-                }],
-            ),
-        ])),
+        awards: Mutex::new(HashMap::new()),
         notes: Mutex::new(HashMap::new()),
         discussions: Mutex::new(HashMap::from([
             (
@@ -725,6 +690,8 @@ async fn mentions_snapshot_feature_flags_when_they_start() -> Result<()> {
         mention_calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    record_general_pass(&state, 52, "sha52").await?;
+    record_general_pass(&state, 53, "sha53").await?;
     state
         .feature_flags
         .set_runtime_feature_flag_overrides(&crate::config::RuntimeFeatureFlagOverrides {
@@ -808,14 +775,7 @@ async fn scan_runs_mention_command_for_standalone_discussion_comment() -> Result
     let gitlab = Arc::new(FakeGitLab {
         bot_user: bot_user.clone(),
         mrs: Mutex::new(vec![mr(33, "sha33")]),
-        awards: Mutex::new(HashMap::from([(
-            ("group/repo".to_string(), 33),
-            vec![AwardEmoji {
-                id: 331,
-                name: "thumbsup".to_string(),
-                user: bot_user,
-            }],
-        )])),
+        awards: Mutex::new(HashMap::new()),
         notes: Mutex::new(HashMap::new()),
         discussions: Mutex::new(HashMap::from([(
             ("group/repo".to_string(), 33),
@@ -854,6 +814,7 @@ async fn scan_runs_mention_command_for_standalone_discussion_comment() -> Result
         mention_calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    record_general_pass(&state, 33, "sha33").await?;
     let service = ReviewService::new(
         config,
         gitlab.clone(),
@@ -922,14 +883,7 @@ async fn scan_runs_mention_command_for_reply_from_non_mr_author() -> Result<()> 
     let gitlab = Arc::new(FakeGitLab {
         bot_user: bot_user.clone(),
         mrs: Mutex::new(vec![mr(34, "sha34")]),
-        awards: Mutex::new(HashMap::from([(
-            ("group/repo".to_string(), 34),
-            vec![AwardEmoji {
-                id: 341,
-                name: "thumbsup".to_string(),
-                user: bot_user.clone(),
-            }],
-        )])),
+        awards: Mutex::new(HashMap::new()),
         notes: Mutex::new(HashMap::new()),
         discussions: Mutex::new(HashMap::from([(
             ("group/repo".to_string(), 34),
@@ -978,6 +932,7 @@ async fn scan_runs_mention_command_for_reply_from_non_mr_author() -> Result<()> 
         mention_calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    record_general_pass(&state, 34, "sha34").await?;
     let service = ReviewService::new(
         config,
         gitlab.clone(),
@@ -1046,14 +1001,7 @@ async fn dry_run_skips_mention_commands_and_thread_status_writes() -> Result<()>
     let gitlab = Arc::new(FakeGitLab {
         bot_user: bot_user.clone(),
         mrs: Mutex::new(vec![mr(31, "sha31")]),
-        awards: Mutex::new(HashMap::from([(
-            ("group/repo".to_string(), 31),
-            vec![AwardEmoji {
-                id: 311,
-                name: "thumbsup".to_string(),
-                user: bot_user,
-            }],
-        )])),
+        awards: Mutex::new(HashMap::new()),
         notes: Mutex::new(HashMap::new()),
         discussions: Mutex::new(HashMap::from([(
             ("group/repo".to_string(), 31),
@@ -1098,6 +1046,7 @@ async fn dry_run_skips_mention_commands_and_thread_status_writes() -> Result<()>
         mention_calls: Mutex::new(0),
     });
     let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    record_general_pass(&state, 31, "sha31").await?;
     let service = ReviewService::new(
         config,
         gitlab.clone(),

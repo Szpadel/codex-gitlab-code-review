@@ -24,10 +24,6 @@ impl AwardService {
         Ok(has_bot_award(&awards, self.bot_user_id, name))
     }
 
-    pub(crate) async fn create_award(&self, repo: &str, iid: u64, name: &str) -> Result<()> {
-        self.gitlab.add_award(repo, iid, name).await
-    }
-
     pub(crate) async fn ensure_award(&self, repo: &str, iid: u64, name: &str) -> Result<()> {
         if self.bot_user_id == 0 {
             return Ok(());
