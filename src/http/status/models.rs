@@ -1,5 +1,6 @@
 use crate::codex_runner::CodexUsageSnapshot;
 use crate::flow::retry::RunRetryStatus;
+use crate::flow::run_queue::QueuedRun;
 use crate::run_history_kind::RunHistoryKind;
 use crate::state::{
     AuthLimitResetEntry, InProgressMentionCommand, InProgressReview, PersistedScanStatus,
@@ -107,6 +108,8 @@ pub struct HistorySnapshot {
     pub previous_cursor: Option<String>,
     pub next_cursor: Option<String>,
     pub token_statistics: Vec<TokenUsageStatisticSnapshot>,
+    /// Runs that wait in the run queue. They have no run-history row yet.
+    pub queued_runs: Vec<QueuedRun>,
     pub runs: Vec<HistoryRunListItem>,
 }
 

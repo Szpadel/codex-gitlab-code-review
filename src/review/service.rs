@@ -10,7 +10,9 @@ use crate::flow::review::{
     QueuedReview, ReviewEligibility, ReviewFlow, merge_request_lookup_reports_missing,
     review_skip_reason,
 };
-use crate::flow::run_queue::{EnqueueOutcome, JobKey, RunJob, RunQueue};
+use crate::flow::run_queue::{
+    EnqueueOutcome, JobKey, QueuedRun, QueuedRunsProvider, RunJob, RunQueue,
+};
 use crate::flow::{ActiveTaskRegistry, FlowJob, FlowShared, RescanRequests};
 use crate::gitlab::{GitLabApi, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
@@ -899,6 +901,12 @@ fn flow_job_runner(
 impl RunRetryStatusProvider for ReviewService {
     fn retry_statuses_for_run_ids(&self, run_ids: &[i64]) -> HashMap<i64, RunRetryStatus> {
         self.retry_backoff.statuses_for_run_ids(run_ids, Utc::now())
+    }
+}
+
+impl QueuedRunsProvider for ReviewService {
+    fn queued_runs(&self) -> Vec<QueuedRun> {
+        self.run_queue.queued_runs()
     }
 }
 

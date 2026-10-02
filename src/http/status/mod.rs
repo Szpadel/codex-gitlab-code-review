@@ -19,7 +19,7 @@ pub use models::{
 };
 pub use rate_limit_service::RateLimitService;
 pub use skills_service::SkillsService;
-pub use status_service::StatusService;
+pub use status_service::{RunStateProviders, StatusService};
 pub use usage_service::UsageService;
 
 #[cfg(test)]

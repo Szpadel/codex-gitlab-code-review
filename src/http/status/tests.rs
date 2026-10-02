@@ -13,6 +13,7 @@ use super::{
 };
 use crate::config::{Config, FeatureFlagSnapshot, test_builder::ConfigBuilder};
 use crate::flow::retry::{RunRetryStatus, RunRetryStatusProvider};
+use crate::flow::run_queue::{QueuedRun, QueuedRunsProvider};
 use crate::review_lane::ReviewLane;
 use crate::run_history_kind::RunHistoryKind;
 use crate::state::{
@@ -104,6 +105,91 @@ async fn history_snapshot_includes_in_memory_retry_status() -> Result<()> {
             .as_ref()
             .map(|retry| retry.label.as_str()),
         Some("retry 1/5 in 15m")
+    );
+    Ok(())
+}
+
+struct StaticQueuedRunsProvider {
+    runs: Vec<QueuedRun>,
+}
+
+impl QueuedRunsProvider for StaticQueuedRunsProvider {
+    fn queued_runs(&self) -> Vec<QueuedRun> {
+        self.runs.clone()
+    }
+}
+
+fn queued_run(kind: RunHistoryKind, repo: &str, iid: u64) -> QueuedRun {
+    QueuedRun {
+        kind,
+        repo: repo.to_string(),
+        iid,
+        head_sha: format!("head-{iid}"),
+        queued_at: 1_790_000_000,
+    }
+}
+
+#[tokio::test]
+async fn history_snapshot_filters_queued_runs_like_recorded_runs() -> Result<()> {
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let services = HttpServices::new(test_config(), state, false, None).with_queued_runs_provider(
+        Arc::new(StaticQueuedRunsProvider {
+            runs: vec![
+                queued_run(RunHistoryKind::Review, "group/repo", 1),
+                queued_run(RunHistoryKind::Security, "group/repo", 1),
+                queued_run(RunHistoryKind::Review, "group/other", 2),
+            ],
+        }),
+    );
+    let snapshot = |query: super::HistoryQuery| {
+        let services = services.clone();
+        async move {
+            services
+                .status
+                .history_snapshot(super::HistoryQuery {
+                    limit: 100,
+                    ..query
+                })
+                .await
+        }
+    };
+
+    let all = snapshot(super::HistoryQuery::default()).await?;
+    let repo_and_kind = snapshot(super::HistoryQuery {
+        repo: Some("group/repo".to_string()),
+        kind: Some(RunHistoryKind::Security),
+        ..super::HistoryQuery::default()
+    })
+    .await?;
+    let with_result = snapshot(super::HistoryQuery {
+        result: Some("pass".to_string()),
+        ..super::HistoryQuery::default()
+    })
+    .await?;
+    let later_page = snapshot(super::HistoryQuery {
+        after: Some(
+            crate::state::RunHistoryCursor {
+                started_at: 1,
+                id: 1,
+            }
+            .encode(),
+        ),
+        ..super::HistoryQuery::default()
+    })
+    .await?;
+
+    assert_eq!(all.queued_runs.len(), 3);
+    assert_eq!(
+        repo_and_kind.queued_runs,
+        vec![queued_run(RunHistoryKind::Security, "group/repo", 1)]
+    );
+    assert!(
+        with_result.queued_runs.is_empty(),
+        "queued runs have no result yet"
+    );
+    assert!(
+        later_page.queued_runs.is_empty(),
+        "queued runs show on the first page only"
     );
     Ok(())
 }

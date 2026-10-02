@@ -1,10 +1,11 @@
 use super::{
-    AdminService, BackfillService, RateLimitService, SkillsService, StatusService,
-    TranscriptBackfillSource, UsageService,
+    AdminService, BackfillService, RateLimitService, RunStateProviders, SkillsService,
+    StatusService, TranscriptBackfillSource, UsageService,
 };
 use crate::codex_runner::CodexRunner;
 use crate::config::Config;
 use crate::flow::retry::RunRetryStatusProvider;
+use crate::flow::run_queue::QueuedRunsProvider;
 use crate::skills::SkillsManager;
 use crate::state::ReviewStateStore;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ pub struct HttpServices {
     run_once: bool,
     runtime_mode: String,
     transcript_backfill_source_override: Option<Arc<dyn TranscriptBackfillSource>>,
-    retry_status_provider: Option<Arc<dyn RunRetryStatusProvider>>,
+    run_state: RunStateProviders,
 }
 
 impl HttpServices {
@@ -44,7 +45,7 @@ impl HttpServices {
             run_once,
             "normal".to_string(),
             None,
-            None,
+            RunStateProviders::default(),
         )
     }
 
@@ -60,7 +61,17 @@ impl HttpServices {
         mut self,
         retry_status_provider: Arc<dyn RunRetryStatusProvider>,
     ) -> Self {
-        self.retry_status_provider = Some(retry_status_provider);
+        self.run_state.retry_statuses = Some(retry_status_provider);
+        self.rebuild_services();
+        self
+    }
+
+    #[must_use]
+    pub fn with_queued_runs_provider(
+        mut self,
+        queued_runs_provider: Arc<dyn QueuedRunsProvider>,
+    ) -> Self {
+        self.run_state.queued_runs = Some(queued_runs_provider);
         self.rebuild_services();
         self
     }
@@ -82,7 +93,7 @@ impl HttpServices {
         run_once: bool,
         runtime_mode: String,
         transcript_backfill_source_override: Option<Arc<dyn TranscriptBackfillSource>>,
-        retry_status_provider: Option<Arc<dyn RunRetryStatusProvider>>,
+        run_state: RunStateProviders,
     ) -> Self {
         let feature_flag_availability = config.feature_flag_availability();
         let admin = Arc::new(AdminService::new(
@@ -115,7 +126,7 @@ impl HttpServices {
             Arc::clone(&admin),
             Arc::clone(&ratelimit),
             Arc::clone(&backfill),
-            retry_status_provider.clone(),
+            run_state.clone(),
         ));
 
         Self {
@@ -131,7 +142,7 @@ impl HttpServices {
             run_once,
             runtime_mode,
             transcript_backfill_source_override,
-            retry_status_provider,
+            run_state,
         }
     }
 
@@ -143,7 +154,7 @@ impl HttpServices {
             self.run_once,
             self.runtime_mode.clone(),
             self.transcript_backfill_source_override.clone(),
-            self.retry_status_provider.clone(),
+            self.run_state.clone(),
         );
         self.status = rebuilt.status;
         self.admin = rebuilt.admin;

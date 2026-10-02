@@ -7,6 +7,7 @@ use crate::codex_runner::{CodexRunner, DockerCodexRunner, RunnerRuntimeOptions};
 use crate::config::{Config, ValidatedConfig, validate_config};
 use crate::dev_mode::{DevToolsService, MockCodexRunner};
 use crate::flow::retry::RunRetryStatusProvider;
+use crate::flow::run_queue::QueuedRunsProvider;
 use crate::gitlab::bot_user::resolve_and_update_bot_user_config;
 use crate::gitlab::{GitLabApi, GitLabClient};
 use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
@@ -153,6 +154,7 @@ fn build_dev_runtime(
             Some(Arc::clone(&runner)),
         )
         .with_retry_status_provider(Arc::clone(&service) as Arc<dyn RunRetryStatusProvider>)
+        .with_queued_runs_provider(Arc::clone(&service) as Arc<dyn QueuedRunsProvider>)
         .with_runtime_mode("development"),
     );
     Ok(RuntimeServices {
@@ -244,6 +246,7 @@ async fn build_normal_runtime(
             Some(Arc::clone(&runner)),
         )
         .with_retry_status_provider(Arc::clone(&service) as Arc<dyn RunRetryStatusProvider>)
+        .with_queued_runs_provider(Arc::clone(&service) as Arc<dyn QueuedRunsProvider>)
         .with_runtime_mode("normal"),
     );
 

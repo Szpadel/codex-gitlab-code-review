@@ -7,6 +7,7 @@ use super::html::{
     render_unix_timestamp, run_kind_label,
 };
 use crate::flow::retry::RunRetryStatus;
+use crate::flow::run_queue::QueuedRun;
 use crate::run_history_kind::RunHistoryKind;
 use urlencoding::encode;
 
@@ -21,9 +22,11 @@ pub(in crate::http) fn render_history_page(
          {}\
          {}\
          {}\
+         {}\
          {}",
         render_history_filters(filters),
         render_token_statistics(&snapshot.token_statistics),
+        render_queued_run_table(&snapshot.queued_runs),
         render_history_run_table("All runs", &snapshot.runs),
         render_history_pagination(snapshot, "/history")
     );
@@ -42,9 +45,10 @@ pub(in crate::http) fn render_mr_history_page(
     development_enabled: bool,
 ) -> String {
     let body = format!(
-        "<section class=\"hero\"><h1>MR history</h1><p class=\"muted\">Sessions for {} !{}.</p></section>{}{}",
+        "<section class=\"hero\"><h1>MR history</h1><p class=\"muted\">Sessions for {} !{}.</p></section>{}{}{}",
         escape_html(&snapshot.repo),
         snapshot.iid,
+        render_queued_run_table(&snapshot.history.queued_runs),
         render_history_run_table("Sessions for this MR", &snapshot.history.runs),
         render_history_pagination(
             &snapshot.history,
@@ -222,6 +226,39 @@ fn render_token_statistics(statistics: &[TokenUsageStatisticSnapshot]) -> String
     )
 }
 
+fn render_queued_run_table(runs: &[QueuedRun]) -> String {
+    render_table_section(
+        "Queued runs",
+        if runs.is_empty() {
+            "<p class=\"empty\">No runs wait in the queue.</p>".to_string()
+        } else {
+            let rows = runs.iter().map(render_queued_run_row).collect::<String>();
+            format!(
+                "<p class=\"muted\">A free run slot starts the first mention or general review that can start. Security reviews start when no other run can start.</p><div class=\"table-scroll\"><table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Head SHA</th><th>Queued</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            )
+        },
+    )
+}
+
+fn render_queued_run_row(run: &QueuedRun) -> String {
+    format!(
+        "<tr>\
+         <td><span class=\"badge badge-{}\">{}</span></td>\
+         <td>{}</td>\
+         <td><a href=\"{}\">!{}</a></td>\
+         <td><code>{}</code></td>\
+         <td>{}</td>\
+         </tr>",
+        escape_html(run_kind_label(run.kind)),
+        escape_html(run_kind_label(run.kind)),
+        escape_html(&run.repo),
+        mr_history_href(&run.repo, run.iid),
+        run.iid,
+        escape_html(&run.head_sha),
+        render_unix_timestamp(run.queued_at),
+    )
+}
+
 fn render_history_run_table(title: &str, runs: &[HistoryRunListItem]) -> String {
     render_table_section(
         title,
@@ -331,6 +368,7 @@ mod tests {
             previous_cursor: None,
             next_cursor: None,
             token_statistics: Vec::new(),
+            queued_runs: Vec::new(),
             runs: vec![HistoryRunListItem::new(
                 RunHistoryListItem {
                     id: 7,
@@ -358,5 +396,56 @@ mod tests {
         let html = render_history_page(&snapshot, None, false);
 
         assert!(html.contains("error retry 1/5 in 15m"));
+    }
+
+    #[test]
+    fn history_page_lists_queued_runs_before_recorded_runs() {
+        let snapshot = HistorySnapshot {
+            generated_at: "2026-03-23T00:00:00Z".to_string(),
+            filters: HistoryQuery::default(),
+            limit: 100,
+            has_previous: false,
+            has_next: false,
+            previous_cursor: None,
+            next_cursor: None,
+            token_statistics: Vec::new(),
+            queued_runs: vec![QueuedRun {
+                kind: RunHistoryKind::Security,
+                repo: "group/<repo>".to_string(),
+                iid: 12,
+                head_sha: "abc123".to_string(),
+                queued_at: 1_790_000_000,
+            }],
+            runs: Vec::new(),
+        };
+
+        let html = render_history_page(&snapshot, None, false);
+
+        let queued = html.find("Queued runs").expect("queued section");
+        let recorded = html.find("All runs").expect("run table");
+        assert!(queued < recorded);
+        assert!(html.contains("<span class=\"badge badge-security\">security</span>"));
+        assert!(html.contains("group/&lt;repo&gt;"));
+        assert!(html.contains("<code>abc123</code>"));
+    }
+
+    #[test]
+    fn history_page_states_an_empty_queue() {
+        let snapshot = HistorySnapshot {
+            generated_at: "2026-03-23T00:00:00Z".to_string(),
+            filters: HistoryQuery::default(),
+            limit: 100,
+            has_previous: false,
+            has_next: false,
+            previous_cursor: None,
+            next_cursor: None,
+            token_statistics: Vec::new(),
+            queued_runs: Vec::new(),
+            runs: Vec::new(),
+        };
+
+        let html = render_history_page(&snapshot, None, false);
+
+        assert!(html.contains("No runs wait in the queue."));
     }
 }

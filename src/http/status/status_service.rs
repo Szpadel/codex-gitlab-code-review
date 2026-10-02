@@ -7,6 +7,7 @@ use super::{
 };
 use crate::config::Config;
 use crate::flow::retry::{RunRetryStatus, RunRetryStatusProvider};
+use crate::flow::run_queue::{QueuedRun, QueuedRunsProvider};
 use crate::run_history_kind::RunHistoryKind;
 use crate::service_error::ServiceError;
 use crate::state::{
@@ -17,6 +18,13 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// In-memory run state that the review service supplies to the history views.
+#[derive(Clone, Default)]
+pub struct RunStateProviders {
+    pub retry_statuses: Option<Arc<dyn RunRetryStatusProvider>>,
+    pub queued_runs: Option<Arc<dyn QueuedRunsProvider>>,
+}
+
 #[derive(Clone)]
 pub struct StatusService {
     config: StatusConfig,
@@ -24,7 +32,7 @@ pub struct StatusService {
     admin: Arc<AdminService>,
     ratelimit: Arc<RateLimitService>,
     backfill: Arc<BackfillService>,
-    retry_status_provider: Option<Arc<dyn RunRetryStatusProvider>>,
+    run_state: RunStateProviders,
 }
 
 #[derive(Clone)]
@@ -55,7 +63,7 @@ impl StatusService {
         admin: Arc<AdminService>,
         ratelimit: Arc<RateLimitService>,
         backfill: Arc<BackfillService>,
-        retry_status_provider: Option<Arc<dyn RunRetryStatusProvider>>,
+        run_state: RunStateProviders,
     ) -> Self {
         Self {
             config: StatusConfig {
@@ -84,7 +92,7 @@ impl StatusService {
             admin,
             ratelimit,
             backfill,
-            retry_status_provider,
+            run_state,
         }
     }
 
@@ -178,6 +186,7 @@ impl StatusService {
                 .transpose()?,
         };
         let limit = list_query.normalized_limit();
+        let queued_runs = self.queued_runs_for(&query);
         let page = self.state.run_history.list_run_history(&list_query).await?;
         let statistics = self
             .state
@@ -196,8 +205,32 @@ impl StatusService {
             previous_cursor: page.previous_cursor.map(RunHistoryCursor::encode),
             next_cursor: page.next_cursor.map(RunHistoryCursor::encode),
             token_statistics: token_usage_statistic_snapshots(statistics),
+            queued_runs,
             runs,
         })
+    }
+
+    /// Lists the waiting runs that match the repository, MR, and kind filters.
+    /// Waiting runs have no result and no text yet, so a result or search filter hides
+    /// them. They show only on the first page.
+    fn queued_runs_for(&self, query: &HistoryQuery) -> Vec<QueuedRun> {
+        let Some(provider) = self.run_state.queued_runs.as_ref() else {
+            return Vec::new();
+        };
+        if query.result.is_some()
+            || query.search.is_some()
+            || query.after.is_some()
+            || query.before.is_some()
+        {
+            return Vec::new();
+        }
+        provider
+            .queued_runs()
+            .into_iter()
+            .filter(|run| query.repo.as_ref().is_none_or(|repo| &run.repo == repo))
+            .filter(|run| query.iid.is_none_or(|iid| run.iid == iid))
+            .filter(|run| query.kind.is_none_or(|kind| run.kind == kind))
+            .collect()
     }
 
     /// # Errors
@@ -320,7 +353,8 @@ impl StatusService {
     }
 
     fn retry_statuses_for_run_ids(&self, run_ids: &[i64]) -> HashMap<i64, RunRetryStatus> {
-        self.retry_status_provider
+        self.run_state
+            .retry_statuses
             .as_ref()
             .map(|provider| provider.retry_statuses_for_run_ids(run_ids))
             .unwrap_or_default()

@@ -25,7 +25,7 @@ pub mod retry;
 pub(crate) mod review;
 pub(crate) mod review_comments;
 mod review_project;
-pub(crate) mod run_queue;
+pub mod run_queue;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ActiveReviewKey {

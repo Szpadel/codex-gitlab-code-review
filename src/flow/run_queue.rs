@@ -8,6 +8,8 @@
 //! thus bounded by the open MRs per review lane plus the unprocessed mention notes.
 
 use crate::review_lane::ReviewLane;
+use crate::run_history_kind::RunHistoryKind;
+use chrono::Utc;
 use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -39,6 +41,13 @@ impl JobKey {
         }
     }
 
+    const fn run_history_kind(&self) -> RunHistoryKind {
+        match self {
+            Self::Review { lane, .. } => lane.run_history_kind(),
+            Self::Mention { .. } => RunHistoryKind::Mention,
+        }
+    }
+
     const fn priority(&self) -> JobPriority {
         match self {
             Self::Review {
@@ -59,6 +68,24 @@ enum JobPriority {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct MergeRequestKey(String, u64);
+
+/// Run that waits in the run queue, as the History page shows it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct QueuedRun {
+    pub kind: RunHistoryKind,
+    pub repo: String,
+    pub iid: u64,
+    /// Head that the producer saw. A review reads the MR again when it starts.
+    pub head_sha: String,
+    /// UTC Unix timestamp in seconds of the first time the run was queued.
+    pub queued_at: i64,
+}
+
+/// Supplies the runs that wait in the run queue.
+pub trait QueuedRunsProvider: Send + Sync {
+    /// Returns the waiting runs in the order in which they start when nothing blocks them.
+    fn queued_runs(&self) -> Vec<QueuedRun>;
+}
 
 /// Supplies the facts the queue needs to order and separate a job.
 pub(crate) trait QueueJob: Send + 'static {
@@ -115,6 +142,7 @@ pub(crate) enum EnqueueOutcome {
 
 struct WaitingEntry<J> {
     sequence: u64,
+    queued_at: i64,
     job: J,
 }
 
@@ -180,9 +208,14 @@ impl<J: QueueJob> RunQueue<J> {
         } else {
             let sequence = state.next_sequence;
             state.next_sequence += 1;
-            state
-                .waiting
-                .insert(key.clone(), WaitingEntry { sequence, job });
+            state.waiting.insert(
+                key.clone(),
+                WaitingEntry {
+                    sequence,
+                    queued_at: Utc::now().timestamp(),
+                    job,
+                },
+            );
             EnqueueOutcome::Queued
         };
         let started = self.take_startable(&mut state);
@@ -214,6 +247,26 @@ impl<J: QueueJob> RunQueue<J> {
     pub(crate) fn contains(&self, key: &JobKey) -> bool {
         let state = self.lock_state();
         state.waiting.contains_key(key) || state.running.contains_key(key)
+    }
+
+    /// Lists the waiting jobs in the order in which they start when nothing blocks them.
+    pub(crate) fn queued_runs(&self) -> Vec<QueuedRun> {
+        let state = self.lock_state();
+        let mut entries = state.waiting.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, entry)| (key.priority(), entry.sequence));
+        entries
+            .into_iter()
+            .map(|(key, entry)| {
+                let MergeRequestKey(repo, iid) = key.merge_request();
+                QueuedRun {
+                    kind: key.run_history_kind(),
+                    repo,
+                    iid,
+                    head_sha: entry.job.head_sha().to_string(),
+                    queued_at: entry.queued_at,
+                }
+            })
+            .collect()
     }
 
     /// Waits until no job waits and no job runs.
@@ -764,5 +817,30 @@ mod tests {
             .expect("queue should become idle after a panic");
 
         assert_eq!(*started.lock().unwrap(), vec!["panic", "next"]);
+    }
+
+    #[tokio::test]
+    async fn queued_runs_list_foreground_work_before_security_reviews() {
+        let harness = Harness::new(1);
+
+        harness
+            .queue
+            .enqueue(review(ReviewLane::General, 9, "running"));
+        harness.queue.enqueue(review(ReviewLane::Security, 1, "a1"));
+        harness.queue.enqueue(mention(2, 20, "feature-2"));
+        let queued = harness.queue.queued_runs();
+        harness.finish_all().await;
+
+        assert_eq!(
+            queued
+                .iter()
+                .map(|run| (run.kind, run.iid, run.head_sha.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (RunHistoryKind::Mention, 2, "head"),
+                (RunHistoryKind::Security, 1, "a1")
+            ]
+        );
+        assert!(queued.iter().all(|run| run.queued_at > 0));
     }
 }
