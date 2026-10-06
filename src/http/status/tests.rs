@@ -216,10 +216,11 @@ async fn review_rate_limit_snapshot_includes_rules_buckets_and_pending() -> Resu
         })
         .await?;
 
-    let now = Utc::now().timestamp();
+    // Past consumption makes the snapshot exercise a partially refilled bucket.
+    let consumed_at = Utc::now().timestamp() - 1;
     state
         .review_rate_limit
-        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 99, now)
+        .try_consume_review_rate_limits(ReviewLane::General, "group/repo", 99, consumed_at)
         .await?;
     state
         .review_rate_limit
@@ -228,8 +229,8 @@ async fn review_rate_limit_snapshot_includes_rules_buckets_and_pending() -> Resu
             "group/repo",
             99,
             "abc123",
-            now,
-            now + 120,
+            consumed_at,
+            consumed_at + 120,
         )
         .await?;
 
@@ -240,7 +241,12 @@ async fn review_rate_limit_snapshot_includes_rules_buckets_and_pending() -> Resu
     assert_eq!(snapshot.rules[0].scope_subject, "group/repo");
     assert_eq!(snapshot.active_buckets.len(), 1);
     assert_eq!(snapshot.active_buckets[0].rule_id, rule_id);
-    assert_eq!(snapshot.active_buckets[0].available_slots, 1.0);
+    // Refill can advance before the snapshot, but a full bucket is not active.
+    let available_slots = snapshot.active_buckets[0].available_slots;
+    assert!(
+        available_slots > 1.0 && available_slots < 2.0,
+        "expected a partially refilled bucket, got {available_slots} available slots"
+    );
     assert_eq!(snapshot.pending.len(), 1);
     assert_eq!(snapshot.pending[0].repo, "group/repo");
     assert_eq!(snapshot.pending[0].iid, 99);
