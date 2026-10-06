@@ -2,6 +2,8 @@ use super::*;
 use crate::codex_runner::{
     CodexRunner, MentionCommandContext, MentionCommandResult, MentionCommandStatus, ReviewContext,
 };
+use crate::flow::run_queue::QueuedRunsProvider;
+use crate::run_history_kind::RunHistoryKind;
 use async_trait::async_trait;
 use tokio::sync::{Notify, Semaphore};
 
@@ -102,6 +104,116 @@ async fn security_reviews_start_after_queued_general_reviews() -> Result<()> {
             (ReviewLane::Security, 1, "a1".to_string()),
             (ReviewLane::Security, 2, "b1".to_string()),
         ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rate_limited_general_review_releases_its_slot_and_resumes_from_pending() -> Result<()> {
+    let gitlab = fake_gitlab(vec![mr(1, "a1"), mr(2, "b1")]);
+    let runner = OrderRecordingRunner::new();
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let rule_id = state
+        .review_rate_limit
+        .create_review_rate_limit_rule(&review_rate_limit_rule(
+            "general-only",
+            "General only",
+            ReviewRateLimitRuleSpec {
+                scope: ReviewRateLimitScope::Project,
+                scope_repo: "group/repo",
+                scope_iid: None,
+                applies_to_review: true,
+                applies_to_security: false,
+                capacity: 1,
+                window_seconds: 3_600,
+            },
+        ))
+        .await?;
+    let service = service_with_one_slot(gitlab.clone(), state.clone(), runner.clone());
+
+    // The first general review consumes the last token while the other jobs wait.
+    service.scan_once_incremental().await?;
+    runner.wait_for_first_start().await;
+    runner.release_first.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), service.wait_for_idle())
+        .await
+        .context("wait for security reviews after the general rate limit blocks MR 2")?;
+
+    assert_eq!(
+        runner.starts(),
+        vec![
+            (ReviewLane::General, 1, "a1".to_string()),
+            (ReviewLane::Security, 1, "a1".to_string()),
+            (ReviewLane::Security, 2, "b1".to_string()),
+        ],
+        "a rate-limited general review must release its slot for security"
+    );
+    let pending = state
+        .review_rate_limit
+        .list_review_rate_limit_pending()
+        .await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].lane, ReviewLane::General);
+    assert_eq!(pending[0].iid, 2);
+    assert_eq!(pending[0].last_seen_head_sha, "b1");
+    assert!(pending[0].next_retry_at > Utc::now().timestamp());
+    assert_eq!(
+        service
+            .next_pending_rate_limit_retry_at()
+            .await?
+            .map(|retry_at| retry_at.timestamp()),
+        Some(pending[0].next_retry_at)
+    );
+
+    // Restore a token and make the row due without waiting for the rate-limit window.
+    state
+        .review_rate_limit
+        .refund_review_rate_limit_rule(&rule_id, Utc::now().timestamp())
+        .await?;
+    state
+        .review_rate_limit
+        .upsert_review_rate_limit_pending(
+            ReviewLane::General,
+            "group/repo",
+            2,
+            "b1",
+            pending[0].last_blocked_at,
+            0,
+        )
+        .await?;
+    set_head(&gitlab, 2, "b2");
+
+    // A new service simulates restart recovery from the persisted pending row.
+    let retry_runner = OrderRecordingRunner::new();
+    let retry_service = service_with_one_slot(gitlab, state.clone(), retry_runner.clone());
+    retry_service.queue_due_pending_retries().await?;
+    retry_runner.wait_for_first_start().await;
+    retry_runner.release_first.add_permits(1);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        retry_service.wait_for_idle(),
+    )
+    .await
+    .context("wait for the pending general review after capacity returns")?;
+
+    assert_eq!(
+        retry_runner.starts(),
+        vec![(ReviewLane::General, 2, "b2".to_string())],
+        "only the pending lane must retry, using the latest head"
+    );
+    assert!(
+        state
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?
+            .is_empty()
+    );
+    assert!(
+        state
+            .review_state
+            .list_in_progress_reviews()
+            .await?
+            .is_empty()
     );
     Ok(())
 }
@@ -355,6 +467,82 @@ async fn wait_until(condition: impl Fn() -> bool) {
     })
     .await
     .expect("condition should become true");
+}
+
+#[tokio::test]
+async fn blocked_general_review_keeps_security_reviews_of_other_merge_requests_queued() -> Result<()>
+{
+    let gitlab = fake_gitlab(vec![mr(41, "sha41"), mr(42, "sha42")]);
+    add_mention_trigger(&gitlab, 41, 410);
+    let runner = HeldRunner::new(RunKind::Mention, 41);
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    let mut config = mention_config();
+    config.feature_flags.security_review = true;
+    let service = ReviewService::new(
+        config,
+        gitlab,
+        state.clone(),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    // MR 41's mention blocks its general review while MR 42 releases the other slot.
+    service.scan_once_incremental().await?;
+    runner.wait_for_held_start().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        service.wait_for_run_finished(),
+    )
+    .await
+    .context("wait for MR 42 to release its run slot")?;
+
+    // A due retry must keep foreground priority while the mention blocks it.
+    state
+        .review_rate_limit
+        .upsert_review_rate_limit_pending(ReviewLane::General, "group/repo", 41, "sha41", 0, 0)
+        .await?;
+    service.queue_due_pending_retries().await?;
+    let pending_before_mention_finishes = state
+        .review_rate_limit
+        .list_review_rate_limit_pending()
+        .await?;
+    let queued_before_mention_finishes = service.queued_runs();
+
+    runner.release.add_permits(1);
+    tokio::time::timeout(std::time::Duration::from_secs(5), service.wait_for_idle())
+        .await
+        .context("wait for queued reviews after MR 41's mention finishes")?;
+
+    assert_eq!(
+        queued_before_mention_finishes
+            .iter()
+            .map(|run| (run.kind, run.iid))
+            .collect::<Vec<_>>(),
+        vec![
+            (RunHistoryKind::Review, 41),
+            (RunHistoryKind::Security, 41),
+            (RunHistoryKind::Security, 42),
+        ],
+        "security must stay queued even when the blocked general review cannot use the free slot"
+    );
+    assert_eq!(pending_before_mention_finishes.len(), 1);
+    assert_eq!(pending_before_mention_finishes[0].lane, ReviewLane::General);
+    assert_eq!(pending_before_mention_finishes[0].iid, 41);
+    assert!(
+        state
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?
+            .is_empty()
+    );
+
+    // The lanes can run in parallel once no foreground job waits.
+    let mut reviewed_merge_requests = runner.reviews.lock().unwrap().clone();
+    reviewed_merge_requests.sort_unstable();
+    assert_eq!(reviewed_merge_requests, vec![41, 41, 42, 42]);
+    assert_eq!(*runner.mentions.lock().unwrap(), vec![41]);
+    Ok(())
 }
 
 #[tokio::test]

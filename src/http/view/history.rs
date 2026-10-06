@@ -234,7 +234,7 @@ fn render_queued_run_table(runs: &[QueuedRun]) -> String {
         } else {
             let rows = runs.iter().map(render_queued_run_row).collect::<String>();
             format!(
-                "<p class=\"muted\">A free run slot starts the first mention or general review that can start. Security reviews start when no other run can start.</p><div class=\"table-scroll\"><table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Head SHA</th><th>Queued</th></tr></thead><tbody>{rows}</tbody></table></div>"
+                "<p class=\"muted\">A free run slot starts the first mention or general review that can start. Security reviews start only when no mention or general review waits. Blocked reviews or mentions can leave slots idle. Running jobs are not interrupted.</p><div class=\"table-scroll\"><table><thead><tr><th>Kind</th><th>Repo</th><th>MR</th><th>Head SHA</th><th>Queued</th></tr></thead><tbody>{rows}</tbody></table></div>"
             )
         },
     )
@@ -427,6 +427,10 @@ mod tests {
         assert!(html.contains("<span class=\"badge badge-security\">security</span>"));
         assert!(html.contains("group/&lt;repo&gt;"));
         assert!(html.contains("<code>abc123</code>"));
+        assert!(
+            html.contains("Security reviews start only when no mention or general review waits.")
+        );
+        assert!(html.contains("Running jobs are not interrupted."));
     }
 
     #[test]

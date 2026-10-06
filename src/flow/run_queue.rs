@@ -1,8 +1,9 @@
 //! In-memory queue that starts mention commands and reviews in priority order.
 //!
-//! Scans add jobs and return. A free run slot starts the oldest waiting mention
-//! or general review. A security review starts only when no mention or general
-//! review can start. Same-MR and same-branch exclusions are in `Blockers`.
+//! Scans add jobs and return. A free run slot starts the oldest eligible mention
+//! or general review. Security reviews start only when no mention or general
+//! review waits. A blocked foreground job can leave a slot idle. Running jobs
+//! continue. Same-MR and same-branch exclusions are in `Blockers`.
 //!
 //! The queue keeps at most one waiting and one running job per key. Its size is
 //! thus bounded by the open MRs per review lane plus the unprocessed mention notes.
@@ -361,13 +362,19 @@ fn makes_redundant(key: &JobKey, running: &RunningEntry, head_sha: &str) -> bool
     }
 }
 
+/// Selects the oldest eligible job at the highest waiting priority.
+/// Returns no job when that priority group is blocked.
 fn next_startable_key<J: QueueJob>(state: &QueueState<J>) -> Option<JobKey> {
+    let highest_waiting_priority = state.waiting.keys().map(JobKey::priority).min()?;
     let blockers = Blockers::new(state);
     state
         .waiting
         .iter()
-        .filter(|(key, entry)| blockers.allow(key, entry.job.mention_branch()))
-        .min_by_key(|(key, entry)| (key.priority(), entry.sequence))
+        .filter(|(key, entry)| {
+            key.priority() == highest_waiting_priority
+                && blockers.allow(key, entry.job.mention_branch())
+        })
+        .min_by_key(|(_, entry)| entry.sequence)
         .map(|(key, _)| key.clone())
 }
 
@@ -598,6 +605,144 @@ mod tests {
                 review_key(ReviewLane::General, 2),
                 mention_key(3, 30),
                 review_key(ReviewLane::Security, 1),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_general_review_prevents_security_dispatch() {
+        let harness = Harness::new(2);
+
+        // Occupy both slots before the follow-up review and security review wait.
+        harness.queue.enqueue(review(ReviewLane::General, 1, "old"));
+        harness
+            .queue
+            .enqueue(review(ReviewLane::General, 9, "held"));
+        harness.queue.enqueue(review(ReviewLane::General, 1, "new"));
+        harness
+            .queue
+            .enqueue(review(ReviewLane::Security, 2, "security"));
+
+        // The spare slot must stay idle while the follow-up review is blocked.
+        harness.finish(&review_key(ReviewLane::General, 9), 2).await;
+        timeout(
+            Duration::from_secs(1),
+            harness.queue.wait_for_job_finished(),
+        )
+        .await
+        .expect("the unrelated review should finish");
+        let starts_while_follow_up_waits = harness.started_keys();
+
+        harness.finish(&review_key(ReviewLane::General, 1), 4).await;
+        harness.finish_all().await;
+
+        assert_eq!(
+            starts_while_follow_up_waits,
+            vec![
+                review_key(ReviewLane::General, 1),
+                review_key(ReviewLane::General, 9),
+            ],
+            "a blocked general review must prevent a new security review"
+        );
+        assert_eq!(
+            harness.started_keys()[2..],
+            [
+                review_key(ReviewLane::General, 1),
+                review_key(ReviewLane::Security, 2),
+            ],
+            "security may start after the follow-up review takes its slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_mention_prevents_security_dispatch() {
+        for blocker in [
+            review(ReviewLane::General, 1, "old"),
+            review(ReviewLane::Security, 1, "old"),
+            mention(2, 20, "shared"),
+        ] {
+            let harness = Harness::new(2);
+            let blocker_key = blocker.key();
+
+            // The mention waits for either its MR or its shared branch.
+            harness.queue.enqueue(blocker);
+            harness
+                .queue
+                .enqueue(review(ReviewLane::General, 9, "held"));
+            harness.queue.enqueue(mention(1, 10, "shared"));
+            harness.queue.enqueue(review(ReviewLane::General, 1, "new"));
+            harness
+                .queue
+                .enqueue(review(ReviewLane::Security, 3, "security"));
+
+            // A free slot must not start security while foreground work is blocked.
+            harness.finish(&review_key(ReviewLane::General, 9), 2).await;
+            timeout(
+                Duration::from_secs(1),
+                harness.queue.wait_for_job_finished(),
+            )
+            .await
+            .expect("the unrelated review should finish");
+            let starts_while_mention_waits = harness.started_keys();
+
+            harness
+                .finish(&blocker_key, starts_while_mention_waits.len() + 1)
+                .await;
+            let starts_while_mention_runs = harness.started_keys();
+            harness.finish(&mention_key(1, 10), 5).await;
+            harness.finish_all().await;
+
+            assert_eq!(
+                starts_while_mention_waits,
+                vec![blocker_key.clone(), review_key(ReviewLane::General, 9)],
+                "a blocked mention must prevent a new security review"
+            );
+            assert_eq!(
+                starts_while_mention_runs,
+                vec![
+                    blocker_key,
+                    review_key(ReviewLane::General, 9),
+                    mention_key(1, 10),
+                ],
+                "the mention must keep security waiting while it blocks the general review"
+            );
+            assert_eq!(
+                harness.started_keys()[3..],
+                [
+                    review_key(ReviewLane::General, 1),
+                    review_key(ReviewLane::Security, 3),
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_work_does_not_interrupt_running_security() {
+        let harness = Harness::new(1);
+
+        harness
+            .queue
+            .enqueue(review(ReviewLane::Security, 1, "security"));
+        harness
+            .queue
+            .enqueue(review(ReviewLane::General, 2, "general"));
+        harness.settle().await;
+        let starts_before_security_finishes = harness.started_keys();
+        harness
+            .finish(&review_key(ReviewLane::Security, 1), 2)
+            .await;
+        harness.finish_all().await;
+
+        assert_eq!(
+            starts_before_security_finishes,
+            vec![review_key(ReviewLane::Security, 1)],
+            "foreground work must wait for a running security review to release its slot"
+        );
+        assert_eq!(
+            harness.started_keys(),
+            vec![
+                review_key(ReviewLane::Security, 1),
+                review_key(ReviewLane::General, 2),
             ]
         );
     }
