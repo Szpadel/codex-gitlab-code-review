@@ -36,8 +36,12 @@ uuid = { version = "1.26.1", features = ["v4"] }
 flate2 = "1.1.10"
 tar = "0.4.46"
 zip = "8.6.0"
+openidconnect = { version = "4.1.0", default-features = false, features = ["timing-resistant-secret-traits"] }
+tower-sessions = { version = "0.14.0", default-features = false, features = ["axum-core"] }
+moka = { version = "0.12.16", features = ["future"] }
 
 [dev-dependencies]
+reqwest = { version = "0.13.5", default-features = false, features = ["query"] }
 insta = "1.48.0"
 pretty_assertions = "1.4.1"
 tempfile = "3.27.0"

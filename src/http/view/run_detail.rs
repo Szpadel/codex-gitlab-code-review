@@ -17,7 +17,7 @@ pub(in crate::http) fn render_run_detail_page(
     snapshot: &RunDetailSnapshot,
     gitlab_base_url: &str,
     csrf_token: Option<&str>,
-    development_enabled: bool,
+    navigation: super::PageNavigation,
 ) -> String {
     let run = &snapshot.run;
     let body = format!(
@@ -48,13 +48,7 @@ pub(in crate::http) fn render_run_detail_page(
         ),
         transcript_script_tag(),
     );
-    render_shell(
-        "Run Detail",
-        NavItem::History,
-        body,
-        csrf_token,
-        development_enabled,
-    )
+    render_shell("Run Detail", NavItem::History, body, csrf_token, navigation)
 }
 
 fn render_run_metadata(run: &HistoryRunRecord) -> String {
@@ -475,8 +469,12 @@ mod tests {
             transcript_backfill: None,
         };
 
-        let html =
-            render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None, false);
+        let html = render_run_detail_page(
+            &snapshot,
+            "https://gitlab.example.com/api/v4",
+            None,
+            super::super::PageNavigation::default(),
+        );
 
         assert!(html.contains("Reused cached security context from"));
         assert!(html.contains("/history/42"));
@@ -504,8 +502,12 @@ mod tests {
             transcript_backfill: None,
         };
 
-        let html =
-            render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None, false);
+        let html = render_run_detail_page(
+            &snapshot,
+            "https://gitlab.example.com/api/v4",
+            None,
+            super::super::PageNavigation::default(),
+        );
 
         assert!(html.contains("<dt>Retry</dt>"));
         assert!(html.contains("retry 1/5 in 15m"));
@@ -534,8 +536,12 @@ mod tests {
             transcript_backfill: None,
         };
 
-        let html =
-            render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None, false);
+        let html = render_run_detail_page(
+            &snapshot,
+            "https://gitlab.example.com/api/v4",
+            None,
+            super::super::PageNavigation::default(),
+        );
 
         assert!(html.contains("Security context"));
         assert!(html.contains("main"));
@@ -561,8 +567,12 @@ mod tests {
             transcript_backfill: None,
         };
 
-        let html =
-            render_run_detail_page(&snapshot, "https://gitlab.example.com/api/v4", None, false);
+        let html = render_run_detail_page(
+            &snapshot,
+            "https://gitlab.example.com/api/v4",
+            None,
+            super::super::PageNavigation::default(),
+        );
 
         assert!(html.contains("trigger-note-body"));
         assert!(html.contains("<img"));

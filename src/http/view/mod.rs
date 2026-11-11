@@ -9,6 +9,15 @@ mod skills;
 mod status_page;
 mod usage;
 
+/// Selects navigation actions that the current HTTP runtime supports.
+#[derive(Clone, Copy, Default)]
+pub(super) struct PageNavigation {
+    pub(super) development_enabled: bool,
+    pub(super) oidc_enabled: bool,
+}
+
+pub(super) use html::escape_html;
+
 pub(super) use development::render_development_page;
 pub(super) use history::{render_history_page, render_mr_history_page};
 pub(super) use rate_limits::render_rate_limits_page;

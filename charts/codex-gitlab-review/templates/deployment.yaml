@@ -105,6 +105,13 @@ spec:
                   key: {{ .Values.gitlab.token.secretKey }}
             - name: RUST_LOG
               value: "info"
+{{- if .Values.config.server.oidc.enabled }}
+            - name: CODEX_REVIEW__SERVER__OIDC__CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "config.server.oidc.clientSecret.existingSecret is required" .Values.config.server.oidc.clientSecret.existingSecret }}
+                  key: {{ .Values.config.server.oidc.clientSecret.secretKey }}
+{{- end }}
 {{- if .Values.config.codex.gitlabDiscoveryMcp.enabled }}
 {{- $gitlabDiscoveryAdvertiseUrl := .Values.config.codex.gitlabDiscoveryMcp.advertiseUrl | default "" | trim -}}
 {{- if not $gitlabDiscoveryAdvertiseUrl }}

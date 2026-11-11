@@ -86,6 +86,7 @@ async fn e2e_live_dry_run() -> Result<()> {
         server: ServerConfig {
             bind_addr: "127.0.0.1:0".to_string(),
             status_ui_enabled: false,
+            oidc: None,
         },
     };
 

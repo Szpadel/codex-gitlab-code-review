@@ -28,6 +28,11 @@ pub struct HttpServices {
 }
 
 impl HttpServices {
+    /// Supplies the optional UI login configuration to the HTTP router.
+    pub(in crate::http) fn oidc_config(&self) -> Option<&crate::config::OidcConfig> {
+        self.config.server.oidc.as_ref()
+    }
+
     #[must_use]
     pub fn new(
         config: Config,

@@ -39,7 +39,7 @@ pub(crate) async fn status_page(
     Ok(Html(render_status_page(
         &snapshot,
         Some(app_state.http_services.admin.feature_flag_csrf_token()),
-        app_state.development_enabled(),
+        app_state.navigation(),
     )))
 }
 
@@ -67,7 +67,7 @@ pub(crate) async fn history_page(
     Ok(Html(render_history_page(
         &snapshot,
         Some(app_state.http_services.admin.feature_flag_csrf_token()),
-        app_state.development_enabled(),
+        app_state.navigation(),
     )))
 }
 
@@ -108,7 +108,7 @@ pub(crate) async fn mr_history_page(
     Ok(Html(render_mr_history_page(
         &snapshot,
         Some(app_state.http_services.admin.feature_flag_csrf_token()),
-        app_state.development_enabled(),
+        app_state.navigation(),
     )))
 }
 
@@ -143,7 +143,7 @@ pub(crate) async fn run_detail_page(
         &snapshot,
         app_state.http_services.status.gitlab_base_url(),
         Some(app_state.http_services.admin.feature_flag_csrf_token()),
-        app_state.development_enabled(),
+        app_state.navigation(),
     )))
 }
 
@@ -187,7 +187,7 @@ pub(crate) async fn skills_page(
     Ok(Html(render_skills_page(
         &snapshot,
         Some(app_state.http_services.admin.admin_csrf_token()),
-        app_state.development_enabled(),
+        app_state.navigation(),
     )))
 }
 
@@ -206,7 +206,7 @@ pub(crate) async fn skill_detail_page(
     Ok(Html(render_skill_detail_page(
         &snapshot,
         Some(app_state.http_services.admin.admin_csrf_token()),
-        app_state.development_enabled(),
+        app_state.navigation(),
     )))
 }
 
@@ -246,7 +246,7 @@ pub(crate) async fn rate_limits_page(
         &snapshot,
         &target_suggestions,
         Some(app_state.http_services.admin.admin_csrf_token()),
-        app_state.development_enabled(),
+        app_state.navigation(),
     )))
 }
 
@@ -259,7 +259,7 @@ pub(crate) async fn usage_page(
         &snapshot,
         params.account.as_deref().zip(params.reset.as_deref()),
         Some(app_state.http_services.admin.admin_csrf_token()),
-        app_state.development_enabled(),
+        app_state.navigation(),
     )))
 }
 
@@ -439,6 +439,7 @@ pub(crate) async fn development_page(
     Ok(Html(render_development_page(
         &snapshot,
         Some(app_state.http_services.admin.admin_csrf_token()),
+        app_state.navigation(),
     )))
 }
 

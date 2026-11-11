@@ -15,4 +15,5 @@ Note:
 `ingress.enabled` only exposes the Service. It does not enable the status UI/API.
 Set `config.server.statusUiEnabled=true` if you want `/`, `/status`, and `/api/status`
 to exist behind your ingress/proxy. `/healthz` remains available regardless.
+Configure `config.server.oidc` for OIDC login, or use an authenticated admin proxy.
 {{- end }}

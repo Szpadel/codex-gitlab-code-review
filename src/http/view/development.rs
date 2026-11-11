@@ -7,6 +7,7 @@ use crate::dev_mode::DevelopmentSnapshot;
 pub(in crate::http) fn render_development_page(
     snapshot: &DevelopmentSnapshot,
     csrf_token: Option<&str>,
+    navigation: super::PageNavigation,
 ) -> String {
     let add_repo_form = format!(
         "<section class=\"card\"><h2>Add repository</h2>\
@@ -69,5 +70,11 @@ pub(in crate::http) fn render_development_page(
         "<section class=\"hero\"><h1>Development tools</h1><p class=\"muted\">Mocked GitLab and mocked Codex are active. Runtime state database: <code>{}</code>.</p></section>{add_repo_form}{repo_table}",
         escape_html(&snapshot.database_path),
     );
-    render_shell("Development", NavItem::Development, body, csrf_token, true)
+    render_shell(
+        "Development",
+        NavItem::Development,
+        body,
+        csrf_token,
+        navigation,
+    )
 }

@@ -48,7 +48,7 @@ pub(super) fn render_shell(
     active: NavItem,
     content: String,
     csrf_token: Option<&str>,
-    development_enabled: bool,
+    navigation: super::PageNavigation,
 ) -> String {
     let content = content.into_boxed_str();
     format!(
@@ -64,7 +64,7 @@ pub(super) fn render_shell(
         render_feature_flag_csrf_meta_tag(csrf_token),
         page_style(),
         timestamp::style_fragment(),
-        render_nav(active, development_enabled),
+        render_nav(active, navigation),
         content,
         timestamp::script_tag(),
         feature_flag_script(),
@@ -93,7 +93,7 @@ pub(super) fn render_optional_unix_timestamp(timestamp: Option<i64>) -> String {
     timestamp.map_or_else(|| "-".to_string(), render_unix_timestamp)
 }
 
-fn render_nav(active: NavItem, development_enabled: bool) -> String {
+fn render_nav(active: NavItem, navigation: super::PageNavigation) -> String {
     let mut items = vec![
         (NavItem::Status, "/status", "Status"),
         (NavItem::History, "/history", "History"),
@@ -101,7 +101,7 @@ fn render_nav(active: NavItem, development_enabled: bool) -> String {
         (NavItem::Usage, "/usage", "Usage"),
         (NavItem::Skills, "/skills", "Skills"),
     ];
-    if development_enabled {
+    if navigation.development_enabled {
         items.push((NavItem::Development, "/development", "Development"));
     }
     let links = items
@@ -120,7 +120,12 @@ fn render_nav(active: NavItem, development_enabled: bool) -> String {
             )
         })
         .collect::<String>();
-    format!("<nav class=\"nav\">{links}</nav>")
+    let logout = if navigation.oidc_enabled {
+        "<a class=\"nav-link\" href=\"/auth/logout\">Sign out</a>"
+    } else {
+        ""
+    };
+    format!("<nav class=\"nav\">{links}{logout}</nav>")
 }
 
 pub(super) fn mr_history_href(repo: &str, iid: u64) -> String {
@@ -159,7 +164,7 @@ pub(super) fn format_number(value: i64) -> String {
     output
 }
 
-pub(super) fn escape_html(value: &str) -> String {
+pub(in crate::http) fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")

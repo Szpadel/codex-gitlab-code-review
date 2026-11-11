@@ -8,6 +8,7 @@ pub const BROWSER_MCP_REMOTE_DEBUGGING_PORT: u16 = 9222;
 pub(crate) mod defaults;
 pub mod feature_flags;
 mod load;
+mod oidc;
 #[cfg(test)]
 pub(crate) mod test_builder;
 mod validate;
@@ -373,6 +374,32 @@ pub struct ServerConfig {
     pub bind_addr: String,
     #[serde(default)]
     pub status_ui_enabled: bool,
+    /// Protects the UI and JSON endpoints when configured. Health checks stay public.
+    #[serde(default)]
+    pub oidc: Option<OidcConfig>,
+}
+
+/// Uses provider discovery and the authorization code flow for UI access.
+/// The provider's application policies must restrict admission to administrators.
+#[derive(Clone, Deserialize)]
+pub struct OidcConfig {
+    pub issuer_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    /// External callback URL, including `/auth/callback`. HTTPS is required outside loopback.
+    pub redirect_url: String,
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OidcConfig")
+            .field("issuer_url", &self.issuer_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[redacted]")
+            .field("redirect_url", &self.redirect_url)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

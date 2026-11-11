@@ -2,6 +2,7 @@ mod errors;
 mod forms;
 mod handlers;
 mod markdown;
+mod oidc;
 mod status;
 mod timestamp;
 mod transcript;
@@ -52,6 +53,13 @@ impl HttpAppState {
     fn development_enabled(&self) -> bool {
         self.dev_tools_service.is_some()
     }
+
+    fn navigation(&self) -> view::PageNavigation {
+        view::PageNavigation {
+            development_enabled: self.development_enabled(),
+            oidc_enabled: self.http_services.oidc_config().is_some(),
+        }
+    }
 }
 
 pub fn app_router_with_dev_tools(
@@ -62,14 +70,13 @@ pub fn app_router_with_dev_tools(
         http_services,
         dev_tools_service,
     };
-    let mut router = Router::new().route("/healthz", get(healthcheck));
+    let mut router = Router::new();
     if app_state.http_services.admin.status_ui_enabled() {
         let skill_upload_router = Router::new()
             .route("/skills/upload", post(upload_skill))
             .layer(DefaultBodyLimit::max(MAX_SKILL_ARCHIVE_BYTES));
-        // The status UI is expected to sit behind an admin-only trusted auth
-        // proxy when enabled. Server-side CSRF enforcement protects the
-        // runtime feature-flag write path within that authenticated surface.
+        // Apply one authentication boundary after all UI routes are registered.
+        // Existing CSRF checks continue to protect authenticated writes.
         router = router
             .merge(skill_upload_router)
             .route("/", get(status_page))
@@ -129,8 +136,13 @@ pub fn app_router_with_dev_tools(
                     post(simulate_development_commit),
                 );
         }
+        if let Some(config) = app_state.http_services.oidc_config() {
+            router = oidc::protect(router, config.clone());
+        }
     }
-    router.with_state(app_state)
+    router
+        .route("/healthz", get(healthcheck))
+        .with_state(app_state)
 }
 
 /// Serves a bound listener until cancellation. Returns server errors.

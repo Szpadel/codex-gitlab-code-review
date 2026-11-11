@@ -36,6 +36,8 @@ use crate::http::test_support::{
 
 mod feature_flags;
 mod history;
+mod oidc;
+mod oidc_provider;
 mod rate_limits;
 mod run_detail_backfill_async_security;
 mod run_detail_backfill_core;

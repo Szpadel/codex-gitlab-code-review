@@ -64,6 +64,9 @@ pub fn validate_config(mut config: Config) -> Result<ValidatedConfig> {
     validate_mcp_server_overrides(&config.codex)?;
     validate_session_overrides(&config.codex)?;
     validate_reasoning_summary_overrides(&config.codex)?;
+    if let Some(oidc) = &config.server.oidc {
+        super::oidc::validate(oidc)?;
+    }
 
     Ok(ValidatedConfig(config))
 }

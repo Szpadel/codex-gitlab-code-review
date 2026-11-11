@@ -288,3 +288,9 @@ data:
     server:
       bind_addr: {{ .Values.config.server.bindAddr | quote }}
       status_ui_enabled: {{ .Values.config.server.statusUiEnabled }}
+{{- if .Values.config.server.oidc.enabled }}
+      oidc:
+        issuer_url: {{ required "config.server.oidc.issuerUrl is required" .Values.config.server.oidc.issuerUrl | quote }}
+        client_id: {{ required "config.server.oidc.clientId is required" .Values.config.server.oidc.clientId | quote }}
+        redirect_url: {{ required "config.server.oidc.redirectUrl is required" .Values.config.server.oidc.redirectUrl | quote }}
+{{- end }}

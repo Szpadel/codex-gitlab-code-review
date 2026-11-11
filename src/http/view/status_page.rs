@@ -11,7 +11,7 @@ use crate::state::{
 pub(in crate::http) fn render_status_page(
     snapshot: &StatusSnapshot,
     csrf_token: Option<&str>,
-    development_enabled: bool,
+    navigation: super::PageNavigation,
 ) -> String {
     let scan = &snapshot.scan;
     let config = &snapshot.config;
@@ -108,13 +108,7 @@ pub(in crate::http) fn render_status_page(
         render_auth_section(&snapshot.auth_limit_resets),
         render_catalog_section(&snapshot.project_catalogs),
     );
-    render_shell(
-        "Status",
-        NavItem::Status,
-        body,
-        csrf_token,
-        development_enabled,
-    )
+    render_shell("Status", NavItem::Status, body, csrf_token, navigation)
 }
 
 fn render_reviews_section(reviews: &[InProgressReview]) -> String {

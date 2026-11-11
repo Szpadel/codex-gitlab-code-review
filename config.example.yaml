@@ -252,5 +252,13 @@ server:
   # Required. Health server bind address.
   bind_addr: "0.0.0.0:8080"
   # Optional. Enable the status HTML/JSON endpoints on the same listener.
-  # Keep this false unless the listener is reachable only through an authenticated proxy.
+  # Configure oidc below or restrict access through an authenticated admin proxy.
   status_ui_enabled: false
+  # Optional. Omit this block to retain proxy-managed authentication.
+  # Authentik application policies must admit only administrators of this service.
+  # oidc:
+  #   issuer_url: "https://auth.example.com/application/o/codex-review/"
+  #   client_id: "codex-review"
+  #   # Set CODEX_REVIEW__SERVER__OIDC__CLIENT_SECRET instead of storing a secret here.
+  #   client_secret: ""
+  #   redirect_url: "https://review.example.com/auth/callback"

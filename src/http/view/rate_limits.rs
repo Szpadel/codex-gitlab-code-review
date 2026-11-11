@@ -19,7 +19,7 @@ pub(in crate::http) fn render_rate_limits_page(
     snapshot: &StatusRateLimitSnapshot,
     target_suggestions: &[ReviewRateLimitTarget],
     csrf_token: Option<&str>,
-    development_enabled: bool,
+    navigation: super::PageNavigation,
 ) -> String {
     let summary = format!(
         "<div class=\"rate-limit-summary\">\
@@ -50,7 +50,7 @@ pub(in crate::http) fn render_rate_limits_page(
         NavItem::RateLimits,
         body,
         csrf_token,
-        development_enabled,
+        navigation,
     )
 }
 

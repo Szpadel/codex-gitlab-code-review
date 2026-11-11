@@ -210,6 +210,16 @@ config:
     # If false, ingress can still route to /healthz but the status UI/API stays disabled.
     # Runtime feature-flag changes through the web UI require this to be true.
     statusUiEnabled: false
+    # Authentik application policies control who can use all UI admin functions.
+    oidc:
+      enabled: false
+      issuerUrl: ""
+      clientId: ""
+      redirectUrl: ""
+      clientSecret:
+        # Required when enabled. Use an existing Kubernetes Secret.
+        existingSecret: ""
+        secretKey: "client-secret"
 
 gitlab:
   baseUrl: "https://gitlab.example.com"

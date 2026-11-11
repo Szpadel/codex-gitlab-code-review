@@ -14,7 +14,7 @@ use urlencoding::encode;
 pub(in crate::http) fn render_history_page(
     snapshot: &HistorySnapshot,
     csrf_token: Option<&str>,
-    development_enabled: bool,
+    navigation: super::PageNavigation,
 ) -> String {
     let filters = &snapshot.filters;
     let body = format!(
@@ -30,19 +30,13 @@ pub(in crate::http) fn render_history_page(
         render_history_run_table("All runs", &snapshot.runs),
         render_history_pagination(snapshot, "/history")
     );
-    render_shell(
-        "History",
-        NavItem::History,
-        body,
-        csrf_token,
-        development_enabled,
-    )
+    render_shell("History", NavItem::History, body, csrf_token, navigation)
 }
 
 pub(in crate::http) fn render_mr_history_page(
     snapshot: &MrHistorySnapshot,
     csrf_token: Option<&str>,
-    development_enabled: bool,
+    navigation: super::PageNavigation,
 ) -> String {
     let body = format!(
         "<section class=\"hero\"><h1>MR history</h1><p class=\"muted\">Sessions for {} !{}.</p></section>{}{}{}",
@@ -55,13 +49,7 @@ pub(in crate::http) fn render_mr_history_page(
             &mr_history_href(&snapshot.repo, snapshot.iid)
         )
     );
-    render_shell(
-        "MR History",
-        NavItem::History,
-        body,
-        csrf_token,
-        development_enabled,
-    )
+    render_shell("MR History", NavItem::History, body, csrf_token, navigation)
 }
 
 fn render_history_filters(filters: &HistorySnapshotFilters) -> String {
@@ -393,7 +381,7 @@ mod tests {
             )],
         };
 
-        let html = render_history_page(&snapshot, None, false);
+        let html = render_history_page(&snapshot, None, super::super::PageNavigation::default());
 
         assert!(html.contains("error retry 1/5 in 15m"));
     }
@@ -419,7 +407,7 @@ mod tests {
             runs: Vec::new(),
         };
 
-        let html = render_history_page(&snapshot, None, false);
+        let html = render_history_page(&snapshot, None, super::super::PageNavigation::default());
 
         let queued = html.find("Queued runs").expect("queued section");
         let recorded = html.find("All runs").expect("run table");
@@ -448,7 +436,7 @@ mod tests {
             runs: Vec::new(),
         };
 
-        let html = render_history_page(&snapshot, None, false);
+        let html = render_history_page(&snapshot, None, super::super::PageNavigation::default());
 
         assert!(html.contains("No runs wait in the queue."));
     }

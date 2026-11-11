@@ -11,7 +11,7 @@ pub(in crate::http) fn render_usage_page(
     snapshot: &UsagePageSnapshot,
     reset_notice: Option<(&str, &str)>,
     csrf_token: Option<&str>,
-    development_enabled: bool,
+    navigation: super::PageNavigation,
 ) -> String {
     let accounts_with_usage = snapshot
         .accounts
@@ -46,13 +46,7 @@ pub(in crate::http) fn render_usage_page(
             .map(|account| render_account(account, csrf_token))
             .collect::<String>(),
     );
-    render_shell(
-        "Usage Limits",
-        NavItem::Usage,
-        body,
-        csrf_token,
-        development_enabled,
-    )
+    render_shell("Usage Limits", NavItem::Usage, body, csrf_token, navigation)
 }
 
 fn render_reset_notice(reset_notice: Option<(&str, &str)>) -> String {

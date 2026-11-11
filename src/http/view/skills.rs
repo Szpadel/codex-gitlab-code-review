@@ -9,7 +9,7 @@ use crate::skills::{
 pub(in crate::http) fn render_skills_page(
     snapshot: &SkillListSnapshot,
     csrf_token: Option<&str>,
-    development_enabled: bool,
+    navigation: super::PageNavigation,
 ) -> String {
     let body = format!(
         "<section class=\"hero\"><h1>Skills</h1><p class=\"muted\">Upload, preview, and delete user-managed Codex skills.</p></section>\
@@ -23,19 +23,13 @@ pub(in crate::http) fn render_skills_page(
         render_csrf_hidden_input(csrf_token),
         render_skill_table(snapshot)
     );
-    render_shell(
-        "Skills",
-        NavItem::Skills,
-        body,
-        csrf_token,
-        development_enabled,
-    )
+    render_shell("Skills", NavItem::Skills, body, csrf_token, navigation)
 }
 
 pub(in crate::http) fn render_skill_detail_page(
     snapshot: &SkillPreviewSnapshot,
     csrf_token: Option<&str>,
-    development_enabled: bool,
+    navigation: super::PageNavigation,
 ) -> String {
     let metadata = vec![
         ("Name".to_string(), escape_html(&snapshot.name)),
@@ -83,7 +77,7 @@ pub(in crate::http) fn render_skill_detail_page(
         NavItem::Skills,
         body,
         csrf_token,
-        development_enabled,
+        navigation,
     )
 }
 
