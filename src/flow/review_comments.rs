@@ -1,3 +1,5 @@
+//! Publishes review findings with inline anchors and fallback MR notes.
+
 use crate::codex_runner::{ReviewComment, repo_checkout_root};
 use crate::config::Config;
 use crate::flow::comment_text::sanitize_comment_text;
@@ -98,7 +100,7 @@ pub(crate) async fn post_review_comment(request: PostReviewCommentRequest<'_>) -
         return Ok(());
     }
 
-    let mut seen_finding_markers = match load_existing_finding_markers(
+    let seen_finding_markers = match load_existing_finding_markers(
         request.gitlab,
         request.repo,
         request.mr.iid,
@@ -134,71 +136,13 @@ pub(crate) async fn post_review_comment(request: PostReviewCommentRequest<'_>) -
             return Ok(());
         }
     };
-    let (latest_version, anchors_by_path) = match load_inline_review_context(
-        request.gitlab,
-        request.repo,
-        request.mr.iid,
-        request.head_sha,
+    let fallback_findings = publish_inline_findings(
+        &request,
+        options,
+        worktree_root.as_str(),
+        seen_finding_markers,
     )
-    .await
-    {
-        Ok(Some((latest_version, anchors_by_path))) => (Some(latest_version), anchors_by_path),
-        Ok(None) => (None, HashMap::new()),
-        Err(err) => {
-            warn!(
-                request.repo,
-                iid = request.mr.iid,
-                head_sha = request.head_sha,
-                error = %err,
-                "failed to load inline review metadata; falling back to regular MR note"
-            );
-            (None, HashMap::new())
-        }
-    };
-
-    let mut fallback_findings = Vec::new();
-    let mut findings = request.comment.findings.iter().peekable();
-    while let Some(finding) = findings.next() {
-        let marker = finding_marker(options.finding_marker_prefix, request.head_sha, finding);
-        if !seen_finding_markers.insert(marker.clone()) {
-            continue;
-        }
-
-        let Some(discussion) = build_inline_discussion(
-            finding,
-            latest_version.as_ref(),
-            &anchors_by_path,
-            options,
-            request.head_sha,
-            project_web_base.as_str(),
-            worktree_root.as_str(),
-        ) else {
-            fallback_findings.push(finding.clone());
-            continue;
-        };
-        if let Err(err) = request
-            .gitlab
-            .create_diff_discussion(request.repo, request.mr.iid, &discussion)
-            .await
-        {
-            warn!(
-                request.repo,
-                iid = request.mr.iid,
-                head_sha = request.head_sha,
-                error = %err,
-                "failed to post inline review discussion; falling back to regular MR note"
-            );
-            fallback_findings.push(finding.clone());
-            for remaining in findings {
-                let marker =
-                    finding_marker(options.finding_marker_prefix, request.head_sha, remaining);
-                if seen_finding_markers.insert(marker) {
-                    fallback_findings.push(remaining.clone());
-                }
-            }
-            break;
-        }
-    }
+    .await;
 
     if !fallback_findings.is_empty()
         || request.comment.overall_explanation.is_some()
@@ -221,6 +165,102 @@ pub(crate) async fn post_review_comment(request: PostReviewCommentRequest<'_>) -
     }
 
     Ok(())
+}
+
+/// Returns unposted, unique findings. Stops inline writes after the first posting failure.
+async fn publish_inline_findings(
+    request: &PostReviewCommentRequest<'_>,
+    options: ReviewCommentPostingOptions<'_>,
+    worktree_root: &str,
+    mut seen_finding_markers: HashSet<String>,
+) -> Vec<ReviewFinding> {
+    let (latest_version, anchors_by_path) = inline_context_or_fallback(request).await;
+    let mut fallback_findings = Vec::new();
+    let mut findings = request.comment.findings.iter().peekable();
+    while let Some(finding) = findings.next() {
+        let marker = finding_marker(options.finding_marker_prefix, request.head_sha, finding);
+        if !seen_finding_markers.insert(marker.clone()) {
+            continue;
+        }
+
+        let Some(discussion) = build_inline_discussion(
+            finding,
+            latest_version.as_ref(),
+            &anchors_by_path,
+            options,
+            request.head_sha,
+            request.project.source_web_base.as_str(),
+            worktree_root,
+        ) else {
+            fallback_findings.push(finding.clone());
+            continue;
+        };
+        if !post_inline_discussion_best_effort(request, &discussion).await {
+            fallback_findings.push(finding.clone());
+            for remaining in findings {
+                let marker =
+                    finding_marker(options.finding_marker_prefix, request.head_sha, remaining);
+                if seen_finding_markers.insert(marker) {
+                    fallback_findings.push(remaining.clone());
+                }
+            }
+            break;
+        }
+    }
+
+    fallback_findings
+}
+
+/// Logs metadata failures and disables inline anchors so findings use the fallback note.
+async fn inline_context_or_fallback(
+    request: &PostReviewCommentRequest<'_>,
+) -> (
+    Option<MergeRequestDiffVersion>,
+    HashMap<String, DiffFileAnchors>,
+) {
+    match load_inline_review_context(
+        request.gitlab,
+        request.repo,
+        request.mr.iid,
+        request.head_sha,
+    )
+    .await
+    {
+        Ok(Some((latest_version, anchors_by_path))) => (Some(latest_version), anchors_by_path),
+        Ok(None) => (None, HashMap::new()),
+        Err(err) => {
+            warn!(
+                request.repo,
+                iid = request.mr.iid,
+                head_sha = request.head_sha,
+                error = %err,
+                "failed to load inline review metadata; falling back to regular MR note"
+            );
+            (None, HashMap::new())
+        }
+    }
+}
+
+/// Logs a failed inline write so the caller can publish this and later findings in one note.
+async fn post_inline_discussion_best_effort(
+    request: &PostReviewCommentRequest<'_>,
+    discussion: &MergeRequestDiffDiscussion,
+) -> bool {
+    if let Err(err) = request
+        .gitlab
+        .create_diff_discussion(request.repo, request.mr.iid, discussion)
+        .await
+    {
+        warn!(
+            request.repo,
+            iid = request.mr.iid,
+            head_sha = request.head_sha,
+            error = %err,
+            "failed to post inline review discussion; falling back to regular MR note"
+        );
+        return false;
+    }
+    true
 }
 
 async fn load_inline_review_context(

@@ -11,6 +11,60 @@ async fn pending_mention_source_failure_keeps_pending_row() -> Result<()> {
     check_pending_mention_failure(None).await
 }
 
+#[tokio::test]
+async fn pending_mention_with_deleted_trigger_clears_row_and_quota_award() -> Result<()> {
+    let mut config = test_config();
+    config.review.mention_commands.enabled = true;
+    config.review.mention_commands.bot_username = Some("bot".to_string());
+    config.review.quota_emoji = "fuelpump".to_string();
+    let gitlab = fake_gitlab(vec![mr(1, "sha1")]);
+    gitlab
+        .add_discussion_note_award("group/repo", 1, "discussion", 2, "fuelpump")
+        .await?;
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    state
+        .mention_quota_pending
+        .upsert_mention_quota_pending(MentionQuotaPendingUpsert {
+            repo: "group/repo",
+            iid: 1,
+            discussion_id: "discussion",
+            trigger_note_id: 2,
+            head_sha: "sha1",
+            blocked_at: 0,
+            next_retry_at: 0,
+        })
+        .await?;
+    let runner = Arc::new(MentionRunner {
+        mention_calls: Mutex::new(0),
+    });
+    let service = ReviewService::new(
+        config,
+        gitlab.clone(),
+        state.clone(),
+        runner.clone(),
+        1,
+        default_created_after(),
+    );
+
+    service.process_due_pending_retries().await?;
+
+    assert!(
+        state
+            .mention_quota_pending
+            .list_mention_quota_pending()
+            .await?
+            .is_empty()
+    );
+    assert_eq!(*runner.mention_calls.lock().unwrap(), 0);
+    assert!(
+        gitlab
+            .list_discussion_note_awards("group/repo", 1, "discussion", 2)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
 async fn check_pending_mention_failure(discussion_error: Option<&str>) -> Result<()> {
     let mut config = test_config();
     config.review.mention_commands.enabled = true;

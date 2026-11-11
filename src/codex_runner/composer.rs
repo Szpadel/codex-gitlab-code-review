@@ -17,38 +17,19 @@ impl DockerCodexRunner {
         run_history_id: Option<i64>,
     ) -> Option<ComposerInstallResult> {
         let mode = ComposerInstallMode::for_flags(feature_flags)?;
-        let presence = self
-            .exec_container_command_with_env_allow_failure(
-                container_id,
-                vec![
-                    "test".to_string(),
-                    "-f".to_string(),
-                    "composer.json".to_string(),
-                ],
-                Some(repo_path),
-                None,
-            )
-            .await;
-        let preflight_error = match presence {
-            Ok(output) if output.exit_code == 0 => None,
-            Ok(output) if output.exit_code == 1 => {
-                return Some(ComposerInstallResult::skipped(mode, None));
+        match self.composer_manifest_exists(container_id, repo_path).await {
+            Ok(true) => {}
+            Ok(false) => return Some(ComposerInstallResult::skipped(mode, None)),
+            Err(error) => {
+                warn!(
+                    container_id,
+                    repo_path, error, "Composer file check failed. Continue without installation"
+                );
+                let result = ComposerInstallResult::failed(mode, None, error);
+                self.append_composer_install_result(run_history_id, mode.command_label(), &result)
+                    .await;
+                return Some(result);
             }
-            Ok(output) => Some(format!(
-                "Check composer.json failed with exit code {}: {}",
-                output.exit_code, output.stderr
-            )),
-            Err(err) => Some(format!("Check composer.json failed: {err:#}")),
-        };
-        if let Some(error) = preflight_error {
-            warn!(
-                container_id,
-                repo_path, error, "Composer file check failed. Continue without installation"
-            );
-            let result = ComposerInstallResult::failed(mode, None, error);
-            self.append_composer_install_result(run_history_id, mode.command_label(), &result)
-                .await;
-            return Some(result);
         }
         let plan = ComposerInstallPlan::prepare(
             self.gitlab.as_ref(),
@@ -93,6 +74,35 @@ impl DockerCodexRunner {
         }
 
         Some(result)
+    }
+
+    /// Distinguish a missing manifest from a failed container file check.
+    async fn composer_manifest_exists(
+        &self,
+        container_id: &str,
+        repo_path: &str,
+    ) -> std::result::Result<bool, String> {
+        let presence = self
+            .exec_container_command_with_env_allow_failure(
+                container_id,
+                vec![
+                    "test".to_string(),
+                    "-f".to_string(),
+                    "composer.json".to_string(),
+                ],
+                Some(repo_path),
+                None,
+            )
+            .await;
+        match presence {
+            Ok(output) if output.exit_code == 0 => Ok(true),
+            Ok(output) if output.exit_code == 1 => Ok(false),
+            Ok(output) => Err(format!(
+                "Check composer.json failed with exit code {}: {}",
+                output.exit_code, output.stderr
+            )),
+            Err(err) => Err(format!("Check composer.json failed: {err:#}")),
+        }
     }
 
     async fn append_composer_install_result(

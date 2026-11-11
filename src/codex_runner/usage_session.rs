@@ -36,10 +36,15 @@ struct UsageWorker {
 }
 
 struct UsageRequest {
+    call: UsageCall,
+    response: oneshot::Sender<Result<Value>>,
+}
+
+/// Owns the RPC payload independently of its response channel.
+struct UsageCall {
     method: &'static str,
     params: Value,
     timeout_error: &'static str,
-    response: oneshot::Sender<Result<Value>>,
 }
 
 // A worker must still remove its container after the last runner reference disappears.
@@ -135,9 +140,11 @@ impl DockerCodexRunner {
         let (response, receiver) = oneshot::channel();
         requests
             .send(UsageRequest {
-                method,
-                params,
-                timeout_error,
+                call: UsageCall {
+                    method,
+                    params,
+                    timeout_error,
+                },
                 response,
             })
             .await
@@ -174,6 +181,9 @@ impl DockerCodexRunner {
     }
 }
 
+/// Own the account connection until shutdown or request-channel closure.
+/// Startup is not cancelled. Failed RPC cleanup completes before another connection starts.
+/// Failed request cleanup retains the session for a later removal attempt.
 async fn run_usage_worker(
     runner: Weak<DockerCodexRunner>,
     auth_host_path: String,
@@ -223,28 +233,8 @@ async fn run_usage_worker(
             }
         }
         let started = session.as_mut().expect("Usage session started");
-        let mut request_result = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => Err(anyhow!("Usage sessions are shutting down")),
-            result = runner.run_session_with_timeout(
-                RunSessionConfig {
-                    app_server_container_id: started.container_id.clone(),
-                    browser_container_id: None,
-                    browser_mcp: None,
-                    timeout_duration: Duration::from_secs(runner.codex.timeout_seconds),
-                    timeout_error: request.timeout_error,
-                },
-                async {
-                    if initialize {
-                        started.client.initialize().await?;
-                        started.client.initialized().await?;
-                    }
-                    started.client.request(request.method, request.params).await
-                },
-            ) => result,
-        };
-        // Usage RPCs do not consume notifications. Do not retain them between requests.
-        started.client.pending_notifications.clear();
+        let mut request_result =
+            run_usage_call(&runner, started, initialize, request.call, &shutdown).await;
         if request_result.is_err()
             && let Err(error) = removal.remove(&mut session).await
         {
@@ -261,4 +251,38 @@ async fn run_usage_worker(
         warn!(auth_host_path, error = %error, "Failed to remove Usage container");
     }
     cleanup
+}
+
+/// Run the startup handshake only for a new connection. Shutdown takes precedence over the RPC.
+/// Discard queued notifications after success, failure, or shutdown.
+async fn run_usage_call(
+    runner: &DockerCodexRunner,
+    started: &mut StartedAppServer,
+    initialize: bool,
+    call: UsageCall,
+    shutdown: &CancellationToken,
+) -> Result<Value> {
+    let result = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Err(anyhow!("Usage sessions are shutting down")),
+        result = runner.run_session_with_timeout(
+            RunSessionConfig {
+                app_server_container_id: started.container_id.clone(),
+                browser_container_id: None,
+                browser_mcp: None,
+                timeout_duration: Duration::from_secs(runner.codex.timeout_seconds),
+                timeout_error: call.timeout_error,
+            },
+            async {
+                if initialize {
+                    started.client.initialize().await?;
+                    started.client.initialized().await?;
+                }
+                started.client.request(call.method, call.params).await
+            },
+        ) => result,
+    };
+    // Usage RPCs do not consume notifications. Do not retain them between requests.
+    started.client.pending_notifications.clear();
+    result
 }

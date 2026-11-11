@@ -320,6 +320,103 @@ async fn interleaved_stderr_does_not_corrupt_stdout_json() -> Result<()> {
 }
 
 #[tokio::test]
+async fn reasoning_deltas_enrich_history_and_are_consumed_on_completion() -> Result<()> {
+    let notifications = [
+        (
+            "item/reasoning/summaryPartAdded",
+            json!({"itemId": "reasoning"}),
+        ),
+        (
+            "item/reasoning/summaryTextDelta",
+            json!({"itemId": "reasoning", "delta": " First "}),
+        ),
+        (
+            "item/reasoning/summaryPartAdded",
+            json!({"itemId": "reasoning"}),
+        ),
+        (
+            "item/reasoning/summaryTextDelta",
+            json!({"itemId": "reasoning", "delta": "Second "}),
+        ),
+        (
+            "item/reasoning/textDelta",
+            json!({"itemId": "reasoning", "delta": " Detail "}),
+        ),
+        (
+            "item/completed",
+            json!({"item": {"id": "reasoning", "type": "reasoning", "summary": [], "content": []}}),
+        ),
+        (
+            "item/completed",
+            json!({"item": {"id": "reasoning", "type": "reasoning", "summary": [], "content": []}}),
+        ),
+        ("turn/completed", json!({"turn": {"status": "completed"}})),
+    ];
+    let mut client = empty_app_server_client();
+    client.output = Box::pin(futures::stream::iter(notifications.map(
+        |(method, params)| {
+            Ok(LogOutput::StdOut {
+                message: format!("{}\n", json!({"method": method, "params": params})).into(),
+            })
+        },
+    )));
+    let mut events = Vec::new();
+    let message = client
+        .stream_turn_message(
+            "thread",
+            "turn",
+            None,
+            |batch| {
+                events.extend(batch);
+                async {}
+            },
+            || async {},
+        )
+        .await?;
+    assert!(message.is_empty());
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].event_type, "item_completed");
+    assert_eq!(events[0].payload["summary"], json!(["First \nSecond"]));
+    assert_eq!(events[0].payload["content"], json!(["Detail"]));
+    assert_eq!(events[1].payload["summary"], json!([]));
+    assert_eq!(events[1].payload["content"], json!([]));
+    assert_eq!(events[2].event_type, "turn_completed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn runner_diagnostics_are_not_messages_and_errors_survive_stdout_closure() -> Result<()> {
+    let mut client = empty_app_server_client();
+    client.log_all_json = true;
+    client.output = Box::pin(futures::stream::iter([
+        Ok(LogOutput::StdOut {
+            message: b" \nnot json\ncodex-runner: started\ncodex-install: installed\ncodex-runner-warn: warning\ncodex-install-error: first\n".as_slice().into(),
+        }),
+        Ok(LogOutput::StdErr {
+            message: b"codex-runner-error: second\n".as_slice().into(),
+        }),
+        Ok(LogOutput::Console {
+            message: b"{\"answer\":true}\n".as_slice().into(),
+        }),
+    ]));
+    assert_eq!(client.next_message().await?, json!({"answer": true}));
+    assert_eq!(
+        client.recent_runner_errors,
+        VecDeque::from([
+            "codex-install-error: first".to_string(),
+            "codex-runner-error: second".to_string(),
+        ])
+    );
+    let error = client.next_message().await.unwrap_err();
+    assert!(is_app_server_io_failure(&error));
+    assert!(format!("{error:#}").contains("codex app-server closed stdout"));
+    assert!(
+        format!("{error:#}").contains("codex-install-error: first | codex-runner-error: second")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn fragmented_long_lines_complete_within_deadline() -> Result<()> {
     let text = "x".repeat(2 * 1024 * 1024);
     let expected = json!({"text": text});

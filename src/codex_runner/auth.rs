@@ -7,7 +7,6 @@ use crate::codex_runner::app_server_diagnostics::AppServerContainerDiagnosticsCo
 use crate::codex_runner::duration::{
     parse_duration_seconds_from_text, safe_cooldown_duration, safe_duration_from_seconds,
 };
-use anyhow::Context as _;
 use std::fmt;
 
 pub(crate) const QUOTA_LAST_PROBE_AT_KEY: &str = "codex_quota_last_probe_at";
@@ -49,6 +48,13 @@ pub(crate) enum AuthFailureKind {
     UsageLimited { reset_at: DateTime<Utc> },
     AuthUnavailable,
     Other,
+}
+
+/// Retry messages retain account context. Other failures must stop account fallback.
+enum AuthFallbackFailure {
+    UsageLimited(String),
+    AuthUnavailable(String),
+    Other(anyhow::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,6 +278,8 @@ impl DockerCodexRunner {
             .await
     }
 
+    /// Try accounts in order. Probe blocked accounts only when no account is available.
+    /// Preserve concurrent reset markers and propagate state errors before returning output.
     pub(crate) async fn run_with_auth_fallback<R, F, Fut>(
         &self,
         action: AuthFallbackAction,
@@ -288,32 +296,8 @@ impl DockerCodexRunner {
             if self.auth_accounts.is_empty() {
                 bail!(action.no_available_accounts_message());
             }
+            available_accounts = self.probe_blocked_auth_accounts(action, now).await?;
             probe_started = true;
-            self.state
-                .service_state
-                .set_service_state_value(QUOTA_LAST_PROBE_AT_KEY, &now.to_rfc3339())
-                .await?;
-            let mut blocked_accounts = Vec::new();
-            for account in &self.auth_accounts {
-                blocked_accounts.push((self.stored_limit_reset_at(account, now).await?, account));
-            }
-            blocked_accounts.sort_by(|(left_reset, left_account), (right_reset, right_account)| {
-                left_reset
-                    .cmp(right_reset)
-                    .then_with(|| left_account.name.cmp(&right_account.name))
-            });
-            available_accounts = blocked_accounts
-                .into_iter()
-                .map(|(_, account)| account.clone())
-                .collect();
-            info!(
-                action = action.action_label(),
-                accounts = ?available_accounts
-                    .iter()
-                    .map(|account| account.name.as_str())
-                    .collect::<Vec<_>>(),
-                "all codex auth accounts have usage-limit markers; probing blocked accounts"
-            );
         }
 
         let mut auth_fallback_errors = Vec::new();
@@ -329,69 +313,37 @@ impl DockerCodexRunner {
                 action = action.action_label(),
                 "running codex action with auth account"
             );
-            match execute(account.clone()).await {
+            let err = match execute(account.clone()).await {
                 Ok(output) => {
-                    if let Some(marker) = reset_marker_at_attempt {
-                        self.state
-                            .service_state
-                            .clear_auth_limit_reset_at_if_matches(&account.state_key, &marker.raw)
-                            .await?;
-                    } else {
-                        self.clear_limit_reset_if_stale(&account, attempt_started_at)
-                            .await?;
-                    }
+                    self.clear_limit_reset_after_success(
+                        &account,
+                        reset_marker_at_attempt,
+                        attempt_started_at,
+                    )
+                    .await?;
                     return Ok(output);
                 }
-                Err(err) => {
-                    let kind = classify_auth_failure(
-                        &err,
-                        Utc::now(),
-                        self.codex.usage_limit_fallback_cooldown_seconds,
-                    );
-                    let kind = classify_auth_failure_for_account(kind, &err, &account);
-                    match kind {
-                        AuthFailureKind::UsageLimited { reset_at } => {
-                            self.mark_limit_reset_at(&account, reset_at).await?;
-                            warn!(
-                                account = account.name.as_str(),
-                                is_primary = account.is_primary,
-                                reset_at = %reset_at,
-                                error = %err,
-                                action = action.action_label(),
-                                "{}",
-                                action.usage_limited_log_message()
-                            );
-                            auth_fallback_errors.push(action.usage_limited_error_message(
-                                account.name.as_str(),
-                                reset_at,
-                                &err,
-                            ));
-                        }
-                        AuthFailureKind::AuthUnavailable => {
-                            saw_auth_unavailable = true;
-                            warn!(
-                                account = account.name.as_str(),
-                                is_primary = account.is_primary,
-                                error = %err,
-                                action = action.action_label(),
-                                "{}",
-                                action.auth_unavailable_log_message()
-                            );
-                            auth_fallback_errors.push(
-                                action.auth_unavailable_error_message(account.name.as_str(), &err),
-                            );
-                        }
-                        AuthFailureKind::Other => {
-                            let context = action.unexpected_failure_context(account.name.as_str());
-                            if probe_started {
-                                self.state
-                                    .service_state
-                                    .clear_service_state_value(QUOTA_LAST_PROBE_AT_KEY)
-                                    .await?;
-                            }
-                            return Err(err).with_context(|| context);
-                        }
+                Err(err) => err,
+            };
+            match self
+                .record_auth_fallback_failure(action, &account, err)
+                .await?
+            {
+                AuthFallbackFailure::UsageLimited(message) => {
+                    auth_fallback_errors.push(message);
+                }
+                AuthFallbackFailure::AuthUnavailable(message) => {
+                    saw_auth_unavailable = true;
+                    auth_fallback_errors.push(message);
+                }
+                AuthFallbackFailure::Other(err) => {
+                    if probe_started {
+                        self.state
+                            .service_state
+                            .clear_service_state_value(QUOTA_LAST_PROBE_AT_KEY)
+                            .await?;
                     }
+                    return Err(err);
                 }
             }
         }
@@ -423,6 +375,115 @@ impl DockerCodexRunner {
             reset_at: quota_reset_at,
             retry_at,
         }))
+    }
+
+    /// Persist usage limits before allowing fallback. State failures stop the action unchanged.
+    async fn record_auth_fallback_failure(
+        &self,
+        action: AuthFallbackAction,
+        account: &AuthAccount,
+        err: anyhow::Error,
+    ) -> Result<AuthFallbackFailure> {
+        let kind = classify_auth_failure(
+            &err,
+            Utc::now(),
+            self.codex.usage_limit_fallback_cooldown_seconds,
+        );
+        let kind = classify_auth_failure_for_account(kind, &err, account);
+        match kind {
+            AuthFailureKind::UsageLimited { reset_at } => {
+                let message = self
+                    .record_usage_limited_auth_failure(action, account, reset_at, &err)
+                    .await?;
+                Ok(AuthFallbackFailure::UsageLimited(message))
+            }
+            AuthFailureKind::AuthUnavailable => Ok(AuthFallbackFailure::AuthUnavailable(
+                report_auth_unavailable_failure(action, account, &err),
+            )),
+            AuthFailureKind::Other => Ok(AuthFallbackFailure::Other(
+                err.context(action.unexpected_failure_context(account.name.as_str())),
+            )),
+        }
+    }
+
+    /// Save the reset marker before reporting an account's usage-limit failure.
+    async fn record_usage_limited_auth_failure(
+        &self,
+        action: AuthFallbackAction,
+        account: &AuthAccount,
+        reset_at: DateTime<Utc>,
+        err: &anyhow::Error,
+    ) -> Result<String> {
+        self.mark_limit_reset_at(account, reset_at).await?;
+        warn!(
+            account = account.name.as_str(),
+            is_primary = account.is_primary,
+            reset_at = %reset_at,
+            error = %err,
+            action = action.action_label(),
+            "{}",
+            action.usage_limited_log_message()
+        );
+        Ok(action.usage_limited_error_message(account.name.as_str(), reset_at, err))
+    }
+
+    /// Record the probe before reading reset markers. Order accounts by reset time, then name.
+    /// The caller must check that configured accounts exist and none are available.
+    async fn probe_blocked_auth_accounts(
+        &self,
+        action: AuthFallbackAction,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<AuthAccount>> {
+        self.state
+            .service_state
+            .set_service_state_value(QUOTA_LAST_PROBE_AT_KEY, &now.to_rfc3339())
+            .await?;
+        let available_accounts = self.auth_accounts_by_reset_time(now).await?;
+        info!(
+            action = action.action_label(),
+            accounts = ?available_accounts
+                .iter()
+                .map(|account| account.name.as_str())
+                .collect::<Vec<_>>(),
+            "all codex auth accounts have usage-limit markers; probing blocked accounts"
+        );
+        Ok(available_accounts)
+    }
+
+    /// Read reset markers in configured order, then sort by reset time and account name.
+    async fn auth_accounts_by_reset_time(&self, now: DateTime<Utc>) -> Result<Vec<AuthAccount>> {
+        let mut blocked_accounts = Vec::new();
+        for account in &self.auth_accounts {
+            blocked_accounts.push((self.stored_limit_reset_at(account, now).await?, account));
+        }
+        blocked_accounts.sort_by(|(left_reset, left_account), (right_reset, right_account)| {
+            left_reset
+                .cmp(right_reset)
+                .then_with(|| left_account.name.cmp(&right_account.name))
+        });
+        Ok(blocked_accounts
+            .into_iter()
+            .map(|(_, account)| account.clone())
+            .collect())
+    }
+
+    /// Delete only the observed probe marker or a marker stale before this attempt.
+    async fn clear_limit_reset_after_success(
+        &self,
+        account: &AuthAccount,
+        reset_marker_at_attempt: Option<AuthLimitResetMarker>,
+        attempt_started_at: DateTime<Utc>,
+    ) -> Result<()> {
+        if let Some(marker) = reset_marker_at_attempt {
+            self.state
+                .service_state
+                .clear_auth_limit_reset_at_if_matches(&account.state_key, &marker.raw)
+                .await?;
+        } else {
+            self.clear_limit_reset_if_stale(account, attempt_started_at)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn earliest_stored_limit_reset_at(
@@ -483,6 +544,23 @@ impl DockerCodexRunner {
             retry_at: reset_at.min(probe_due_at),
         }))
     }
+}
+
+/// Report account fallback and retain its error text for the combined failure.
+fn report_auth_unavailable_failure(
+    action: AuthFallbackAction,
+    account: &AuthAccount,
+    err: &anyhow::Error,
+) -> String {
+    warn!(
+        account = account.name.as_str(),
+        is_primary = account.is_primary,
+        error = %err,
+        action = action.action_label(),
+        "{}",
+        action.auth_unavailable_log_message()
+    );
+    action.auth_unavailable_error_message(account.name.as_str(), err)
 }
 
 fn quota_retry_at(

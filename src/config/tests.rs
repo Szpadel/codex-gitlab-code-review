@@ -214,12 +214,18 @@ docker:
 }
 
 #[test]
-fn defaults_mention_commands_when_missing() {
+fn defaults_review_instructions_and_deferral_emojis_when_missing() {
     let yaml = base_config_yaml("");
     let config = load_from_yaml(&yaml);
     assert_eq!(config.review.additional_developer_instructions, None);
     assert_eq!(config.review.rate_limit_emoji, "hourglass_flowing_sand");
     assert_eq!(config.review.quota_emoji, "fuelpump");
+}
+
+#[test]
+fn defaults_mention_commands_when_missing() {
+    let yaml = base_config_yaml("");
+    let config = load_from_yaml(&yaml);
     assert!(!config.review.mention_commands.enabled);
     assert_eq!(config.review.mention_commands.bot_username, None);
     assert_eq!(config.review.mention_commands.eyes_emoji, None);
@@ -230,11 +236,29 @@ fn defaults_mention_commands_when_missing() {
             .additional_developer_instructions,
         None
     );
+}
+
+#[test]
+fn defaults_usage_limit_fallback_when_missing() {
+    let yaml = base_config_yaml("");
+    let config = load_from_yaml(&yaml);
     assert!(config.codex.fallback_auth_accounts.is_empty());
     assert_eq!(config.codex.usage_limit_fallback_cooldown_seconds, 3600);
     assert_eq!(config.codex.usage_limit_recheck_seconds, 900);
+}
+
+#[test]
+fn defaults_mcp_server_overrides_when_missing() {
+    let yaml = base_config_yaml("");
+    let config = load_from_yaml(&yaml);
     assert!(config.codex.mcp_server_overrides.review.is_empty());
     assert!(config.codex.mcp_server_overrides.mention.is_empty());
+}
+
+#[test]
+fn defaults_session_overrides_when_missing() {
+    let yaml = base_config_yaml("");
+    let config = load_from_yaml(&yaml);
     assert_eq!(config.codex.session_overrides.review.model, None);
     assert_eq!(config.codex.session_overrides.review.reasoning_effort, None);
     assert_eq!(config.codex.session_overrides.mention.model, None);
@@ -278,6 +302,12 @@ fn defaults_mention_commands_when_missing() {
             .as_deref(),
         Some("medium")
     );
+}
+
+#[test]
+fn defaults_reasoning_summary_when_missing() {
+    let yaml = base_config_yaml("");
+    let config = load_from_yaml(&yaml);
     assert_eq!(
         config.codex.reasoning_summary.review.as_deref(),
         Some("detailed")
@@ -286,7 +316,19 @@ fn defaults_mention_commands_when_missing() {
         config.codex.reasoning_summary.mention.as_deref(),
         Some("detailed")
     );
+}
+
+#[test]
+fn defaults_browser_mcp_when_missing() {
+    let yaml = base_config_yaml("");
+    let config = load_from_yaml(&yaml);
     assert_eq!(config.codex.browser_mcp, BrowserMcpConfig::default());
+}
+
+#[test]
+fn defaults_work_tmpfs_when_missing() {
+    let yaml = base_config_yaml("");
+    let config = load_from_yaml(&yaml);
     assert!(!config.codex.work_tmpfs.enabled);
     assert_eq!(config.codex.work_tmpfs.size_mib, None);
 }

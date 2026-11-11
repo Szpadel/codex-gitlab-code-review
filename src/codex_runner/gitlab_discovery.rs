@@ -1,3 +1,4 @@
+use super::container::ContainerExecOutput;
 use super::{
     BTreeMap, ContainerInspectResponse, Context, DockerCodexRunner, FeatureFlagSnapshot,
     GITLAB_DISCOVERY_MCP_STARTUP_TURN_ID, GitLabDiscoveryMcpService, NewRunHistoryEvent,
@@ -182,6 +183,9 @@ impl DockerCodexRunner {
         }))
     }
 
+    /// Probe inside the review container without blocking the review on failure.
+    /// Persist diagnostic failures and unsupported URLs. Clear warnings for script SKIP output
+    /// or unavailable execution.
     pub(crate) async fn probe_gitlab_discovery_mcp_endpoint(
         &self,
         prepared: Option<&PreparedGitLabDiscoveryMcp>,
@@ -215,84 +219,14 @@ impl DockerCodexRunner {
             .await
         {
             Ok(output) => {
-                let first_line = output
-                    .stdout
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| {
-                        matches!(
-                            line.split_whitespace().next(),
-                            Some("OK" | "ERROR" | "SKIP")
-                        )
-                    })
-                    .or_else(|| {
-                        output
-                            .stdout
-                            .lines()
-                            .map(str::trim)
-                            .find(|line| !line.is_empty())
-                    })
-                    .unwrap_or("");
-                if first_line.starts_with("OK ") {
-                    self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
-                        .await;
-                    debug!(
-                        container_id,
-                        url = prepared.runtime_config.advertise_url.as_str(),
-                        detail = first_line,
-                        stdout = output.stdout.trim(),
-                        stderr = output.stderr.trim(),
-                        "gitlab discovery MCP endpoint passed startup probe"
-                    );
-                } else if first_line.starts_with("SKIP ") {
-                    self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
-                        .await;
-                    warn!(
-                        container_id,
-                        url = prepared.runtime_config.advertise_url.as_str(),
-                        detail = first_line,
-                        stdout = output.stdout.trim(),
-                        stderr = output.stderr.trim(),
-                        "gitlab discovery MCP reachability probe skipped inside review container"
-                    );
-                } else {
-                    warn!(
-                        container_id,
-                        network_container_id =
-                            registered.map_or("<unregistered>", |binding| binding
-                                .network_container_id
-                                .as_str()),
-                        peer_ips = registered
-                            .map(|binding| binding
-                                .peer_ips
-                                .iter()
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(","))
-                            .unwrap_or_default(),
-                        url = prepared.runtime_config.advertise_url.as_str(),
-                        detail = first_line,
-                        stdout = output.stdout.trim(),
-                        stderr = output.stderr.trim(),
-                        "gitlab discovery MCP endpoint failed startup probe"
-                    );
-                    if first_line.is_empty() {
-                        self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
-                            .await;
-                        warn!(
-                            container_id,
-                            url = prepared.runtime_config.advertise_url.as_str(),
-                            "gitlab discovery MCP startup probe returned no diagnostic output"
-                        );
-                    } else {
-                        self.append_gitlab_discovery_mcp_startup_failure(
-                            run_history_id,
-                            prepared.runtime_config.advertise_url.as_str(),
-                            first_line,
-                        )
-                        .await;
-                    }
-                }
+                self.handle_gitlab_discovery_probe_output(
+                    &prepared.runtime_config,
+                    container_id,
+                    registered,
+                    run_history_id,
+                    &output,
+                )
+                .await;
             }
             Err(err) => {
                 self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
@@ -310,6 +244,135 @@ impl DockerCodexRunner {
                 );
             }
         }
+    }
+
+    /// Interpret the script's status line independently of its process exit code.
+    async fn handle_gitlab_discovery_probe_output(
+        &self,
+        runtime_config: &GitLabDiscoveryMcpRuntimeConfig,
+        container_id: &str,
+        registered: Option<&RegisteredGitLabDiscoverySession>,
+        run_history_id: Option<i64>,
+        output: &ContainerExecOutput,
+    ) {
+        let first_line = gitlab_discovery_probe_status_line(&output.stdout);
+        if first_line.starts_with("OK ") {
+            self.record_gitlab_discovery_probe_passed(
+                runtime_config,
+                container_id,
+                run_history_id,
+                output,
+                first_line,
+            )
+            .await;
+        } else if first_line.starts_with("SKIP ") {
+            self.record_gitlab_discovery_probe_skipped(
+                runtime_config,
+                container_id,
+                run_history_id,
+                output,
+                first_line,
+            )
+            .await;
+        } else {
+            report_gitlab_discovery_probe_failure(
+                runtime_config,
+                container_id,
+                registered,
+                output,
+                first_line,
+            );
+            self.record_gitlab_discovery_probe_failure(
+                runtime_config,
+                container_id,
+                run_history_id,
+                first_line,
+            )
+            .await;
+        }
+    }
+
+    /// Clear any startup warning before reporting a successful endpoint probe.
+    async fn record_gitlab_discovery_probe_passed(
+        &self,
+        runtime_config: &GitLabDiscoveryMcpRuntimeConfig,
+        container_id: &str,
+        run_history_id: Option<i64>,
+        output: &ContainerExecOutput,
+        detail: &str,
+    ) {
+        self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
+            .await;
+        debug!(
+            container_id,
+            url = runtime_config.advertise_url.as_str(),
+            detail,
+            stdout = output.stdout.trim(),
+            stderr = output.stderr.trim(),
+            "gitlab discovery MCP endpoint passed startup probe"
+        );
+    }
+
+    /// A probe skipped inside the container must not retain an earlier startup warning.
+    async fn record_gitlab_discovery_probe_skipped(
+        &self,
+        runtime_config: &GitLabDiscoveryMcpRuntimeConfig,
+        container_id: &str,
+        run_history_id: Option<i64>,
+        output: &ContainerExecOutput,
+        detail: &str,
+    ) {
+        self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
+            .await;
+        warn!(
+            container_id,
+            url = runtime_config.advertise_url.as_str(),
+            detail,
+            stdout = output.stdout.trim(),
+            stderr = output.stderr.trim(),
+            "gitlab discovery MCP reachability probe skipped inside review container"
+        );
+    }
+
+    /// Keep warnings only when the probe supplied a diagnostic line.
+    async fn record_gitlab_discovery_probe_failure(
+        &self,
+        runtime_config: &GitLabDiscoveryMcpRuntimeConfig,
+        container_id: &str,
+        run_history_id: Option<i64>,
+        detail: &str,
+    ) {
+        if !detail.is_empty() {
+            self.append_gitlab_discovery_mcp_startup_failure(
+                run_history_id,
+                runtime_config.advertise_url.as_str(),
+                detail,
+            )
+            .await;
+            return;
+        }
+        self.record_gitlab_discovery_probe_no_diagnostic(
+            runtime_config,
+            container_id,
+            run_history_id,
+        )
+        .await;
+    }
+
+    /// Clear a stale warning when execution succeeded without diagnostic output.
+    async fn record_gitlab_discovery_probe_no_diagnostic(
+        &self,
+        runtime_config: &GitLabDiscoveryMcpRuntimeConfig,
+        container_id: &str,
+        run_history_id: Option<i64>,
+    ) {
+        self.clear_gitlab_discovery_mcp_startup_failure(run_history_id)
+            .await;
+        warn!(
+            container_id,
+            url = runtime_config.advertise_url.as_str(),
+            "gitlab discovery MCP startup probe returned no diagnostic output"
+        );
     }
 
     pub(crate) async fn append_gitlab_discovery_mcp_startup_failure(
@@ -384,6 +447,50 @@ impl DockerCodexRunner {
         );
         Ok(peer_ips)
     }
+}
+
+/// Include the network binding and complete output when a probe has no success status.
+fn report_gitlab_discovery_probe_failure(
+    runtime_config: &GitLabDiscoveryMcpRuntimeConfig,
+    container_id: &str,
+    registered: Option<&RegisteredGitLabDiscoverySession>,
+    output: &ContainerExecOutput,
+    detail: &str,
+) {
+    warn!(
+        container_id,
+        network_container_id = registered.map_or("<unregistered>", |binding| binding
+            .network_container_id
+            .as_str()),
+        peer_ips = registered
+            .map(|binding| binding
+                .peer_ips
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(","))
+            .unwrap_or_default(),
+        url = runtime_config.advertise_url.as_str(),
+        detail,
+        stdout = output.stdout.trim(),
+        stderr = output.stderr.trim(),
+        "gitlab discovery MCP endpoint failed startup probe"
+    );
+}
+
+/// Prefer a status token over informational lines, then use the first non-empty line.
+fn gitlab_discovery_probe_status_line(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            matches!(
+                line.split_whitespace().next(),
+                Some("OK" | "ERROR" | "SKIP")
+            )
+        })
+        .or_else(|| stdout.lines().map(str::trim).find(|line| !line.is_empty()))
+        .unwrap_or("")
 }
 
 fn container_peer_ips(inspect: &ContainerInspectResponse) -> BTreeSet<String> {

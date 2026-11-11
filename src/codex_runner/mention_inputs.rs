@@ -17,6 +17,12 @@ pub(crate) struct PreparedMentionInputs {
     pub(crate) turn_input: Vec<Value>,
 }
 
+enum MentionImageDownload {
+    Downloaded(String),
+    TooLarge,
+    Unavailable,
+}
+
 impl PreparedMentionInputs {
     fn text_only(prompt: &str) -> Self {
         Self {
@@ -164,52 +170,71 @@ impl DockerCodexRunner {
             .take(MAX_MENTION_IMAGES)
             .enumerate()
         {
-            let file_name = sanitized_attachment_filename(upload.filename.as_str(), index);
-            let destination = format!("{temp_dir}/{file_name}");
-            let url = gitlab_project_upload_api_url(
-                &self.git_base,
-                ctx.discussion_project_path.as_str(),
-                upload.secret.as_str(),
-                upload.filename.as_str(),
-            );
-            let command = mention_image_download_exec_command(&destination, &url);
-            let download = self
-                .exec_container_command_with_env_allow_failure(
-                    container_id,
-                    command.clone(),
-                    Some(repo_dir),
-                    Some(vec![format!("GITLAB_TOKEN={}", self.gitlab_token)]),
-                )
-                .await;
-            if download
-                .as_ref()
-                .is_ok_and(|output| output.exit_code == MENTION_IMAGE_TOO_LARGE_EXIT_CODE)
+            match self
+                .download_mention_image(container_id, repo_dir, ctx, &temp_dir, index, upload)
+                .await
             {
-                prompt.push_str(&format!(
+                MentionImageDownload::Downloaded(destination) => image_paths.push(destination),
+                MentionImageDownload::TooLarge => prompt.push_str(&format!(
                     "\n\nImage {} was skipped because it exceeds the {}-byte limit.",
                     index + 1,
                     MAX_MENTION_IMAGE_BYTES
-                ));
-                continue;
+                )),
+                MentionImageDownload::Unavailable => {}
             }
-            let download = download.and_then(|output| {
-                super::container::validate_container_exec_result(&command, Some(repo_dir), output)
-            });
-            if let Err(err) = download {
-                warn!(
-                    repo = ctx.discussion_project_path.as_str(),
-                    discussion_id = ctx.discussion_id.as_str(),
-                    trigger_note_id = ctx.trigger_note_id,
-                    asset_url = upload.absolute_url.as_str(),
-                    error = %err,
-                    "failed to download mention image upload inside container"
-                );
-                continue;
-            }
-            image_paths.push(destination);
         }
         prepared.turn_input = build_mention_turn_input(&prompt, &image_paths);
         prepared
+    }
+
+    /// Retain only successful downloads. Log failures without failing the mention command.
+    async fn download_mention_image(
+        &self,
+        container_id: &str,
+        repo_dir: &str,
+        ctx: &MentionCommandContext,
+        temp_dir: &str,
+        index: usize,
+        upload: &crate::gitlab::links::GitLabMarkdownImageUpload,
+    ) -> MentionImageDownload {
+        let file_name = sanitized_attachment_filename(upload.filename.as_str(), index);
+        let destination = format!("{temp_dir}/{file_name}");
+        let url = gitlab_project_upload_api_url(
+            &self.git_base,
+            ctx.discussion_project_path.as_str(),
+            upload.secret.as_str(),
+            upload.filename.as_str(),
+        );
+        let command = mention_image_download_exec_command(&destination, &url);
+        let download = self
+            .exec_container_command_with_env_allow_failure(
+                container_id,
+                command.clone(),
+                Some(repo_dir),
+                Some(vec![format!("GITLAB_TOKEN={}", self.gitlab_token)]),
+            )
+            .await;
+        if download
+            .as_ref()
+            .is_ok_and(|output| output.exit_code == MENTION_IMAGE_TOO_LARGE_EXIT_CODE)
+        {
+            return MentionImageDownload::TooLarge;
+        }
+        let download = download.and_then(|output| {
+            super::container::validate_container_exec_result(&command, Some(repo_dir), output)
+        });
+        if let Err(err) = download {
+            warn!(
+                repo = ctx.discussion_project_path.as_str(),
+                discussion_id = ctx.discussion_id.as_str(),
+                trigger_note_id = ctx.trigger_note_id,
+                asset_url = upload.absolute_url.as_str(),
+                error = %err,
+                "failed to download mention image upload inside container"
+            );
+            return MentionImageDownload::Unavailable;
+        }
+        MentionImageDownload::Downloaded(destination)
     }
 }
 

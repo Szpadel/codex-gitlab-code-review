@@ -132,3 +132,110 @@ async fn run_review_with_fake_runtime_persists_gitlab_discovery_startup_warning(
     assert_eq!(discovery.removed_bindings(), vec!["app-1"]);
     Ok(())
 }
+
+#[tokio::test]
+async fn discovery_probe_updates_warning_from_status_not_informational_output() -> Result<()> {
+    let harness = Arc::new(FakeRunnerHarness::default());
+    let runner =
+        test_runner_with_fake_runtime(test_codex_config(), false, Arc::clone(&harness), None).await;
+    let prepared = PreparedGitLabDiscoveryMcp {
+        source_repo: "group/repo".to_string(),
+        feature_flags: FeatureFlagSnapshot::default(),
+        allow: ResolvedGitLabDiscoveryAllowList {
+            target_repos: BTreeSet::new(),
+            target_groups: BTreeSet::new(),
+        },
+        runtime_config: GitLabDiscoveryMcpRuntimeConfig {
+            server_name: "gitlab-discovery".to_string(),
+            advertise_url: "http://gitlab-discovery.internal:8091/mcp".to_string(),
+            clone_root: "/work/mcp".to_string(),
+        },
+    };
+    let run_history_id = runner
+        .state
+        .run_history
+        .start_run_history(NewRunHistory {
+            kind: RunHistoryKind::Review,
+            repo: "group/repo".to_string(),
+            iid: 11,
+            head_sha: "abc123".to_string(),
+            discussion_id: None,
+            trigger_note_id: None,
+            trigger_note_author_name: None,
+            trigger_note_body: None,
+            command_repo: None,
+        })
+        .await?;
+
+    // Each probe must replace or clear the earlier warning, not leave stale events.
+    for (stdout, expected_detail) in [
+        (Some("INFO healthz\n OK reachable\nERROR later\n"), None),
+        (Some("INFO healthz\nSKIP no curl\n"), None),
+        (Some(" \n"), None),
+        (None, None),
+        (
+            Some("INFO healthz\n ERROR connect failure\n"),
+            Some("ERROR connect failure"),
+        ),
+        (
+            Some("unrecognized diagnostic\n"),
+            Some("unrecognized diagnostic"),
+        ),
+        (Some("OK\n"), Some("OK")),
+    ] {
+        runner
+            .append_gitlab_discovery_mcp_startup_failure(
+                Some(run_history_id),
+                &prepared.runtime_config.advertise_url,
+                "earlier failure",
+            )
+            .await;
+        let request = ExecContainerCommandRequest {
+            container_id: "app-1".to_string(),
+            command: gitlab_discovery_mcp_probe_exec_command(&prepared.runtime_config)
+                .expect("probe command"),
+            cwd: None,
+            env: None,
+        };
+        if let Some(stdout) = stdout {
+            harness.push_exec_output(
+                request,
+                ContainerExecOutput {
+                    exit_code: 0,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                },
+            );
+        } else {
+            harness.push_exec_error(request, "container exec failed");
+        }
+
+        runner
+            .probe_gitlab_discovery_mcp_endpoint(
+                Some(&prepared),
+                "app-1",
+                None,
+                Some(run_history_id),
+            )
+            .await;
+        runner.state.flush_background_writes().await?;
+        let events = runner
+            .state
+            .run_history
+            .list_run_history_events(run_history_id)
+            .await?;
+        let warning = events
+            .iter()
+            .find(|event| event.event_type == "item_completed");
+        match expected_detail {
+            Some(detail) => {
+                let expected = format!(
+                    "GitLab discovery MCP startup warning: endpoint http://gitlab-discovery.internal:8091/mcp {detail}. MCP tools may be unavailable in this run."
+                );
+                assert_eq!(warning.expect("startup warning").payload["text"], expected);
+            }
+            None => assert!(warning.is_none(), "stale warning for {stdout:?}"),
+        }
+    }
+    Ok(())
+}

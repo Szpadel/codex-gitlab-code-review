@@ -1,3 +1,5 @@
+//! Lane-specific review admission, execution, and interrupted-claim recovery.
+
 use crate::codex_runner::{
     CodexQuotaExhausted, CodexResult, ReviewComment, ReviewContext, SecurityReviewContentFlagged,
 };
@@ -26,7 +28,8 @@ use crate::lifecycle::ServiceLifecycle;
 use crate::review_deduplication::ReviewDiscussionSource;
 use crate::review_lane::ReviewLane;
 use crate::state::{
-    NewRunHistory, ReviewRateLimitAcquireOutcome, ReviewStateStore, RunHistoryFinish,
+    InProgressReview, NewRunHistory, ReviewRateLimitAcquireOutcome, ReviewStateStore,
+    RunHistoryFinish,
 };
 use anyhow::{Error, Result};
 use async_trait::async_trait;
@@ -246,6 +249,8 @@ impl ReviewFlow {
             .await
     }
 
+    /// Attempts eyes cleanup, clears retries, and cancels this lane's interrupted claims.
+    /// Logs per-claim failures. Returns an error if the claim list cannot be read.
     pub(crate) async fn recover_in_progress(&self) -> Result<()> {
         let in_progress = self
             .shared
@@ -258,63 +263,75 @@ impl ReviewFlow {
                 count = in_progress.len(),
                 "recovering interrupted in-progress reviews"
             );
-            for review in in_progress {
-                if review.lane != self.lane {
-                    continue;
-                }
-                let retry_key = RetryKey::new(
-                    review.lane,
-                    review.repo.as_str(),
-                    review.iid,
-                    review.head_sha.as_str(),
-                );
-                if self.shared.config.review.dry_run || !self.uses_awards() {
-                    info!(
-                        repo = review.repo.as_str(),
-                        iid = review.iid,
-                        "dry run: skipping eyes removal during recovery"
-                    );
-                } else if let Err(err) = self
-                    .shared
-                    .award_service
-                    .remove_award(
-                        review.repo.as_str(),
-                        review.iid,
-                        &self.shared.config.review.eyes_emoji,
-                    )
-                    .await
-                {
-                    warn!(
-                        repo = review.repo.as_str(),
-                        iid = review.iid,
-                        error = %err,
-                        "failed to remove eyes award while recovering review"
-                    );
-                }
-                self.retry_backoff.clear(&retry_key);
-                if let Err(err) = self
-                    .shared
-                    .state
-                    .review_state
-                    .finish_review_for_lane(
-                        review.repo.as_str(),
-                        review.iid,
-                        review.head_sha.as_str(),
-                        review.lane,
-                        ReviewRunResult::Cancelled.as_str(),
-                    )
-                    .await
-                {
-                    warn!(
-                        repo = review.repo.as_str(),
-                        iid = review.iid,
-                        error = %err,
-                        "failed to mark interrupted review as cancelled"
-                    );
-                }
+        }
+        for review in in_progress {
+            if review.lane != self.lane {
+                continue;
             }
+            let retry_key = RetryKey::new(
+                review.lane,
+                review.repo.as_str(),
+                review.iid,
+                review.head_sha.as_str(),
+            );
+            if self.shared.config.review.dry_run || !self.uses_awards() {
+                info!(
+                    repo = review.repo.as_str(),
+                    iid = review.iid,
+                    "dry run: skipping eyes removal during recovery"
+                );
+            } else {
+                self.remove_recovery_eyes_best_effort(&review).await;
+            }
+            self.retry_backoff.clear(&retry_key);
+            self.cancel_interrupted_review_best_effort(&review).await;
         }
         Ok(())
+    }
+
+    /// Logs cleanup failures. The caller excludes dry runs and lanes without awards.
+    async fn remove_recovery_eyes_best_effort(&self, review: &InProgressReview) {
+        if let Err(err) = self
+            .shared
+            .award_service
+            .remove_award(
+                review.repo.as_str(),
+                review.iid,
+                &self.shared.config.review.eyes_emoji,
+            )
+            .await
+        {
+            warn!(
+                repo = review.repo.as_str(),
+                iid = review.iid,
+                error = %err,
+                "failed to remove eyes award while recovering review"
+            );
+        }
+    }
+
+    /// Logs persistence failures so recovery can continue with the next claim.
+    async fn cancel_interrupted_review_best_effort(&self, review: &InProgressReview) {
+        if let Err(err) = self
+            .shared
+            .state
+            .review_state
+            .finish_review_for_lane(
+                review.repo.as_str(),
+                review.iid,
+                review.head_sha.as_str(),
+                review.lane,
+                ReviewRunResult::Cancelled.as_str(),
+            )
+            .await
+        {
+            warn!(
+                repo = review.repo.as_str(),
+                iid = review.iid,
+                error = %err,
+                "failed to mark interrupted review as cancelled"
+            );
+        }
     }
 
     /// Checks whether this lane must review `head_sha`. Takes no claim and no rate-limit bucket.
@@ -860,31 +877,10 @@ impl ReviewFlow {
 
     async fn start_queued(&self, job: &QueuedReview, running_head: &RunningHead) -> Result<()> {
         let repo = job.repo.as_str();
-        let mr = match self.shared.gitlab.get_mr(repo, job.iid).await {
-            Ok(mr) => mr,
-            Err(err) if merge_request_lookup_reports_missing(&err) => {
-                debug!(
-                    repo,
-                    iid = job.iid,
-                    lane = self.lane.as_str(),
-                    "skip queued review: merge request no longer exists"
-                );
-                return self
-                    .clear_review_rate_limit_pending_if_needed(repo, job.iid)
-                    .await;
-            }
-            Err(err) => return Err(err.context("refresh merge request for queued review")),
+        let Some(mr) = self.refresh_queued_merge_request(job).await? else {
+            return Ok(());
         };
-        if job.eligibility == ReviewEligibility::Automatic
-            && let Some(reason) = review_skip_reason(&mr, self.shared.created_after)
-        {
-            debug!(
-                repo,
-                iid = job.iid,
-                lane = self.lane.as_str(),
-                ?reason,
-                "skip queued review: merge request is not eligible"
-            );
+        if self.queued_review_is_ineligible(job, &mr) {
             return self
                 .clear_review_rate_limit_pending_if_needed(repo, job.iid)
                 .await;
@@ -910,24 +906,11 @@ impl ReviewFlow {
             );
         }
         let history = AdmissionHistory::new(self.shared.gitlab.as_ref(), repo, job.iid);
-        let acquired_rule_ids = match self
-            .evaluate_review_gate(repo, &mr, &head_sha, &history)
+        let Some(acquired_rule_ids) = self
+            .acquire_queued_review(job, &mr, &head_sha, &history)
             .await?
-        {
-            ReviewGateOutcome::Ready(ready) => ready.acquired_rule_ids,
-            ReviewGateOutcome::Skip(outcome) => {
-                if !outcome.keeps_pending_retry() {
-                    self.clear_review_rate_limit_pending_if_needed(repo, job.iid)
-                        .await?;
-                }
-                return Ok(());
-            }
-            // Only a run that ended without cleanup leaves a busy claim. Retry after the stale sweep.
-            ReviewGateOutcome::ClaimBusy => {
-                self.request_rescan(job);
-                return Ok(());
-            }
-            ReviewGateOutcome::RateLimited => return Ok(()),
+        else {
+            return Ok(());
         };
         // Heartbeats keep the claim alive while the review runs.
         let _active_review = self.shared.active_tasks.track_review(ActiveReviewKey {
@@ -956,6 +939,78 @@ impl ReviewFlow {
                 prepared.task.run_history_id,
             )
             .await
+    }
+
+    /// Clears pending retries for a missing MR. Propagates other lookup or cleanup failures.
+    async fn refresh_queued_merge_request(
+        &self,
+        job: &QueuedReview,
+    ) -> Result<Option<MergeRequest>> {
+        let repo = job.repo.as_str();
+        let mr = match self.shared.gitlab.get_mr(repo, job.iid).await {
+            Ok(mr) => mr,
+            Err(err) if merge_request_lookup_reports_missing(&err) => {
+                debug!(
+                    repo,
+                    iid = job.iid,
+                    lane = self.lane.as_str(),
+                    "skip queued review: merge request no longer exists"
+                );
+                self.clear_review_rate_limit_pending_if_needed(repo, job.iid)
+                    .await?;
+                return Ok(None);
+            }
+            Err(err) => return Err(err.context("refresh merge request for queued review")),
+        };
+        Ok(Some(mr))
+    }
+
+    /// Logs automatic-review exclusions. Explicit requests bypass automatic eligibility rules.
+    fn queued_review_is_ineligible(&self, job: &QueuedReview, mr: &MergeRequest) -> bool {
+        if job.eligibility != ReviewEligibility::Automatic {
+            return false;
+        }
+        let Some(reason) = review_skip_reason(mr, self.shared.created_after) else {
+            return false;
+        };
+        debug!(
+            repo = job.repo.as_str(),
+            iid = job.iid,
+            lane = self.lane.as_str(),
+            ?reason,
+            "skip queued review: merge request is not eligible"
+        );
+        true
+    }
+
+    /// Applies pending-row cleanup and rescan policy to gates that do not acquire a claim.
+    async fn acquire_queued_review(
+        &self,
+        job: &QueuedReview,
+        mr: &MergeRequest,
+        head_sha: &str,
+        history: &AdmissionHistory<'_>,
+    ) -> Result<Option<Vec<String>>> {
+        let repo = job.repo.as_str();
+        match self
+            .evaluate_review_gate(repo, mr, head_sha, history)
+            .await?
+        {
+            ReviewGateOutcome::Ready(ready) => Ok(Some(ready.acquired_rule_ids)),
+            ReviewGateOutcome::Skip(outcome) => {
+                if !outcome.keeps_pending_retry() {
+                    self.clear_review_rate_limit_pending_if_needed(repo, job.iid)
+                        .await?;
+                }
+                Ok(None)
+            }
+            // Only a run that ended without cleanup leaves a busy claim. Retry after the stale sweep.
+            ReviewGateOutcome::ClaimBusy => {
+                self.request_rescan(job);
+                Ok(None)
+            }
+            ReviewGateOutcome::RateLimited => Ok(None),
+        }
     }
 
     /// Makes the next incremental scan queue this review again. Delays a due retry of the MR.

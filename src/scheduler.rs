@@ -19,7 +19,7 @@ use crate::gitlab_discovery_mcp::GitLabDiscoveryMcpService;
 use crate::http::{AdminService, HttpServices, run_http_server_with_dev_tools};
 use crate::lifecycle::ServiceLifecycleSignal;
 use crate::review::{ReviewService, ScanRunStatus};
-use crate::state::{ScanMode, ScanOutcome};
+use crate::state::{ReviewStateStore, ScanMode, ScanOutcome};
 
 mod transcript_retention;
 
@@ -37,6 +37,13 @@ enum ScheduledWakeReason {
 struct ScheduledWake {
     at: DateTime<Utc>,
     reason: ScheduledWakeReason,
+}
+
+enum ScheduledWait {
+    Ready,
+    Recalculate,
+    ShutdownRequested,
+    ChannelClosed,
 }
 
 pub(crate) trait ShutdownSignalSource: Send + Sync {
@@ -99,6 +106,8 @@ pub(crate) async fn run(runtime: BootstrappedRuntime) -> Result<()> {
     run_with_hooks(runtime, &signal_source, &http_launcher).await
 }
 
+/// Stops runs, usage sessions, writes, and background tasks after the scheduler exits.
+/// Scheduler errors take precedence over usage cleanup and SQLite drain errors.
 pub(crate) async fn run_with_hooks(
     runtime: BootstrappedRuntime,
     signal_source: &dyn ShutdownSignalSource,
@@ -112,14 +121,29 @@ pub(crate) async fn run_with_hooks(
     // Scans do not wait for their runs, so runs can still be active on every exit path.
     // Stop them and wait for their cleanup before the runner and the state store close.
     service.request_shutdown();
-    if let Err(err) = service.recover_in_progress_reviews().await {
-        warn!(error = %err, "shutdown recovery of interrupted reviews failed");
-    }
+    recover_interrupted_reviews(
+        service.as_ref(),
+        "shutdown recovery of interrupted reviews failed",
+    )
+    .await;
     service.wait_for_active_tasks().await;
+    let cleanup = shutdown_usage_sessions(runner.as_ref()).await;
+    let drain = drain_background_writes(state.as_ref()).await;
+    background_tasks.shutdown().await;
+    result.and(cleanup).and(drain)
+}
+
+/// Reports usage cleanup failures and returns them for the final exit result.
+async fn shutdown_usage_sessions(runner: &dyn CodexRunner) -> Result<()> {
     let cleanup = runner.shutdown_usage_sessions().await;
     if let Err(error) = &cleanup {
         warn!(error = %error, "Failed to shut down Usage sessions");
     }
+    cleanup
+}
+
+/// Bounds the SQLite drain and reports failures without preventing task shutdown.
+async fn drain_background_writes(state: &ReviewStateStore) -> Result<()> {
     let drain = tokio::time::timeout(
         SQLITE_SHUTDOWN_DRAIN_TIMEOUT,
         state.shutdown_background_writes(),
@@ -130,8 +154,7 @@ pub(crate) async fn run_with_hooks(
     if let Err(error) = &drain {
         warn!(error = %error, "sqlite background drain failed");
     }
-    background_tasks.shutdown().await;
-    result.and(cleanup).and(drain)
+    drain
 }
 
 async fn run_until_stopped(
@@ -151,13 +174,14 @@ async fn run_until_stopped(
         ..
     } = runtime;
 
-    if let Err(err) = service.recover_in_progress_reviews().await {
-        warn!(error = %err, "startup recovery of interrupted reviews failed");
-    }
-    if let Err(err) = http_services.admin.recover_startup_status().await {
-        warn!(error = %err, "failed to reconcile startup scan status");
-    }
+    recover_interrupted_reviews(
+        service.as_ref(),
+        "startup recovery of interrupted reviews failed",
+    )
+    .await;
+    recover_startup_scan_status(http_services.admin.as_ref()).await;
 
+    // Bind HTTP before scans can admit runs.
     let background_tasks = state.background_tasks();
     http_launcher
         .launch(
@@ -167,6 +191,7 @@ async fn run_until_stopped(
             &background_tasks,
         )
         .await?;
+
     let _startup_warmup = spawn_startup_warmup(runner, &state.background_tasks());
     let _transcript_retention = transcript_retention::spawn(
         Arc::clone(&state),
@@ -175,30 +200,13 @@ async fn run_until_stopped(
     );
 
     if run_once {
-        info!("running single scan");
-        if let Err(err) = http_services.admin.clear_next_scan_at().await {
-            warn!(error = %err, "failed to clear next scheduled scan status");
-        }
-        let scan = run_tracked_scan(
+        return run_single_scan(
+            service.as_ref(),
             http_services.admin.as_ref(),
-            ScanMode::Full,
-            service.scan_once(),
-        );
-        tokio::pin!(scan);
-        tokio::select! {
-            result = &mut scan => result?,
-            error = background_tasks.wait_for_listener_failure() => {
-                let (shutdown_tx, _) = watch::channel(false);
-                handle_service_signal(ServiceLifecycleSignal::FastStop, service.as_ref(),
-                    http_services.admin.as_ref(), gitlab_discovery_mcp.as_ref(), &shutdown_tx).await;
-                if let Err(scan_error) = scan.await {
-                    warn!(error = %scan_error, "single scan failed during shutdown");
-                }
-                return Err(error);
-            }
-        }
-        info!("single scan complete");
-        return Ok(());
+            gitlab_discovery_mcp.as_ref(),
+            &background_tasks,
+        )
+        .await;
     }
 
     let shutdown_signal = async {
@@ -233,31 +241,19 @@ async fn run_until_stopped(
     });
     tokio::select! {
         signal_result = &mut shutdown_signal => {
-            let signal = *signal_result.as_ref().unwrap_or(&ServiceLifecycleSignal::FastStop);
-            handle_service_signal(
-                signal,
+            return stop_scheduler_task(
+                signal_result,
+                "initial scan",
+                initial_scan,
                 service.as_ref(),
                 http_services.admin.as_ref(),
                 gitlab_discovery_mcp.as_ref(),
                 &shutdown_tx,
             )
             .await;
-            log_task_result("initial scan", initial_scan.await);
-            if matches!(signal, ServiceLifecycleSignal::GracefulDrain) {
-                finalize_graceful_drain(
-                    service.as_ref(),
-                    gitlab_discovery_mcp.as_ref(),
-                )
-                .await;
-            }
-            return signal_result.map(|_| ());
         }
         initial_result = &mut initial_scan => {
-            if let Ok(Err(err)) = &initial_result {
-                warn!(error = %format!("{err:#}"), "initial scan failed");
-            } else if let Err(err) = &initial_result {
-                warn!(error = %err, "initial scan task failed");
-            }
+            log_initial_scan_result(initial_result);
         }
     }
 
@@ -276,24 +272,16 @@ async fn run_until_stopped(
 
     tokio::select! {
         signal_result = &mut shutdown_signal => {
-            let signal = *signal_result.as_ref().unwrap_or(&ServiceLifecycleSignal::FastStop);
-            handle_service_signal(
-                signal,
+            stop_scheduler_task(
+                signal_result,
+                "schedule loop",
+                scheduled_loop,
                 service.as_ref(),
                 http_services.admin.as_ref(),
                 gitlab_discovery_mcp.as_ref(),
                 &shutdown_tx,
             )
-            .await;
-            log_task_result("schedule loop", scheduled_loop.await);
-            if matches!(signal, ServiceLifecycleSignal::GracefulDrain) {
-                finalize_graceful_drain(
-                    service.as_ref(),
-                    gitlab_discovery_mcp.as_ref(),
-                )
-                .await;
-            }
-            signal_result.map(|_| ())
+            .await
         }
         scheduled_result = &mut scheduled_loop => {
             match scheduled_result {
@@ -305,6 +293,116 @@ async fn run_until_stopped(
             }
         }
     }
+}
+
+/// Runs once without subscribing to OS signals. Listener failure still stops the scan.
+async fn run_single_scan(
+    service: &ReviewService,
+    admin_service: &AdminService,
+    gitlab_discovery_mcp: Option<&Arc<GitLabDiscoveryMcpService>>,
+    background_tasks: &BackgroundTasks,
+) -> Result<()> {
+    prepare_single_scan(admin_service).await;
+    supervise_single_scan(
+        service,
+        admin_service,
+        gitlab_discovery_mcp,
+        background_tasks,
+    )
+    .await?;
+    info!("single scan complete");
+    Ok(())
+}
+
+/// Single-scan mode clears any persisted scheduled wake before scan admission.
+async fn prepare_single_scan(admin_service: &AdminService) {
+    info!("running single scan");
+    clear_next_scan_status(admin_service).await;
+}
+
+/// Listener failure cancels the scan and waits for it before returning the listener error.
+async fn supervise_single_scan(
+    service: &ReviewService,
+    admin_service: &AdminService,
+    gitlab_discovery_mcp: Option<&Arc<GitLabDiscoveryMcpService>>,
+    background_tasks: &BackgroundTasks,
+) -> Result<()> {
+    let scan = run_tracked_scan(admin_service, ScanMode::Full, service.scan_once());
+    tokio::pin!(scan);
+    tokio::select! {
+        result = &mut scan => result?,
+        error = background_tasks.wait_for_listener_failure() => {
+            stop_single_scan(service, admin_service, gitlab_discovery_mcp, scan).await;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Requests a fast stop and waits for the interrupted scan before reporting listener failure.
+async fn stop_single_scan<F>(
+    service: &ReviewService,
+    admin_service: &AdminService,
+    gitlab_discovery_mcp: Option<&Arc<GitLabDiscoveryMcpService>>,
+    scan: F,
+) where
+    F: Future<Output = Result<()>>,
+{
+    let (shutdown_tx, _) = watch::channel(false);
+    handle_service_signal(
+        ServiceLifecycleSignal::FastStop,
+        service,
+        admin_service,
+        gitlab_discovery_mcp,
+        &shutdown_tx,
+    )
+    .await;
+    report_single_scan_shutdown(scan.await);
+}
+
+/// A scan failure during shutdown must not replace the listener failure.
+fn report_single_scan_shutdown(result: Result<()>) {
+    if let Err(scan_error) = result {
+        warn!(error = %scan_error, "single scan failed during shutdown");
+    }
+}
+
+/// A signal-source failure uses a fast stop. The original signal result remains the exit result.
+async fn stop_scheduler_task(
+    signal_result: Result<ServiceLifecycleSignal>,
+    label: &str,
+    task: JoinHandle<Result<()>>,
+    service: &ReviewService,
+    admin_service: &AdminService,
+    gitlab_discovery_mcp: Option<&Arc<GitLabDiscoveryMcpService>>,
+    shutdown_tx: &watch::Sender<bool>,
+) -> Result<()> {
+    let signal = *signal_result
+        .as_ref()
+        .unwrap_or(&ServiceLifecycleSignal::FastStop);
+    handle_service_signal(
+        signal,
+        service,
+        admin_service,
+        gitlab_discovery_mcp,
+        shutdown_tx,
+    )
+    .await;
+    log_task_result(label, task.await);
+    if matches!(signal, ServiceLifecycleSignal::GracefulDrain) {
+        finalize_graceful_drain(service, gitlab_discovery_mcp).await;
+    }
+    signal_result.map(|_| ())
+}
+
+/// Initial scan failures are reported, but they do not prevent scheduled scans.
+fn log_initial_scan_result(result: std::result::Result<Result<()>, tokio::task::JoinError>) {
+    let (error, message) = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => (format!("{error:#}"), "initial scan failed"),
+        Err(error) => (error.to_string(), "initial scan task failed"),
+    };
+    warn!(error = %error, "{message}");
 }
 
 fn spawn_startup_warmup(
@@ -331,6 +429,7 @@ fn parse_timezone(value: Option<&str>) -> Result<chrono_tz::Tz> {
     }
 }
 
+/// Reports scan failures and continues scheduling. Missing future cron times stop the loop.
 async fn run_schedule_loop(
     service: &ReviewService,
     admin_service: &AdminService,
@@ -346,21 +445,12 @@ async fn run_schedule_loop(
 
     loop {
         if *shutdown_rx.borrow() {
-            if let Err(err) = admin_service.clear_next_scan_at().await {
-                warn!(error = %err, "failed to clear next scheduled scan status");
-            }
-            info!("stopping schedule loop: shutdown requested");
+            record_schedule_shutdown(admin_service).await;
             return Ok(());
         }
 
         let now = Utc::now().with_timezone(&tz);
-        let next_pending_retry_at = match service.next_pending_rate_limit_retry_at().await {
-            Ok(value) => value,
-            Err(err) => {
-                warn!(error = %err, "failed to load next pending review wake time");
-                None
-            }
-        };
+        let next_pending_retry_at = load_pending_retry_at(service).await;
         let next_review_backoff_at = service.next_review_backoff_retry_at();
         let scheduled_wake = select_next_wake(
             now.with_timezone(&Utc),
@@ -368,70 +458,27 @@ async fn run_schedule_loop(
             next_pending_retry_at,
             next_review_backoff_at,
         );
-        if let Err(err) = admin_service
-            .set_next_scan_at(Some(scheduled_wake.at))
-            .await
-        {
-            warn!(error = %err, "failed to persist next scheduled scan status");
-        }
+        persist_next_scan_status(admin_service, scheduled_wake.at).await;
 
         let delay = (scheduled_wake.at.with_timezone(&tz) - now)
             .to_std()
             .unwrap_or_else(|_| Duration::from_secs(0));
-        let sleep = tokio::time::sleep(delay);
-        tokio::pin!(sleep);
-
-        tokio::select! {
-            () = &mut sleep => {}
-            // A finished run can add an earlier retry or pending time.
-            () = service.wait_for_run_finished() => continue,
-            changed = shutdown_rx.changed() => match changed {
-                Ok(()) if *shutdown_rx.borrow() => {
-                    if let Err(err) = admin_service.clear_next_scan_at().await {
-                        warn!(error = %err, "failed to clear next scheduled scan status");
-                    }
-                    info!("stopping schedule loop: shutdown requested");
-                    return Ok(());
-                }
-                Ok(()) => continue,
-                Err(_) => return Ok(()),
-            },
+        match wait_for_scheduled_wake(service, delay, &mut shutdown_rx).await {
+            ScheduledWait::Ready => {}
+            ScheduledWait::Recalculate => continue,
+            ScheduledWait::ShutdownRequested => {
+                record_schedule_shutdown(admin_service).await;
+                return Ok(());
+            }
+            ScheduledWait::ChannelClosed => return Ok(()),
         }
 
         if *shutdown_rx.borrow() {
-            if let Err(err) = admin_service.clear_next_scan_at().await {
-                warn!(error = %err, "failed to clear next scheduled scan status");
-            }
-            info!("stopping schedule loop: shutdown requested");
+            record_schedule_shutdown(admin_service).await;
             return Ok(());
         }
 
-        let scan_result = match scheduled_wake.reason {
-            ScheduledWakeReason::Cron => {
-                run_tracked_scan(
-                    admin_service,
-                    ScanMode::Incremental,
-                    service.scan_once_incremental(),
-                )
-                .await
-            }
-            ScheduledWakeReason::PendingRateLimit => {
-                run_tracked_scan(
-                    admin_service,
-                    ScanMode::Incremental,
-                    service.queue_due_pending_retries(),
-                )
-                .await
-            }
-            ScheduledWakeReason::ReviewBackoff => {
-                run_tracked_scan(
-                    admin_service,
-                    ScanMode::Incremental,
-                    service.queue_due_review_backoff_retries(),
-                )
-                .await
-            }
-        };
+        let scan_result = run_scheduled_scan(service, admin_service, scheduled_wake.reason).await;
         if let Err(err) = scan_result {
             warn!(error = %format!("{err:#}"), "scheduled wake failed");
         }
@@ -442,6 +489,90 @@ async fn run_schedule_loop(
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("cron has no future times"))?
                 .with_timezone(&Utc);
+        }
+    }
+}
+
+/// A retry lookup failure leaves cron and in-memory backoff wakes available.
+async fn load_pending_retry_at(service: &ReviewService) -> Option<DateTime<Utc>> {
+    match service.next_pending_rate_limit_retry_at().await {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(error = %err, "failed to load next pending review wake time");
+            None
+        }
+    }
+}
+
+/// Status persistence failures do not prevent the scheduled wake.
+async fn persist_next_scan_status(admin_service: &AdminService, at: DateTime<Utc>) {
+    if let Err(err) = admin_service.set_next_scan_at(Some(at)).await {
+        warn!(error = %err, "failed to persist next scheduled scan status");
+    }
+}
+
+/// Clearing status is best effort so shutdown can continue after a storage failure.
+async fn clear_next_scan_status(admin_service: &AdminService) {
+    if let Err(err) = admin_service.clear_next_scan_at().await {
+        warn!(error = %err, "failed to clear next scheduled scan status");
+    }
+}
+
+/// Clears the next wake and reports shutdown. Storage failure does not delay loop exit.
+async fn record_schedule_shutdown(admin_service: &AdminService) {
+    clear_next_scan_status(admin_service).await;
+    info!("stopping schedule loop: shutdown requested");
+}
+
+/// A finished run can add an earlier retry. Channel closure exits without clearing scan status.
+async fn wait_for_scheduled_wake(
+    service: &ReviewService,
+    delay: Duration,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> ScheduledWait {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    tokio::select! {
+        () = &mut sleep => ScheduledWait::Ready,
+        () = service.wait_for_run_finished() => ScheduledWait::Recalculate,
+        changed = shutdown_rx.changed() => match changed {
+            Ok(()) if *shutdown_rx.borrow() => ScheduledWait::ShutdownRequested,
+            Ok(()) => ScheduledWait::Recalculate,
+            Err(_) => ScheduledWait::ChannelClosed,
+        },
+    }
+}
+
+/// All wake reasons record an incremental scan. Failures return to the loop for reporting.
+async fn run_scheduled_scan(
+    service: &ReviewService,
+    admin_service: &AdminService,
+    reason: ScheduledWakeReason,
+) -> Result<()> {
+    match reason {
+        ScheduledWakeReason::Cron => {
+            run_tracked_scan(
+                admin_service,
+                ScanMode::Incremental,
+                service.scan_once_incremental(),
+            )
+            .await
+        }
+        ScheduledWakeReason::PendingRateLimit => {
+            run_tracked_scan(
+                admin_service,
+                ScanMode::Incremental,
+                service.queue_due_pending_retries(),
+            )
+            .await
+        }
+        ScheduledWakeReason::ReviewBackoff => {
+            run_tracked_scan(
+                admin_service,
+                ScanMode::Incremental,
+                service.queue_due_review_backoff_retries(),
+            )
+            .await
         }
     }
 }
@@ -482,6 +613,7 @@ fn select_next_wake(
     wake
 }
 
+/// Records scan status without letting persistence failures prevent or replace the scan result.
 pub(crate) async fn run_tracked_scan<F>(
     admin_service: &AdminService,
     mode: ScanMode,
@@ -493,48 +625,33 @@ where
     if let Err(err) = admin_service.mark_scan_started(mode).await {
         warn!(error = %err, ?mode, "failed to persist scan start status");
     }
+
     let result = scan.await;
-    match &result {
-        Ok(ScanRunStatus::Interrupted) => {
-            if let Err(status_err) = admin_service
-                .mark_scan_finished(
-                    mode,
-                    ScanOutcome::Failure,
-                    Some("scan interrupted by shutdown".to_string()),
-                )
-                .await
-            {
-                warn!(
-                    error = %status_err,
-                    ?mode,
-                    "failed to persist interrupted scan status"
-                );
-            }
-        }
-        Ok(ScanRunStatus::Completed) => {
-            if let Err(err) = admin_service
-                .mark_scan_finished(mode, ScanOutcome::Success, None)
-                .await
-            {
-                warn!(error = %err, ?mode, "failed to persist successful scan status");
-            }
-        }
-        Err(err) => {
-            if let Err(status_err) = admin_service
-                .mark_scan_finished(mode, ScanOutcome::Failure, Some(err.to_string()))
-                .await
-            {
-                warn!(
-                    error = %status_err,
-                    ?mode,
-                    "failed to persist failed scan status"
-                );
-            }
-        }
+    let (outcome, error, failure_message) = match &result {
+        Ok(ScanRunStatus::Interrupted) => (
+            ScanOutcome::Failure,
+            Some("scan interrupted by shutdown".to_string()),
+            "failed to persist interrupted scan status",
+        ),
+        Ok(ScanRunStatus::Completed) => (
+            ScanOutcome::Success,
+            None,
+            "failed to persist successful scan status",
+        ),
+        Err(err) => (
+            ScanOutcome::Failure,
+            Some(err.to_string()),
+            "failed to persist failed scan status",
+        ),
+    };
+
+    if let Err(status_err) = admin_service.mark_scan_finished(mode, outcome, error).await {
+        warn!(error = %status_err, ?mode, "{failure_message}");
     }
     result.map(|_| ())
 }
 
+/// Fast stop cancels runs and reconciles state. Graceful drain lets started runs finish.
 async fn handle_service_signal(
     signal: ServiceLifecycleSignal,
     service: &ReviewService,
@@ -555,13 +672,31 @@ async fn handle_service_signal(
                 service.shutdown();
             }
             let _ = shutdown_tx.send(true);
-            if let Err(err) = service.recover_in_progress_reviews().await {
-                warn!(error = %err, "shutdown recovery of interrupted reviews failed");
-            }
-            if let Err(err) = admin_service.reconcile_interrupted_run_history().await {
-                warn!(error = %err, "shutdown reconciliation of run history failed");
-            }
+            recover_interrupted_reviews(service, "shutdown recovery of interrupted reviews failed")
+                .await;
+            reconcile_shutdown_history(admin_service).await;
         }
+    }
+}
+
+/// Recovery failures are reported so startup or shutdown can continue.
+async fn recover_interrupted_reviews(service: &ReviewService, failure_message: &str) {
+    if let Err(err) = service.recover_in_progress_reviews().await {
+        warn!(error = %err, "{failure_message}");
+    }
+}
+
+/// Startup status failures are reported without preventing HTTP startup or scan admission.
+async fn recover_startup_scan_status(admin_service: &AdminService) {
+    if let Err(err) = admin_service.recover_startup_status().await {
+        warn!(error = %err, "failed to reconcile startup scan status");
+    }
+}
+
+/// History failures are reported without preventing task cleanup.
+async fn reconcile_shutdown_history(admin_service: &AdminService) {
+    if let Err(err) = admin_service.reconcile_interrupted_run_history().await {
+        warn!(error = %err, "shutdown reconciliation of run history failed");
     }
 }
 
@@ -721,6 +856,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracked_scan_persists_completion_and_returns_scan_errors() -> Result<()> {
+        use crate::state::ScanState;
+
+        let config = test_config();
+        let state = build_review_state_store(&config).await?;
+        let http_services = HttpServices::new(config, Arc::clone(&state), false, None);
+        let cases = [
+            (Ok(ScanRunStatus::Completed), ScanOutcome::Success, None),
+            (
+                Ok(ScanRunStatus::Interrupted),
+                ScanOutcome::Failure,
+                Some("scan interrupted by shutdown"),
+            ),
+            (
+                Err(anyhow!("repository discovery failed")),
+                ScanOutcome::Failure,
+                Some("repository discovery failed"),
+            ),
+        ];
+
+        for (scan_result, outcome, error) in cases {
+            let scan_error = scan_result.as_ref().err().map(ToString::to_string);
+            let result = run_tracked_scan(http_services.admin.as_ref(), ScanMode::Full, async {
+                let status = state.service_state.get_scan_status().await?;
+                assert_eq!(status.state, ScanState::Scanning);
+                assert_eq!(status.mode, Some(ScanMode::Full));
+                scan_result
+            })
+            .await;
+
+            assert_eq!(result.err().map(|err| err.to_string()), scan_error);
+            let status = state.service_state.get_scan_status().await?;
+            assert_eq!(status.state, ScanState::Idle);
+            assert_eq!(status.mode, Some(ScanMode::Full));
+            assert_eq!(status.outcome, Some(outcome));
+            assert_eq!(status.error.as_deref(), error);
+            assert!(status.started_at.is_some());
+            assert!(status.finished_at.is_some());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schedule_shutdown_clears_status_but_channel_closure_keeps_it() -> Result<()> {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warmup_started = Arc::new(Notify::new());
+        let runner = Arc::new(BlockingWarmupRunner {
+            events: Arc::clone(&events),
+            warmup_started: Arc::clone(&warmup_started),
+            release_warmup: Arc::new(Notify::new()),
+            release_scan_on_stop: None,
+        });
+        let runtime =
+            runtime_with_recording_sources(Arc::clone(&events), warmup_started, runner).await?;
+        let admin_service = runtime.http_services.admin.as_ref();
+        let schedule = Schedule::from_str("@yearly")?;
+        admin_service.set_next_scan_at(Some(Utc::now())).await?;
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        run_schedule_loop(
+            runtime.service.as_ref(),
+            admin_service,
+            schedule.clone(),
+            chrono_tz::UTC,
+            shutdown_rx,
+        )
+        .await?;
+        let status = runtime.state.service_state.get_scan_status().await?;
+        assert!(status.next_scan_at.is_none());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        drop(shutdown_tx);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_schedule_loop(
+                runtime.service.as_ref(),
+                admin_service,
+                schedule,
+                chrono_tz::UTC,
+                shutdown_rx,
+            ),
+        )
+        .await??;
+        let status = runtime.state.service_state.get_scan_status().await?;
+        assert!(status.next_scan_at.is_some());
+        assert!(events.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn run_once_path_can_be_tested_without_waiting_for_os_signals() -> Result<()> {
         let mut config = test_config();
         apply_dev_mode_profile(&mut config);
@@ -755,6 +980,7 @@ mod tests {
             events: Arc::clone(&events),
             warmup_started: Arc::clone(&warmup_started),
             release_warmup: Arc::clone(&release_warmup),
+            release_scan_on_stop: None,
         });
         let runner_reference = Arc::downgrade(&runner);
         let runtime =
@@ -785,6 +1011,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn listener_failure_during_single_scan_keeps_listener_error_and_cleans_up() -> Result<()>
+    {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let warmup_started = Arc::new(Notify::new());
+        let scan_started = Arc::new(Notify::new());
+        let release_scan = Arc::new(Notify::new());
+        let runner = Arc::new(BlockingWarmupRunner {
+            events: Arc::clone(&events),
+            warmup_started: Arc::clone(&warmup_started),
+            release_warmup: Arc::new(Notify::new()),
+            release_scan_on_stop: Some(Arc::clone(&release_scan)),
+        });
+        let runner_reference = Arc::downgrade(&runner);
+        let mut runtime = runtime_with_recording_sources(
+            Arc::clone(&events),
+            Arc::clone(&warmup_started),
+            runner,
+        )
+        .await?;
+        let service = Arc::try_unwrap(runtime.service)
+            .ok()
+            .expect("test owns the review service");
+        runtime.service = Arc::new(service.with_dynamic_repo_source(Arc::new(
+            RecordingRepoSource {
+                events: Arc::clone(&events),
+                warmup_started,
+                blocked_scan: Some(BlockedScan {
+                    started: Arc::clone(&scan_started),
+                    release: release_scan,
+                }),
+            },
+        )));
+        let state = Arc::clone(&runtime.state);
+        let background_tasks = state.background_tasks();
+        background_tasks.spawn_listener("HTTP server", async move {
+            scan_started.notified().await;
+            Err(anyhow!("listener stopped during single scan"))
+        });
+        let launcher = RecordingHttpServerLauncher {
+            launches: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_hooks(runtime, &PanicSignalSource, &launcher),
+        )
+        .await?
+        .expect_err("listener failure must fail run-once mode");
+
+        assert_eq!(
+            error.to_string(),
+            "HTTP server failed: listener stopped during single scan"
+        );
+        let status = state.service_state.get_scan_status().await?;
+        assert_eq!(status.outcome, Some(ScanOutcome::Failure));
+        assert_eq!(
+            status.error.as_deref(),
+            Some("repository discovery failed during stop")
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["warmup", "resolve_repos", "usage_shutdown"]
+        );
+        assert!(background_tasks.cancellation().is_cancelled());
+        assert!(runner_reference.upgrade().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn scheduler_shuts_down_usage_after_signals_and_errors() -> Result<()> {
         for signal in [
             Some(ServiceLifecycleSignal::GracefulDrain),
@@ -798,6 +1093,7 @@ mod tests {
                 events: events.clone(),
                 warmup_started: warmup_started.clone(),
                 release_warmup: release_warmup.clone(),
+                release_scan_on_stop: None,
             });
             let mut runtime =
                 runtime_with_recording_sources(events.clone(), warmup_started, runner).await?;
@@ -923,6 +1219,7 @@ mod tests {
             events: events.clone(),
             warmup_started: warmup_started.clone(),
             release_warmup: Arc::new(Notify::new()),
+            release_scan_on_stop: None,
         });
         let mut runtime =
             runtime_with_recording_sources(events.clone(), warmup_started, runner).await?;
@@ -1080,6 +1377,7 @@ mod tests {
         let dynamic_repo_source: Arc<dyn DynamicRepoSource> = Arc::new(RecordingRepoSource {
             events,
             warmup_started,
+            blocked_scan: None,
         });
         let service = Arc::new(
             ReviewService::new(
@@ -1116,10 +1414,21 @@ mod tests {
         events: EventLog,
         warmup_started: Arc<Notify>,
         release_warmup: Arc<Notify>,
+        release_scan_on_stop: Option<Arc<Notify>>,
     }
 
     #[async_trait]
     impl CodexRunner for BlockingWarmupRunner {
+        async fn stop_active_reviews(&self) -> Result<()> {
+            // Startup recovery must not release a scan that has not started.
+            if self.events.lock().unwrap().contains(&"resolve_repos")
+                && let Some(release) = &self.release_scan_on_stop
+            {
+                release.notify_one();
+            }
+            Ok(())
+        }
+
         async fn shutdown_usage_sessions(&self) -> Result<()> {
             self.events
                 .lock()
@@ -1154,6 +1463,12 @@ mod tests {
     struct RecordingRepoSource {
         events: EventLog,
         warmup_started: Arc<Notify>,
+        blocked_scan: Option<BlockedScan>,
+    }
+
+    struct BlockedScan {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
     }
 
     #[async_trait]
@@ -1166,6 +1481,11 @@ mod tests {
                 .lock()
                 .expect("event log lock")
                 .push("resolve_repos");
+            if let Some(scan) = &self.blocked_scan {
+                scan.started.notify_one();
+                scan.release.notified().await;
+                return Err(anyhow!("repository discovery failed during stop"));
+            }
             Ok(vec!["demo/group/service-a".to_string()])
         }
     }

@@ -14,7 +14,7 @@ use crate::flow::run_queue::{
     EnqueueOutcome, JobKey, QueuedRun, QueuedRunsProvider, RunJob, RunQueue,
 };
 use crate::flow::{ActiveTaskRegistry, FlowJob, FlowShared, RescanRequests};
-use crate::gitlab::{GitLabApi, gitlab_error_has_status};
+use crate::gitlab::{GitLabApi, MergeRequest, gitlab_error_has_status};
 use crate::lifecycle::ServiceLifecycle;
 use crate::review::scan_coordinator::ScanCoordinator;
 use crate::review::scan_pipeline::{run_pending_retry_pipeline, run_scan_pipeline};
@@ -432,28 +432,10 @@ impl ReviewService {
         );
         let mr = match self.gitlab.get_mr(&pending.repo, pending.iid).await {
             Ok(mr) => mr,
-            Err(err) if merge_request_lookup_reports_missing(&err) => {
-                warn!(
-                    repo = pending.repo.as_str(),
-                    iid = pending.iid,
-                    discussion_id = pending.discussion_id.as_str(),
-                    trigger_note_id = pending.trigger_note_id,
-                    error = %err,
-                    "merge request lookup failed while retrying pending mention; clearing pending row"
-                );
-                return self.clear_pending_mention(pending).await;
-            }
             Err(err) => {
-                warn!(
-                    repo = pending.repo.as_str(),
-                    iid = pending.iid,
-                    discussion_id = pending.discussion_id.as_str(),
-                    trigger_note_id = pending.trigger_note_id,
-                    error = %err,
-                    "merge request lookup failed while retrying pending mention; deferring retry"
-                );
-                self.defer_pending_mention(pending).await?;
-                return Ok(());
+                return self
+                    .handle_pending_mention_lookup_error(pending, &err)
+                    .await;
             }
         };
         let Some(head_sha) = mr.head_sha() else {
@@ -494,6 +476,52 @@ impl ReviewService {
         if pending_job_found || self.shutdown_requested() {
             return Ok(());
         }
+        self.reconcile_pending_mention_without_job(pending).await
+    }
+
+    /// Clears missing-MR rows or defers transient lookup failures after reporting the error.
+    /// State write errors propagate, but handled lookup errors do not.
+    async fn handle_pending_mention_lookup_error(
+        &self,
+        pending: &MentionQuotaPendingEntry,
+        err: &anyhow::Error,
+    ) -> Result<()> {
+        if self.report_pending_mention_lookup_error(pending, err) {
+            self.clear_pending_mention(pending).await
+        } else {
+            self.defer_pending_mention(pending).await.map(|_| ())
+        }
+    }
+
+    /// Reports the retry decision and returns whether the MR is missing.
+    fn report_pending_mention_lookup_error(
+        &self,
+        pending: &MentionQuotaPendingEntry,
+        err: &anyhow::Error,
+    ) -> bool {
+        let missing = merge_request_lookup_reports_missing(err);
+        let message = if missing {
+            "merge request lookup failed while retrying pending mention; clearing pending row"
+        } else {
+            "merge request lookup failed while retrying pending mention; deferring retry"
+        };
+        warn!(
+            repo = pending.repo.as_str(),
+            iid = pending.iid,
+            discussion_id = pending.discussion_id.as_str(),
+            trigger_note_id = pending.trigger_note_id,
+            error = %err,
+            "{message}"
+        );
+        missing
+    }
+
+    /// Keeps active or quota-blocked triggers pending and clears completed or absent triggers.
+    /// Call only after admission queued no matching job and shutdown did not stop queueing.
+    async fn reconcile_pending_mention_without_job(
+        &self,
+        pending: &MentionQuotaPendingEntry,
+    ) -> Result<()> {
         match self
             .state
             .mention_commands
@@ -584,44 +612,11 @@ impl ReviewService {
         }
         let mr = match self.gitlab.get_mr(&pending.repo, pending.iid).await {
             Ok(mr) => mr,
-            Err(err) if merge_request_lookup_reports_missing(&err) => {
-                warn!(
-                    repo = pending.repo.as_str(),
-                    iid = pending.iid,
-                    lane = pending.lane.as_str(),
-                    error = %err,
-                    "merge request lookup failed while retrying pending review; clearing pending row"
-                );
-                return self.clear_pending_review(pending).await;
-            }
             Err(err) => {
-                warn!(
-                    repo = pending.repo.as_str(),
-                    iid = pending.iid,
-                    lane = pending.lane.as_str(),
-                    error = %err,
-                    "merge request lookup failed while retrying pending review; deferring retry"
-                );
-                self.defer_pending_review(pending).await?;
-                return Ok(());
+                return self.handle_pending_review_lookup_error(pending, &err).await;
             }
         };
-        if let Some(reason) = review_skip_reason(&mr, self.created_after) {
-            debug!(
-                repo = pending.repo,
-                iid = pending.iid,
-                ?reason,
-                "clear pending review: MR is not eligible"
-            );
-            return self.clear_pending_review(pending).await;
-        }
-        let Some(head_sha) = mr.head_sha() else {
-            warn!(
-                repo = pending.repo.as_str(),
-                iid = pending.iid,
-                lane = pending.lane.as_str(),
-                "missing head sha while retrying pending review; clearing pending row"
-            );
+        let Some(head_sha) = self.pending_review_head(pending, &mr) else {
             return self.clear_pending_review(pending).await;
         };
         // The job clears or rewrites the row when it starts. Deferring first lets that write win.
@@ -638,6 +633,82 @@ impl ReviewService {
         })
         .await;
         Ok(())
+    }
+
+    /// Clears missing-MR rows or defers transient lookup failures after reporting the error.
+    /// State write errors propagate, but handled lookup errors do not.
+    async fn handle_pending_review_lookup_error(
+        &self,
+        pending: &ReviewRateLimitPendingEntry,
+        err: &anyhow::Error,
+    ) -> Result<()> {
+        if self.report_pending_review_lookup_error(pending, err) {
+            self.clear_pending_review(pending).await
+        } else {
+            self.defer_pending_review(pending).await.map(|_| ())
+        }
+    }
+
+    /// Reports the retry decision and returns whether the MR is missing.
+    fn report_pending_review_lookup_error(
+        &self,
+        pending: &ReviewRateLimitPendingEntry,
+        err: &anyhow::Error,
+    ) -> bool {
+        let missing = merge_request_lookup_reports_missing(err);
+        let message = if missing {
+            "merge request lookup failed while retrying pending review; clearing pending row"
+        } else {
+            "merge request lookup failed while retrying pending review; deferring retry"
+        };
+        warn!(
+            repo = pending.repo.as_str(),
+            iid = pending.iid,
+            lane = pending.lane.as_str(),
+            error = %err,
+            "{message}"
+        );
+        missing
+    }
+
+    /// Returns the current head only when the MR is eligible for an automatic review.
+    /// Reports ineligible MRs without changing their pending state.
+    fn pending_review_head(
+        &self,
+        pending: &ReviewRateLimitPendingEntry,
+        mr: &MergeRequest,
+    ) -> Option<String> {
+        if !self.pending_review_is_eligible(pending, mr) {
+            return None;
+        }
+        let Some(head_sha) = mr.head_sha() else {
+            warn!(
+                repo = pending.repo.as_str(),
+                iid = pending.iid,
+                lane = pending.lane.as_str(),
+                "missing head sha while retrying pending review; clearing pending row"
+            );
+            return None;
+        };
+        Some(head_sha)
+    }
+
+    /// Reports why the automatic review cannot run, without changing pending state.
+    fn pending_review_is_eligible(
+        &self,
+        pending: &ReviewRateLimitPendingEntry,
+        mr: &MergeRequest,
+    ) -> bool {
+        if let Some(reason) = review_skip_reason(mr, self.created_after) {
+            debug!(
+                repo = pending.repo,
+                iid = pending.iid,
+                ?reason,
+                "clear pending review: MR is not eligible"
+            );
+            return false;
+        }
+        true
     }
 
     async fn defer_pending_review(&self, pending: &ReviewRateLimitPendingEntry) -> Result<bool> {
@@ -867,34 +938,62 @@ impl ReviewService {
         for job in mentions.jobs {
             self.enqueue(FlowJob::Mention(Box::new(job)));
         }
-        match mr.created_at {
-            None => warn!(
+        self.queue_explicit_review_lanes(repo, iid, &mr, &head_sha)
+            .await;
+        self.wait_for_idle().await;
+        Ok(())
+    }
+
+    /// Queues both review lanes for MRs after the cutoff, including drafts.
+    /// Missing creation times do not qualify. Does not wait for the queued runs.
+    async fn queue_explicit_review_lanes(
+        &self,
+        repo: &str,
+        iid: u64,
+        mr: &MergeRequest,
+        head_sha: &str,
+    ) {
+        let Some(created_at) = mr.created_at else {
+            warn!(
                 repo = repo,
                 iid = iid,
                 "missing created_at, skipping review"
-            ),
-            Some(created_at) if created_at <= self.created_after => debug!(
+            );
+            return;
+        };
+        if !self.explicit_review_is_after_cutoff(repo, iid, created_at) {
+            return;
+        }
+        for lane in [ReviewLane::General, ReviewLane::Security] {
+            self.queue_review(QueuedReview {
+                lane,
+                repo: repo.to_string(),
+                iid,
+                head_sha: head_sha.to_string(),
+                eligibility: ReviewEligibility::Explicit,
+            })
+            .await;
+        }
+    }
+
+    /// Reports MRs at or before the cutoff. Explicit reviews do not use draft or state gates.
+    fn explicit_review_is_after_cutoff(
+        &self,
+        repo: &str,
+        iid: u64,
+        created_at: DateTime<Utc>,
+    ) -> bool {
+        if created_at <= self.created_after {
+            debug!(
                 repo = repo,
                 iid = iid,
                 created_at = %created_at,
                 cutoff = %self.created_after,
                 "skip: MR created before cutoff"
-            ),
-            Some(_) => {
-                for lane in [ReviewLane::General, ReviewLane::Security] {
-                    self.queue_review(QueuedReview {
-                        lane,
-                        repo: repo.to_string(),
-                        iid,
-                        head_sha: head_sha.clone(),
-                        eligibility: ReviewEligibility::Explicit,
-                    })
-                    .await;
-                }
-            }
+            );
+            return false;
         }
-        self.wait_for_idle().await;
-        Ok(())
+        true
     }
 }
 

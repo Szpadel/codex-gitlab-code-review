@@ -218,6 +218,35 @@ fn parse_session_file(
     )
 }
 
+/// Decode non-empty JSONL records lazily, so parsing and normalization retain their order.
+/// EOF errors and corrupt unterminated final records remain retryable.
+/// Other errors include the physical line number and path.
+fn decode_session_records<'a>(
+    path: &'a Path,
+    raw: &'a str,
+) -> impl Iterator<Item = Result<Value>> + 'a {
+    let non_empty_line_count = raw.lines().filter(|line| !line.trim().is_empty()).count();
+    raw.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .enumerate()
+        .map(
+            move |(non_empty_line_index, (line_no, line))| match serde_json::from_str(line) {
+                Ok(record) => Ok(record),
+                Err(err)
+                    if err.is_eof()
+                        || (non_empty_line_index + 1 == non_empty_line_count
+                            && !raw.ends_with('\n')) =>
+                {
+                    Err(anyhow!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR))
+                }
+                Err(err) => Err(err).with_context(|| {
+                    format!("parse session line {} from {}", line_no + 1, path.display())
+                }),
+            },
+        )
+}
+
 fn parse_session_file_details(
     path: &Path,
     expected_session_id: Option<&str>,
@@ -230,7 +259,6 @@ fn parse_session_file_details(
     });
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read session file {}", path.display()))?;
-    let non_empty_line_count = raw.lines().filter(|line| !line.trim().is_empty()).count();
     let mut parsed = ParsedSessionFile::default();
     let mut current_turn_id = None::<String>;
     let mut started_turns = HashSet::<String>::new();
@@ -244,26 +272,8 @@ fn parse_session_file_details(
     let mut pending_review_wrapper_items = Vec::<Value>::new();
     let mut session_matches = None::<bool>;
 
-    let mut non_empty_line_index = 0usize;
-    for (line_no, line) in raw.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        non_empty_line_index += 1;
-        let record: Value = match serde_json::from_str(line) {
-            Ok(record) => record,
-            Err(err)
-                if err.is_eof()
-                    || (non_empty_line_index == non_empty_line_count && !raw.ends_with('\n')) =>
-            {
-                return Err(anyhow!(TRANSCRIPT_BACKFILL_SOURCE_INCOMPLETE_ERROR));
-            }
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("parse session line {} from {}", line_no + 1, path.display())
-                });
-            }
-        };
+    for record in decode_session_records(path, &raw) {
+        let record = record?;
         let timestamp = record
             .get("timestamp")
             .and_then(Value::as_str)
@@ -478,30 +488,46 @@ fn parse_session_file_details(
         && !pending_review_wrapper_items.is_empty()
         && let Some(parent_turn_id) = last_completed_turn_id
     {
-        for item in pending_review_wrapper_items.drain(..) {
-            push_event(
-                &mut parsed.events,
-                Some(parent_turn_id.clone()),
-                "item_completed",
-                item,
-            );
-        }
-        parsed
-            .review_child_turn_ids_by_parent
-            .entry(parent_turn_id.clone())
-            .or_default()
-            .extend(
-                review_wrapper_child_turn_ids
-                    .iter()
-                    .filter(|child_turn_id| child_turn_id.as_str() != parent_turn_id)
-                    .cloned(),
-            );
+        append_review_wrapper_to_parent(
+            &mut parsed,
+            &parent_turn_id,
+            &mut pending_review_wrapper_items,
+            &review_wrapper_child_turn_ids,
+        );
     }
     parsed.events = scope_events_to_target_turn(parsed.events, target_turn_id)?;
     if parsed.events.is_empty() && parsed.review_child_turn_ids_by_parent.is_empty() {
         return Ok(None);
     }
     Ok(Some(parsed))
+}
+
+/// Attach a pending full-thread wrapper to its completed parent.
+/// Exclude the parent ID from its child mapping.
+fn append_review_wrapper_to_parent(
+    parsed: &mut ParsedSessionFile,
+    parent_turn_id: &str,
+    pending_items: &mut Vec<Value>,
+    child_turn_ids: &HashSet<String>,
+) {
+    for item in pending_items.drain(..) {
+        push_event(
+            &mut parsed.events,
+            Some(parent_turn_id.to_string()),
+            "item_completed",
+            item,
+        );
+    }
+    parsed
+        .review_child_turn_ids_by_parent
+        .entry(parent_turn_id.to_string())
+        .or_default()
+        .extend(
+            child_turn_ids
+                .iter()
+                .filter(|child_turn_id| child_turn_id.as_str() != parent_turn_id)
+                .cloned(),
+        );
 }
 
 fn review_mappings_for_turn(

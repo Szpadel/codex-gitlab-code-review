@@ -79,15 +79,7 @@ impl DockerCodexRunner {
             return;
         }
 
-        let Ok(fetch_url) = self
-            .clone_url(&ctx.repo)
-            .map(|url| url.replace("${GITLAB_TOKEN}", self.gitlab_token.as_str()))
-        else {
-            warn!(
-                repo = ctx.repo,
-                iid = ctx.mr.iid,
-                "failed to build authenticated URL for historical review commits"
-            );
+        let Some(fetch_url) = self.historical_review_fetch_url_best_effort(ctx) else {
             return;
         };
         let refspecs = shas
@@ -121,6 +113,21 @@ impl DockerCodexRunner {
                 error = %err,
                 "failed to fetch historical review commits; continuing with available context"
             ),
+        }
+    }
+
+    /// Return no URL when authentication setup fails so deduplication can continue.
+    fn historical_review_fetch_url_best_effort(&self, ctx: &ReviewContext) -> Option<String> {
+        match self.clone_url(&ctx.repo) {
+            Ok(url) => Some(url.replace("${GITLAB_TOKEN}", self.gitlab_token.as_str())),
+            Err(_) => {
+                warn!(
+                    repo = ctx.repo,
+                    iid = ctx.mr.iid,
+                    "failed to build authenticated URL for historical review commits"
+                );
+                None
+            }
         }
     }
 

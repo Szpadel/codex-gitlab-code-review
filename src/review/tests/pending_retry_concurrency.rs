@@ -122,6 +122,87 @@ async fn pending_wake_returns_before_queued_reviews_finish() -> Result<()> {
 }
 
 #[tokio::test]
+async fn pending_wake_handles_later_rows_before_returning_first_mention_error() -> Result<()> {
+    let mut config = test_config();
+    config.review.mention_commands.enabled = true;
+    config.review.mention_commands.bot_username = Some("bot".to_string());
+    let gitlab = Arc::new(
+        InlineReviewGitLab::new(
+            fake_gitlab(vec![mr(1, "sha1"), mr(2, "sha2")]),
+            vec![],
+            vec![],
+        )
+        .with_list_discussions_error("discussion lookup failed"),
+    );
+    let state = Arc::new(ReviewStateStore::new(":memory:").await?);
+    for iid in 1..=2 {
+        state
+            .mention_quota_pending
+            .upsert_mention_quota_pending(crate::state::MentionQuotaPendingUpsert {
+                repo: "group/repo",
+                iid,
+                discussion_id: "discussion",
+                trigger_note_id: 10,
+                head_sha: &format!("sha{iid}"),
+                blocked_at: 0,
+                next_retry_at: 0,
+            })
+            .await?;
+    }
+    state
+        .review_rate_limit
+        .upsert_review_rate_limit_pending(
+            ReviewLane::General,
+            "group/outside-targets",
+            3,
+            "sha3",
+            0,
+            0,
+        )
+        .await?;
+    let service = ReviewService::new(
+        config,
+        gitlab,
+        state.clone(),
+        Arc::new(FakeRunner {
+            result: Mutex::new(None),
+            calls: Mutex::new(0),
+        }),
+        1,
+        default_created_after(),
+    );
+
+    let error = service
+        .queue_due_pending_retries()
+        .await
+        .expect_err("mention admission failures must remain visible");
+
+    let message = format!("{error:#}");
+    assert!(message.contains("load discussions for mention commands in group/repo !1"));
+    assert!(message.contains("discussion lookup failed"));
+    let pending = state
+        .mention_quota_pending
+        .list_mention_quota_pending()
+        .await?;
+    assert_eq!(pending.len(), 2);
+    assert!(
+        pending
+            .iter()
+            .all(|row| row.next_retry_at > Utc::now().timestamp()),
+        "both failed mention rows must be deferred"
+    );
+    assert!(
+        state
+            .review_rate_limit
+            .list_review_rate_limit_pending()
+            .await?
+            .is_empty(),
+        "review rows must be handled after mention failures"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn graceful_drain_keeps_pending_rows_of_dropped_reviews() -> Result<()> {
     let mut config = test_config();
     config.review.max_concurrent = 2;

@@ -48,6 +48,11 @@ pub(crate) struct ReasoningBuffer {
     text: String,
 }
 
+enum ReasoningPart {
+    Summary,
+    Text,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TurnStreamNotificationOutcome {
     Continue,
@@ -395,6 +400,9 @@ impl AppServerClient {
         }
     }
 
+    /// Buffer deltas and record turn events. The caller must filter thread and turn IDs.
+    /// Record completed items before callbacks, and turn completion before reporting failures.
+    /// Cyber-policy failures retain their typed error for the review caller.
     pub(crate) fn handle_turn_notification<FDelta, FCompleted>(
         &mut self,
         method: &str,
@@ -407,268 +415,33 @@ impl AppServerClient {
         FDelta: FnMut(&str, &str),
         FCompleted: FnMut(&Value),
     {
-        let TurnNotificationContext {
-            thread_id,
-            turn_id,
-            history_capture,
-        } = context;
         match method {
-            "turn/started" => {
-                history_capture.push(
-                    Some(turn_id_from_params(params).unwrap_or(turn_id)),
-                    "turn_started",
-                    json!({}),
-                );
-                info!(thread_id, turn_id, "codex turn started");
-            }
+            "turn/started" => Self::handle_turn_started(params, context),
             "item/agentMessage/delta" => {
-                if let Some(delta) = params
-                    .and_then(|value| value.get("delta"))
-                    .and_then(|value| value.as_str())
-                {
-                    let item_id = params
-                        .and_then(|value| value.get("itemId"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("<unknown>");
-                    if item_id != "<unknown>" {
-                        self.agent_message_buffers
-                            .entry(item_id.to_string())
-                            .or_default()
-                            .push_str(delta);
-                    }
-                    on_agent_message_delta(item_id, delta);
-                }
+                self.handle_agent_message_delta(params, &mut on_agent_message_delta);
             }
-            "item/commandExecution/outputDelta" => {
-                if let Some(delta) = params
-                    .and_then(|value| value.get("delta"))
-                    .and_then(|value| value.as_str())
-                {
-                    let item_id = params
-                        .and_then(|value| value.get("itemId"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("<unknown>");
-                    if item_id != "<unknown>" {
-                        self.command_output_buffers
-                            .entry(item_id.to_string())
-                            .or_default()
-                            .push_str(delta);
-                    }
-                    info!(item_id, kind = "command", output = %delta, "codex command output");
-                }
-            }
+            "item/commandExecution/outputDelta" => self.handle_command_output_delta(params),
             "item/reasoning/summaryTextDelta" => {
-                if let Some(delta) = params
-                    .and_then(|value| value.get("delta"))
-                    .and_then(|value| value.as_str())
-                {
-                    let item_id = params
-                        .and_then(|value| value.get("itemId"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("<unknown>");
-                    if item_id != "<unknown>" {
-                        self.reasoning_buffers
-                            .entry(item_id.to_string())
-                            .or_default()
-                            .summary
-                            .push_str(delta);
-                    }
-                }
+                self.handle_reasoning_delta(params, ReasoningPart::Summary);
             }
             "item/reasoning/textDelta" => {
-                if let Some(delta) = params
-                    .and_then(|value| value.get("delta"))
-                    .and_then(|value| value.as_str())
-                {
-                    let item_id = params
-                        .and_then(|value| value.get("itemId"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("<unknown>");
-                    if item_id != "<unknown>" {
-                        self.reasoning_buffers
-                            .entry(item_id.to_string())
-                            .or_default()
-                            .text
-                            .push_str(delta);
-                    }
-                }
+                self.handle_reasoning_delta(params, ReasoningPart::Text);
             }
-            "item/reasoning/summaryPartAdded" => {
-                let item_id = params
-                    .and_then(|value| value.get("itemId"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("<unknown>");
-                if item_id != "<unknown>" {
-                    let entry = self
-                        .reasoning_buffers
-                        .entry(item_id.to_string())
-                        .or_default();
-                    if !entry.summary.is_empty() {
-                        entry.summary.push('\n');
-                    }
-                }
-            }
-            "item/started" => {
-                if let Some(item) = params.and_then(|value| value.get("item"))
-                    && let Some(item_type) = item.get("type").and_then(|value| value.as_str())
-                {
-                    match item_type {
-                        "commandExecution" => {
-                            let item_id = item
-                                .get("id")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("<unknown>");
-                            let command = item
-                                .get("command")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("<unknown>");
-                            let cwd = item
-                                .get("cwd")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("<unknown>");
-                            let status = item
-                                .get("status")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("<unknown>");
-                            info!(item_id, command, cwd, status, "codex command started");
-                        }
-                        "reasoning" => {
-                            if self.log_all_json {
-                                debug!(item_type, "codex item started");
-                            }
-                        }
-                        _ => {
-                            info!(item_type, "codex item started");
-                        }
-                    }
-                }
-            }
+            "item/reasoning/summaryPartAdded" => self.handle_reasoning_summary_part_added(params),
+            "item/started" => self.handle_item_started(params),
             "item/completed" => {
-                if let Some(item) = params.and_then(|value| value.get("item"))
-                    && let Some(item_type) = item.get("type").and_then(|value| value.as_str())
-                {
-                    let event_turn_id = turn_id_from_params(params).unwrap_or(turn_id);
-                    let mut completed_item = item.clone();
-                    if item_type == "reasoning" {
-                        if let Some(item_id) = item.get("id").and_then(|value| value.as_str())
-                            && let Some(buffer) = self.reasoning_buffers.remove(item_id)
-                        {
-                            let summary = buffer.summary.trim().to_string();
-                            let text = buffer.text.trim().to_string();
-                            completed_item = enrich_reasoning_item(
-                                item,
-                                item_id,
-                                summary.as_str(),
-                                text.as_str(),
-                            );
-                            let reasoning_log = match (summary.is_empty(), text.is_empty()) {
-                                (false, false) => format!("{summary}\n\n{text}"),
-                                (false, true) => summary.clone(),
-                                (true, false) => text.clone(),
-                                (true, true) => String::new(),
-                            };
-                            if !reasoning_log.trim().is_empty() {
-                                info!(
-                                    item_id,
-                                    reasoning = reasoning_log.as_str(),
-                                    "codex reasoning completed"
-                                );
-                            }
-                        }
-                    } else if matches!(item_type, "agentMessage" | "AgentMessage") {
-                        let item_id = item
-                            .get("id")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("<unknown>");
-                        let buffered_message = (item_id != "<unknown>")
-                            .then(|| self.agent_message_buffers.remove(item_id))
-                            .flatten();
-                        let extracted = extract_agent_message_text(item).or(buffered_message);
-                        if let Some(message) = extracted
-                            && !message.trim().is_empty()
-                        {
-                            completed_item = enrich_agent_message_item(item, message.as_str());
-                        }
-                    } else if item_type == "commandExecution" {
-                        let item_id = item
-                            .get("id")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("<unknown>");
-                        if let Some(output) = (item_id != "<unknown>")
-                            .then(|| self.command_output_buffers.remove(item_id))
-                            .flatten()
-                            && !output.is_empty()
-                        {
-                            completed_item = enrich_command_execution_item(item, output.as_str());
-                        }
-                        let command = item
-                            .get("command")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("<unknown>");
-                        let cwd = item
-                            .get("cwd")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("<unknown>");
-                        let status = item
-                            .get("status")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("<unknown>");
-                        let exit_code = item.get("exitCode").and_then(serde_json::Value::as_i64);
-                        let duration_ms =
-                            item.get("durationMs").and_then(serde_json::Value::as_i64);
-                        info!(
-                            item_id,
-                            command, cwd, status, exit_code, duration_ms, "codex command completed"
-                        );
-                    } else {
-                        info!(item_type, "codex item completed");
-                    }
-                    history_capture.push(
-                        Some(event_turn_id),
-                        "item_completed",
-                        completed_item.clone(),
-                    );
-                    on_item_completed(&completed_item);
-                }
+                self.handle_item_completed(params, context, &mut on_item_completed);
             }
             "rawResponse/completed" => {
                 if let Some(payload) = params {
-                    history_capture.push(
-                        Some(turn_id_from_params(params).unwrap_or(turn_id)),
+                    context.history_capture.push(
+                        Some(turn_id_from_params(params).unwrap_or(context.turn_id)),
                         "raw_response_completed",
                         payload.clone(),
                     );
                 }
             }
-            "turn/completed" => {
-                let status = params
-                    .and_then(|value| value.get("turn"))
-                    .and_then(|value| value.get("status"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown");
-                let error_message = turn_completed_error_message(params);
-                let payload = match error_message.as_deref() {
-                    Some(error) => json!({ "status": status, "error": error }),
-                    None => json!({ "status": status }),
-                };
-                history_capture.push(
-                    Some(turn_id_from_params(params).unwrap_or(turn_id)),
-                    "turn_completed",
-                    payload,
-                );
-                info!(status, "codex turn completed");
-                if status == "failed" {
-                    let error_message = error_message.as_deref().unwrap_or("unknown error");
-                    if turn_error_is_cyber_policy(params) {
-                        return Err(SecurityReviewContentFlagged {
-                            message: error_message.to_string(),
-                        }
-                        .into());
-                    }
-                    return Err(anyhow!("codex turn failed: {error_message}"));
-                }
-                return Ok(TurnStreamNotificationOutcome::TurnCompleted);
-            }
+            "turn/completed" => return Self::handle_turn_completed(params, context),
             "error" => {
                 if let Some(error_message) = params
                     .and_then(|value| value.get("error"))
@@ -685,6 +458,242 @@ impl AppServerClient {
             }
         }
         Ok(TurnStreamNotificationOutcome::Continue)
+    }
+
+    /// Use the notification turn ID for history and the context IDs for the log.
+    fn handle_turn_started(params: Option<&Value>, context: TurnNotificationContext<'_>) {
+        context.history_capture.push(
+            Some(turn_id_from_params(params).unwrap_or(context.turn_id)),
+            "turn_started",
+            json!({}),
+        );
+        let thread_id = context.thread_id;
+        let turn_id = context.turn_id;
+        info!(thread_id, turn_id, "codex turn started");
+    }
+
+    /// Buffer identified deltas, then notify the caller even if the item ID is absent.
+    fn handle_agent_message_delta<FDelta>(&mut self, params: Option<&Value>, on_delta: &mut FDelta)
+    where
+        FDelta: FnMut(&str, &str),
+    {
+        let Some(delta) = params
+            .and_then(|value| value.get("delta"))
+            .and_then(|value| value.as_str())
+        else {
+            return;
+        };
+        let item_id = params
+            .and_then(|value| value.get("itemId"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        if item_id != "<unknown>" {
+            self.agent_message_buffers
+                .entry(item_id.to_string())
+                .or_default()
+                .push_str(delta);
+        }
+        on_delta(item_id, delta);
+    }
+
+    /// Log every output delta, but buffer only deltas with an item ID.
+    fn handle_command_output_delta(&mut self, params: Option<&Value>) {
+        let Some(delta) = params
+            .and_then(|value| value.get("delta"))
+            .and_then(|value| value.as_str())
+        else {
+            return;
+        };
+        let item_id = params
+            .and_then(|value| value.get("itemId"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        if item_id != "<unknown>" {
+            self.command_output_buffers
+                .entry(item_id.to_string())
+                .or_default()
+                .push_str(delta);
+        }
+        info!(item_id, kind = "command", output = %delta, "codex command output");
+    }
+
+    /// Buffer reasoning only when both a string delta and an item ID are present.
+    fn handle_reasoning_delta(&mut self, params: Option<&Value>, part: ReasoningPart) {
+        let Some(delta) = params
+            .and_then(|value| value.get("delta"))
+            .and_then(|value| value.as_str())
+        else {
+            return;
+        };
+        let item_id = params
+            .and_then(|value| value.get("itemId"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        if item_id == "<unknown>" {
+            return;
+        }
+        let buffer = self
+            .reasoning_buffers
+            .entry(item_id.to_string())
+            .or_default();
+        match part {
+            ReasoningPart::Summary => buffer.summary.push_str(delta),
+            ReasoningPart::Text => buffer.text.push_str(delta),
+        }
+    }
+
+    /// Separate summary parts only after summary text exists.
+    fn handle_reasoning_summary_part_added(&mut self, params: Option<&Value>) {
+        let item_id = params
+            .and_then(|value| value.get("itemId"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        if item_id == "<unknown>" {
+            return;
+        }
+        let buffer = self
+            .reasoning_buffers
+            .entry(item_id.to_string())
+            .or_default();
+        if !buffer.summary.is_empty() {
+            buffer.summary.push('\n');
+        }
+    }
+
+    /// Ignore items without a type. Command starts include execution metadata.
+    fn handle_item_started(&self, params: Option<&Value>) {
+        let Some(item) = params.and_then(|value| value.get("item")) else {
+            return;
+        };
+        let Some(item_type) = item.get("type").and_then(|value| value.as_str()) else {
+            return;
+        };
+        match item_type {
+            "commandExecution" => log_command_started(item),
+            "reasoning" => self.log_reasoning_started(item_type),
+            _ => info!(item_type, "codex item started"),
+        }
+    }
+
+    /// Reasoning starts appear only when full JSON logging is enabled.
+    fn log_reasoning_started(&self, item_type: &str) {
+        if self.log_all_json {
+            debug!(item_type, "codex item started");
+        }
+    }
+
+    /// Consume buffered content before history capture and the completion callback.
+    fn handle_item_completed<FCompleted>(
+        &mut self,
+        params: Option<&Value>,
+        context: TurnNotificationContext<'_>,
+        on_completed: &mut FCompleted,
+    ) where
+        FCompleted: FnMut(&Value),
+    {
+        let Some(item) = params.and_then(|value| value.get("item")) else {
+            return;
+        };
+        let Some(item_type) = item.get("type").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let event_turn_id = turn_id_from_params(params).unwrap_or(context.turn_id);
+        let completed_item = match item_type {
+            "reasoning" => self.complete_reasoning_item(item),
+            "agentMessage" | "AgentMessage" => self.complete_agent_message_item(item),
+            "commandExecution" => self.complete_command_execution_item(item),
+            _ => {
+                info!(item_type, "codex item completed");
+                item.clone()
+            }
+        };
+        context.history_capture.push(
+            Some(event_turn_id),
+            "item_completed",
+            completed_item.clone(),
+        );
+        on_completed(&completed_item);
+    }
+
+    /// Consume reasoning deltas. Completed fields take precedence over buffered content.
+    fn complete_reasoning_item(&mut self, item: &Value) -> Value {
+        let Some(item_id) = item.get("id").and_then(|value| value.as_str()) else {
+            return item.clone();
+        };
+        let Some(buffer) = self.reasoning_buffers.remove(item_id) else {
+            return item.clone();
+        };
+        let summary = buffer.summary.trim().to_string();
+        let text = buffer.text.trim().to_string();
+        let completed_item = enrich_reasoning_item(item, item_id, &summary, &text);
+        log_reasoning_completed(item_id, &summary, &text);
+        completed_item
+    }
+
+    /// Consume message deltas even when the completed item already contains text.
+    fn complete_agent_message_item(&mut self, item: &Value) -> Value {
+        let item_id = item
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        let buffered_message = (item_id != "<unknown>")
+            .then(|| self.agent_message_buffers.remove(item_id))
+            .flatten();
+        let Some(message) = extract_agent_message_text(item).or(buffered_message) else {
+            return item.clone();
+        };
+        if message.trim().is_empty() {
+            return item.clone();
+        }
+        enrich_agent_message_item(item, &message)
+    }
+
+    /// Consume command deltas without replacing output already present in the item.
+    fn complete_command_execution_item(&mut self, item: &Value) -> Value {
+        let item_id = item
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<unknown>");
+        let mut completed_item = item.clone();
+        if let Some(output) = (item_id != "<unknown>")
+            .then(|| self.command_output_buffers.remove(item_id))
+            .flatten()
+            && !output.is_empty()
+        {
+            completed_item = enrich_command_execution_item(item, &output);
+        }
+        log_command_completed(item, item_id);
+        completed_item
+    }
+
+    /// Record completion before returning a turn failure.
+    fn handle_turn_completed(
+        params: Option<&Value>,
+        context: TurnNotificationContext<'_>,
+    ) -> Result<TurnStreamNotificationOutcome> {
+        let status = params
+            .and_then(|value| value.get("turn"))
+            .and_then(|value| value.get("status"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let error_message = turn_completed_error_message(params);
+        let payload = match error_message.as_deref() {
+            Some(error) => json!({ "status": status, "error": error }),
+            None => json!({ "status": status }),
+        };
+        context.history_capture.push(
+            Some(turn_id_from_params(params).unwrap_or(context.turn_id)),
+            "turn_completed",
+            payload,
+        );
+        info!(status, "codex turn completed");
+        if status == "failed" {
+            return Err(turn_failure(
+                params,
+                error_message.as_deref().unwrap_or("unknown error"),
+            ));
+        }
+        Ok(TurnStreamNotificationOutcome::TurnCompleted)
     }
 
     pub(crate) async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -792,6 +801,8 @@ impl AppServerClient {
         Ok(())
     }
 
+    /// Return the next stdout JSON value. Stderr is never parsed as protocol messages.
+    /// Docker read failures and closed stdout retain recent runner errors.
     pub(crate) async fn next_message(&mut self) -> Result<Value> {
         loop {
             if let Some(line) =
@@ -823,16 +834,7 @@ impl AppServerClient {
                         self.stdout_buffer.extend_from_slice(&message);
                     }
                     LogOutput::StdErr { message } => {
-                        self.stderr_buffer.extend_from_slice(&message);
-                        while let Some(line) =
-                            take_output_line(&mut self.stderr_buffer, &mut self.stderr_scan_offset)
-                        {
-                            let line = String::from_utf8_lossy(&line);
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() && !self.handle_runner_diagnostic(trimmed) {
-                                debug!(line = %trimmed, "codex app-server stderr");
-                            }
-                        }
+                        self.append_stderr(&message);
                     }
                     LogOutput::StdIn { .. } => {}
                 },
@@ -852,19 +854,35 @@ impl AppServerClient {
         }
     }
 
-    /// Log runner prefixes and retain errors for later I/O failures.
-    fn handle_runner_diagnostic(&mut self, line: &str) -> bool {
-        if line.starts_with("codex-runner:") || line.starts_with("codex-install:") {
-            info!("{}", line);
-        } else if line.starts_with("codex-runner-error:")
-            || line.starts_with("codex-install-error:")
+    /// Process complete stderr lines and retain any incomplete line for the next chunk.
+    fn append_stderr(&mut self, message: &[u8]) {
+        self.stderr_buffer.extend_from_slice(message);
+        while let Some(line) =
+            take_output_line(&mut self.stderr_buffer, &mut self.stderr_scan_offset)
         {
-            warn!("{}", line);
-            self.push_runner_error(line);
-        } else if line.starts_with("codex-runner-warn:") {
-            warn!("{}", line);
-        } else {
+            let line = String::from_utf8_lossy(&line);
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !self.handle_runner_diagnostic(trimmed) {
+                debug!(line = %trimmed, "codex app-server stderr");
+            }
+        }
+    }
+
+    /// Log runner prefixes and retain errors for later I/O failures.
+    /// Return false for output without a recognized prefix.
+    fn handle_runner_diagnostic(&mut self, line: &str) -> bool {
+        let Some((prefix, _)) = line.split_once(':') else {
             return false;
+        };
+        match prefix {
+            "codex-runner" | "codex-install" => info!("{}", line),
+            "codex-runner-error" | "codex-install-error" | "codex-runner-warn" => {
+                warn!("{}", line);
+                if matches!(prefix, "codex-runner-error" | "codex-install-error") {
+                    self.push_runner_error(line);
+                }
+            }
+            _ => return false,
         }
         true
     }
@@ -876,6 +894,77 @@ impl AppServerClient {
             self.recent_runner_errors.pop_front();
         }
     }
+}
+
+/// Missing string metadata uses the log placeholder `<unknown>`.
+fn log_command_started(item: &Value) {
+    let item_id = item
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<unknown>");
+    let command = item
+        .get("command")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<unknown>");
+    let cwd = item
+        .get("cwd")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<unknown>");
+    let status = item
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<unknown>");
+    info!(item_id, command, cwd, status, "codex command started");
+}
+
+/// Log original execution metadata, not the enriched command output.
+fn log_command_completed(item: &Value, item_id: &str) {
+    let command = item
+        .get("command")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<unknown>");
+    let cwd = item
+        .get("cwd")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<unknown>");
+    let status = item
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("<unknown>");
+    let exit_code = item.get("exitCode").and_then(serde_json::Value::as_i64);
+    let duration_ms = item.get("durationMs").and_then(serde_json::Value::as_i64);
+    info!(
+        item_id,
+        command, cwd, status, exit_code, duration_ms, "codex command completed"
+    );
+}
+
+/// Join buffered reasoning for the log. Do not emit an empty reasoning message.
+fn log_reasoning_completed(item_id: &str, summary: &str, text: &str) {
+    let reasoning_log = match (summary.is_empty(), text.is_empty()) {
+        (false, false) => format!("{summary}\n\n{text}"),
+        (false, true) => summary.to_string(),
+        (true, false) => text.to_string(),
+        (true, true) => String::new(),
+    };
+    if !reasoning_log.trim().is_empty() {
+        info!(
+            item_id,
+            reasoning = reasoning_log.as_str(),
+            "codex reasoning completed"
+        );
+    }
+}
+
+/// Preserve the typed cyber-policy failure for the security-review caller.
+fn turn_failure(params: Option<&Value>, error_message: &str) -> anyhow::Error {
+    if turn_error_is_cyber_policy(params) {
+        return SecurityReviewContentFlagged {
+            message: error_message.to_string(),
+        }
+        .into();
+    }
+    anyhow!("codex turn failed: {error_message}")
 }
 
 /// Scan only new bytes. Reset the offset after a complete line is consumed.

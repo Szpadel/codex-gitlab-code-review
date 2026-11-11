@@ -259,6 +259,8 @@ impl DockerCodexRunner {
         err.context(formatted)
     }
 
+    /// Wait for DevTools logs or a continuous running grace period before the endpoint probe.
+    /// Fail on container exit or timeout, with the latest diagnostics attached.
     pub(crate) async fn wait_for_browser_container_ready(
         &self,
         browser_container_id: &str,
@@ -276,62 +278,35 @@ impl DockerCodexRunner {
             let diagnostics = self
                 .collect_browser_container_diagnostics(browser_container_id, launch)
                 .await;
-            if browser_logs_report_ready(&diagnostics.log_tail, BROWSER_MCP_REMOTE_DEBUGGING_PORT) {
+            if report_browser_devtools_ready(&diagnostics.log_tail, browser_container_id)
+                || report_browser_wrapper_devtools_ready(
+                    &diagnostics.log_tail,
+                    launch,
+                    browser_container_id,
+                )
+            {
+                return Ok(());
+            }
+            if browser_running_grace_elapsed(diagnostics.state.as_ref(), &mut running_since) {
                 info!(
                     container_id = browser_container_id,
                     expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
-                    "browser container reported DevTools readiness"
+                    grace_period_secs = BROWSER_CONTAINER_RUNNING_GRACE_PERIOD.as_secs(),
+                    "browser container stayed running without a recognized DevTools log marker; deferring endpoint probe to app-server container"
                 );
                 return Ok(());
-            }
-            if browser_logs_report_headless_shell_wrapper_ready(&diagnostics.log_tail, launch) {
-                info!(
-                    container_id = browser_container_id,
-                    expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
-                    internal_port = HEADLESS_SHELL_WRAPPER_INTERNAL_DEVTOOLS_PORT,
-                    "browser container reported wrapper-managed DevTools process readiness"
-                );
-                return Ok(());
-            }
-            if diagnostics.state.as_ref().and_then(|state| state.running) == Some(true) {
-                let running_since_ref = running_since.get_or_insert_with(Instant::now);
-                if running_since_ref.elapsed() >= BROWSER_CONTAINER_RUNNING_GRACE_PERIOD {
-                    info!(
-                        container_id = browser_container_id,
-                        expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
-                        grace_period_secs = BROWSER_CONTAINER_RUNNING_GRACE_PERIOD.as_secs(),
-                        "browser container stayed running without a recognized DevTools log marker; deferring endpoint probe to app-server container"
-                    );
-                    return Ok(());
-                }
-            } else {
-                running_since = None;
             }
             if browser_container_has_exited(diagnostics.state.as_ref()) {
-                let formatted = diagnostics.format_context();
-                warn!(
-                    container_id = browser_container_id,
-                    diagnostics = %formatted,
-                    "browser container exited before readiness"
-                );
-                return Err(anyhow!(
-                    "browser container exited before reporting readiness on port {BROWSER_MCP_REMOTE_DEBUGGING_PORT}"
-                )
-                .context(formatted));
+                return Err(browser_exited_before_readiness_error(
+                    browser_container_id,
+                    diagnostics.format_context(),
+                ));
             }
             if Instant::now() >= deadline {
-                let formatted = diagnostics.format_context();
-                warn!(
-                    container_id = browser_container_id,
-                    diagnostics = %formatted,
-                    "browser container readiness timed out"
-                );
-                return Err(anyhow!(
-                    "browser container did not report readiness on port {} within {} seconds",
-                    BROWSER_MCP_REMOTE_DEBUGGING_PORT,
-                    BROWSER_CONTAINER_READY_TIMEOUT.as_secs()
-                )
-                .context(formatted));
+                return Err(browser_readiness_timeout_error(
+                    browser_container_id,
+                    diagnostics.format_context(),
+                ));
             }
             sleep(Duration::from_secs(1)).await;
         }
@@ -416,6 +391,85 @@ impl DockerCodexRunner {
             return Err(err);
         }
         Ok(id)
+    }
+}
+
+/// Report readiness only when logs identify the external DevTools port.
+fn report_browser_devtools_ready(log_tail: &BrowserLogTail, browser_container_id: &str) -> bool {
+    if browser_logs_report_ready(log_tail, BROWSER_MCP_REMOTE_DEBUGGING_PORT) {
+        info!(
+            container_id = browser_container_id,
+            expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+            "browser container reported DevTools readiness"
+        );
+        return true;
+    }
+    false
+}
+
+/// Accept the internal DevTools port only for a wrapper-managed launch.
+fn report_browser_wrapper_devtools_ready(
+    log_tail: &BrowserLogTail,
+    launch: &BrowserLaunchConfig,
+    browser_container_id: &str,
+) -> bool {
+    if browser_logs_report_headless_shell_wrapper_ready(log_tail, launch) {
+        info!(
+            container_id = browser_container_id,
+            expected_port = BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+            internal_port = HEADLESS_SHELL_WRAPPER_INTERNAL_DEVTOOLS_PORT,
+            "browser container reported wrapper-managed DevTools process readiness"
+        );
+        return true;
+    }
+    false
+}
+
+/// Report a startup exit and attach the collected diagnostics to its error.
+fn browser_exited_before_readiness_error(
+    browser_container_id: &str,
+    diagnostics: String,
+) -> anyhow::Error {
+    warn!(
+        container_id = browser_container_id,
+        diagnostics = %diagnostics,
+        "browser container exited before readiness"
+    );
+    anyhow!(
+        "browser container exited before reporting readiness on port {BROWSER_MCP_REMOTE_DEBUGGING_PORT}"
+    )
+    .context(diagnostics)
+}
+
+/// Report a startup timeout and attach the collected diagnostics to its error.
+fn browser_readiness_timeout_error(
+    browser_container_id: &str,
+    diagnostics: String,
+) -> anyhow::Error {
+    warn!(
+        container_id = browser_container_id,
+        diagnostics = %diagnostics,
+        "browser container readiness timed out"
+    );
+    anyhow!(
+        "browser container did not report readiness on port {} within {} seconds",
+        BROWSER_MCP_REMOTE_DEBUGGING_PORT,
+        BROWSER_CONTAINER_READY_TIMEOUT.as_secs()
+    )
+    .context(diagnostics)
+}
+
+/// Reset the grace period whenever the container is not known to be running.
+fn browser_running_grace_elapsed(
+    state: Option<&BrowserContainerStateSnapshot>,
+    running_since: &mut Option<Instant>,
+) -> bool {
+    if state.and_then(|state| state.running) == Some(true) {
+        let running_since = running_since.get_or_insert_with(Instant::now);
+        running_since.elapsed() >= BROWSER_CONTAINER_RUNNING_GRACE_PERIOD
+    } else {
+        *running_since = None;
+        false
     }
 }
 

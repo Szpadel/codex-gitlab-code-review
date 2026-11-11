@@ -431,6 +431,17 @@ impl DockerCodexRunner {
             .is_some_and(|value| value == owner_id)
     }
 
+    fn owns_managed_container(
+        &self,
+        names: &[String],
+        labels: Option<&HashMap<String, String>>,
+    ) -> bool {
+        names
+            .iter()
+            .any(|name| Self::is_managed_container_name(name))
+            && Self::has_review_owner_label(labels, &self.owner_id)
+    }
+
     pub(crate) async fn stop_active_review_containers_best_effort(&self) {
         #[cfg(test)]
         if let RunnerRuntime::Fake(harness) = &self.runtime {
@@ -445,14 +456,7 @@ impl DockerCodexRunner {
                 }
             };
             for container in containers {
-                if !container
-                    .names
-                    .iter()
-                    .any(|name| Self::is_managed_container_name(name))
-                {
-                    continue;
-                }
-                if !Self::has_review_owner_label(container.labels.as_ref(), &self.owner_id) {
+                if !self.owns_managed_container(&container.names, container.labels.as_ref()) {
                     continue;
                 }
                 let Some(id) = container.id.as_deref() else {
@@ -470,66 +474,70 @@ impl DockerCodexRunner {
         };
         #[cfg(not(test))]
         let RunnerRuntime::Docker { docker, .. } = &self.runtime;
+        let Some(containers) = self.list_review_containers_best_effort(docker).await else {
+            return;
+        };
+
+        for container in containers {
+            let names = container.names.unwrap_or_default();
+            if !self.owns_managed_container(&names, container.labels.as_ref()) {
+                continue;
+            }
+            let Some(id) = managed_container_id(container.id.as_deref(), &names) else {
+                continue;
+            };
+            self.remove_managed_docker_container_best_effort(docker, id, &names)
+                .await;
+        }
+    }
+
+    /// Log listing failures and leave active containers untouched on failure.
+    async fn list_review_containers_best_effort(
+        &self,
+        docker: &Docker,
+    ) -> Option<Vec<bollard::models::ContainerSummary>> {
         let filters = Self::review_container_filters(&self.owner_id);
         let options = ListContainersOptionsBuilder::new()
             .all(true)
             .filters(&filters)
             .build();
 
-        let containers = match docker.list_containers(Some(options)).await {
-            Ok(containers) => containers,
+        match docker.list_containers(Some(options)).await {
+            Ok(containers) => Some(containers),
             Err(err) => {
                 warn!(
                     error = %err,
                     "failed to list docker containers while stopping active codex reviews"
                 );
-                return;
+                None
             }
-        };
+        }
+    }
 
-        for container in containers {
-            let names = container.names.unwrap_or_default();
-            if !names
+    /// Report all Docker removal failures, including already absent managed containers.
+    async fn remove_managed_docker_container_best_effort(
+        &self,
+        docker: &Docker,
+        id: &str,
+        names: &[String],
+    ) {
+        if let Err(err) = docker
+            .remove_container(
+                id,
+                Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+            )
+            .await
+        {
+            let container_name = names
                 .iter()
-                .any(|name| Self::is_managed_container_name(name))
-            {
-                continue;
-            }
-            if !Self::has_review_owner_label(container.labels.as_ref(), &self.owner_id) {
-                continue;
-            }
-
-            let Some(id) = container.id.as_deref() else {
-                let names_value = if names.is_empty() {
-                    "<unknown>".to_string()
-                } else {
-                    names.join(",")
-                };
-                warn!(
-                    container_names = names_value.as_str(),
-                    "skipping managed codex container without id"
-                );
-                continue;
-            };
-
-            if let Err(err) = docker
-                .remove_container(
-                    id,
-                    Some(RemoveContainerOptionsBuilder::new().force(true).build()),
-                )
-                .await
-            {
-                let container_name = names
-                    .iter()
-                    .find(|name| Self::is_managed_container_name(name))
-                    .map_or("<unknown>", |name| name.trim_start_matches('/'));
-                warn!(
-                    container_id = id,
-                    container_name,
-                    error = %err,
-                    "failed to remove managed codex container"
-                );
-            }
+                .find(|name| Self::is_managed_container_name(name))
+                .map_or("<unknown>", |name| name.trim_start_matches('/'));
+            warn!(
+                container_id = id,
+                container_name,
+                error = %err,
+                "failed to remove managed codex container"
+            );
         }
     }
 
@@ -541,62 +549,23 @@ impl DockerCodexRunner {
         browser_mcp: Option<&BrowserMcpConfig>,
         extra_hosts: Vec<String>,
     ) -> Result<StartedAppServer> {
+        #[cfg(test)]
+        if let RunnerRuntime::Fake(_) = &self.runtime {
+            return self
+                .start_fake_app_server_container(
+                    script,
+                    auth_host_path,
+                    extras,
+                    browser_mcp,
+                    extra_hosts,
+                )
+                .await;
+        }
         let AppServerContainerExtras {
             binds: extra_binds,
             env: extra_env,
             cleanup,
         } = extras;
-        #[cfg(test)]
-        if let RunnerRuntime::Fake(harness) = &self.runtime {
-            let image_ref = Self::normalize_image_reference(&self.codex.image);
-            self.ensure_image_available(&image_ref).await?;
-            let browser_launch = browser_mcp.map(BrowserLaunchConfig::from_browser_mcp);
-            if let Some(launch) = browser_launch.as_ref() {
-                self.ensure_image_available(&launch.image).await?;
-            }
-            let mut binds = vec![format!(
-                "{}:{}:rw",
-                auth_host_path, self.codex.auth_mount_path
-            )];
-            binds.extend(extra_binds);
-            let mounts = self.work_tmpfs_mounts();
-            let started = harness
-                .start_app_server_container(test_support::StartAppServerContainerRequest {
-                    image: image_ref,
-                    cmd: Self::app_server_cmd(script),
-                    env: self.env_vars(&extra_env),
-                    binds,
-                    mounts,
-                    labels: Self::review_container_labels(&self.owner_id),
-                    extra_hosts,
-                    browser_mcp: browser_mcp.cloned(),
-                    log_all_json: self.log_all_json,
-                })
-                .await?;
-            if let Some(cleanup) = cleanup.as_ref() {
-                if let Some(browser_id) = started.browser_container_id.as_deref() {
-                    cleanup.record(browser_id);
-                }
-                cleanup.record(&started.container_id);
-            }
-            if let (Some(browser_container_id), Some(launch)) = (
-                started.browser_container_id.as_deref(),
-                browser_launch.as_ref(),
-            ) && let Err(err) = self
-                .wait_for_browser_container_ready(browser_container_id, launch)
-                .await
-            {
-                self.remove_startup_container(&started.container_id, cleanup.as_ref())
-                    .await;
-                if let Some(browser_id) = started.browser_container_id.as_deref() {
-                    self.remove_startup_container(browser_id, cleanup.as_ref())
-                        .await;
-                }
-                return Err(err);
-            }
-            return Ok(started);
-        }
-
         #[cfg(test)]
         let docker = match &self.runtime {
             RunnerRuntime::Docker { docker, .. } => docker,
@@ -679,11 +648,12 @@ impl DockerCodexRunner {
             .await
             .with_context(|| format!("start docker container {id}"));
         if let Err(err) = start_result {
-            self.remove_startup_container(&id, cleanup.as_ref()).await;
-            if let Some(browser_id) = browser_container_id.as_deref() {
-                self.remove_startup_container(browser_id, cleanup.as_ref())
-                    .await;
-            }
+            self.cleanup_failed_app_server_startup(
+                &id,
+                browser_container_id.as_deref(),
+                cleanup.as_ref(),
+            )
+            .await;
             return Err(err);
         }
 
@@ -705,11 +675,12 @@ impl DockerCodexRunner {
         {
             Ok(attach) => attach,
             Err(err) => {
-                self.remove_startup_container(&id, cleanup.as_ref()).await;
-                if let Some(browser_id) = browser_container_id.as_deref() {
-                    self.remove_startup_container(browser_id, cleanup.as_ref())
-                        .await;
-                }
+                self.cleanup_failed_app_server_startup(
+                    &id,
+                    browser_container_id.as_deref(),
+                    cleanup.as_ref(),
+                )
+                .await;
                 return Err(err);
             }
         };
@@ -719,6 +690,123 @@ impl DockerCodexRunner {
             browser_container_id,
             client: AppServerClient::new(attach, self.log_all_json),
         })
+    }
+
+    /// Remove the app-server container before the browser and release their startup records.
+    async fn cleanup_failed_app_server_startup(
+        &self,
+        container_id: &str,
+        browser_container_id: Option<&str>,
+        cleanup: Option<&ContainerCleanup>,
+    ) {
+        self.remove_startup_container(container_id, cleanup).await;
+        if let Some(browser_id) = browser_container_id {
+            self.remove_startup_container(browser_id, cleanup).await;
+        }
+    }
+
+    /// Record created fake containers before checking browser readiness.
+    #[cfg(test)]
+    async fn start_fake_app_server_container(
+        &self,
+        script: String,
+        auth_host_path: &str,
+        extras: AppServerContainerExtras,
+        browser_mcp: Option<&BrowserMcpConfig>,
+        extra_hosts: Vec<String>,
+    ) -> Result<StartedAppServer> {
+        let RunnerRuntime::Fake(harness) = &self.runtime else {
+            unreachable!("fake startup requires fake runtime");
+        };
+        let image_ref = Self::normalize_image_reference(&self.codex.image);
+        self.ensure_image_available(&image_ref).await?;
+        let browser_launch = browser_mcp.map(BrowserLaunchConfig::from_browser_mcp);
+        if let Some(launch) = browser_launch.as_ref() {
+            self.ensure_image_available(&launch.image).await?;
+        }
+        let mut binds = vec![format!(
+            "{}:{}:rw",
+            auth_host_path, self.codex.auth_mount_path
+        )];
+        binds.extend(extras.binds);
+        let started = harness
+            .start_app_server_container(test_support::StartAppServerContainerRequest {
+                image: image_ref,
+                cmd: Self::app_server_cmd(script),
+                env: self.env_vars(&extras.env),
+                binds,
+                mounts: self.work_tmpfs_mounts(),
+                labels: Self::review_container_labels(&self.owner_id),
+                extra_hosts,
+                browser_mcp: browser_mcp.cloned(),
+                log_all_json: self.log_all_json,
+            })
+            .await?;
+        record_started_container_cleanup(&started, extras.cleanup.as_ref());
+        self.wait_for_fake_startup_browser(
+            &started.container_id,
+            started.browser_container_id.as_deref(),
+            browser_launch.as_ref(),
+            extras.cleanup.as_ref(),
+        )
+        .await?;
+        Ok(started)
+    }
+
+    /// Remove and release recorded startup containers if browser readiness fails.
+    #[cfg(test)]
+    async fn wait_for_fake_startup_browser(
+        &self,
+        container_id: &str,
+        browser_container_id: Option<&str>,
+        browser_launch: Option<&BrowserLaunchConfig>,
+        cleanup: Option<&ContainerCleanup>,
+    ) -> Result<()> {
+        if let (Some(browser_container_id), Some(launch)) = (browser_container_id, browser_launch)
+            && let Err(err) = self
+                .wait_for_browser_container_ready(browser_container_id, launch)
+                .await
+        {
+            self.cleanup_failed_app_server_startup(
+                container_id,
+                Some(browser_container_id),
+                cleanup,
+            )
+            .await;
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+/// Warn when Docker lists a managed container without an ID.
+fn managed_container_id<'a>(id: Option<&'a str>, names: &[String]) -> Option<&'a str> {
+    if id.is_some() {
+        return id;
+    }
+    let names_value = if names.is_empty() {
+        "<unknown>".to_string()
+    } else {
+        names.join(",")
+    };
+    warn!(
+        container_names = names_value.as_str(),
+        "skipping managed codex container without id"
+    );
+    None
+}
+
+/// Record browser startup before app-server startup for outer cancellation cleanup.
+#[cfg(test)]
+fn record_started_container_cleanup(
+    started: &StartedAppServer,
+    cleanup: Option<&ContainerCleanup>,
+) {
+    if let Some(cleanup) = cleanup {
+        if let Some(browser_id) = started.browser_container_id.as_deref() {
+            cleanup.record(browser_id);
+        }
+        cleanup.record(&started.container_id);
     }
 }
 
