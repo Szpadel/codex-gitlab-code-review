@@ -1,0 +1,3 @@
+# Temporary legacy ceiling under the code-style skill's incremental reduction policy.
+# New code must remain at 10 or lower.
+cognitive-complexity-threshold = 24

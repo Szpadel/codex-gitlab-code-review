@@ -3,6 +3,9 @@ name = "codex-gitlab-code-review"
 version = "0.1.0"
 edition = "2024"
 
+[lints.clippy]
+cognitive_complexity = "deny"
+
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
